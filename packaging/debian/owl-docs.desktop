@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Name=Owl Docs
+GenericName=Word Processor
+Comment=Offline word processor with optional Codex assistance
+TryExec=owl-docs
+Exec=owl-docs %f
+Icon=owl-docs
+Terminal=false
+StartupNotify=true
+StartupWMClass=owl-docs
+Categories=Office;WordProcessor;
+MimeType=application/vnd.openxmlformats-officedocument.wordprocessingml.document;
+Keywords=Owl;Docs;DOCX;Word;Document;Editor;Writing;

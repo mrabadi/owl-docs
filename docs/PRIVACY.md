@@ -1,0 +1,11 @@
+# Privacy and networking
+
+The current application code contains no telemetry, analytics, update checks, advertising, crash uploads, remote-font lookup, or cloud-spelling client. Spelling uses a local Hunspell dictionary. A reviewed support-bundle and diagnostic-log implementation has not been built yet, so this repository makes no claim about such a facility.
+
+The editor operates when Codex is absent or disabled. When the user explicitly enables chat, the application launches the official Codex executable and indicates that requested document context may be processed by Codex/OpenAI. Authentication uses app-server account methods and may open the user's browser; Owl Docs does not read Codex credential files or browser cookies.
+
+For the current chat path, the Codex thread is requested with a read-only sandbox, approvals disabled, and an empty temporary working directory. The child receives an allowlisted environment and the packaged ChatGPT Codex binary is preferred over `PATH` when present. This is not a complete OS security boundary: read-only Codex mode can still permit filesystem reads outside that directory according to the installed runtime's sandbox behavior. The initial turn contains the user's message plus at most 12,000 characters each of current selection and document outline. Registered semantic read tools can subsequently return requested document chunks, bounded to 200,000 UTF-16 code units per call without splitting surrogate pairs. Document text is labeled as untrusted context.
+
+The live `editor.v1` bridge supports bounded reads and creates revision-checked preview branches; only the desktop UI can accept a preview. Its path-free file-capability tool currently denies requests because no grant workflow is attached. Save and PDF destinations in the current UI come only from native user file dialogs.
+
+OS-level network denial for the GUI, renderer, and future MCP helper is a roadmap requirement, not an implemented guarantee. Every GUI file open is preflighted in the restricted parser worker, and the GUI reparses the same held descriptor rather than reopening the pathname when it builds the preservation model. That still leaves an in-process parser surface, so do not treat the present prototype as a complete security boundary for hostile files.

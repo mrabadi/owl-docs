@@ -1,0 +1,354 @@
+cmake_minimum_required(VERSION 3.22)
+
+project(OwlDocs VERSION 0.1.9 LANGUAGES CXX)
+
+include(GNUInstallDirs)
+include(CTest)
+find_package(PkgConfig REQUIRED)
+
+option(DOCXSTUDIO_BUILD_APP "Build the Qt desktop application" ON)
+option(DOCXSTUDIO_STRICT_WARNINGS "Treat compiler warnings as errors" OFF)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+function(docxstudio_warnings target)
+    target_compile_options(${target} PRIVATE
+        $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall;-Wextra;-Wpedantic;-Wconversion;-Wshadow>)
+    if(DOCXSTUDIO_STRICT_WARNINGS)
+        target_compile_options(${target} PRIVATE
+            $<$<CXX_COMPILER_ID:GNU,Clang>:-Werror>)
+    endif()
+endfunction()
+
+add_library(docxstudio_core
+    src/core/types.cpp
+    src/core/formatting.cpp
+    src/core/document.cpp
+    src/core/document_session.cpp
+)
+target_include_directories(docxstudio_core PUBLIC include)
+target_compile_features(docxstudio_core PUBLIC cxx_std_20)
+docxstudio_warnings(docxstudio_core)
+
+add_library(docxstudio_math
+    src/math/ast.cpp
+    src/math/latex_parser.cpp
+)
+target_include_directories(docxstudio_math PUBLIC include)
+target_compile_features(docxstudio_math PUBLIC cxx_std_20)
+docxstudio_warnings(docxstudio_math)
+
+pkg_check_modules(LIBZIP REQUIRED IMPORTED_TARGET libzip)
+pkg_check_modules(PUGIXML REQUIRED IMPORTED_TARGET pugixml)
+add_library(docxstudio_ooxml src/ooxml/docx_document.cpp)
+target_include_directories(docxstudio_ooxml PUBLIC include)
+target_link_libraries(docxstudio_ooxml PUBLIC
+    docxstudio_math PkgConfig::LIBZIP PkgConfig::PUGIXML)
+target_compile_features(docxstudio_ooxml PUBLIC cxx_std_20)
+docxstudio_warnings(docxstudio_ooxml)
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    pkg_check_modules(LIBSECCOMP REQUIRED IMPORTED_TARGET libseccomp)
+    add_library(docxstudio_worker
+        src/worker/sandbox.cpp
+        src/worker/protocol.cpp
+        src/worker/client.cpp
+    )
+    target_include_directories(docxstudio_worker PUBLIC include)
+    target_link_libraries(docxstudio_worker PUBLIC
+        PkgConfig::LIBSECCOMP PkgConfig::LIBZIP PkgConfig::PUGIXML)
+    target_compile_features(docxstudio_worker PUBLIC cxx_std_20)
+    docxstudio_warnings(docxstudio_worker)
+
+    add_executable(owl-docs-parser-worker src/worker/parser_worker_main.cpp)
+    target_link_libraries(owl-docs-parser-worker PRIVATE docxstudio_worker)
+    docxstudio_warnings(owl-docs-parser-worker)
+    install(TARGETS owl-docs-parser-worker
+            RUNTIME DESTINATION ${CMAKE_INSTALL_LIBEXECDIR}/owl-docs)
+endif()
+
+find_package(nlohmann_json CONFIG REQUIRED)
+add_library(docxstudio_codex
+    src/codex/transport.cpp
+    src/codex/client.cpp
+    src/codex/editor_tools.cpp
+    src/codex/redaction.cpp
+)
+target_include_directories(docxstudio_codex PUBLIC include)
+target_link_libraries(docxstudio_codex PUBLIC nlohmann_json::nlohmann_json)
+target_compile_features(docxstudio_codex PUBLIC cxx_std_20)
+docxstudio_warnings(docxstudio_codex)
+
+if(DOCXSTUDIO_BUILD_APP)
+    find_package(Qt6 6.2 REQUIRED COMPONENTS Core Gui Widgets PrintSupport)
+    find_package(SQLite3 REQUIRED)
+    pkg_check_modules(HUNSPELL REQUIRED IMPORTED_TARGET hunspell)
+
+    add_library(docxstudio_app STATIC
+        src/app/MainWindow.cpp
+        src/app/EditorPreferences.cpp
+        src/app/FontFamilyPicker.cpp
+        src/app/ListPropertiesDialog.cpp
+        src/app/FileFingerprint.cpp
+        src/app/CommandRegistry.cpp
+        src/app/RibbonWidget.cpp
+        src/app/ChatDock.cpp
+        src/app/ChatStore.cpp
+        src/app/RecoveryCodec.cpp
+        src/app/SpellChecker.cpp
+        src/app/DocumentCanvas.cpp
+        src/app/QtDisplayListRenderer.cpp
+        src/app/QtProcess.cpp
+        src/app/CodexController.cpp
+        src/app/EditorToolBridge.cpp
+        src/app/OwlDocsIcon.cpp
+        src/app/MathLayout.cpp
+        include/docxstudio/app/MainWindow.h
+        include/docxstudio/app/EditorPreferences.h
+        include/docxstudio/app/FontFamilyPicker.h
+        include/docxstudio/app/ListPropertiesDialog.h
+        include/docxstudio/app/FileFingerprint.h
+        include/docxstudio/app/CommandRegistry.h
+        include/docxstudio/app/RibbonWidget.h
+        include/docxstudio/app/ChatDock.h
+        include/docxstudio/app/DocumentCanvas.h
+        include/docxstudio/app/CodexController.h
+        include/docxstudio/app/QtProcess.h
+        include/docxstudio/app/EditorToolBridge.h
+        include/docxstudio/app/RecoveryCodec.h
+        include/docxstudio/app/OwlDocsIcon.h
+        include/docxstudio/app/MathLayout.h
+    )
+    set_target_properties(docxstudio_app PROPERTIES AUTOMOC ON)
+    target_include_directories(docxstudio_app PUBLIC include)
+    target_link_libraries(docxstudio_app PUBLIC
+        docxstudio_core docxstudio_math docxstudio_ooxml docxstudio_codex docxstudio_worker
+        Qt6::Core Qt6::Gui Qt6::Widgets Qt6::PrintSupport
+        SQLite::SQLite3 PkgConfig::HUNSPELL
+    )
+    target_compile_definitions(docxstudio_app PUBLIC
+        DOCXSTUDIO_VERSION="${PROJECT_VERSION}"
+        DOCXSTUDIO_INSTALL_PARSER_WORKER_PATH="${CMAKE_INSTALL_FULL_LIBEXECDIR}/owl-docs/owl-docs-parser-worker")
+    add_dependencies(docxstudio_app owl-docs-parser-worker)
+    docxstudio_warnings(docxstudio_app)
+
+    add_executable(owl-docs
+        src/app/main.cpp
+        resources/owl-docs.qrc
+    )
+    set_target_properties(owl-docs PROPERTIES AUTORCC ON)
+    target_link_libraries(owl-docs PRIVATE docxstudio_app)
+    docxstudio_warnings(owl-docs)
+
+    # Developer-side, opt-in fidelity probe. It intentionally uses MainWindow's
+    # restricted DOCX import path and the same DocumentCanvas PDF renderer as
+    # the desktop application, but is not part of release packages.
+    add_executable(owl-docs-fidelity-probe EXCLUDE_FROM_ALL
+        tools/owl_docs_fidelity_probe.cpp
+    )
+    target_link_libraries(owl-docs-fidelity-probe PRIVATE docxstudio_app)
+    add_dependencies(owl-docs-fidelity-probe owl-docs-parser-worker)
+    docxstudio_warnings(owl-docs-fidelity-probe)
+
+    install(TARGETS owl-docs RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+    install(FILES packaging/debian/owl-docs.desktop
+            DESTINATION ${CMAKE_INSTALL_DATADIR}/applications)
+    install(FILES packaging/debian/owl-docs.xml
+            DESTINATION ${CMAKE_INSTALL_DATADIR}/mime/packages)
+    install(FILES packaging/icons/owl-docs.svg
+            DESTINATION ${CMAKE_INSTALL_DATADIR}/icons/hicolor/scalable/apps)
+    foreach(OWL_DOCS_ICON_SIZE 16 24 32 48 64 128 256 512)
+        install(FILES
+                packaging/icons/hicolor/${OWL_DOCS_ICON_SIZE}x${OWL_DOCS_ICON_SIZE}/apps/owl-docs.png
+                DESTINATION
+                ${CMAKE_INSTALL_DATADIR}/icons/hicolor/${OWL_DOCS_ICON_SIZE}x${OWL_DOCS_ICON_SIZE}/apps)
+    endforeach()
+endif()
+
+if(BUILD_TESTING)
+    add_executable(core_tests tests/core_tests.cpp)
+    target_link_libraries(core_tests PRIVATE docxstudio_core)
+    docxstudio_warnings(core_tests)
+    add_test(NAME core_tests COMMAND core_tests)
+
+    add_executable(codex_tests tests/codex_tests.cpp)
+    target_link_libraries(codex_tests PRIVATE docxstudio_codex)
+    docxstudio_warnings(codex_tests)
+    add_test(NAME codex_tests COMMAND codex_tests)
+
+    add_executable(math_tests tests/math_tests.cpp)
+    target_link_libraries(math_tests PRIVATE docxstudio_math)
+    docxstudio_warnings(math_tests)
+    add_test(NAME math_tests COMMAND math_tests)
+
+    if(TARGET docxstudio_app)
+        add_executable(math_layout_tests tests/math_layout_tests.cpp)
+        target_link_libraries(math_layout_tests PRIVATE docxstudio_app)
+        docxstudio_warnings(math_layout_tests)
+        add_test(NAME math_layout_tests COMMAND math_layout_tests)
+        set_tests_properties(math_layout_tests PROPERTIES
+            ENVIRONMENT "QT_QPA_PLATFORM=offscreen;XDG_DATA_HOME=/tmp/owl-docs-math-layout-tests")
+    endif()
+
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/ooxml_tests.cpp")
+        add_executable(ooxml_tests tests/ooxml_tests.cpp)
+        target_link_libraries(ooxml_tests PRIVATE docxstudio_ooxml)
+        docxstudio_warnings(ooxml_tests)
+        add_test(NAME ooxml_tests COMMAND ooxml_tests)
+    endif()
+
+    if(TARGET docxstudio_worker)
+        add_executable(worker_tests tests/worker_tests.cpp)
+        target_link_libraries(worker_tests PRIVATE docxstudio_worker)
+        target_compile_definitions(worker_tests PRIVATE
+            DOCXSTUDIO_PARSER_WORKER_PATH="$<TARGET_FILE:owl-docs-parser-worker>")
+        add_dependencies(worker_tests owl-docs-parser-worker)
+        docxstudio_warnings(worker_tests)
+        add_test(NAME worker_tests COMMAND worker_tests)
+    endif()
+
+    if(DOCXSTUDIO_BUILD_APP)
+        add_executable(app_smoke_tests tests/app_smoke_tests.cpp)
+        target_link_libraries(app_smoke_tests PRIVATE docxstudio_app)
+        docxstudio_warnings(app_smoke_tests)
+        add_test(NAME app_smoke_tests COMMAND app_smoke_tests)
+        set_tests_properties(app_smoke_tests PROPERTIES
+            ENVIRONMENT "QT_QPA_PLATFORM=offscreen;XDG_DATA_HOME=/tmp/owl-docs-tests")
+
+        add_executable(editor_interaction_tests tests/editor_interaction_tests.cpp)
+        target_link_libraries(editor_interaction_tests PRIVATE docxstudio_app)
+        docxstudio_warnings(editor_interaction_tests)
+        add_test(NAME editor_interaction_tests COMMAND editor_interaction_tests)
+        set_tests_properties(editor_interaction_tests PROPERTIES
+            ENVIRONMENT "QT_QPA_PLATFORM=offscreen;XDG_DATA_HOME=/tmp/owl-docs-tests")
+
+        add_executable(layout_conformance_tests
+            tests/layout_conformance_tests.cpp)
+        target_link_libraries(layout_conformance_tests PRIVATE docxstudio_app)
+        docxstudio_warnings(layout_conformance_tests)
+        add_test(NAME layout_conformance_tests COMMAND layout_conformance_tests)
+        set_tests_properties(layout_conformance_tests PROPERTIES
+            ENVIRONMENT "QT_QPA_PLATFORM=offscreen;XDG_DATA_HOME=/tmp/owl-docs-layout-conformance-tests")
+
+        add_executable(editor_preferences_tests tests/editor_preferences_tests.cpp)
+        target_link_libraries(editor_preferences_tests PRIVATE docxstudio_app)
+        docxstudio_warnings(editor_preferences_tests)
+        add_test(NAME editor_preferences_tests COMMAND editor_preferences_tests)
+
+        add_executable(main_window_preferences_tests
+            tests/main_window_preferences_tests.cpp)
+        target_link_libraries(main_window_preferences_tests PRIVATE docxstudio_app)
+        docxstudio_warnings(main_window_preferences_tests)
+        add_test(NAME main_window_preferences_tests
+                 COMMAND main_window_preferences_tests)
+        set_tests_properties(main_window_preferences_tests PROPERTIES
+            ENVIRONMENT "QT_QPA_PLATFORM=offscreen;XDG_DATA_HOME=/tmp/owl-docs-main-window-preferences-tests")
+
+        add_executable(list_properties_ui_tests
+            tests/list_properties_ui_tests.cpp)
+        target_link_libraries(list_properties_ui_tests PRIVATE docxstudio_app)
+        docxstudio_warnings(list_properties_ui_tests)
+        add_test(NAME list_properties_ui_tests COMMAND list_properties_ui_tests)
+        set_tests_properties(list_properties_ui_tests PROPERTIES
+            ENVIRONMENT "QT_QPA_PLATFORM=offscreen;XDG_DATA_HOME=/tmp/owl-docs-list-properties-ui-tests")
+
+        add_executable(table_ui_tests tests/table_ui_tests.cpp)
+        target_link_libraries(table_ui_tests PRIVATE docxstudio_app)
+        docxstudio_warnings(table_ui_tests)
+        add_test(NAME table_ui_tests COMMAND table_ui_tests)
+        set_tests_properties(table_ui_tests PROPERTIES
+            ENVIRONMENT "QT_QPA_PLATFORM=offscreen;XDG_DATA_HOME=/tmp/owl-docs-table-ui-tests")
+
+        add_executable(ribbon_widget_tests tests/ribbon_widget_tests.cpp)
+        target_link_libraries(ribbon_widget_tests PRIVATE docxstudio_app)
+        docxstudio_warnings(ribbon_widget_tests)
+        add_test(NAME ribbon_widget_tests COMMAND ribbon_widget_tests)
+        set_tests_properties(ribbon_widget_tests PROPERTIES
+            ENVIRONMENT "QT_QPA_PLATFORM=offscreen;XDG_DATA_HOME=/tmp/owl-docs-ribbon-widget-tests")
+
+        add_executable(equation_ui_tests tests/equation_ui_tests.cpp)
+        target_link_libraries(equation_ui_tests PRIVATE docxstudio_app)
+        docxstudio_warnings(equation_ui_tests)
+        add_test(NAME equation_ui_tests COMMAND equation_ui_tests)
+        set_tests_properties(equation_ui_tests PROPERTIES
+            ENVIRONMENT "QT_QPA_PLATFORM=offscreen;XDG_DATA_HOME=/tmp/owl-docs-equation-ui-tests")
+
+        add_executable(print_tests tests/print_tests.cpp)
+        target_link_libraries(print_tests PRIVATE docxstudio_app)
+        docxstudio_warnings(print_tests)
+        add_test(NAME print_tests COMMAND print_tests)
+        set_tests_properties(print_tests PROPERTIES
+            ENVIRONMENT "QT_QPA_PLATFORM=offscreen;XDG_DATA_HOME=/tmp/owl-docs-print-tests")
+
+        add_executable(combined_docx_roundtrip_tests tests/combined_docx_roundtrip_tests.cpp)
+        target_link_libraries(combined_docx_roundtrip_tests PRIVATE docxstudio_app)
+        docxstudio_warnings(combined_docx_roundtrip_tests)
+        add_test(NAME combined_docx_roundtrip_tests COMMAND combined_docx_roundtrip_tests)
+        set_tests_properties(combined_docx_roundtrip_tests PROPERTIES
+            ENVIRONMENT "QT_QPA_PLATFORM=offscreen;XDG_DATA_HOME=/tmp/owl-docs-combined-roundtrip-tests")
+
+        add_executable(editor_tool_bridge_tests tests/editor_tool_bridge_tests.cpp)
+        target_link_libraries(editor_tool_bridge_tests PRIVATE docxstudio_app)
+        docxstudio_warnings(editor_tool_bridge_tests)
+        add_test(NAME editor_tool_bridge_tests COMMAND editor_tool_bridge_tests)
+        set_tests_properties(editor_tool_bridge_tests PROPERTIES
+            ENVIRONMENT "QT_QPA_PLATFORM=offscreen;XDG_DATA_HOME=/tmp/owl-docs-tests")
+
+        add_executable(app_import_tests tests/app_import_tests.cpp)
+        target_link_libraries(app_import_tests PRIVATE docxstudio_app)
+        docxstudio_warnings(app_import_tests)
+        add_test(NAME app_import_tests COMMAND app_import_tests)
+        set_tests_properties(app_import_tests PROPERTIES
+            ENVIRONMENT "QT_QPA_PLATFORM=offscreen;XDG_DATA_HOME=/tmp/owl-docs-tests")
+
+        add_executable(recovery_tests tests/recovery_tests.cpp)
+        target_link_libraries(recovery_tests PRIVATE docxstudio_app)
+        docxstudio_warnings(recovery_tests)
+        add_test(NAME recovery_tests COMMAND recovery_tests)
+
+        add_executable(file_fingerprint_tests tests/file_fingerprint_tests.cpp)
+        target_link_libraries(file_fingerprint_tests PRIVATE docxstudio_app)
+        docxstudio_warnings(file_fingerprint_tests)
+        add_test(NAME file_fingerprint_tests COMMAND file_fingerprint_tests)
+
+        add_executable(branding_tests
+            tests/branding_tests.cpp
+            resources/owl-docs.qrc
+        )
+        set_target_properties(branding_tests PROPERTIES AUTORCC ON)
+        target_link_libraries(branding_tests PRIVATE docxstudio_app)
+        target_compile_definitions(branding_tests PRIVATE
+            OWL_DOCS_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+        docxstudio_warnings(branding_tests)
+        add_test(NAME branding_tests COMMAND branding_tests)
+        set_tests_properties(branding_tests PROPERTIES
+            ENVIRONMENT "QT_QPA_PLATFORM=offscreen;XDG_DATA_HOME=/tmp/owl-docs-branding-tests")
+    endif()
+endif()
+
+set(CPACK_GENERATOR "DEB")
+set(CPACK_PACKAGE_NAME "owl-docs")
+set(CPACK_PACKAGE_VENDOR "Owl Docs")
+set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "Offline word processor with optional Codex assistance")
+set(CPACK_DEBIAN_PACKAGE_DESCRIPTION
+    "Offline DOCX word processor with optional Codex assistance.\n Owl Docs provides local document editing, PDF export, and an optional\n user-enabled Codex chat experience.")
+set(CPACK_DEBIAN_PACKAGE_MAINTAINER "Owl Docs")
+set(CPACK_DEBIAN_PACKAGE_REPLACES "docx-studio")
+set(CPACK_DEBIAN_PACKAGE_CONFLICTS "docx-studio")
+set(CPACK_DEBIAN_FILE_NAME DEB-DEFAULT)
+set(CPACK_DEBIAN_PACKAGE_SECTION "editors")
+set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS ON)
+set(CPACK_DEBIAN_PACKAGE_DEPENDS
+    "hunspell-en-us, fonts-crosextra-carlito, qt6-qpa-plugins")
+set(CPACK_DEBIAN_PACKAGE_CONTROL_EXTRA
+    "${CMAKE_CURRENT_SOURCE_DIR}/packaging/debian/postinst;${CMAKE_CURRENT_SOURCE_DIR}/packaging/debian/postrm")
+set(CPACK_DEBIAN_PACKAGE_CONTROL_STRICT_PERMISSION ON)
+set(CPACK_STRIP_FILES ON)
+set(CPACK_INSTALL_DEFAULT_DIRECTORY_PERMISSIONS
+    OWNER_READ OWNER_WRITE OWNER_EXECUTE
+    GROUP_READ GROUP_EXECUTE
+    WORLD_READ WORLD_EXECUTE)
+include(CPack)

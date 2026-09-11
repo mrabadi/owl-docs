@@ -1,0 +1,13 @@
+<RCC>
+  <qresource prefix="/icons">
+    <file alias="owl-docs.svg">../packaging/icons/owl-docs.svg</file>
+    <file alias="owl-docs-16.png">../packaging/icons/hicolor/16x16/apps/owl-docs.png</file>
+    <file alias="owl-docs-24.png">../packaging/icons/hicolor/24x24/apps/owl-docs.png</file>
+    <file alias="owl-docs-32.png">../packaging/icons/hicolor/32x32/apps/owl-docs.png</file>
+    <file alias="owl-docs-48.png">../packaging/icons/hicolor/48x48/apps/owl-docs.png</file>
+    <file alias="owl-docs-64.png">../packaging/icons/hicolor/64x64/apps/owl-docs.png</file>
+    <file alias="owl-docs-128.png">../packaging/icons/hicolor/128x128/apps/owl-docs.png</file>
+    <file alias="owl-docs-256.png">../packaging/icons/hicolor/256x256/apps/owl-docs.png</file>
+    <file alias="owl-docs-512.png">../packaging/icons/hicolor/512x512/apps/owl-docs.png</file>
+  </qresource>
+</RCC>

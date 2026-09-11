@@ -1,0 +1,429 @@
+#pragma once
+
+#include "docxstudio/core/document_session.h"
+
+#include <QAbstractScrollArea>
+#include <QColor>
+#include <QElapsedTimer>
+#include <QImage>
+#include <QPoint>
+#include <QString>
+
+#include <cstdint>
+#include <memory>
+#include <optional>
+#include <string>
+#include <utility>
+#include <vector>
+
+class QInputMethodEvent;
+class QMouseEvent;
+class QPaintEvent;
+class QPdfWriter;
+class QPrinter;
+class QTextLayout;
+class QTimer;
+
+namespace docxstudio::app {
+
+class SpellChecker;
+
+struct ImportedInlineImagePresentation {
+    core::NodeId paragraphId;
+    QImage image;
+    double widthPoints{0.0};
+    double heightPoints{0.0};
+    QString accessibleName;
+};
+
+enum class ImportedCellVerticalAlignment { top, center, bottom };
+
+struct ImportedCellBorderPresentation {
+    std::uint32_t argb{0xff000000U};
+    double widthPoints{0.5};
+};
+
+struct ImportedTableCellPresentation {
+    QString sourceText;
+    std::vector<core::FormatRun> formats;
+    std::optional<core::ParagraphAlignment> alignment;
+    double spaceBeforePoints{0.0};
+    double spaceAfterPoints{0.0};
+    std::optional<std::uint32_t> lineSpacing;
+    std::optional<core::LineSpacingRule> lineSpacingRule;
+    ImportedCellVerticalAlignment verticalAlignment{
+        ImportedCellVerticalAlignment::top};
+    double paddingTopPoints{4.0};
+    double paddingRightPoints{5.0};
+    double paddingBottomPoints{4.0};
+    double paddingLeftPoints{5.0};
+    std::optional<std::uint32_t> fillArgb;
+    std::optional<ImportedCellBorderPresentation> borderTop;
+    std::optional<ImportedCellBorderPresentation> borderRight;
+    std::optional<ImportedCellBorderPresentation> borderBottom;
+    std::optional<ImportedCellBorderPresentation> borderLeft;
+};
+
+struct ImportedTablePresentation {
+    core::NodeId tableId;
+    std::optional<core::ParagraphAlignment> alignment;
+    std::vector<double> columnWidthsPoints;
+    // When supplied by the DOCX importer, identities prevent stale ordinal
+    // presentation data from being reused after structural table edits.
+    std::vector<core::NodeId> cellIds;
+    std::vector<ImportedTableCellPresentation> cells;
+    std::optional<core::TableStyle> sourceSemanticStyle;
+    std::optional<std::string> sourceStyleId;
+};
+
+class DocumentCanvas final : public QAbstractScrollArea {
+    Q_OBJECT
+
+public:
+    explicit DocumentCanvas(SpellChecker& spelling, QWidget* parent = nullptr);
+    ~DocumentCanvas() override;
+
+    void setDocument(core::Document document);
+    void setImportedPresentation(
+        std::vector<ImportedInlineImagePresentation> images,
+        std::vector<ImportedTablePresentation> tables);
+    void setEditorDefaults(const QString& fontFamily, double fontPointSize,
+                           int tabWidthSpaces);
+    void setDefaultListLayout(const core::ListLayout& layout);
+    QString defaultFontFamily() const { return defaultFontFamily_; }
+    double defaultFontPointSize() const noexcept { return defaultFontPointSize_; }
+    int tabWidthSpaces() const noexcept { return tabWidthSpaces_; }
+    const core::ListLayout& defaultListLayout() const noexcept {
+        return defaultListLayout_;
+    }
+    core::DocumentSnapshot snapshot() const;
+    core::Range selection() const;
+    QString selectedText() const;
+    QString outlineText(std::size_t maxCharacters = 12000) const;
+
+    bool isModified() const noexcept { return modified_; }
+    bool hasNonTextChanges() const noexcept { return nonTextModified_; }
+    bool hasPageLayoutChanges() const noexcept { return pageLayoutModified_; }
+    void markSaved() noexcept;
+    void markRecovered();
+    void setZoomPercent(int percent);
+    int zoomPercent() const noexcept { return zoomPercent_; }
+    double pageWidthPoints() const noexcept { return pageWidthPoints_; }
+    double pageHeightPoints() const noexcept { return pageHeightPoints_; }
+    double marginTopPoints() const noexcept { return marginTopPoints_; }
+    double marginRightPoints() const noexcept { return marginRightPoints_; }
+    double marginBottomPoints() const noexcept { return marginBottomPoints_; }
+    double marginLeftPoints() const noexcept { return marginLeftPoints_; }
+    int pageCount() const;
+    int currentPageNumber() const;
+
+    void undo();
+    void redo();
+    void cut();
+    void copy();
+    void paste();
+    void selectAll();
+    void insertText(const QString& text);
+    bool insertEquation(const QString& latex, bool display = false);
+    bool insertTable(std::size_t rows, std::size_t columns, bool headerRow);
+    bool insertTableRow(bool after);
+    bool insertTableColumn(bool after);
+    bool deleteSelectedTableRows();
+    bool deleteSelectedTableColumns();
+    bool setTableStyle(const QString& styleKey);
+    bool activateTableCell(core::NodeId tableId, std::size_t row,
+                           std::size_t column, std::size_t utf16Offset = 0);
+    // Selects the inclusive rectangular cell range. This is distinct from an
+    // insertion caret inside one cell and from selecting the table object.
+    bool selectTableCells(core::NodeId tableId,
+                          std::size_t anchorRow, std::size_t anchorColumn,
+                          std::size_t focusRow, std::size_t focusColumn);
+    bool selectTable(core::NodeId tableId);
+    bool moveSelectedTable(bool forward);
+    std::optional<core::NodeId> selectedTableId() const noexcept {
+        return selectedTable_;
+    }
+    void toggleBullets();
+    void toggleNumbering();
+    bool hasActiveList() const;
+    int activeListLevel() const;
+    std::optional<core::ListLayout> currentListLayout() const;
+    bool setCurrentListLayout(const core::ListLayout& layout);
+    bool changeListLevel(bool outdent);
+    void insertPageBreak();
+    void applyCharacterFormat(const core::CharacterFormatDelta& delta);
+    void applyParagraphFormat(const core::ParagraphFormatDelta& delta);
+    void toggleBold();
+    void toggleItalic();
+    void toggleUnderline();
+    void toggleStrike();
+    void setBaseline(core::BaselinePosition baseline);
+    void toggleBaseline(core::BaselinePosition baseline);
+    void setFontFamily(const QString& family);
+    void setFontPointSize(double points);
+    void setForeground(const QColor& color);
+    void setHighlight(const QColor& color);
+    void clearHighlight();
+    void beginColorAdjustment();
+    void endColorAdjustment() noexcept;
+    QColor currentTextColor() const;
+    QColor currentHighlightColor() const;
+    QString currentFontFamily() const;
+    double currentFontPointSize() const;
+    void refreshCursorFormat();
+    void setAlignment(core::ParagraphAlignment alignment);
+    void setMarginsPoints(double top, double right, double bottom, double left);
+    void setPageSizePoints(double width, double height);
+    void setImportedPageLayout(double width, double height,
+                               double top, double right,
+                               double bottom, double left);
+    void toggleOrientation();
+
+    bool findNext(const QString& needle, bool caseSensitive = false);
+    int replaceAll(const QString& needle, const QString& replacement,
+                   bool caseSensitive = false);
+    bool exportPdf(const QString& path, QString& error);
+    bool configurePrinter(QPrinter& printer, QString& error) const;
+    bool printTo(QPrinter& printer, QString& error);
+    bool createOperationsPreview(core::Revision expectedRevision,
+                                 const std::vector<core::Operation>& operations,
+                                 const QString& label,
+                                 QString& summary,
+                                 QString& error);
+    bool createReplacementPreview(const QString& replacement, QString& summary, QString& error);
+    bool acceptPreview(QString& error);
+    void discardPreview();
+    bool hasPreview() const noexcept { return previewId_.has_value(); }
+    QString previewIdString() const {
+        return previewId_ ? QString::fromStdString(previewId_->toString()) : QString();
+    }
+
+signals:
+    void documentChanged(qulonglong revision);
+    void selectionChanged();
+    void cursorFormatChanged(const QString& family, double pointSize,
+                             const QColor& textColor);
+    void cursorHighlightChanged(const QColor& highlightColor);
+    void cursorStyleChanged(bool bold, bool italic, bool underline,
+                            bool strike, bool superscript, bool subscript);
+    void cursorListStateChanged(bool bullets, bool numbering);
+    void cursorListContextChanged(bool active, int oneBasedLevel);
+    void listPropertiesRequested();
+    void pageStatusChanged(int currentPage, int pageCount, int wordCount);
+    void operationFailed(const QString& message);
+
+protected:
+    void paintEvent(QPaintEvent* event) override;
+    void resizeEvent(QResizeEvent* event) override;
+    void keyPressEvent(QKeyEvent* event) override;
+    void inputMethodEvent(QInputMethodEvent* event) override;
+    QVariant inputMethodQuery(Qt::InputMethodQuery query) const override;
+    bool focusNextPrevChild(bool next) override;
+    void mousePressEvent(QMouseEvent* event) override;
+    void mouseDoubleClickEvent(QMouseEvent* event) override;
+    void mouseMoveEvent(QMouseEvent* event) override;
+    void mouseReleaseEvent(QMouseEvent* event) override;
+    void contextMenuEvent(QContextMenuEvent* event) override;
+    void focusInEvent(QFocusEvent* event) override;
+    void focusOutEvent(QFocusEvent* event) override;
+
+private:
+    struct VisualLine;
+    struct ParagraphVisual;
+    struct EquationVisual;
+    struct TableCellVisual;
+    struct TableRowVisual;
+    struct TableVisual;
+    struct BlockPlacement;
+    struct Hit;
+    struct TableCursor {
+        core::NodeId tableId;
+        std::size_t row{};
+        std::size_t column{};
+        std::size_t utf16Offset{};
+
+        auto operator<=>(const TableCursor&) const = default;
+    };
+    struct PendingSpellingWord {
+        enum class Container { bodyParagraph, tableCell };
+
+        Container container{Container::bodyParagraph};
+        core::NodeId ownerId;
+        std::size_t row{};
+        std::size_t column{};
+        std::size_t start{};
+        std::size_t end{};
+    };
+    struct TableCellSelection {
+        core::NodeId tableId;
+        std::size_t anchorRow{};
+        std::size_t anchorColumn{};
+        std::size_t focusRow{};
+        std::size_t focusColumn{};
+
+        auto operator<=>(const TableCellSelection&) const = default;
+    };
+    struct LineAffinity {
+        core::NodeId paragraphId;
+        int textStart{};
+    };
+    struct CursorState {
+        core::Range selection;
+        core::CharacterFormat typingFormat;
+        std::optional<TableCursor> tableCursor;
+        std::optional<std::size_t> tableSelectionAnchor;
+        std::optional<TableCellSelection> tableCellSelection;
+        std::optional<core::NodeId> selectedTable;
+        std::optional<LineAffinity> lineAffinity;
+        std::optional<double> preferredVerticalX;
+        double pageWidthPoints;
+        double pageHeightPoints;
+        double marginTopPoints;
+        double marginRightPoints;
+        double marginBottomPoints;
+        double marginLeftPoints;
+        std::uint64_t stateId;
+        std::uint64_t nonTextStateId;
+        std::uint64_t pageLayoutStateId;
+    };
+    struct CursorHistoryEntry {
+        CursorState before;
+        CursorState after;
+        bool documentTransaction;
+    };
+
+    void invalidateLayout();
+    void ensureLayout() const;
+    void rebuildLayout() const;
+    void updateScrollBars() const;
+    void updateStatus();
+    void revealCursor();
+    void emitCursorFormat();
+    CursorState captureEditorState() const;
+    void restoreEditorState(const CursorState& state);
+    void updateDirtyFlags();
+    void recordLayoutChange(const CursorState& before);
+    bool rejectLiveEditDuringPreview();
+    void endTypingGroup() noexcept;
+    void resetVerticalNavigation() noexcept;
+    void clearPendingSpellingWord() noexcept;
+    void setPendingSpellingWordFromTypedText(const QString& insertedText);
+    void refreshPendingSpellingWordAfterEdit();
+    void commitPendingSpellingWordIfCaretLeft();
+    bool suppressSpellingWord(PendingSpellingWord::Container container,
+                              core::NodeId ownerId, std::size_t row,
+                              std::size_t column, std::size_t start,
+                              std::size_t end) const noexcept;
+    bool apply(std::vector<core::Operation> operations,
+               std::optional<core::Position> resultingCursor = std::nullopt,
+               std::optional<core::CharacterFormat> resultingTypingFormat =
+                   std::nullopt,
+               bool coalesceTyping = false,
+               std::optional<core::Range> resultingSelection = std::nullopt,
+               bool coalesceWithPrevious = false,
+               bool updateTableSelection = false,
+               std::optional<TableCursor> resultingTableCursor = std::nullopt,
+               std::optional<core::NodeId> resultingSelectedTable = std::nullopt,
+               std::optional<LineAffinity> resultingLineAffinity = std::nullopt);
+    bool replaceTableCellText(const QString& text, bool coalesceTyping);
+    bool moveActiveTableCell(bool forward);
+    bool deleteSelectedTable();
+    bool clearSelectedTableCells();
+    bool hasClipboardSelection() const noexcept;
+    std::vector<std::pair<std::size_t, std::size_t>>
+    selectedTableCells(const core::Table& table) const;
+    bool tableCellIsSelected(core::NodeId tableId, std::size_t row,
+                             std::size_t column) const noexcept;
+    void applyCharacterFormatInternal(const core::CharacterFormatDelta& delta,
+                                      bool coalesceWithPrevious);
+    void replaceSelection(const QString& text, bool coalesceTyping = false);
+    bool continuePlainTextList();
+    bool resequenceNumberedList(core::NodeId paragraphId,
+                                bool coalesceWithPrevious);
+    void togglePlainTextList(bool numbered);
+    bool handlePlainTextListBackspace();
+    void deleteBackward(bool byWord = false);
+    void deleteForward(bool byWord = false);
+    void moveHorizontal(bool forward, bool extend, bool byWord = false);
+    void moveVertical(bool down, bool extend);
+    Hit hitTest(const QPoint& viewportPoint) const;
+    const VisualLine* visualLineForCaret() const;
+    QRectF caretRectInContent() const;
+    std::vector<core::NodeId> selectedParagraphIds() const;
+    core::CharacterFormat currentCharacterFormat() const;
+    core::CharacterFormat selectedCharacterFormat() const;
+    core::CharacterFormat activeCharacterFormat() const;
+    int paragraphIndex(core::NodeId id) const;
+    QString paragraphText(core::NodeId id) const;
+    void setCursor(core::Position position, bool extend,
+                   bool preserveVerticalNavigation = false);
+    void selectRange(core::Range range, const LineAffinity& lineAffinity);
+    QString wordAt(const core::Position& position, core::Range* range = nullptr) const;
+    void renderPage(QPainter& painter, int pageIndex, const QPointF& origin, double scale,
+                    bool decorations) const;
+
+    SpellChecker& spelling_;
+    std::unique_ptr<core::DocumentSession> session_;
+    core::Range selection_;
+    core::CharacterFormat typingFormat_;
+    bool modified_{false};
+    bool nonTextModified_{false};
+    bool pageLayoutModified_{false};
+    bool selecting_{false};
+    int zoomPercent_{100};
+    double pageWidthPoints_{612.0};
+    double pageHeightPoints_{792.0};
+    double marginTopPoints_{72.0};
+    double marginRightPoints_{72.0};
+    double marginBottomPoints_{72.0};
+    double marginLeftPoints_{72.0};
+    QString defaultFontFamily_{QStringLiteral("Carlito")};
+    double defaultFontPointSize_{11.0};
+    int tabWidthSpaces_{4};
+    core::ListLayout defaultListLayout_;
+
+    mutable core::Revision layoutRevision_;
+    mutable bool layoutValid_{false};
+    mutable bool layoutIsPreview_{false};
+    mutable int pageCount_{1};
+    mutable std::vector<std::unique_ptr<ParagraphVisual>> visuals_;
+    mutable std::vector<std::unique_ptr<TableVisual>> tableVisuals_;
+    mutable std::vector<BlockPlacement> blockPlacements_;
+    std::vector<ImportedInlineImagePresentation> importedImages_;
+    std::vector<ImportedTablePresentation> importedTables_;
+    std::optional<core::PreviewId> previewId_;
+    core::Revision previewRevision_;
+    std::optional<core::Position> previewCursor_;
+    bool previewHasNonTextChanges_{false};
+    QTimer* typingGroupTimer_{nullptr};
+    bool typingGroupActive_{false};
+    bool colorAdjustmentActive_{false};
+    std::optional<core::Revision> colorAdjustmentLastRevision_;
+    std::optional<PendingSpellingWord> pendingSpellingWord_;
+    QElapsedTimer multiClickTimer_;
+    QPoint lastDoubleClickPosition_;
+    bool tripleClickArmed_{false};
+    std::optional<TableCursor> tableCursor_;
+    std::optional<std::size_t> tableSelectionAnchor_;
+    std::optional<TableCellSelection> tableCellSelection_;
+    std::optional<TableCursor> tableMouseSelectionAnchor_;
+    std::optional<core::NodeId> selectedTable_;
+    bool draggingTable_{false};
+    bool tableDropTargetValid_{false};
+    std::optional<core::NodeId> tableDropBefore_;
+    std::optional<LineAffinity> lineAffinity_;
+    std::optional<double> preferredVerticalX_;
+    std::vector<CursorHistoryEntry> undoCursorHistory_;
+    std::vector<CursorHistoryEntry> redoCursorHistory_;
+    std::uint64_t currentStateId_{0};
+    std::uint64_t savedStateId_{0};
+    std::uint64_t nextStateId_{1};
+    std::uint64_t currentNonTextStateId_{0};
+    std::uint64_t savedNonTextStateId_{0};
+    std::uint64_t nextNonTextStateId_{1};
+    std::uint64_t currentPageLayoutStateId_{0};
+    std::uint64_t savedPageLayoutStateId_{0};
+    std::uint64_t nextPageLayoutStateId_{1};
+};
+
+}  // namespace docxstudio::app
