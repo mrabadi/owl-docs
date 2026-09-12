@@ -24,6 +24,23 @@ struct InsertEquation {
     std::optional<CharacterFormat> format;
 };
 
+struct InsertImage {
+    Position position;
+    EncodedImagePayload encoded_payload;
+    ImageFormat image_format{ImageFormat::png};
+    std::string accessible_name;
+    std::int64_t width_emu{0};
+    std::int64_t height_emu{0};
+    NodeId image_id{NodeId::generate()};
+    std::optional<CharacterFormat> character_format;
+};
+
+struct ResizeImage {
+    NodeId image_id;
+    std::int64_t width_emu{0};
+    std::int64_t height_emu{0};
+};
+
 struct DeleteRange {
     Range range;
 };
@@ -142,13 +159,15 @@ struct DeleteTable {
     NodeId table_id;
 };
 
-using Operation = std::variant<InsertText, InsertEquation, DeleteRange, ReplaceRange,
-                               SetCharacterFormat, SetParagraphFormat, SplitParagraph,
-                               MergeWithNextParagraph, InsertTable, SetTableCellText,
+using Operation = std::variant<InsertText, InsertEquation, InsertImage,
+                               ResizeImage, DeleteRange, ReplaceRange,
+                               SetCharacterFormat, SetParagraphFormat,
+                               SplitParagraph, MergeWithNextParagraph,
+                               InsertTable, SetTableCellText,
                                SetTableCellCharacterFormat,
                                SetTableCellParagraphFormat, AppendTableRow,
-                               InsertTableRow, DeleteTableRows, InsertTableColumn,
-                               DeleteTableColumns, SetTableStyle, MoveTable,
-                               DeleteTable>;
+                               InsertTableRow, DeleteTableRows,
+                               InsertTableColumn, DeleteTableColumns,
+                               SetTableStyle, MoveTable, DeleteTable>;
 
 }  // namespace docxstudio::core

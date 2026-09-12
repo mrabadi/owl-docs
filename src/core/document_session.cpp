@@ -1,7 +1,11 @@
 #include "docxstudio/core/document_session.h"
 
+#include <algorithm>
+#include <cstdint>
+#include <limits>
 #include <sstream>
 #include <type_traits>
+#include <unordered_set>
 #include <utility>
 
 namespace docxstudio::core {
@@ -17,6 +21,14 @@ Result<void> applyOne(Document& document, const Operation& operation) {
                 return document.insertEquation(
                     typed.position, typed.canonical_latex, typed.display,
                     typed.equation_id, typed.format);
+            } else if constexpr (std::is_same_v<Type, InsertImage>) {
+                return document.insertImage(
+                    typed.position, typed.encoded_payload, typed.image_format,
+                    typed.accessible_name, typed.width_emu, typed.height_emu,
+                    typed.image_id, typed.character_format);
+            } else if constexpr (std::is_same_v<Type, ResizeImage>) {
+                return document.resizeImage(
+                    typed.image_id, typed.width_emu, typed.height_emu);
             } else if constexpr (std::is_same_v<Type, DeleteRange>) {
                 return document.deleteRange(typed.range);
             } else if constexpr (std::is_same_v<Type, ReplaceRange>) {
@@ -71,11 +83,137 @@ Result<void> applyOne(Document& document, const Operation& operation) {
         operation);
 }
 
+using PayloadIdentity = const std::uint8_t*;
+
+void collectPayloadIdentities(
+    const Document& document,
+    std::unordered_set<PayloadIdentity>& identities) {
+    for (const auto& paragraph : document.paragraphs()) {
+        for (const auto& image : paragraph.images()) {
+            const auto bytes = image.encoded_payload.bytes();
+            if (!bytes.empty()) {
+                identities.insert(bytes.data());
+            }
+        }
+    }
+}
+
 }  // namespace
 
 DocumentSession::DocumentSession() = default;
 
 DocumentSession::DocumentSession(Document document) : document_(std::move(document)) {}
+
+DocumentSession::DocumentSession(Document document, DocumentSessionLimits limits)
+    : document_(std::move(document)), limits_(limits) {}
+
+void DocumentSession::trimHistoryStack(std::vector<HistoryEntry>& stack) {
+    if (stack.size() <= limits_.maximum_history_entries) {
+        return;
+    }
+    const auto removed = stack.size() - limits_.maximum_history_entries;
+    stack.erase(stack.begin(),
+                stack.begin() + static_cast<std::ptrdiff_t>(removed));
+}
+
+void DocumentSession::trimRetainedHistoryImages() {
+    std::unordered_set<PayloadIdentity> active;
+    collectPayloadIdentities(document_, active);
+    for (const auto& [id, branch] : previews_) {
+        static_cast<void>(id);
+        collectPayloadIdentities(branch.document, active);
+    }
+    const auto retained_bytes = [this, &active]() {
+        std::unordered_set<PayloadIdentity> retained;
+        std::size_t total = 0;
+        const auto collect_history_document =
+            [&active, &retained, &total](const Document& document) {
+                for (const auto& paragraph : document.paragraphs()) {
+                    for (const auto& image : paragraph.images()) {
+                        const auto bytes = image.encoded_payload.bytes();
+                        if (bytes.empty() || active.contains(bytes.data()) ||
+                            !retained.insert(bytes.data()).second) {
+                            continue;
+                        }
+                        if (bytes.size() >
+                            std::numeric_limits<std::size_t>::max() - total) {
+                            total = std::numeric_limits<std::size_t>::max();
+                        } else {
+                            total += bytes.size();
+                        }
+                    }
+                }
+            };
+        const auto collect_stack = [&collect_history_document](
+                                       const std::vector<HistoryEntry>& stack) {
+            for (const auto& entry : stack) {
+                collect_history_document(entry.before);
+                collect_history_document(entry.after);
+            }
+        };
+        collect_stack(undo_);
+        collect_stack(redo_);
+        for (const auto& [id, branch] : previews_) {
+            static_cast<void>(id);
+            collect_stack(branch.undo);
+            collect_stack(branch.redo);
+        }
+        return total;
+    };
+
+    const auto stack_retains_inactive_payload =
+        [&active](const std::vector<HistoryEntry>& stack) {
+            for (const auto& entry : stack) {
+                for (const Document* document :
+                     {&entry.before, &entry.after}) {
+                    for (const auto& paragraph : document->paragraphs()) {
+                        for (const auto& image : paragraph.images()) {
+                            const auto bytes = image.encoded_payload.bytes();
+                            if (!bytes.empty() &&
+                                !active.contains(bytes.data())) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+            return false;
+        };
+    const auto discard_oldest =
+        [this, &stack_retains_inactive_payload]() {
+        // Preserve the live document's undo history ahead of disposable
+        // preview-internal history. Erasing the front retains a contiguous
+        // chain from the current state for both undo and redo stacks. Stacks
+        // that retain no budgeted payload are left intact.
+        for (auto& [id, branch] : previews_) {
+            static_cast<void>(id);
+            if (stack_retains_inactive_payload(branch.undo)) {
+                branch.undo.erase(branch.undo.begin());
+                return true;
+            }
+            if (stack_retains_inactive_payload(branch.redo)) {
+                branch.redo.erase(branch.redo.begin());
+                return true;
+            }
+        }
+        if (stack_retains_inactive_payload(redo_)) {
+            redo_.erase(redo_.begin());
+            return true;
+        }
+        if (stack_retains_inactive_payload(undo_)) {
+            undo_.erase(undo_.begin());
+            return true;
+        }
+        return false;
+    };
+
+    while (retained_bytes() >
+           limits_.maximum_retained_history_image_bytes) {
+        if (!discard_oldest()) {
+            break;
+        }
+    }
+}
 
 DocumentSnapshot DocumentSession::snapshot() const {
     std::scoped_lock lock(mutex_);
@@ -146,6 +284,8 @@ Result<BatchResult> DocumentSession::applyBatch(Revision expected_revision,
     redo_.clear();
     document_ = std::move(candidate.value());
     revision_ = next.value();
+    trimHistoryStack(undo_);
+    trimRetainedHistoryImages();
     return BatchResult{revision_, true};
 }
 
@@ -167,6 +307,8 @@ Result<BatchResult> DocumentSession::undo(Revision expected_revision) {
     document_ = entry.before;
     redo_.push_back(std::move(entry));
     revision_ = next.value();
+    trimHistoryStack(redo_);
+    trimRetainedHistoryImages();
     return BatchResult{revision_, true};
 }
 
@@ -188,6 +330,8 @@ Result<BatchResult> DocumentSession::redo(Revision expected_revision) {
     document_ = entry.after;
     undo_.push_back(std::move(entry));
     revision_ = next.value();
+    trimHistoryStack(undo_);
+    trimRetainedHistoryImages();
     return BatchResult{revision_, true};
 }
 
@@ -201,10 +345,19 @@ bool DocumentSession::canRedo() const {
     return !redo_.empty();
 }
 
+DocumentHistoryDepths DocumentSession::historyDepths() const {
+    std::scoped_lock lock(mutex_);
+    return {undo_.size(), redo_.size()};
+}
+
 Result<PreviewSnapshot> DocumentSession::createPreview(Revision expected_document_revision) {
     std::scoped_lock lock(mutex_);
     if (expected_document_revision != revision_) {
         return revisionConflict(expected_document_revision, revision_, false);
+    }
+    if (previews_.size() >= limits_.maximum_preview_branches) {
+        return Error{ErrorCode::invalid_operation,
+                     "The document has reached the preview-branch limit"};
     }
 
     auto id = PreviewId::generate();
@@ -259,6 +412,8 @@ Result<BatchResult> DocumentSession::applyPreviewBatch(PreviewId preview_id,
     branch.redo.clear();
     branch.document = std::move(candidate.value());
     branch.revision = next.value();
+    trimHistoryStack(branch.undo);
+    trimRetainedHistoryImages();
     return BatchResult{branch.revision, true};
 }
 
@@ -286,6 +441,8 @@ Result<BatchResult> DocumentSession::undoPreview(PreviewId preview_id,
     branch.document = entry.before;
     branch.redo.push_back(std::move(entry));
     branch.revision = next.value();
+    trimHistoryStack(branch.redo);
+    trimRetainedHistoryImages();
     return BatchResult{branch.revision, true};
 }
 
@@ -313,6 +470,8 @@ Result<BatchResult> DocumentSession::redoPreview(PreviewId preview_id,
     branch.document = entry.after;
     branch.undo.push_back(std::move(entry));
     branch.revision = next.value();
+    trimHistoryStack(branch.undo);
+    trimRetainedHistoryImages();
     return BatchResult{branch.revision, true};
 }
 
@@ -337,6 +496,7 @@ Result<BatchResult> DocumentSession::acceptPreview(PreviewId preview_id,
     }
     if (branch.document == document_) {
         previews_.erase(found);
+        trimRetainedHistoryImages();
         return BatchResult{revision_, false};
     }
     const auto next = increment(revision_);
@@ -350,6 +510,8 @@ Result<BatchResult> DocumentSession::acceptPreview(PreviewId preview_id,
     document_ = accepted;
     revision_ = next.value();
     previews_.erase(found);
+    trimHistoryStack(undo_);
+    trimRetainedHistoryImages();
     return BatchResult{revision_, true};
 }
 
@@ -358,6 +520,7 @@ Result<void> DocumentSession::discardPreview(PreviewId preview_id) {
     if (previews_.erase(preview_id) == 0) {
         return Error{ErrorCode::preview_not_found, "Preview branch not found"};
     }
+    trimRetainedHistoryImages();
     return {};
 }
 

@@ -1,5 +1,7 @@
 #include "docxstudio/core/document.h"
 
+#include "docxstudio/raster/validation.h"
+
 #include <algorithm>
 #include <iterator>
 #include <limits>
@@ -93,6 +95,68 @@ Result<void> validateEquationSource(std::string_view source) {
     return {};
 }
 
+Result<void> validateImageDimensions(std::int64_t width_emu,
+                                     std::int64_t height_emu) {
+    if (width_emu <= 0 || height_emu <= 0) {
+        return Error{ErrorCode::invalid_operation,
+                     "Image dimensions must be positive"};
+    }
+    if (width_emu > kMaximumInlineImageDimensionEmu ||
+        height_emu > kMaximumInlineImageDimensionEmu) {
+        return Error{ErrorCode::invalid_operation,
+                     "Image dimensions exceed the geometry limit"};
+    }
+    return {};
+}
+
+Result<void> validateImageMetadata(const ImageAtom& image) {
+    if (!image.id.isValid()) {
+        return Error{ErrorCode::invalid_node_id,
+                     "Image NodeId cannot be zero"};
+    }
+    if (image.encoded_payload.empty()) {
+        return Error{ErrorCode::invalid_operation,
+                     "Encoded image payload cannot be empty"};
+    }
+    if (image.encoded_payload.size() > kMaximumEncodedImageBytes) {
+        return Error{ErrorCode::invalid_operation,
+                     "Encoded image payload exceeds the size limit"};
+    }
+    if (imageContentType(image.format).empty()) {
+        return Error{ErrorCode::invalid_operation,
+                     "Encoded image format is unsupported"};
+    }
+    if (image.accessible_name.size() > kMaximumImageAccessibleNameBytes) {
+        return Error{ErrorCode::invalid_operation,
+                     "Image accessible name exceeds the size limit"};
+    }
+    if (!isValidUtf8(image.accessible_name)) {
+        return Error{ErrorCode::invalid_operation,
+                     "Image accessible name is not valid UTF-8"};
+    }
+    const auto dimensions_validation =
+        validateImageDimensions(image.width_emu, image.height_emu);
+    if (!dimensions_validation) {
+        return dimensions_validation.error();
+    }
+    return {};
+}
+
+Result<void> validateImagePayload(const ImageAtom& image) {
+    const auto expected_format = image.format == ImageFormat::png
+        ? raster::Format::png
+        : raster::Format::jpeg;
+    raster::ValidationLimits raster_limits;
+    raster_limits.maximum_encoded_bytes = kMaximumEncodedImageBytes;
+    if (!raster::inspect(image.encoded_payload.bytes(), expected_format,
+                         raster_limits)
+             .ok()) {
+        return Error{ErrorCode::invalid_operation,
+                     "Encoded image payload is malformed or does not match its format"};
+    }
+    return {};
+}
+
 Error paragraphMissing(NodeId id) {
     return Error{ErrorCode::paragraph_not_found, "Paragraph not found: " + id.toString()};
 }
@@ -106,6 +170,49 @@ Error bodyBlockMissing(NodeId id) {
 }
 
 }  // namespace
+
+EncodedImagePayload::EncodedImagePayload()
+    : storage_(std::make_shared<const std::vector<std::uint8_t>>()) {}
+
+EncodedImagePayload::EncodedImagePayload(std::vector<std::uint8_t> bytes)
+    : storage_(std::make_shared<const std::vector<std::uint8_t>>(
+          std::move(bytes))) {}
+
+std::span<const std::uint8_t> EncodedImagePayload::bytes() const noexcept {
+    return storage_ ? std::span<const std::uint8_t>(*storage_)
+                    : std::span<const std::uint8_t>{};
+}
+
+std::size_t EncodedImagePayload::size() const noexcept {
+    return storage_ ? storage_->size() : 0;
+}
+
+bool EncodedImagePayload::empty() const noexcept {
+    return size() == 0;
+}
+
+bool EncodedImagePayload::operator==(
+    const EncodedImagePayload& other) const noexcept {
+    if (storage_ == other.storage_) {
+        return true;
+    }
+    const auto left = bytes();
+    const auto right = other.bytes();
+    return left.size() == right.size() &&
+           std::equal(left.begin(), left.end(), right.begin());
+}
+
+std::strong_ordering EncodedImagePayload::operator<=>(
+    const EncodedImagePayload& other) const noexcept {
+    if (storage_ == other.storage_) {
+        return std::strong_ordering::equal;
+    }
+    const auto left = bytes();
+    const auto right = other.bytes();
+    return std::lexicographical_compare_three_way(
+        left.begin(), left.end(), right.begin(), right.end(),
+        std::compare_three_way{});
+}
 
 bool isValidUtf16(const std::u16string& text) noexcept {
     for (std::size_t index = 0; index < text.size(); ++index) {
@@ -625,6 +732,17 @@ const EquationAtom* Paragraph::equationAt(std::size_t utf16_offset) const noexce
         : nullptr;
 }
 
+const ImageAtom* Paragraph::imageAt(std::size_t utf16_offset) const noexcept {
+    const auto found = std::lower_bound(
+        images_.begin(), images_.end(), utf16_offset,
+        [](const ImageAtom& image, std::size_t offset) {
+            return image.utf16_offset < offset;
+        });
+    return found != images_.end() && found->utf16_offset == utf16_offset
+        ? &*found
+        : nullptr;
+}
+
 Result<void> Paragraph::insertText(std::size_t offset, const std::u16string& text,
                                    const std::optional<CharacterFormat>& format) {
     if (!isUtf16Boundary(text_, offset)) {
@@ -662,8 +780,15 @@ Result<void> Paragraph::insertText(std::size_t offset, const std::u16string& tex
             equation.utf16_offset += text.size();
         }
     }
+    auto updated_images = images_;
+    for (auto& image : updated_images) {
+        if (image.utf16_offset >= offset) {
+            image.utf16_offset += text.size();
+        }
+    }
     setContent(std::move(updated_text), std::move(formats));
     equations_ = std::move(updated_equations);
+    images_ = std::move(updated_images);
     return {};
 }
 
@@ -715,8 +840,60 @@ Result<void> Paragraph::insertEquation(
         });
     updated_equations.insert(insertion, std::move(equation));
 
+    auto updated_images = images_;
+    for (auto& image : updated_images) {
+        if (image.utf16_offset >= offset) {
+            ++image.utf16_offset;
+        }
+    }
+
     setContent(std::move(updated_text), std::move(formats));
     equations_ = std::move(updated_equations);
+    images_ = std::move(updated_images);
+    return {};
+}
+
+Result<void> Paragraph::insertImage(
+    std::size_t offset, ImageAtom image,
+    const std::optional<CharacterFormat>& character_format) {
+    if (!isUtf16Boundary(text_, offset)) {
+        return Error{ErrorCode::invalid_position,
+                     "Image insertion offset is not a UTF-16 boundary"};
+    }
+    // Document::insertImage validates the complete atom, global identity and
+    // resource limits before this private mutation helper is reached.
+
+    auto formats = denseFormats();
+    const auto insertion_format =
+        character_format.value_or(characterFormatAt(offset));
+    formats.insert(formats.begin() + static_cast<std::ptrdiff_t>(offset),
+                   insertion_format);
+    auto updated_text = text_;
+    updated_text.insert(offset, 1, kInlineObjectReplacementCharacter);
+
+    auto updated_equations = equations_;
+    for (auto& equation : updated_equations) {
+        if (equation.utf16_offset >= offset) {
+            ++equation.utf16_offset;
+        }
+    }
+    auto updated_images = images_;
+    for (auto& existing : updated_images) {
+        if (existing.utf16_offset >= offset) {
+            ++existing.utf16_offset;
+        }
+    }
+    image.utf16_offset = offset;
+    const auto insertion = std::lower_bound(
+        updated_images.begin(), updated_images.end(), offset,
+        [](const ImageAtom& existing, std::size_t candidate_offset) {
+            return existing.utf16_offset < candidate_offset;
+        });
+    updated_images.insert(insertion, std::move(image));
+
+    setContent(std::move(updated_text), std::move(formats));
+    equations_ = std::move(updated_equations);
+    images_ = std::move(updated_images);
     return {};
 }
 
@@ -741,8 +918,18 @@ Result<void> Paragraph::erase(std::size_t start, std::size_t end) {
             equation.utf16_offset -= end - start;
         }
     }
+    auto updated_images = images_;
+    std::erase_if(updated_images, [start, end](const ImageAtom& image) {
+        return image.utf16_offset >= start && image.utf16_offset < end;
+    });
+    for (auto& image : updated_images) {
+        if (image.utf16_offset >= end) {
+            image.utf16_offset -= end - start;
+        }
+    }
     setContent(std::move(updated_text), std::move(formats));
     equations_ = std::move(updated_equations);
+    images_ = std::move(updated_images);
     return {};
 }
 
@@ -787,6 +974,9 @@ Result<Document> Document::create(std::vector<Paragraph> paragraphs) {
         return Error{ErrorCode::invalid_operation, "A document must contain at least one paragraph"};
     }
     std::unordered_set<NodeId, NodeIdHash> identifiers;
+    std::size_t image_count = 0;
+    std::size_t encoded_image_bytes = 0;
+    std::vector<const ImageAtom*> image_payloads_to_inspect;
     for (const auto& paragraph : paragraphs) {
         if (!paragraph.id().isValid()) {
             return Error{ErrorCode::invalid_node_id, "Paragraph NodeId cannot be zero"};
@@ -797,24 +987,24 @@ Result<Document> Document::create(std::vector<Paragraph> paragraphs) {
         if (!isValidUtf16(paragraph.text())) {
             return Error{ErrorCode::invalid_utf16, "Paragraph contains malformed UTF-16"};
         }
-        std::size_t equation_index = 0;
-        for (std::size_t offset = 0; offset < paragraph.text().size(); ++offset) {
-            if (paragraph.text()[offset] != kInlineObjectReplacementCharacter) {
-                continue;
-            }
-            if (equation_index >= paragraph.equations_.size() ||
-                paragraph.equations_[equation_index].utf16_offset != offset) {
-                return Error{ErrorCode::invalid_operation,
-                             "Paragraph contains an orphan inline-object placeholder"};
-            }
-            ++equation_index;
-        }
-        if (equation_index != paragraph.equations_.size()) {
-            return Error{ErrorCode::invalid_operation,
-                         "Paragraph equation metadata has no matching placeholder"};
-        }
+        std::unordered_set<std::size_t> typed_object_offsets;
         for (std::size_t index = 0; index < paragraph.equations_.size(); ++index) {
             const auto& equation = paragraph.equations_[index];
+            if (index > 0 && paragraph.equations_[index - 1].utf16_offset >=
+                                 equation.utf16_offset) {
+                return Error{ErrorCode::invalid_operation,
+                             "Paragraph equations are not in document order"};
+            }
+            if (equation.utf16_offset >= paragraph.text().size() ||
+                paragraph.text()[equation.utf16_offset] !=
+                    kInlineObjectReplacementCharacter) {
+                return Error{ErrorCode::invalid_operation,
+                             "Equation metadata has no matching placeholder"};
+            }
+            if (!typed_object_offsets.insert(equation.utf16_offset).second) {
+                return Error{ErrorCode::invalid_operation,
+                             "Inline-object placeholder maps to multiple typed objects"};
+            }
             if (!equation.id.isValid()) {
                 return Error{ErrorCode::invalid_node_id,
                              "Equation NodeId cannot be zero"};
@@ -823,16 +1013,56 @@ Result<Document> Document::create(std::vector<Paragraph> paragraphs) {
                 return Error{ErrorCode::duplicate_node_id,
                              "Document NodeIds must be unique"};
             }
-            if (index > 0 && paragraph.equations_[index - 1].utf16_offset >=
-                                 equation.utf16_offset) {
-                return Error{ErrorCode::invalid_operation,
-                             "Paragraph equations are not in document order"};
-            }
             const auto source_validation =
                 validateEquationSource(equation.canonical_latex);
             if (!source_validation) {
                 return source_validation.error();
             }
+        }
+        for (std::size_t index = 0; index < paragraph.images_.size(); ++index) {
+            const auto& image = paragraph.images_[index];
+            if (index > 0 && paragraph.images_[index - 1].utf16_offset >=
+                                 image.utf16_offset) {
+                return Error{ErrorCode::invalid_operation,
+                             "Paragraph images are not in document order"};
+            }
+            if (image.utf16_offset >= paragraph.text().size() ||
+                paragraph.text()[image.utf16_offset] !=
+                    kInlineObjectReplacementCharacter) {
+                return Error{ErrorCode::invalid_operation,
+                             "Image metadata has no matching placeholder"};
+            }
+            if (!typed_object_offsets.insert(image.utf16_offset).second) {
+                return Error{ErrorCode::invalid_operation,
+                             "Inline-object placeholder maps to multiple typed objects"};
+            }
+            const auto metadata_validation = validateImageMetadata(image);
+            if (!metadata_validation) {
+                return metadata_validation.error();
+            }
+            if (!identifiers.insert(image.id).second) {
+                return Error{ErrorCode::duplicate_node_id,
+                             "Document NodeIds must be unique"};
+            }
+            ++image_count;
+            if (image_count > kMaximumInlineImagesPerDocument) {
+                return Error{ErrorCode::invalid_operation,
+                             "Document exceeds the inline-image count limit"};
+            }
+            if (image.encoded_payload.size() >
+                kMaximumDocumentEncodedImageBytes - encoded_image_bytes) {
+                return Error{ErrorCode::invalid_operation,
+                             "Document exceeds the encoded-image byte limit"};
+            }
+            encoded_image_bytes += image.encoded_payload.size();
+            image_payloads_to_inspect.push_back(&image);
+        }
+        const auto placeholder_count = static_cast<std::size_t>(std::count(
+            paragraph.text().begin(), paragraph.text().end(),
+            kInlineObjectReplacementCharacter));
+        if (placeholder_count != typed_object_offsets.size()) {
+            return Error{ErrorCode::invalid_operation,
+                         "Paragraph contains an orphan inline-object placeholder"};
         }
         const auto paragraph_validation = paragraph.format().validate();
         if (!paragraph_validation) {
@@ -846,6 +1076,12 @@ Result<Document> Document::create(std::vector<Paragraph> paragraphs) {
             if (!format_validation) {
                 return format_validation.error();
             }
+        }
+    }
+    for (const auto* image : image_payloads_to_inspect) {
+        const auto payload_validation = validateImagePayload(*image);
+        if (!payload_validation) {
+            return payload_validation.error();
         }
     }
     return Document(std::move(paragraphs));
@@ -868,6 +1104,18 @@ const EquationAtom* Document::findEquation(NodeId id) const noexcept {
             paragraph.equations().begin(), paragraph.equations().end(),
             [id](const EquationAtom& equation) { return equation.id == id; });
         if (found != paragraph.equations().end()) {
+            return &*found;
+        }
+    }
+    return nullptr;
+}
+
+const ImageAtom* Document::findImage(NodeId id) const noexcept {
+    for (const auto& paragraph : paragraphs_) {
+        const auto found = std::find_if(
+            paragraph.images().begin(), paragraph.images().end(),
+            [id](const ImageAtom& image) { return image.id == id; });
+        if (found != paragraph.images().end()) {
             return &*found;
         }
     }
@@ -902,7 +1150,8 @@ std::optional<std::size_t> Document::bodyBlockIndex(NodeId id) const noexcept {
 }
 
 bool Document::nodeIdInUse(NodeId id) const noexcept {
-    if (findParagraph(id) || findTable(id) || findEquation(id)) {
+    if (findParagraph(id) || findTable(id) || findEquation(id) ||
+        findImage(id)) {
         return true;
     }
     for (const auto& table : tables_) {
@@ -981,6 +1230,91 @@ Result<void> Document::insertEquation(
         format);
 }
 
+Result<void> Document::insertImage(
+    const Position& position, EncodedImagePayload encoded_payload,
+    ImageFormat image_format, std::string accessible_name,
+    std::int64_t width_emu, std::int64_t height_emu, NodeId image_id,
+    const std::optional<CharacterFormat>& character_format) {
+    const auto position_validation = validatePosition(position);
+    if (!position_validation) {
+        return position_validation.error();
+    }
+    if (!image_id.isValid()) {
+        return Error{ErrorCode::invalid_node_id,
+                     "Image NodeId cannot be zero"};
+    }
+    if (nodeIdInUse(image_id)) {
+        return Error{ErrorCode::duplicate_node_id,
+                     "Image NodeId already exists"};
+    }
+    ImageAtom image{image_id, position.utf16_offset,
+                    std::move(encoded_payload), image_format,
+                    std::move(accessible_name), width_emu, height_emu};
+    const auto metadata_validation = validateImageMetadata(image);
+    if (!metadata_validation) {
+        return metadata_validation.error();
+    }
+    if (character_format) {
+        const auto format_validation = character_format->validate();
+        if (!format_validation) {
+            return format_validation.error();
+        }
+    }
+
+    std::size_t image_count = 0;
+    std::size_t encoded_image_bytes = 0;
+    for (const auto& paragraph : paragraphs_) {
+        image_count += paragraph.images().size();
+        for (const auto& existing : paragraph.images()) {
+            encoded_image_bytes += existing.encoded_payload.size();
+        }
+    }
+    if (image_count >= kMaximumInlineImagesPerDocument) {
+        return Error{ErrorCode::invalid_operation,
+                     "Document exceeds the inline-image count limit"};
+    }
+    if (encoded_image_bytes > kMaximumDocumentEncodedImageBytes ||
+        image.encoded_payload.size() >
+        kMaximumDocumentEncodedImageBytes - encoded_image_bytes) {
+        return Error{ErrorCode::invalid_operation,
+                     "Document exceeds the encoded-image byte limit"};
+    }
+    const auto payload_validation = validateImagePayload(image);
+    if (!payload_validation) {
+        return payload_validation.error();
+    }
+
+    return paragraphs_[paragraphIndex(position.paragraph_id).value()].insertImage(
+        position.utf16_offset, std::move(image), character_format);
+}
+
+Result<void> Document::resizeImage(NodeId image_id, std::int64_t width_emu,
+                                   std::int64_t height_emu) {
+    if (!image_id.isValid()) {
+        return Error{ErrorCode::invalid_node_id,
+                     "Image NodeId cannot be zero"};
+    }
+    const auto dimensions_validation =
+        validateImageDimensions(width_emu, height_emu);
+    if (!dimensions_validation) {
+        return dimensions_validation.error();
+    }
+    for (auto& paragraph : paragraphs_) {
+        const auto found = std::find_if(
+            paragraph.images_.begin(), paragraph.images_.end(),
+            [image_id](const ImageAtom& image) {
+                return image.id == image_id;
+            });
+        if (found != paragraph.images_.end()) {
+            found->width_emu = width_emu;
+            found->height_emu = height_emu;
+            return {};
+        }
+    }
+    return Error{ErrorCode::invalid_operation,
+                 "Image not found: " + image_id.toString()};
+}
+
 Result<void> Document::deleteRange(const Range& range) {
     const auto normalized_result = normalizeRange(range);
     if (!normalized_result) {
@@ -1045,8 +1379,25 @@ Result<void> Document::deleteRange(const Range& range) {
             joined_equations.push_back(std::move(moved));
         }
     }
+    std::vector<ImageAtom> joined_images;
+    joined_images.reserve(first.images_.size() + last.images_.size());
+    for (const auto& image : first.images_) {
+        if (image.utf16_offset < normalized.start.utf16_offset) {
+            joined_images.push_back(image);
+        }
+    }
+    for (const auto& image : last.images_) {
+        if (image.utf16_offset >= normalized.end.utf16_offset) {
+            auto moved = image;
+            moved.utf16_offset = normalized.start.utf16_offset +
+                                 image.utf16_offset -
+                                 normalized.end.utf16_offset;
+            joined_images.push_back(std::move(moved));
+        }
+    }
     first.setContent(std::move(joined), std::move(joined_formats));
     first.equations_ = std::move(joined_equations);
+    first.images_ = std::move(joined_images);
 
     const std::vector<NodeId> removed_ids(
         [&] {
@@ -1206,13 +1557,28 @@ Result<void> Document::splitParagraph(const Position& position, NodeId new_parag
             right_equations.push_back(std::move(moved));
         }
     }
+    std::vector<ImageAtom> left_images;
+    std::vector<ImageAtom> right_images;
+    left_images.reserve(original.images_.size());
+    right_images.reserve(original.images_.size());
+    for (const auto& image : original.images_) {
+        if (image.utf16_offset < position.utf16_offset) {
+            left_images.push_back(image);
+        } else {
+            auto moved = image;
+            moved.utf16_offset -= position.utf16_offset;
+            right_images.push_back(std::move(moved));
+        }
+    }
 
     original.setContent(std::move(left_text), std::move(left_formats));
     original.equations_ = std::move(left_equations);
+    original.images_ = std::move(left_images);
     Paragraph right(new_paragraph_id, {});
     right.format_ = original_format;
     right.setContent(std::move(right_text), std::move(right_formats));
     right.equations_ = std::move(right_equations);
+    right.images_ = std::move(right_images);
     paragraphs_.insert(paragraphs_.begin() + static_cast<std::ptrdiff_t>(index + 1),
                        std::move(right));
     const auto body_index = bodyBlockIndex(position.paragraph_id);
@@ -1248,6 +1614,7 @@ Result<void> Document::mergeWithNext(NodeId paragraph_id) {
     const auto& second = paragraphs_[index + 1];
     const auto second_id = second.id();
     const auto second_equations = second.equations_;
+    const auto second_images = second.images_;
     const auto first_text_size = first.text_.size();
     auto text = first.text_;
     text.append(second.text_);
@@ -1259,6 +1626,11 @@ Result<void> Document::mergeWithNext(NodeId paragraph_id) {
     for (auto equation : second_equations) {
         equation.utf16_offset += first_text_size;
         first.equations_.push_back(std::move(equation));
+    }
+    first.images_.reserve(first.images_.size() + second_images.size());
+    for (auto image : second_images) {
+        image.utf16_offset += first_text_size;
+        first.images_.push_back(std::move(image));
     }
     paragraphs_.erase(paragraphs_.begin() + static_cast<std::ptrdiff_t>(index + 1));
     const auto second_block = bodyBlockIndex(second_id);

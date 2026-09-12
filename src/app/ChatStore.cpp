@@ -1,11 +1,14 @@
 #include "docxstudio/app/ChatStore.h"
 
+#include "docxstudio/codex/editor_tools.hpp"
+
 #include <sqlite3.h>
 
 #include <algorithm>
 #include <cerrno>
 #include <cstring>
 #include <fcntl.h>
+#include <string_view>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -75,6 +78,76 @@ bool secureSQLiteSidecar(const std::string& path, std::string& error) {
     return false;
 }
 
+bool executeSql(sqlite3* database, const char* sql, std::string& error) {
+    char* rawError = nullptr;
+    if (sqlite3_exec(database, sql, nullptr, nullptr, &rawError) == SQLITE_OK) {
+        return true;
+    }
+    error = rawError ? rawError : "SQLite operation failed";
+    sqlite3_free(rawError);
+    return false;
+}
+
+bool ensureCurrentEditorToolCatalog(sqlite3* database, std::string& error) {
+    {
+        Statement current(
+            database,
+            "SELECT value FROM app_meta WHERE key='editor_tool_catalog_version';");
+        if (!current.get()) {
+            error = sqlite3_errmsg(database);
+            return false;
+        }
+        const int currentStep = sqlite3_step(current.get());
+        if (currentStep == SQLITE_ROW) {
+            const auto* encoded = sqlite3_column_text(current.get(), 0);
+            if (encoded &&
+                std::string_view(reinterpret_cast<const char*>(encoded)) ==
+                    codex::kEditorToolCatalogVersion) {
+                return true;
+            }
+        } else if (currentStep != SQLITE_DONE) {
+            error = sqlite3_errmsg(database);
+            return false;
+        }
+    }
+
+    // The app-server protocol accepts dynamicTools only on thread/start, not
+    // thread/resume. Drop only the server-side thread bindings when the local
+    // catalog changes; the user's local chat history remains intact.
+    if (!executeSql(database, "BEGIN IMMEDIATE;", error)) return false;
+    const auto rollback = [database] {
+        char* ignored = nullptr;
+        sqlite3_exec(database, "ROLLBACK;", nullptr, nullptr, &ignored);
+        sqlite3_free(ignored);
+    };
+    if (!executeSql(database, "DELETE FROM document_threads;", error)) {
+        rollback();
+        return false;
+    }
+    {
+        Statement update(
+            database,
+            "INSERT INTO app_meta(key,value) VALUES('editor_tool_catalog_version',?1) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value;");
+        if (!update.get()) {
+            error = sqlite3_errmsg(database);
+            rollback();
+            return false;
+        }
+        bindText(update.get(), 1, std::string(codex::kEditorToolCatalogVersion));
+        if (sqlite3_step(update.get()) != SQLITE_DONE) {
+            error = sqlite3_errmsg(database);
+            rollback();
+            return false;
+        }
+    }
+    if (!executeSql(database, "COMMIT;", error)) {
+        rollback();
+        return false;
+    }
+    return true;
+}
+
 }  // namespace
 
 ChatStore::~ChatStore() { close(); }
@@ -116,6 +189,10 @@ bool ChatStore::open(const std::string& path, std::string& error) {
         "CREATE INDEX IF NOT EXISTS recovery_journals_updated_idx "
         "ON recovery_journals(updated_at);",
         error)) {
+        close();
+        return false;
+    }
+    if (!ensureCurrentEditorToolCatalog(database_, error)) {
         close();
         return false;
     }

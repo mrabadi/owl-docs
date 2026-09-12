@@ -4,8 +4,7 @@
 
 namespace docxstudio::app {
 
-// Returns the packaged Owl Docs SVG when the platform can render it, with a
-// code-native rendering of the same geometric owl for minimal Qt installs.
+// Returns the packaged Owl Docs raster artwork at each native launcher size.
 QIcon owlDocsApplicationIcon();
 
 }  // namespace docxstudio::app

@@ -1,6 +1,8 @@
 #include "docxstudio/core/document_session.h"
 
+#include <algorithm>
 #include <array>
+#include <cstdint>
 #include <cstdlib>
 #include <initializer_list>
 #include <iostream>
@@ -29,6 +31,78 @@ Document documentWithText(const std::u16string& text) {
     auto document = Document::create({paragraph.value()});
     CHECK(document.hasValue());
     return document.value();
+}
+
+std::vector<std::uint8_t> tinyPngBytes() {
+    // A real 2 x 2 RGB PNG. The core validates its complete container but
+    // intentionally leaves pixel decoding to the raster/UI layer.
+    return {
+        0x89U, 0x50U, 0x4eU, 0x47U, 0x0dU, 0x0aU, 0x1aU, 0x0aU,
+        0x00U, 0x00U, 0x00U, 0x0dU, 0x49U, 0x48U, 0x44U, 0x52U,
+        0x00U, 0x00U, 0x00U, 0x02U, 0x00U, 0x00U, 0x00U, 0x02U,
+        0x08U, 0x02U, 0x00U, 0x00U, 0x00U, 0xfdU, 0xd4U, 0x9aU,
+        0x73U, 0x00U, 0x00U, 0x00U, 0x16U, 0x49U, 0x44U, 0x41U,
+        0x54U, 0x78U, 0x9cU, 0x63U, 0x7cU, 0x16U, 0xa2U, 0xc0U,
+        0xc0U, 0xc0U, 0xc0U, 0xc4U, 0xc0U, 0xc0U, 0xc0U, 0xc0U,
+        0xc0U, 0x00U, 0x00U, 0x11U, 0x28U, 0x01U, 0x5eU, 0xb8U,
+        0xf9U, 0xb4U, 0x71U, 0x00U, 0x00U, 0x00U, 0x00U, 0x49U,
+        0x45U, 0x4eU, 0x44U, 0xaeU, 0x42U, 0x60U, 0x82U,
+    };
+}
+
+std::vector<std::uint8_t> tinyJpegBytes() {
+    // A real 1 x 1 grayscale baseline JPEG.
+    return {
+        0xffU, 0xd8U, 0xffU, 0xe0U, 0x00U, 0x10U, 0x4aU, 0x46U,
+        0x49U, 0x46U, 0x00U, 0x01U, 0x01U, 0x00U, 0x00U, 0x01U,
+        0x00U, 0x01U, 0x00U, 0x00U, 0xffU, 0xdbU, 0x00U, 0x43U,
+        0x00U, 0x06U, 0x04U, 0x05U, 0x06U, 0x05U, 0x04U, 0x06U,
+        0x06U, 0x05U, 0x06U, 0x07U, 0x07U, 0x06U, 0x08U, 0x0aU,
+        0x10U, 0x0aU, 0x0aU, 0x09U, 0x09U, 0x0aU, 0x14U, 0x0eU,
+        0x0fU, 0x0cU, 0x10U, 0x17U, 0x14U, 0x18U, 0x18U, 0x17U,
+        0x14U, 0x16U, 0x16U, 0x1aU, 0x1dU, 0x25U, 0x1fU, 0x1aU,
+        0x1bU, 0x23U, 0x1cU, 0x16U, 0x16U, 0x20U, 0x2cU, 0x20U,
+        0x23U, 0x26U, 0x27U, 0x29U, 0x2aU, 0x29U, 0x19U, 0x1fU,
+        0x2dU, 0x30U, 0x2dU, 0x28U, 0x30U, 0x25U, 0x28U, 0x29U,
+        0x28U, 0xffU, 0xc0U, 0x00U, 0x0bU, 0x08U, 0x00U, 0x01U,
+        0x00U, 0x01U, 0x01U, 0x01U, 0x11U, 0x00U, 0xffU, 0xc4U,
+        0x00U, 0x14U, 0x00U, 0x01U, 0x00U, 0x00U, 0x00U, 0x00U,
+        0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U,
+        0x00U, 0x00U, 0x00U, 0x00U, 0xffU, 0xc4U, 0x00U, 0x14U,
+        0x10U, 0x01U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U,
+        0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U,
+        0x00U, 0x00U, 0xffU, 0xdaU, 0x00U, 0x08U, 0x01U, 0x01U,
+        0x00U, 0x00U, 0x3fU, 0x00U, 0x3fU, 0xffU, 0xd9U,
+    };
+}
+
+EncodedImagePayload maximumSizedJpegPayload() {
+    const auto tiny = tinyJpegBytes();
+    std::vector<std::uint8_t> bytes;
+    bytes.reserve(kMaximumEncodedImageBytes);
+    bytes.insert(bytes.end(), tiny.begin(), tiny.begin() + 2);
+    const std::size_t suffix_size = tiny.size() - 2U;
+    while (bytes.size() + suffix_size < kMaximumEncodedImageBytes) {
+        const std::size_t remaining =
+            kMaximumEncodedImageBytes - bytes.size() - suffix_size;
+        CHECK(remaining >= 4U);
+        std::size_t segment_size = std::min<std::size_t>(remaining, 65537U);
+        const std::size_t tail = remaining - segment_size;
+        if (tail > 0U && tail < 4U) {
+            segment_size -= 4U - tail;
+        }
+        const std::size_t payload_size = segment_size - 4U;
+        const auto declared_size =
+            static_cast<std::uint16_t>(payload_size + 2U);
+        bytes.push_back(0xffU);
+        bytes.push_back(0xe1U);
+        bytes.push_back(static_cast<std::uint8_t>(declared_size >> 8U));
+        bytes.push_back(static_cast<std::uint8_t>(declared_size));
+        bytes.insert(bytes.end(), payload_size, 0U);
+    }
+    bytes.insert(bytes.end(), tiny.begin() + 2, tiny.end());
+    CHECK(bytes.size() == kMaximumEncodedImageBytes);
+    return EncodedImagePayload(std::move(bytes));
 }
 
 void testNodeIdsAndRevision() {
@@ -361,6 +435,680 @@ void testStaleAndIndependentPreviews() {
     CHECK(session.discardPreview(first.value().id));
     CHECK(session.discardPreview(second.value().id));
     CHECK(session.previewCount() == 0);
+}
+
+void testSemanticImageAtomEditing() {
+    CHECK(kMaximumInlineImagesPerDocument == 512);
+    CHECK(kMaximumEncodedImageBytes == 16U * 1024U * 1024U);
+    CHECK(kMaximumDocumentEncodedImageBytes == 32U * 1024U * 1024U);
+    CHECK(kMaximumImageAccessibleNameBytes == 4U * 1024U);
+    CHECK(kMaximumInlineImageDimensionEmu == 254000000);
+    CHECK(imageContentType(ImageFormat::png) == "image/png");
+    CHECK(imageContentType(ImageFormat::jpeg) == "image/jpeg");
+    CHECK(imageContentType(static_cast<ImageFormat>(255)).empty());
+
+    const EncodedImagePayload payload(tinyPngBytes());
+    const EncodedImagePayload jpeg_payload(tinyJpegBytes());
+    const EncodedImagePayload shared = payload;
+    const EncodedImagePayload equal_value(tinyPngBytes());
+    const EncodedImagePayload different(tinyJpegBytes());
+    CHECK(payload == shared);
+    CHECK(payload == equal_value);
+    CHECK(payload != different);
+    CHECK(payload.bytes().data() == shared.bytes().data());
+    CHECK(payload.bytes().data() != equal_value.bytes().data());
+
+    auto surrogate_document = documentWithText(u"A\U0001F600B");
+    const auto surrogate_paragraph =
+        surrogate_document.paragraphs().front().id();
+    const auto surrogate_original = surrogate_document;
+    const auto invalid_image_id = NodeId::generate();
+    CHECK(!surrogate_document.insertImage(
+        {surrogate_paragraph, 2}, payload, ImageFormat::png, "diagram",
+        914400, 914400, invalid_image_id));
+    CHECK(surrogate_document == surrogate_original);
+
+    auto invalid_document = documentWithText(u"ab");
+    const auto invalid_paragraph = invalid_document.paragraphs().front().id();
+    const auto invalid_original = invalid_document;
+    CHECK(!invalid_document.insertImage(
+        {invalid_paragraph, 1}, EncodedImagePayload{}, ImageFormat::png, {},
+        914400, 914400, invalid_image_id));
+    CHECK(!invalid_document.insertImage(
+        {invalid_paragraph, 1}, payload, static_cast<ImageFormat>(255), {},
+        914400, 914400, invalid_image_id));
+    auto malformed_png = tinyPngBytes();
+    malformed_png.pop_back();
+    const auto cheap_duplicate_rejection = invalid_document.insertImage(
+        {invalid_paragraph, 1}, EncodedImagePayload(malformed_png),
+        ImageFormat::png, {}, 914400, 914400, invalid_paragraph);
+    CHECK(!cheap_duplicate_rejection);
+    CHECK(cheap_duplicate_rejection.error().code ==
+          ErrorCode::duplicate_node_id);
+    CHECK(!invalid_document.insertImage(
+        {invalid_paragraph, 1}, EncodedImagePayload(std::move(malformed_png)),
+        ImageFormat::png, {}, 914400, 914400, invalid_image_id));
+    CHECK(!invalid_document.insertImage(
+        {invalid_paragraph, 1}, payload, ImageFormat::jpeg, {}, 914400,
+        914400, invalid_image_id));
+    CHECK(!invalid_document.insertImage(
+        {invalid_paragraph, 1}, payload, ImageFormat::png,
+        std::string(kMaximumImageAccessibleNameBytes + 1U, 'a'), 914400,
+        914400, invalid_image_id));
+    const std::string invalid_utf8{"\xc0\xaf", 2};
+    CHECK(!invalid_document.insertImage(
+        {invalid_paragraph, 1}, payload, ImageFormat::png, invalid_utf8,
+        914400, 914400, invalid_image_id));
+    CHECK(!invalid_document.insertImage(
+        {invalid_paragraph, 1}, payload, ImageFormat::png, {}, 0, 914400,
+        invalid_image_id));
+    CHECK(!invalid_document.insertImage(
+        {invalid_paragraph, 1}, payload, ImageFormat::png, {}, 914400, -1,
+        invalid_image_id));
+    CHECK(!invalid_document.insertImage(
+        {invalid_paragraph, 1}, payload, ImageFormat::png, {},
+        kMaximumInlineImageDimensionEmu + 1, 914400, invalid_image_id));
+    CHECK(!invalid_document.insertImage(
+        {invalid_paragraph, 1}, payload, ImageFormat::png, {}, 914400,
+        914400, NodeId{}));
+    CHECK(!invalid_document.insertImage(
+        {invalid_paragraph, 1}, payload, ImageFormat::png, {}, 914400,
+        914400, invalid_paragraph));
+    const EncodedImagePayload oversized_payload(
+        std::vector<std::uint8_t>(kMaximumEncodedImageBytes + 1U, 0x5a));
+    CHECK(!invalid_document.insertImage(
+        {invalid_paragraph, 1}, oversized_payload, ImageFormat::png, {},
+        914400, 914400, invalid_image_id));
+    CHECK(invalid_document == invalid_original);
+
+    auto document = documentWithText(u"ab");
+    const auto paragraph_id = document.paragraphs().front().id();
+    const auto image_id = NodeId::generate();
+    CharacterFormat character_format;
+    character_format.italic = true;
+    CHECK(document.insertImage(
+        {paragraph_id, 1}, payload, ImageFormat::png, "Revenue diagram",
+        914400, 457200, image_id, character_format));
+    CHECK(document.paragraphs().front().text() == u"a\ufffcb");
+    CHECK(document.paragraphs().front().images().size() == 1);
+    const auto* image = document.paragraphs().front().imageAt(1);
+    CHECK(image != nullptr);
+    if (image) {
+        CHECK(image->id == image_id);
+        CHECK(image->utf16_offset == 1);
+        CHECK(image->format == ImageFormat::png);
+        CHECK(imageContentType(image->format) == "image/png");
+        CHECK(image->accessible_name == "Revenue diagram");
+        CHECK(image->width_emu == 914400);
+        CHECK(image->height_emu == 457200);
+        CHECK(image->encoded_payload == payload);
+        CHECK(image->encoded_payload.bytes().data() == payload.bytes().data());
+    }
+    CHECK(document.findImage(image_id) == image);
+    CHECK(document.paragraphs().front().characterFormatAt(2).italic == true);
+
+    const auto* encoded_address =
+        document.findImage(image_id)->encoded_payload.bytes().data();
+    CHECK(document.insertText({paragraph_id, 0}, u"X"));
+    CHECK(document.paragraphs().front().imageAt(2)->id == image_id);
+    CHECK(document.findImage(image_id)->encoded_payload.bytes().data() ==
+          encoded_address);
+    CHECK(document.insertText({paragraph_id, 2}, u"Y"));
+    CHECK(document.paragraphs().front().imageAt(3)->id == image_id);
+    CHECK(document.insertText({paragraph_id, 4}, u"Z"));
+    CHECK(document.paragraphs().front().imageAt(3)->id == image_id);
+    CHECK(document.deleteRange({{paragraph_id, 3}, {paragraph_id, 3}}));
+    CHECK(document.findImage(image_id) != nullptr);
+    CHECK(document.deleteRange({{paragraph_id, 3}, {paragraph_id, 4}}));
+    CHECK(document.findImage(image_id) == nullptr);
+
+    auto ordered = documentWithText(u"Q");
+    const auto ordered_paragraph = ordered.paragraphs().front().id();
+    const auto first_image = NodeId::generate();
+    const auto second_image = NodeId::generate();
+    const auto third_image = NodeId::generate();
+    const auto equation_id = NodeId::generate();
+    CHECK(ordered.insertImage({ordered_paragraph, 1}, payload,
+                              ImageFormat::png, {}, 1000, 2000,
+                              first_image));
+    CHECK(ordered.insertImage({ordered_paragraph, 1}, jpeg_payload,
+                              ImageFormat::jpeg, {}, 2000, 3000,
+                              second_image));
+    CHECK(ordered.insertEquation({ordered_paragraph, 2}, "x", false,
+                                 equation_id));
+    CHECK(ordered.insertImage({ordered_paragraph, 2}, payload,
+                              ImageFormat::png, {}, 3000, 4000,
+                              third_image));
+    CHECK(ordered.paragraphs().front().text() ==
+          u"Q\ufffc\ufffc\ufffc\ufffc");
+    CHECK(ordered.paragraphs().front().imageAt(1)->id == second_image);
+    CHECK(ordered.paragraphs().front().imageAt(2)->id == third_image);
+    CHECK(ordered.paragraphs().front().equationAt(3)->id == equation_id);
+    CHECK(ordered.paragraphs().front().imageAt(4)->id == first_image);
+    CHECK(ordered.deleteRange(
+        {{ordered_paragraph, 2}, {ordered_paragraph, 3}}));
+    CHECK(ordered.findImage(third_image) == nullptr);
+    CHECK(ordered.paragraphs().front().equationAt(2)->id == equation_id);
+    CHECK(ordered.paragraphs().front().imageAt(3)->id == first_image);
+    CHECK(ordered.replaceRange(
+        {{ordered_paragraph, 1}, {ordered_paragraph, 3}}, u"z"));
+    CHECK(ordered.paragraphs().front().text() == u"Qz\ufffc");
+    CHECK(ordered.findImage(second_image) == nullptr);
+    CHECK(ordered.findEquation(equation_id) == nullptr);
+    CHECK(ordered.paragraphs().front().imageAt(2)->id == first_image);
+
+    auto split = documentWithText(u"ab");
+    const auto split_paragraph = split.paragraphs().front().id();
+    const auto split_image = NodeId::generate();
+    CHECK(split.insertImage({split_paragraph, 1}, payload, ImageFormat::png,
+                            {}, 1000, 1000, split_image));
+    const auto right_paragraph = NodeId::generate();
+    CHECK(split.splitParagraph({split_paragraph, 1}, right_paragraph));
+    CHECK(split.paragraphs()[0].text() == u"a");
+    CHECK(split.paragraphs()[0].images().empty());
+    CHECK(split.paragraphs()[1].text() == u"\ufffcb");
+    CHECK(split.paragraphs()[1].imageAt(0)->id == split_image);
+    CHECK(split.mergeWithNext(split_paragraph));
+    CHECK(split.paragraphs().front().imageAt(1)->id == split_image);
+    const auto after_image_paragraph = NodeId::generate();
+    CHECK(split.splitParagraph({split_paragraph, 2},
+                               after_image_paragraph));
+    CHECK(split.paragraphs()[0].imageAt(1)->id == split_image);
+    CHECK(split.paragraphs()[1].images().empty());
+    CHECK(split.mergeWithNext(split_paragraph));
+
+    auto first = Paragraph::create(u"AB");
+    auto middle = Paragraph::create(u"M");
+    auto last = Paragraph::create(u"CD");
+    CHECK(first && middle && last);
+    auto multiline_result =
+        Document::create({first.value(), middle.value(), last.value()});
+    CHECK(multiline_result);
+    auto multiline = multiline_result.value();
+    const auto first_paragraph = multiline.paragraphs()[0].id();
+    const auto middle_paragraph = multiline.paragraphs()[1].id();
+    const auto last_paragraph = multiline.paragraphs()[2].id();
+    const auto retained_first_image = NodeId::generate();
+    const auto removed_middle_image = NodeId::generate();
+    const auto retained_last_image = NodeId::generate();
+    const auto removed_first_equation = NodeId::generate();
+    const auto removed_last_equation = NodeId::generate();
+    CHECK(multiline.insertImage({first_paragraph, 1}, payload,
+                                ImageFormat::png, {}, 1000, 1000,
+                                retained_first_image));
+    CHECK(multiline.insertEquation({first_paragraph, 2}, "a", false,
+                                   removed_first_equation));
+    CHECK(multiline.insertImage({middle_paragraph, 0}, payload,
+                                ImageFormat::png, {}, 1000, 1000,
+                                removed_middle_image));
+    CHECK(multiline.insertEquation({last_paragraph, 0}, "b", false,
+                                   removed_last_equation));
+    CHECK(multiline.insertImage({last_paragraph, 2}, jpeg_payload,
+                                ImageFormat::jpeg, {}, 1000, 1000,
+                                retained_last_image));
+    CHECK(multiline.deleteRange(
+        {{first_paragraph, 2}, {last_paragraph, 2}}));
+    CHECK(multiline.paragraphs().size() == 1);
+    CHECK(multiline.paragraphs().front().text() ==
+          u"A\ufffc\ufffcD");
+    CHECK(multiline.paragraphs().front().imageAt(1)->id ==
+          retained_first_image);
+    CHECK(multiline.paragraphs().front().imageAt(2)->id ==
+          retained_last_image);
+    CHECK(multiline.findImage(removed_middle_image) == nullptr);
+    CHECK(multiline.findEquation(removed_first_equation) == nullptr);
+    CHECK(multiline.findEquation(removed_last_equation) == nullptr);
+
+    auto invariant = documentWithText(u"xy");
+    const auto invariant_paragraph = invariant.paragraphs().front().id();
+    const auto invariant_image = NodeId::generate();
+    const auto invariant_equation = NodeId::generate();
+    CHECK(invariant.insertImage({invariant_paragraph, 1}, payload,
+                                ImageFormat::png, {}, 1000, 1000,
+                                invariant_image));
+    CHECK(invariant.insertEquation({invariant_paragraph, 2}, "x", false,
+                                   invariant_equation));
+    CHECK(Document::create({invariant.paragraphs().front()}));
+    CHECK(!invariant.insertEquation({invariant_paragraph, 0}, "y", false,
+                                    invariant_image));
+    CHECK(!invariant.insertImage({invariant_paragraph, 0}, payload,
+                                 ImageFormat::png, {}, 1000, 1000,
+                                 invariant_equation));
+    CHECK(!invariant.splitParagraph({invariant_paragraph, 0},
+                                    invariant_image));
+    auto colliding_table = Table::create(1, 1, false, invariant_image);
+    CHECK(colliding_table);
+    CHECK(!invariant.insertTable(std::nullopt, colliding_table.value()));
+
+    auto missing_metadata = invariant.paragraphs().front();
+    auto& missing_images = const_cast<std::vector<ImageAtom>&>(
+        missing_metadata.images());
+    missing_images.clear();
+    CHECK(!Document::create({missing_metadata}));
+
+    auto missing_placeholder = invariant.paragraphs().front();
+    auto& changed_text = const_cast<std::u16string&>(
+        missing_placeholder.text());
+    changed_text[1] = u'z';
+    CHECK(!Document::create({missing_placeholder}));
+
+    auto duplicate_id = invariant.paragraphs().front();
+    auto& duplicate_id_images = const_cast<std::vector<ImageAtom>&>(
+        duplicate_id.images());
+    duplicate_id_images.front().id = invariant_equation;
+    CHECK(!Document::create({duplicate_id}));
+
+    auto colliding_metadata = invariant.paragraphs().front();
+    auto& colliding_images = const_cast<std::vector<ImageAtom>&>(
+        colliding_metadata.images());
+    colliding_images.front().utf16_offset = 2;
+    CHECK(!Document::create({colliding_metadata}));
+
+    auto duplicate_metadata = invariant.paragraphs().front();
+    auto& duplicate_images = const_cast<std::vector<ImageAtom>&>(
+        duplicate_metadata.images());
+    auto duplicate_image = duplicate_images.front();
+    duplicate_image.id = NodeId::generate();
+    duplicate_images.push_back(std::move(duplicate_image));
+    CHECK(!Document::create({duplicate_metadata}));
+
+    auto unordered_atoms = documentWithText(u"x");
+    const auto unordered_paragraph =
+        unordered_atoms.paragraphs().front().id();
+    CHECK(unordered_atoms.insertImage(
+        {unordered_paragraph, 0}, payload, ImageFormat::png, {}, 1000, 1000,
+        NodeId::generate()));
+    CHECK(unordered_atoms.insertImage(
+        {unordered_paragraph, 1}, jpeg_payload, ImageFormat::jpeg, {}, 1000,
+        1000, NodeId::generate()));
+    auto unordered_images = unordered_atoms.paragraphs().front();
+    auto& image_metadata = const_cast<std::vector<ImageAtom>&>(
+        unordered_images.images());
+    std::swap(image_metadata[0], image_metadata[1]);
+    CHECK(!Document::create({unordered_images}));
+
+    auto out_of_bounds_image = unordered_atoms.paragraphs().front();
+    auto& out_of_bounds_metadata = const_cast<std::vector<ImageAtom>&>(
+        out_of_bounds_image.images());
+    out_of_bounds_metadata.front().utf16_offset =
+        out_of_bounds_image.text().size();
+    CHECK(!Document::create({out_of_bounds_image}));
+
+    auto unordered_equations = documentWithText(u"x");
+    const auto equation_paragraph =
+        unordered_equations.paragraphs().front().id();
+    CHECK(unordered_equations.insertEquation(
+        {equation_paragraph, 0}, "a", false, NodeId::generate()));
+    CHECK(unordered_equations.insertEquation(
+        {equation_paragraph, 1}, "b", false, NodeId::generate()));
+    auto unordered_equation_paragraph =
+        unordered_equations.paragraphs().front();
+    auto& equation_metadata = const_cast<std::vector<EquationAtom>&>(
+        unordered_equation_paragraph.equations());
+    std::swap(equation_metadata[0], equation_metadata[1]);
+    CHECK(!Document::create({unordered_equation_paragraph}));
+}
+
+void testImageResourceLimitsAndSessionHistory() {
+    const EncodedImagePayload maximum_payload = maximumSizedJpegPayload();
+    auto byte_limited = documentWithText({});
+    const auto byte_limited_paragraph =
+        byte_limited.paragraphs().front().id();
+    CHECK(byte_limited.insertImage(
+        {byte_limited_paragraph, 0}, maximum_payload, ImageFormat::jpeg, {},
+        1000, 1000, NodeId::generate()));
+    CHECK(byte_limited.insertImage(
+        {byte_limited_paragraph, 1}, maximum_payload, ImageFormat::jpeg, {},
+        1000, 1000, NodeId::generate()));
+    const auto byte_limited_before = byte_limited;
+    CHECK(!byte_limited.insertImage(
+        {byte_limited_paragraph, 2},
+        EncodedImagePayload(tinyPngBytes()),
+        ImageFormat::png, {}, 1000, 1000, NodeId::generate()));
+    CHECK(byte_limited == byte_limited_before);
+    CHECK(Document::create({byte_limited.paragraphs().front()}));
+    auto over_byte_limit = byte_limited.paragraphs().front();
+    auto& over_byte_limit_images = const_cast<std::vector<ImageAtom>&>(
+        over_byte_limit.images());
+    auto extra_large_image = over_byte_limit_images.front();
+    extra_large_image.id = NodeId::generate();
+    extra_large_image.utf16_offset = 2;
+    over_byte_limit_images.push_back(std::move(extra_large_image));
+    auto& over_byte_limit_text = const_cast<std::u16string&>(
+        over_byte_limit.text());
+    over_byte_limit_text.push_back(kInlineObjectReplacementCharacter);
+    CHECK(!Document::create({over_byte_limit}));
+
+    const EncodedImagePayload tiny_payload(tinyPngBytes());
+    auto count_limited = documentWithText({});
+    const auto count_limited_paragraph =
+        count_limited.paragraphs().front().id();
+    for (std::size_t index = 0; index < kMaximumInlineImagesPerDocument;
+         ++index) {
+        CHECK(count_limited.insertImage(
+            {count_limited_paragraph, index}, tiny_payload, ImageFormat::png,
+            {}, 1000, 1000, NodeId::generate()));
+    }
+    CHECK(count_limited.paragraphs().front().images().size() ==
+          kMaximumInlineImagesPerDocument);
+    CHECK(!count_limited.insertImage(
+        {count_limited_paragraph, kMaximumInlineImagesPerDocument},
+        tiny_payload, ImageFormat::png, {}, 1000, 1000,
+        NodeId::generate()));
+    auto malformed_at_count_limit = tinyPngBytes();
+    malformed_at_count_limit.pop_back();
+    const auto cheap_count_rejection = count_limited.insertImage(
+        {count_limited_paragraph, kMaximumInlineImagesPerDocument},
+        EncodedImagePayload(std::move(malformed_at_count_limit)),
+        ImageFormat::png, {}, 1000, 1000, NodeId::generate());
+    CHECK(!cheap_count_rejection);
+    CHECK(cheap_count_rejection.error().message.find("count limit") !=
+          std::string::npos);
+    auto over_count_limit = count_limited.paragraphs().front();
+    auto& over_count_limit_images = const_cast<std::vector<ImageAtom>&>(
+        over_count_limit.images());
+    auto extra_counted_image = over_count_limit_images.front();
+    extra_counted_image.id = NodeId::generate();
+    extra_counted_image.utf16_offset = kMaximumInlineImagesPerDocument;
+    over_count_limit_images.push_back(std::move(extra_counted_image));
+    auto& over_count_limit_text = const_cast<std::u16string&>(
+        over_count_limit.text());
+    over_count_limit_text.push_back(kInlineObjectReplacementCharacter);
+    CHECK(!Document::create({over_count_limit}));
+
+    DocumentSession session(documentWithText(u"x"));
+    auto snapshot = session.snapshot();
+    const auto paragraph_id = snapshot.document.paragraphs().front().id();
+    const auto image_id = NodeId::generate();
+    const EncodedImagePayload payload(tinyPngBytes());
+    const auto* payload_address = payload.bytes().data();
+    const std::vector<Operation> insertion{
+        InsertImage{{paragraph_id, 1}, payload, ImageFormat::png,
+                    "Chart", 914400, 457200, image_id, std::nullopt},
+    };
+    CHECK(session.applyBatch(snapshot.revision, insertion));
+    snapshot = session.snapshot();
+    CHECK(snapshot.document.paragraphs().front().text() == u"x\ufffc");
+    CHECK(snapshot.document.findImage(image_id)->encoded_payload.bytes().data() ==
+          payload_address);
+
+    CHECK(session.undo(snapshot.revision));
+    snapshot = session.snapshot();
+    CHECK(snapshot.document.findImage(image_id) == nullptr);
+    CHECK(snapshot.document.paragraphs().front().text() == u"x");
+    CHECK(session.redo(snapshot.revision));
+    snapshot = session.snapshot();
+    CHECK(snapshot.document.findImage(image_id)->encoded_payload.bytes().data() ==
+          payload_address);
+
+    const std::vector<Operation> resize{
+        ResizeImage{image_id, 1828800, 914400},
+    };
+    CHECK(session.applyBatch(snapshot.revision, resize));
+    snapshot = session.snapshot();
+    CHECK(snapshot.document.findImage(image_id)->width_emu == 1828800);
+    CHECK(snapshot.document.findImage(image_id)->height_emu == 914400);
+    CHECK(session.undo(snapshot.revision));
+    snapshot = session.snapshot();
+    CHECK(snapshot.document.findImage(image_id)->width_emu == 914400);
+    CHECK(session.redo(snapshot.revision));
+    snapshot = session.snapshot();
+    CHECK(snapshot.document.findImage(image_id)->width_emu == 1828800);
+
+    const std::vector<Operation> deletion{
+        DeleteRange{{{paragraph_id, 1}, {paragraph_id, 2}}},
+    };
+    CHECK(session.applyBatch(snapshot.revision, deletion));
+    snapshot = session.snapshot();
+    CHECK(snapshot.document.findImage(image_id) == nullptr);
+    CHECK(session.undo(snapshot.revision));
+    snapshot = session.snapshot();
+    CHECK(snapshot.document.findImage(image_id) != nullptr);
+    CHECK(session.redo(snapshot.revision));
+    snapshot = session.snapshot();
+    CHECK(snapshot.document.findImage(image_id) == nullptr);
+    CHECK(session.undo(snapshot.revision));
+    snapshot = session.snapshot();
+    CHECK(snapshot.document.findImage(image_id) != nullptr);
+
+    auto accepted_preview = session.createPreview(snapshot.revision);
+    CHECK(accepted_preview);
+    const std::vector<Operation> preview_resize{
+        ResizeImage{image_id, 2743200, 1371600},
+    };
+    CHECK(session.applyPreviewBatch(accepted_preview.value().id, Revision{},
+                                    preview_resize));
+    CHECK(session.snapshot().document.findImage(image_id)->width_emu ==
+          1828800);
+    auto preview_snapshot =
+        session.previewSnapshot(accepted_preview.value().id);
+    CHECK(preview_snapshot);
+    CHECK(preview_snapshot.value().document.findImage(image_id)->width_emu ==
+          2743200);
+    CHECK(session.acceptPreview(accepted_preview.value().id,
+                                snapshot.revision, Revision{1}));
+    snapshot = session.snapshot();
+    CHECK(snapshot.document.findImage(image_id)->width_emu == 2743200);
+    CHECK(session.undo(snapshot.revision));
+    snapshot = session.snapshot();
+    CHECK(snapshot.document.findImage(image_id)->width_emu == 1828800);
+
+    auto stale_preview = session.createPreview(snapshot.revision);
+    CHECK(stale_preview);
+    CHECK(session.applyPreviewBatch(stale_preview.value().id, Revision{},
+                                    preview_resize));
+    CHECK(session.applyBatch(
+        snapshot.revision,
+        std::vector<Operation>{ResizeImage{image_id, 3657600, 1828800}}));
+    snapshot = session.snapshot();
+    const auto stale_accept = session.acceptPreview(
+        stale_preview.value().id, snapshot.revision, Revision{1});
+    CHECK(!stale_accept);
+    CHECK(stale_accept.error().code == ErrorCode::preview_conflict);
+    CHECK(snapshot.document.findImage(image_id)->width_emu == 3657600);
+    CHECK(session.discardPreview(stale_preview.value().id));
+
+    DocumentSession atomic(documentWithText(u"base"));
+    const auto before = atomic.snapshot();
+    const auto atomic_paragraph = before.document.paragraphs().front().id();
+    const auto atomic_image = NodeId::generate();
+    const std::vector<Operation> invalid_batch{
+        InsertImage{{atomic_paragraph, 4}, tiny_payload, ImageFormat::png,
+                    {}, 1000, 1000, atomic_image, std::nullopt},
+        ResizeImage{atomic_image, 0, 1000},
+    };
+    CHECK(!atomic.applyBatch(before.revision, invalid_batch));
+    CHECK(atomic.snapshot().revision == before.revision);
+    CHECK(atomic.snapshot().document == before.document);
+}
+
+void testBoundedSessionHistoryAndPreviews() {
+    const DocumentSessionLimits defaults;
+    CHECK(defaults.maximum_history_entries == 256);
+    CHECK(defaults.maximum_preview_branches == 4);
+    CHECK(defaults.maximum_retained_history_image_bytes ==
+          256U * 1024U * 1024U);
+
+    DocumentSessionLimits entry_limits;
+    entry_limits.maximum_history_entries = 3;
+    entry_limits.maximum_preview_branches = 2;
+    DocumentSession entry_limited(documentWithText({}), entry_limits);
+    auto snapshot = entry_limited.snapshot();
+    const auto paragraph_id = snapshot.document.paragraphs().front().id();
+    for (std::size_t index = 0; index < 5; ++index) {
+        const std::vector<Operation> edit{
+            InsertText{{paragraph_id, index}, u"x", std::nullopt},
+        };
+        CHECK(entry_limited.applyBatch(snapshot.revision, edit));
+        snapshot = entry_limited.snapshot();
+    }
+    for (std::size_t index = 0; index < 3; ++index) {
+        CHECK(entry_limited.undo(snapshot.revision));
+        snapshot = entry_limited.snapshot();
+    }
+    CHECK(snapshot.document.paragraphs().front().text() == u"xx");
+    const auto evicted_undo = entry_limited.undo(snapshot.revision);
+    CHECK(!evicted_undo);
+    CHECK(evicted_undo.error().code == ErrorCode::history_empty);
+
+    DocumentSession preview_limited(documentWithText({}), entry_limits);
+    const auto preview_base = preview_limited.snapshot();
+    const auto first_preview =
+        preview_limited.createPreview(preview_base.revision);
+    const auto second_preview =
+        preview_limited.createPreview(preview_base.revision);
+    CHECK(first_preview);
+    CHECK(second_preview);
+    const auto excess_preview =
+        preview_limited.createPreview(preview_base.revision);
+    CHECK(!excess_preview);
+    CHECK(excess_preview.error().code == ErrorCode::invalid_operation);
+    CHECK(preview_limited.discardPreview(first_preview.value().id));
+    CHECK(preview_limited.discardPreview(second_preview.value().id));
+
+    DocumentSessionLimits preview_history_limits;
+    preview_history_limits.maximum_history_entries = 2;
+    preview_history_limits.maximum_preview_branches = 1;
+    DocumentSession preview_history(documentWithText({}),
+                                    preview_history_limits);
+    const auto preview_history_base = preview_history.snapshot();
+    const auto bounded_preview =
+        preview_history.createPreview(preview_history_base.revision);
+    CHECK(bounded_preview);
+    auto preview_revision = bounded_preview.value().revision;
+    const auto preview_paragraph =
+        preview_history_base.document.paragraphs().front().id();
+    for (std::size_t index = 0; index < 4; ++index) {
+        const std::vector<Operation> edit{
+            InsertText{{preview_paragraph, index}, u"p", std::nullopt},
+        };
+        const auto applied = preview_history.applyPreviewBatch(
+            bounded_preview.value().id, preview_revision, edit);
+        CHECK(applied);
+        preview_revision = applied.value().revision;
+    }
+    for (std::size_t index = 0; index < 2; ++index) {
+        const auto undone = preview_history.undoPreview(
+            bounded_preview.value().id, preview_revision);
+        CHECK(undone);
+        preview_revision = undone.value().revision;
+    }
+    const auto evicted_preview_undo = preview_history.undoPreview(
+        bounded_preview.value().id, preview_revision);
+    CHECK(!evicted_preview_undo);
+    CHECK(evicted_preview_undo.error().code == ErrorCode::history_empty);
+
+    const auto image_bytes = tinyPngBytes().size();
+    DocumentSessionLimits shared_media_limits;
+    shared_media_limits.maximum_history_entries = 16;
+    shared_media_limits.maximum_preview_branches = 1;
+    shared_media_limits.maximum_retained_history_image_bytes = image_bytes;
+    DocumentSession shared_media(documentWithText({}), shared_media_limits);
+    snapshot = shared_media.snapshot();
+    const auto shared_paragraph = snapshot.document.paragraphs().front().id();
+    const auto shared_image_id = NodeId::generate();
+    const EncodedImagePayload shared_payload(tinyPngBytes());
+    const auto apply_shared = [&](Operation operation) {
+        const std::vector<Operation> operations{std::move(operation)};
+        const auto applied = shared_media.applyBatch(snapshot.revision,
+                                                     operations);
+        CHECK(applied);
+        snapshot = shared_media.snapshot();
+    };
+    apply_shared(InsertImage{{shared_paragraph, 0}, shared_payload,
+                             ImageFormat::png, {}, 1000, 1000,
+                             shared_image_id, std::nullopt});
+    apply_shared(ResizeImage{shared_image_id, 2000, 2000});
+    apply_shared(ResizeImage{shared_image_id, 3000, 3000});
+    apply_shared(ResizeImage{shared_image_id, 4000, 4000});
+    apply_shared(DeleteRange{{{shared_paragraph, 0},
+                              {shared_paragraph, 1}}});
+    for (std::size_t index = 0; index < 5; ++index) {
+        CHECK(shared_media.undo(snapshot.revision));
+        snapshot = shared_media.snapshot();
+    }
+    CHECK(snapshot.document.paragraphs().front().text().empty());
+    CHECK(!shared_media.undo(snapshot.revision));
+
+    DocumentSession distinct_media(documentWithText({}),
+                                   shared_media_limits);
+    snapshot = distinct_media.snapshot();
+    const auto distinct_paragraph =
+        snapshot.document.paragraphs().front().id();
+    const auto insert_and_delete_distinct = [&]() {
+        const auto image_id = NodeId::generate();
+        const std::vector<Operation> insertion{
+            InsertImage{{distinct_paragraph, 0},
+                        EncodedImagePayload(tinyPngBytes()),
+                        ImageFormat::png, {}, 1000, 1000, image_id,
+                        std::nullopt},
+        };
+        CHECK(distinct_media.applyBatch(snapshot.revision, insertion));
+        snapshot = distinct_media.snapshot();
+        const std::vector<Operation> deletion{
+            DeleteRange{{{distinct_paragraph, 0}, {distinct_paragraph, 1}}},
+        };
+        CHECK(distinct_media.applyBatch(snapshot.revision, deletion));
+        snapshot = distinct_media.snapshot();
+    };
+    insert_and_delete_distinct();
+    insert_and_delete_distinct();
+    CHECK(distinct_media.undo(snapshot.revision));
+    snapshot = distinct_media.snapshot();
+    CHECK(distinct_media.undo(snapshot.revision));
+    snapshot = distinct_media.snapshot();
+    CHECK(snapshot.document.paragraphs().front().text().empty());
+    const auto evicted_media_undo = distinct_media.undo(snapshot.revision);
+    CHECK(!evicted_media_undo);
+    CHECK(evicted_media_undo.error().code == ErrorCode::history_empty);
+
+    DocumentSession preview_retention(documentWithText({}),
+                                      shared_media_limits);
+    snapshot = preview_retention.snapshot();
+    const auto retention_paragraph =
+        snapshot.document.paragraphs().front().id();
+    const EncodedImagePayload retained_by_preview(tinyPngBytes());
+    const EncodedImagePayload retained_by_live_history(tinyPngBytes());
+    const auto preview_image_id = NodeId::generate();
+    const auto live_image_id = NodeId::generate();
+    const auto apply_retention_live = [&](Operation operation) {
+        const std::vector<Operation> operations{std::move(operation)};
+        const auto applied = preview_retention.applyBatch(snapshot.revision,
+                                                          operations);
+        CHECK(applied);
+        snapshot = preview_retention.snapshot();
+    };
+    apply_retention_live(InsertImage{
+        {retention_paragraph, 0}, retained_by_preview, ImageFormat::png, {},
+        1000, 1000, preview_image_id, std::nullopt});
+    apply_retention_live(DeleteRange{{{retention_paragraph, 0},
+                                      {retention_paragraph, 1}}});
+    const auto retaining_preview =
+        preview_retention.createPreview(snapshot.revision);
+    CHECK(retaining_preview);
+    const std::vector<Operation> preview_insertion{
+        InsertImage{{retention_paragraph, 0}, retained_by_preview,
+                    ImageFormat::png, {}, 1000, 1000, preview_image_id,
+                    std::nullopt},
+    };
+    CHECK(preview_retention.applyPreviewBatch(
+        retaining_preview.value().id, retaining_preview.value().revision,
+        preview_insertion));
+    apply_retention_live(InsertImage{
+        {retention_paragraph, 0}, retained_by_live_history,
+        ImageFormat::png, {}, 1000, 1000, live_image_id, std::nullopt});
+    apply_retention_live(DeleteRange{{{retention_paragraph, 0},
+                                      {retention_paragraph, 1}}});
+    CHECK(preview_retention.discardPreview(
+        retaining_preview.value().id));
+    CHECK(preview_retention.undo(snapshot.revision));
+    snapshot = preview_retention.snapshot();
+    CHECK(preview_retention.undo(snapshot.revision));
+    snapshot = preview_retention.snapshot();
+    const auto pruned_after_discard =
+        preview_retention.undo(snapshot.revision);
+    CHECK(!pruned_after_discard);
+    CHECK(pruned_after_discard.error().code == ErrorCode::history_empty);
 }
 
 void testSemanticEquationAtomEditing() {
@@ -1069,6 +1817,9 @@ int main() {
     testUndoCoalescing();
     testPreviewIsolationAndAcceptance();
     testStaleAndIndependentPreviews();
+    testSemanticImageAtomEditing();
+    testImageResourceLimitsAndSessionHistory();
+    testBoundedSessionHistoryAndPreviews();
     testSemanticEquationAtomEditing();
     testEquationStructureAndSessionHistory();
     testSemanticTableOperationsAndHistory();

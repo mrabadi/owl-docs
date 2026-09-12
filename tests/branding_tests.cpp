@@ -7,6 +7,7 @@
 #include <QClipboard>
 #include <QColorDialog>
 #include <QCoreApplication>
+#include <QCryptographicHash>
 #include <QComboBox>
 #include <QDialog>
 #include <QDialogButtonBox>
@@ -25,10 +26,13 @@
 #include <QToolButton>
 #include <QXmlStreamReader>
 
-#include <cstdlib>
+#include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdint>
+#include <cstdlib>
 #include <iostream>
+#include <set>
 
 namespace {
 
@@ -55,6 +59,38 @@ void checkXml(const QString& source, const char* message) {
     QXmlStreamReader reader(source);
     while (!reader.atEnd()) reader.readNext();
     check(!reader.hasError(), message);
+}
+
+double meanVisibleDifference(const QImage& left, const QImage& right) {
+    check(left.size() == right.size(), "icon comparison size mismatch");
+    const QImage lhs = left.convertToFormat(QImage::Format_RGBA8888);
+    const QImage rhs = right.convertToFormat(QImage::Format_RGBA8888);
+    std::uint64_t difference = 0;
+    for (int y = 0; y < lhs.height(); ++y) {
+        const auto* leftLine = lhs.constScanLine(y);
+        const auto* rightLine = rhs.constScanLine(y);
+        for (int x = 0; x < lhs.width(); ++x) {
+            const int leftAlpha = leftLine[x * 4 + 3];
+            const int rightAlpha = rightLine[x * 4 + 3];
+            for (int channel = 0; channel < 3; ++channel) {
+                const int leftPremultiplied =
+                    (static_cast<int>(leftLine[x * 4 + channel]) * leftAlpha +
+                     127) /
+                    255;
+                const int rightPremultiplied =
+                    (static_cast<int>(rightLine[x * 4 + channel]) *
+                         rightAlpha +
+                     127) /
+                    255;
+                difference += static_cast<std::uint64_t>(std::abs(
+                    leftPremultiplied - rightPremultiplied));
+            }
+            difference += static_cast<std::uint64_t>(
+                std::abs(leftAlpha - rightAlpha));
+        }
+    }
+    return static_cast<double>(difference) /
+           static_cast<double>(lhs.width() * lhs.height() * 4);
 }
 
 QStringList paragraphTexts(const docxstudio::app::DocumentCanvas& canvas) {
@@ -95,27 +131,39 @@ int main(int argc, char** argv) {
               mime.contains(QStringLiteral("*.docx")),
           "MIME metadata is missing branding or the DOCX glob");
 
-    const QString icon = readFile(
-        root + QStringLiteral("/packaging/icons/owl-docs.svg"));
-    checkXml(icon, "Owl Docs icon is not valid SVG XML");
-    check(icon.contains(QStringLiteral("<title id=\"title\">Owl Docs</title>")),
-          "Owl Docs icon has no accessible title");
-    check(icon.contains(QStringLiteral("width=\"128\"")) &&
-              icon.contains(QStringLiteral("height=\"128\"")),
-          "Owl Docs SVG has no explicit intrinsic size");
-    check(icon.contains(QStringLiteral("low-poly geometric owl")) &&
-              !icon.contains(QStringLiteral("<linearGradient")) &&
-              !icon.contains(QStringLiteral("<filter")) &&
-              !icon.contains(QStringLiteral("<circle")),
-          "Owl Docs icon is not the flat geometric mascot artwork");
-    for (const auto& color : {QStringLiteral("#E95420"),
-                              QStringLiteral("#77216F"),
-                              QStringLiteral("#5E2750")}) {
-        check(icon.contains(color), "Owl Docs icon is missing an Ubuntu brand color");
+    const QString masterPath =
+        root + QStringLiteral("/packaging/icons/owl-docs-master.png");
+    const QByteArray masterBytes = readBytes(masterPath);
+    check(QCryptographicHash::hash(masterBytes, QCryptographicHash::Sha256)
+                  .toHex() ==
+              QByteArrayLiteral(
+                  "058f151ffce9299c30d8cc068d17f21b4b5c34f3701b6b76641a1fa2f58c6205"),
+          "canonical Owl Docs artwork is not the user-approved raster source");
+    QImage masterImage;
+    check(masterImage.loadFromData(masterBytes) &&
+              masterImage.size() == QSize(1254, 1254),
+          "canonical Owl Docs artwork has the wrong dimensions");
+    int masterTransparentPixels = 0;
+    int masterOpaquePixels = 0;
+    for (int y = 0; y < masterImage.height(); ++y) {
+        for (int x = 0; x < masterImage.width(); ++x) {
+            const int alpha = masterImage.pixelColor(x, y).alpha();
+            if (alpha < 8) ++masterTransparentPixels;
+            if (alpha > 247) ++masterOpaquePixels;
+        }
     }
-    check(readBytes(QStringLiteral(":/icons/owl-docs.svg")) ==
-              readBytes(root + QStringLiteral("/packaging/icons/owl-docs.svg")),
-          "embedded SVG does not match the packaged canonical artwork");
+    const int masterArea = masterImage.width() * masterImage.height();
+    check(masterImage.hasAlphaChannel() &&
+              masterTransparentPixels > masterArea * 2 / 5 &&
+              masterOpaquePixels > masterArea / 2 &&
+              masterImage.pixelColor(0, 0).alpha() == 0 &&
+              masterImage.pixelColor(masterImage.width() / 2,
+                                     masterImage.height() / 2)
+                      .alpha() > 247,
+          "canonical Owl Docs artwork lost its transparent background");
+    check(!QFile::exists(root + QStringLiteral("/packaging/icons/owl-docs.svg")) &&
+              !QFile::exists(QStringLiteral(":/icons/owl-docs.svg")),
+          "stale vector artwork is still packaged or embedded");
 
     constexpr std::array<int, 8> iconSizes{16, 24, 32, 48, 64, 128, 256, 512};
     const QIcon applicationIcon = docxstudio::app::owlDocsApplicationIcon();
@@ -132,40 +180,83 @@ int main(int argc, char** argv) {
         check(sourceImage.loadFromData(sourceBytes) &&
                   sourceImage.size() == QSize(size, size),
               "packaged icon PNG has the wrong dimensions");
+        const QImage reference = masterImage.scaled(
+            QSize(size, size), Qt::IgnoreAspectRatio,
+            Qt::SmoothTransformation);
+        check(meanVisibleDifference(sourceImage, reference) < 6.0,
+              "packaged icon does not preserve the canonical composition");
+        int transparentPixels = 0;
+        int opaquePixels = 0;
+        for (int y = 0; y < sourceImage.height(); ++y) {
+            for (int x = 0; x < sourceImage.width(); ++x) {
+                const int alpha = sourceImage.pixelColor(x, y).alpha();
+                if (alpha < 8) ++transparentPixels;
+                if (alpha > 247) ++opaquePixels;
+            }
+        }
+        const int area = size * size;
+        check(sourceImage.hasAlphaChannel() &&
+                  transparentPixels > area / 4 && opaquePixels > area / 3 &&
+                  sourceImage.pixelColor(0, 0).alpha() < 8 &&
+                  sourceImage.pixelColor(size - 1, size - 1).alpha() < 8 &&
+                  sourceImage.pixelColor(size / 2, size / 2).alpha() > 240,
+              "packaged icon lost the transparent owl silhouette");
+        check(applicationIcon.availableSizes().contains(QSize(size, size)),
+              "application icon does not advertise a packaged launcher size");
         const QPixmap pixmap = applicationIcon.pixmap(size, size);
         check(!pixmap.isNull() && pixmap.size() == QSize(size, size),
               "application icon is missing an exact launcher size");
     }
 
-    const QImage smallIcon = applicationIcon.pixmap(16, 16).toImage()
-                                 .convertToFormat(QImage::Format_ARGB32);
-    int transparentPixels = 0;
-    int orangePixels = 0;
-    int auberginePixels = 0;
-    int lightPixels = 0;
-    for (int y = 0; y < smallIcon.height(); ++y) {
-        for (int x = 0; x < smallIcon.width(); ++x) {
-            const QColor pixel = smallIcon.pixelColor(x, y);
-            if (pixel.alpha() < 32) ++transparentPixels;
-            if (pixel.alpha() < 128) continue;
-            if (pixel.red() > 175 && pixel.green() > 35 &&
-                pixel.green() < 155 && pixel.blue() < 125) {
-                ++orangePixels;
-            }
-            if (pixel.red() > 45 && pixel.red() < 150 &&
-                pixel.green() < 90 && pixel.blue() > 35 &&
-                pixel.blue() < 145) {
-                ++auberginePixels;
-            }
-            if (pixel.red() > 215 && pixel.green() > 190 &&
-                pixel.blue() > 180) {
-                ++lightPixels;
+    for (const int smallSize : {16, 24, 32}) {
+        const QImage smallIcon =
+            applicationIcon.pixmap(smallSize, smallSize).toImage()
+                .convertToFormat(QImage::Format_ARGB32);
+        int transparentPixels = 0;
+        int visiblePixels = 0;
+        int orangePixels = 0;
+        int lightPixels = 0;
+        int darkPixels = 0;
+        int minimumLuma = 255;
+        int maximumLuma = 0;
+        std::set<QRgb> colors;
+        for (int y = 0; y < smallIcon.height(); ++y) {
+            for (int x = 0; x < smallIcon.width(); ++x) {
+                const QColor pixel = smallIcon.pixelColor(x, y);
+                if (pixel.alpha() < 8) ++transparentPixels;
+                if (pixel.alpha() < 128) continue;
+                ++visiblePixels;
+                colors.insert(pixel.rgba());
+                const int luma = qGray(pixel.rgb());
+                minimumLuma = std::min(minimumLuma, luma);
+                maximumLuma = std::max(maximumLuma, luma);
+                if (pixel.red() > 190 && pixel.green() > 60 &&
+                    pixel.green() < 170 && pixel.blue() < 120) {
+                    ++orangePixels;
+                }
+                if (pixel.red() > 210 && pixel.green() > 130 &&
+                    pixel.blue() > 100) {
+                    ++lightPixels;
+                }
+                if (pixel.red() < 95 && pixel.green() < 45 &&
+                    pixel.blue() < 95) {
+                    ++darkPixels;
+                }
             }
         }
+        const int area = smallSize * smallSize;
+        check(transparentPixels > area / 4 && visiblePixels > area / 2 &&
+                  colors.size() > static_cast<std::size_t>(area / 3) &&
+                  orangePixels > area / 10 && lightPixels > area / 20 &&
+                  darkPixels > area / 20 &&
+                  maximumLuma - minimumLuma > 180 &&
+                  smallIcon.pixelColor(0, 0).alpha() < 8 &&
+                  smallIcon.pixelColor(smallSize - 1, smallSize - 1)
+                          .alpha() < 8 &&
+                  smallIcon.pixelColor(smallSize / 2, smallSize / 2)
+                          .alpha() > 240,
+              "small icon lost transparency, composition, detail, or contrast");
     }
-    check(transparentPixels > 0 && orangePixels > 4 &&
-              auberginePixels > 4 && lightPixels > 2,
-          "16 px icon lost the owl silhouette or Ubuntu color contrast");
     const QPixmap renderedIcon =
         applicationIcon.pixmap(512, 512);
     check(!renderedIcon.isNull() && renderedIcon.size() == QSize(512, 512),

@@ -5,6 +5,7 @@
 #include "docxstudio/math/latex_parser.h"
 
 #include <QRegularExpression>
+#include <QTextBoundaryFinder>
 
 #include <algorithm>
 #include <cmath>
@@ -50,6 +51,67 @@ void truncateUtf16Safely(QString& text, qsizetype maximum) {
         --maximum;
     }
     text.truncate(maximum);
+}
+
+struct SearchContext {
+    QString text;
+    std::size_t start{};
+    std::size_t end{};
+};
+
+constexpr std::size_t kMaximumSearchQueryCodePoints = 1024;
+constexpr std::size_t kMaximumSearchResults = 500;
+constexpr qsizetype kSearchContextRadiusUtf16 = 80;
+
+std::size_t unicodeCodePointCount(const QString& text) {
+    std::size_t result = 0;
+    for (qsizetype index = 0; index < text.size(); ++index) {
+        if (text.at(index).isHighSurrogate() && index + 1 < text.size() &&
+            text.at(index + 1).isLowSurrogate()) {
+            ++index;
+        }
+        ++result;
+    }
+    return result;
+}
+
+bool isBoundaryAt(QTextBoundaryFinder& boundaries, const qsizetype position) {
+    boundaries.setPosition(position);
+    return boundaries.isAtBoundary();
+}
+
+SearchContext searchContextFor(const QString& text, const qsizetype matchStart,
+                               const qsizetype matchEnd,
+                               QTextBoundaryFinder& graphemeBoundaries) {
+    qsizetype start = std::max<qsizetype>(
+        0, matchStart - kSearchContextRadiusUtf16);
+    qsizetype end = std::min<qsizetype>(
+        text.size(), matchEnd + kSearchContextRadiusUtf16);
+
+    // Keep the context bounded by moving an interior leading edge forward and
+    // an interior trailing edge backward. Search matches themselves are
+    // required to be grapheme-aligned, so these adjustments cannot omit any
+    // part of the match, even for pathologically long combining sequences.
+    if (!isBoundaryAt(graphemeBoundaries, start)) {
+        const qsizetype adjusted = graphemeBoundaries.toNextBoundary();
+        start = adjusted >= 0 && adjusted <= matchStart ? adjusted : matchStart;
+    }
+    if (!isBoundaryAt(graphemeBoundaries, end)) {
+        const qsizetype adjusted = graphemeBoundaries.toPreviousBoundary();
+        end = adjusted >= matchEnd ? adjusted : matchEnd;
+    }
+    return {text.mid(start, end - start), static_cast<std::size_t>(start),
+            static_cast<std::size_t>(end)};
+}
+
+bool isWholeWordMatch(QTextBoundaryFinder& boundaries, const qsizetype start,
+                      const qsizetype end) {
+    boundaries.setPosition(start);
+    if (!(boundaries.boundaryReasons() & QTextBoundaryFinder::StartOfItem)) {
+        return false;
+    }
+    boundaries.setPosition(end);
+    return boundaries.boundaryReasons() & QTextBoundaryFinder::EndOfItem;
 }
 
 std::optional<std::uint64_t> unsignedValue(const codex::Json& object,
@@ -149,12 +211,14 @@ std::string alignmentName(const core::ParagraphFormat& format) {
     return "left";
 }
 
-codex::Json formattingFor(const core::Paragraph& paragraph,
-                          std::size_t returnedTextStart,
-                          std::size_t returnedTextLength) {
+codex::Json formattingFor(
+    const std::vector<core::FormatRun>& characterFormats,
+    const core::ParagraphFormat& paragraphFormat,
+    std::size_t returnedTextStart,
+    std::size_t returnedTextLength) {
     codex::Json runs = codex::Json::array();
     const std::size_t returnedTextEnd = returnedTextStart + returnedTextLength;
-    for (const auto& run : paragraph.characterFormats()) {
+    for (const auto& run : characterFormats) {
         const std::size_t start = std::max(run.start, returnedTextStart);
         const std::size_t end = std::min(run.end, returnedTextEnd);
         if (start >= end) continue;
@@ -194,8 +258,22 @@ codex::Json formattingFor(const core::Paragraph& paragraph,
                         {"end", end - returnedTextStart},
                         {"style", std::move(format)}});
     }
-    return {{"alignment", alignmentName(paragraph.format())},
+    return {{"alignment", alignmentName(paragraphFormat)},
             {"characterRuns", std::move(runs)}};
+}
+
+codex::Json formattingFor(const core::Paragraph& paragraph,
+                          std::size_t returnedTextStart,
+                          std::size_t returnedTextLength) {
+    return formattingFor(paragraph.characterFormats(), paragraph.format(),
+                         returnedTextStart, returnedTextLength);
+}
+
+codex::Json formattingFor(const core::TableCell& cell,
+                          std::size_t returnedTextStart,
+                          std::size_t returnedTextLength) {
+    return formattingFor(cell.character_formats, cell.paragraph_format,
+                         returnedTextStart, returnedTextLength);
 }
 
 codex::Json equationsFor(const core::Paragraph& paragraph,
@@ -215,6 +293,28 @@ codex::Json equationsFor(const core::Paragraph& paragraph,
              {"display", equation.display}});
     }
     return equations;
+}
+
+codex::Json imagesFor(const core::Paragraph& paragraph,
+                      std::size_t returnedTextStart,
+                      std::size_t returnedTextLength) {
+    codex::Json images = codex::Json::array();
+    const std::size_t returnedTextEnd = returnedTextStart + returnedTextLength;
+    for (const auto& image : paragraph.images()) {
+        if (image.utf16_offset < returnedTextStart ||
+            image.utf16_offset >= returnedTextEnd) {
+            continue;
+        }
+        images.push_back(
+            {{"id", image.id.toString()},
+             {"utf16Offset", image.utf16_offset - returnedTextStart},
+             {"accessibleName", image.accessible_name},
+             {"mimeType", core::imageContentType(image.format)},
+             {"widthEmu", image.width_emu},
+             {"heightEmu", image.height_emu},
+             {"encodedBytes", image.encoded_payload.size()}});
+    }
+    return images;
 }
 
 bool validateDocumentId(const QString& documentId,
@@ -237,14 +337,29 @@ codex::Json readDocument(DocumentCanvas& canvas,
         return {};
     }
     const auto snapshot = canvas.snapshot();
-    if (const auto expected = unsignedValue(arguments, "expectedRevision");
-        expected && *expected != snapshot.revision.value()) {
-        error = QObject::tr("REVISION_CONFLICT: expected %1, current %2")
-                    .arg(*expected)
-                    .arg(snapshot.revision.value());
-        return {};
+    if (const auto found = arguments.find("expectedRevision");
+        found != arguments.end()) {
+        const auto expected = unsignedValue(arguments, "expectedRevision");
+        if (!expected) {
+            error = QObject::tr(
+                "expectedRevision must be a nonnegative integer.");
+            return {};
+        }
+        if (*expected != snapshot.revision.value()) {
+            error = QObject::tr("REVISION_CONFLICT: expected %1, current %2")
+                        .arg(*expected)
+                        .arg(snapshot.revision.value());
+            return {};
+        }
     }
-    const std::string scope = arguments.value("scope", std::string("selection"));
+    std::string scope = "selection";
+    if (const auto found = arguments.find("scope"); found != arguments.end()) {
+        if (!found->is_string()) {
+            error = QObject::tr("scope must be a string.");
+            return {};
+        }
+        scope = found->get<std::string>();
+    }
     static const std::set<std::string> supportedScopes = {
         "selection", "document", "outline", "blocks"};
     if (!supportedScopes.contains(scope)) {
@@ -252,20 +367,84 @@ codex::Json readDocument(DocumentCanvas& canvas,
                     .arg(QString::fromStdString(scope));
         return {};
     }
-    const bool includeFormatting = arguments.value("includeFormatting", true);
+    bool includeFormatting = true;
+    if (const auto found = arguments.find("includeFormatting");
+        found != arguments.end()) {
+        if (!found->is_boolean()) {
+            error = QObject::tr("includeFormatting must be true or false.");
+            return {};
+        }
+        includeFormatting = found->get<bool>();
+    }
     std::size_t maximum = 50000;
-    if (const auto requested = unsignedValue(arguments, "maxCharacters")) {
-        maximum = static_cast<std::size_t>(std::min<std::uint64_t>(*requested, 200000));
+    if (const auto found = arguments.find("maxCharacters");
+        found != arguments.end()) {
+        const auto requested = unsignedValue(arguments, "maxCharacters");
+        if (!requested || *requested == 0 || *requested > 200000) {
+            error = QObject::tr(
+                "maxCharacters must be between 1 and 200000.");
+            return {};
+        }
+        maximum = static_cast<std::size_t>(*requested);
     }
 
     std::set<core::NodeId> requestedIds;
     const auto ids = arguments.find("blockIds");
-    if (ids != arguments.end() && ids->is_array()) {
+    if (ids != arguments.end()) {
+        if (!ids->is_array() || ids->size() > 256) {
+            error = QObject::tr(
+                "blockIds must be an array of at most 256 stable IDs.");
+            return {};
+        }
         for (const auto& encoded : *ids) {
-            if (!encoded.is_string()) continue;
-            if (const auto parsed = core::NodeId::parse(encoded.get<std::string>())) {
-                requestedIds.insert(*parsed);
+            if (!encoded.is_string()) {
+                error = QObject::tr(
+                    "Every blockIds entry must be a stable ID string.");
+                return {};
             }
+            const auto parsed =
+                core::NodeId::parse(encoded.get<std::string>());
+            if (!parsed) {
+                error = QObject::tr(
+                    "A blockIds entry contains an invalid stable ID.");
+                return {};
+            }
+            requestedIds.insert(*parsed);
+        }
+    }
+
+    std::set<std::pair<core::NodeId, core::NodeId>> requestedTableCells;
+    const auto cellTargets = arguments.find("tableCellTargets");
+    if (cellTargets != arguments.end()) {
+        if (!cellTargets->is_array() || cellTargets->size() > 256) {
+            error = QObject::tr(
+                "tableCellTargets must be an array of at most 256 targets.");
+            return {};
+        }
+        for (const auto& encoded : *cellTargets) {
+            if (!encoded.is_object()) {
+                error = QObject::tr(
+                    "Every table-cell read target must be an object.");
+                return {};
+            }
+            const auto tableValue = encoded.find("tableId");
+            const auto cellValue = encoded.find("cellId");
+            if (tableValue == encoded.end() || !tableValue->is_string() ||
+                cellValue == encoded.end() || !cellValue->is_string()) {
+                error = QObject::tr(
+                    "Every table-cell read target requires tableId and cellId.");
+                return {};
+            }
+            const auto tableId =
+                core::NodeId::parse(tableValue->get<std::string>());
+            const auto cellId =
+                core::NodeId::parse(cellValue->get<std::string>());
+            if (!tableId || !cellId) {
+                error = QObject::tr(
+                    "A table-cell read target contains an invalid stable ID.");
+                return {};
+            }
+            requestedTableCells.emplace(*tableId, *cellId);
         }
     }
 
@@ -278,9 +457,99 @@ codex::Json readDocument(DocumentCanvas& canvas,
     codex::Json blocks = codex::Json::array();
     std::size_t characters = 0;
     bool truncated = false;
+    if (scope == "blocks") {
+        bool keepReading = true;
+        for (const core::BodyBlockRef& bodyBlock :
+             snapshot.document.bodyBlocks()) {
+            if (!keepReading) break;
+            if (bodyBlock.kind == core::BodyBlockKind::paragraph) {
+                const core::Paragraph* paragraph =
+                    snapshot.document.findParagraph(bodyBlock.id);
+                if (!paragraph || !requestedIds.contains(paragraph->id())) {
+                    continue;
+                }
+                if (characters >= maximum) {
+                    truncated = true;
+                    break;
+                }
+                QString text = fromUtf16(paragraph->text());
+                const std::size_t remaining = maximum - characters;
+                if (static_cast<std::size_t>(text.size()) > remaining) {
+                    truncateUtf16Safely(
+                        text, static_cast<qsizetype>(remaining));
+                    truncated = true;
+                    keepReading = false;
+                }
+                const std::size_t textLength =
+                    static_cast<std::size_t>(text.size());
+                codex::Json attributes = includeFormatting
+                                             ? formattingFor(*paragraph, 0,
+                                                             textLength)
+                                             : codex::Json::object();
+                attributes["equations"] =
+                    equationsFor(*paragraph, 0, textLength);
+                attributes["images"] = imagesFor(*paragraph, 0, textLength);
+                blocks.push_back({{"id", paragraph->id().toString()},
+                                  {"type", "paragraph"},
+                                  {"text", toUtf8(text)},
+                                  {"attributes", std::move(attributes)}});
+                characters += textLength;
+                continue;
+            }
+
+            const core::Table* table =
+                snapshot.document.findTable(bodyBlock.id);
+            if (!table) continue;
+            for (std::size_t row = 0;
+                 keepReading && row < table->rowCount(); ++row) {
+                for (std::size_t column = 0;
+                     column < table->columnCount(); ++column) {
+                    const core::TableCell* cell = table->cell(row, column);
+                    if (!cell ||
+                        !requestedTableCells.contains(
+                            std::pair{table->id(), cell->id})) {
+                        continue;
+                    }
+                    if (characters >= maximum) {
+                        truncated = true;
+                        keepReading = false;
+                        break;
+                    }
+                    QString text = fromUtf16(cell->text);
+                    const std::size_t remaining = maximum - characters;
+                    if (static_cast<std::size_t>(text.size()) > remaining) {
+                        truncateUtf16Safely(
+                            text, static_cast<qsizetype>(remaining));
+                        truncated = true;
+                        keepReading = false;
+                    }
+                    const std::size_t textLength =
+                        static_cast<std::size_t>(text.size());
+                    codex::Json attributes =
+                        includeFormatting
+                            ? formattingFor(*cell, 0, textLength)
+                            : codex::Json::object();
+                    attributes["tableId"] = table->id().toString();
+                    attributes["row"] = row;
+                    attributes["column"] = column;
+                    blocks.push_back({{"id", cell->id.toString()},
+                                      {"type", "tableCell"},
+                                      {"text", toUtf8(text)},
+                                      {"attributes", std::move(attributes)}});
+                    characters += textLength;
+                    if (!keepReading) break;
+                }
+            }
+        }
+        return {{"documentId", toUtf8(documentId)},
+                {"revision", snapshot.revision.value()},
+                {"scope", scope},
+                {"truncated", truncated},
+                {"blocks", std::move(blocks)}};
+    }
+
     for (std::size_t index = 0; index < snapshot.document.paragraphs().size(); ++index) {
         const auto& paragraph = snapshot.document.paragraphs()[index];
-        if (scope == "blocks" && !requestedIds.contains(paragraph.id())) continue;
         if (scope == "selection" && selected &&
             (index < selected->start_paragraph_index || index > selected->end_paragraph_index)) {
             continue;
@@ -316,6 +585,8 @@ codex::Json readDocument(DocumentCanvas& canvas,
         else block["attributes"] = codex::Json::object();
         block["attributes"]["equations"] = equationsFor(
             paragraph, returnedTextStart, returnedTextLength);
+        block["attributes"]["images"] = imagesFor(
+            paragraph, returnedTextStart, returnedTextLength);
         if (scope == "selection" && selected) {
             const std::size_t start = index == selected->start_paragraph_index
                                           ? selected->start.utf16_offset : 0;
@@ -336,6 +607,193 @@ codex::Json readDocument(DocumentCanvas& canvas,
             {"scope", scope},
             {"truncated", truncated},
             {"blocks", std::move(blocks)}};
+}
+
+codex::Json searchDocument(DocumentCanvas& canvas,
+                           const QString& documentId,
+                           const codex::Json& arguments,
+                           QString& error) {
+    if (!arguments.is_object() ||
+        !validateDocumentId(documentId, arguments, error)) {
+        return {};
+    }
+
+    const auto queryValue = arguments.find("query");
+    if (queryValue == arguments.end() || !queryValue->is_string()) {
+        error = QObject::tr("Editor search requires a nonempty query.");
+        return {};
+    }
+    const std::string queryUtf8 = queryValue->get<std::string>();
+    const QString query = QString::fromUtf8(
+        queryUtf8.data(), static_cast<qsizetype>(queryUtf8.size()));
+    if (query.toUtf8() != QByteArray(queryUtf8.data(),
+                                     static_cast<qsizetype>(queryUtf8.size()))) {
+        error = QObject::tr("Editor search requires a valid UTF-8 query.");
+        return {};
+    }
+    if (query.isEmpty()) {
+        error = QObject::tr("Editor search requires a nonempty query.");
+        return {};
+    }
+    if (unicodeCodePointCount(query) > kMaximumSearchQueryCodePoints) {
+        error = QObject::tr(
+                    "Editor search queries are limited to %1 Unicode code points.")
+                    .arg(kMaximumSearchQueryCodePoints);
+        return {};
+    }
+
+    const auto booleanArgument = [&arguments, &error](
+                                     const char* name, const bool fallback,
+                                     bool& value) {
+        const auto found = arguments.find(name);
+        if (found == arguments.end()) {
+            value = fallback;
+            return true;
+        }
+        if (!found->is_boolean()) {
+            error = QObject::tr("%1 must be true or false.")
+                        .arg(QString::fromLatin1(name));
+            return false;
+        }
+        value = found->get<bool>();
+        return true;
+    };
+    bool caseSensitive = false;
+    bool wholeWord = false;
+    if (!booleanArgument("caseSensitive", false, caseSensitive) ||
+        !booleanArgument("wholeWord", false, wholeWord)) {
+        return {};
+    }
+
+    std::size_t maximum = 100;
+    if (const auto found = arguments.find("maxResults");
+        found != arguments.end()) {
+        const auto requested = unsignedValue(arguments, "maxResults");
+        if (!requested || *requested == 0 ||
+            *requested > kMaximumSearchResults) {
+            error = QObject::tr("maxResults must be between 1 and %1.")
+                        .arg(kMaximumSearchResults);
+            return {};
+        }
+        maximum = static_cast<std::size_t>(*requested);
+    }
+
+    const auto snapshot = canvas.snapshot();
+    if (const auto found = arguments.find("expectedRevision");
+        found != arguments.end()) {
+        const auto expected = unsignedValue(arguments, "expectedRevision");
+        if (!expected) {
+            error = QObject::tr("expectedRevision must be a nonnegative integer.");
+            return {};
+        }
+        if (*expected != snapshot.revision.value()) {
+            error = QObject::tr("REVISION_CONFLICT: expected %1, current %2")
+                        .arg(*expected)
+                        .arg(snapshot.revision.value());
+            return {};
+        }
+    }
+
+    codex::Json results = codex::Json::array();
+    bool truncated = false;
+    const Qt::CaseSensitivity sensitivity =
+        caseSensitive ? Qt::CaseSensitive : Qt::CaseInsensitive;
+
+    const auto searchText = [&](const QString& text,
+                                const std::string& blockId,
+                                const std::optional<std::string>& tableId,
+                                const std::optional<std::string>& cellId,
+                                const std::optional<std::size_t> row,
+                                const std::optional<std::size_t> column) {
+        // QTextBoundaryFinder builds a boundary table for the complete input.
+        // Build each table once per block, not once per candidate match.
+        QTextBoundaryFinder wordBoundaries(QTextBoundaryFinder::Word, text);
+        QTextBoundaryFinder graphemeBoundaries(QTextBoundaryFinder::Grapheme,
+                                               text);
+        qsizetype offset = 0;
+        while (offset <= text.size() - query.size()) {
+            const qsizetype start = text.indexOf(query, offset, sensitivity);
+            if (start < 0) break;
+            const qsizetype end = start + query.size();
+            offset = end > start ? end : start + 1;
+            // Keep every returned semantic offset safe to reuse. Paragraph
+            // hits may become preview targets, while table-cell hits currently
+            // feed the typed read target; neither should split a grapheme.
+            if (!isBoundaryAt(graphemeBoundaries, start) ||
+                !isBoundaryAt(graphemeBoundaries, end)) {
+                continue;
+            }
+            if (wholeWord &&
+                !isWholeWordMatch(wordBoundaries, start, end)) {
+                continue;
+            }
+            if (results.size() >= maximum) {
+                truncated = true;
+                return false;
+            }
+            const SearchContext context = searchContextFor(
+                text, start, end, graphemeBoundaries);
+            codex::Json match = {
+                {"blockId", blockId},
+                {"blockType", tableId ? "tableCell" : "paragraph"},
+                {"start", static_cast<std::size_t>(start)},
+                {"end", static_cast<std::size_t>(end)},
+                {"context", toUtf8(context.text)},
+                {"contextStart", context.start},
+                {"contextEnd", context.end},
+            };
+            if (tableId && cellId && row && column) {
+                match["tableId"] = *tableId;
+                match["cellId"] = *cellId;
+                match["row"] = *row;
+                match["column"] = *column;
+            }
+            results.push_back(std::move(match));
+        }
+        return true;
+    };
+
+    for (const core::BodyBlockRef& block : snapshot.document.bodyBlocks()) {
+        if (block.kind == core::BodyBlockKind::paragraph) {
+            const core::Paragraph* paragraph =
+                snapshot.document.findParagraph(block.id);
+            if (!paragraph) continue;
+            if (!searchText(fromUtf16(paragraph->text()), block.id.toString(),
+                            std::nullopt, std::nullopt, std::nullopt,
+                            std::nullopt)) {
+                break;
+            }
+            continue;
+        }
+
+        const core::Table* table = snapshot.document.findTable(block.id);
+        if (!table) continue;
+        const std::string tableId = table->id().toString();
+        bool keepSearching = true;
+        for (std::size_t row = 0;
+             keepSearching && row < table->rowCount(); ++row) {
+            for (std::size_t column = 0;
+                 column < table->columnCount(); ++column) {
+                const core::TableCell* cell = table->cell(row, column);
+                if (!cell) continue;
+                if (!searchText(fromUtf16(cell->text), cell->id.toString(),
+                                tableId,
+                                cell->id.toString(), row, column)) {
+                    keepSearching = false;
+                    break;
+                }
+            }
+        }
+        if (!keepSearching) break;
+    }
+
+    return {{"documentId", toUtf8(documentId)},
+            {"revision", snapshot.revision.value()},
+            {"query", toUtf8(query)},
+            {"caseSensitive", caseSensitive},
+            {"wholeWord", wholeWord},
+            {"truncated", truncated},
+            {"results", std::move(results)}};
 }
 
 bool appendTextStyle(const codex::Json& operation, const Target& target,
@@ -674,6 +1132,11 @@ codex::Json invokeEditorTool(DocumentCanvas& canvas,
     if (tool == QString::fromLatin1(codex::kEditorReadTool.data(),
                                     static_cast<qsizetype>(codex::kEditorReadTool.size()))) {
         return readDocument(canvas, documentId, arguments, error);
+    }
+    if (tool == QString::fromLatin1(
+                    codex::kEditorSearchTool.data(),
+                    static_cast<qsizetype>(codex::kEditorSearchTool.size()))) {
+        return searchDocument(canvas, documentId, arguments, error);
     }
     if (tool == QString::fromLatin1(codex::kEditorPreviewTool.data(),
                                     static_cast<qsizetype>(codex::kEditorPreviewTool.size()))) {

@@ -2,9 +2,14 @@
 
 #include "docxstudio/core/formatting.h"
 
+#include <compare>
 #include <cstddef>
+#include <cstdint>
+#include <memory>
 #include <optional>
+#include <span>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -183,6 +188,59 @@ struct EquationAtom {
     auto operator<=>(const EquationAtom&) const = default;
 };
 
+inline constexpr std::size_t kMaximumInlineImagesPerDocument = 512;
+inline constexpr std::size_t kMaximumEncodedImageBytes = 16U * 1024U * 1024U;
+inline constexpr std::size_t kMaximumDocumentEncodedImageBytes =
+    32U * 1024U * 1024U;
+inline constexpr std::size_t kMaximumImageAccessibleNameBytes = 4U * 1024U;
+inline constexpr std::int64_t kMaximumInlineImageDimensionEmu = 254000000;
+
+enum class ImageFormat : std::uint8_t { png, jpeg };
+
+[[nodiscard]] constexpr std::string_view imageContentType(
+    ImageFormat format) noexcept {
+    switch (format) {
+        case ImageFormat::png:
+            return "image/png";
+        case ImageFormat::jpeg:
+            return "image/jpeg";
+    }
+    return {};
+}
+
+// Immutable, byte-owning encoded image data. Copies share storage so copying a
+// Document for edits, previews, and undo history never copies the media bytes.
+// Equality and ordering remain value-based for Document's value semantics.
+class EncodedImagePayload {
+public:
+    EncodedImagePayload();
+    explicit EncodedImagePayload(std::vector<std::uint8_t> bytes);
+
+    [[nodiscard]] std::span<const std::uint8_t> bytes() const noexcept;
+    [[nodiscard]] std::size_t size() const noexcept;
+    [[nodiscard]] bool empty() const noexcept;
+
+    [[nodiscard]] bool operator==(
+        const EncodedImagePayload& other) const noexcept;
+    [[nodiscard]] std::strong_ordering operator<=>(
+        const EncodedImagePayload& other) const noexcept;
+
+private:
+    std::shared_ptr<const std::vector<std::uint8_t>> storage_;
+};
+
+struct ImageAtom {
+    NodeId id;
+    std::size_t utf16_offset{0};
+    EncodedImagePayload encoded_payload;
+    ImageFormat format{ImageFormat::png};
+    std::string accessible_name;
+    std::int64_t width_emu{0};
+    std::int64_t height_emu{0};
+
+    auto operator<=>(const ImageAtom&) const = default;
+};
+
 class Paragraph {
 public:
     Paragraph();
@@ -199,6 +257,11 @@ public:
         return equations_;
     }
     [[nodiscard]] const EquationAtom* equationAt(std::size_t utf16_offset) const noexcept;
+    [[nodiscard]] const std::vector<ImageAtom>& images() const noexcept {
+        return images_;
+    }
+    [[nodiscard]] const ImageAtom* imageAt(
+        std::size_t utf16_offset) const noexcept;
     [[nodiscard]] const ParagraphFormat& format() const noexcept { return format_; }
     [[nodiscard]] CharacterFormat characterFormatAt(std::size_t utf16_offset) const;
 
@@ -214,6 +277,9 @@ private:
     [[nodiscard]] Result<void> insertEquation(
         std::size_t offset, EquationAtom equation,
         const std::optional<CharacterFormat>& format);
+    [[nodiscard]] Result<void> insertImage(
+        std::size_t offset, ImageAtom image,
+        const std::optional<CharacterFormat>& character_format);
     [[nodiscard]] Result<void> erase(std::size_t start, std::size_t end);
     [[nodiscard]] Result<void> applyFormat(std::size_t start, std::size_t end,
                                            const CharacterFormatDelta& delta);
@@ -222,6 +288,7 @@ private:
     std::u16string text_;
     std::vector<FormatRun> character_formats_;
     std::vector<EquationAtom> equations_;
+    std::vector<ImageAtom> images_;
     ParagraphFormat format_;
 
     friend class Document;
@@ -241,6 +308,7 @@ public:
     [[nodiscard]] const Paragraph* findParagraph(NodeId id) const noexcept;
     [[nodiscard]] const Table* findTable(NodeId id) const noexcept;
     [[nodiscard]] const EquationAtom* findEquation(NodeId id) const noexcept;
+    [[nodiscard]] const ImageAtom* findImage(NodeId id) const noexcept;
     [[nodiscard]] std::optional<std::size_t> paragraphIndex(NodeId id) const noexcept;
     [[nodiscard]] Result<NormalizedRange> normalizeRange(const Range& range) const;
 
@@ -250,6 +318,14 @@ public:
         const Position& position, std::string canonical_latex, bool display = false,
         NodeId equation_id = NodeId::generate(),
         const std::optional<CharacterFormat>& format = std::nullopt);
+    [[nodiscard]] Result<void> insertImage(
+        const Position& position, EncodedImagePayload encoded_payload,
+        ImageFormat image_format, std::string accessible_name,
+        std::int64_t width_emu, std::int64_t height_emu,
+        NodeId image_id = NodeId::generate(),
+        const std::optional<CharacterFormat>& character_format = std::nullopt);
+    [[nodiscard]] Result<void> resizeImage(
+        NodeId image_id, std::int64_t width_emu, std::int64_t height_emu);
     [[nodiscard]] Result<void> deleteRange(const Range& range);
     [[nodiscard]] Result<void> replaceRange(const Range& range, const std::u16string& text,
                                             const std::optional<CharacterFormat>& format = std::nullopt);

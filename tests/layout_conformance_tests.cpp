@@ -2,6 +2,7 @@
 #include "docxstudio/app/SpellChecker.h"
 
 #include <QApplication>
+#include <QBuffer>
 #include <QColor>
 #include <QImage>
 #include <QInputMethodQueryEvent>
@@ -339,6 +340,21 @@ QRect saturatedColorBounds(const QImage& image, bool red) {
     return result;
 }
 
+std::vector<std::uint8_t> encodedColorPng(const QColor& color,
+                                          int width = 48,
+                                          int height = 32) {
+    QImage image(width, height, QImage::Format_ARGB32_Premultiplied);
+    image.fill(color);
+    QByteArray bytes;
+    QBuffer buffer(&bytes);
+    check(buffer.open(QIODevice::WriteOnly) && image.save(&buffer, "PNG"),
+          "could not encode inline image layout fixture");
+    return {
+        reinterpret_cast<const std::uint8_t*>(bytes.constData()),
+        reinterpret_cast<const std::uint8_t*>(bytes.constData()) +
+            bytes.size()};
+}
+
 void testViewOnlyInlineImagesKeepFragmentOrder(
     docxstudio::app::SpellChecker& spelling) {
     DocumentCanvas canvas(spelling);
@@ -346,27 +362,30 @@ void testViewOnlyInlineImagesKeepFragmentOrder(
     canvas.setPageSizePoints(500.0, 300.0);
     canvas.setMarginsPoints(40.0, 40.0, 40.0, 40.0);
     canvas.setDocument(documentWithText(QStringLiteral("ABCD")));
-    const auto paragraphId =
-        canvas.snapshot().document.paragraphs().front().id();
-
-    QImage red(8, 8, QImage::Format_ARGB32_Premultiplied);
-    red.fill(QColor(255, 0, 0));
-    QImage blue(8, 8, QImage::Format_ARGB32_Premultiplied);
-    blue.fill(QColor(0, 0, 255));
-    canvas.setImportedPresentation(
-        {{paragraphId, 1, red, 36.0, 24.0, QStringLiteral("red")},
-         {paragraphId, 1, blue, 28.0, 24.0, QStringLiteral("blue")}},
-        {});
+    sendKey(canvas, Qt::Key_Right);
+    check(canvas.insertInlineImage(encodedColorPng(Qt::red),
+                                   QStringLiteral("red")),
+          "could not insert first semantic inline image");
+    sendKey(canvas, Qt::Key_Right);
+    check(canvas.insertInlineImage(encodedColorPng(Qt::blue, 37, 32),
+                                   QStringLiteral("blue")),
+          "could not insert second semantic inline image");
     canvas.resize(800, 430);
     canvas.show();
     canvas.setFocus();
     QApplication::processEvents();
 
+    sendKey(canvas, Qt::Key_Home, Qt::ControlModifier);
+    sendKey(canvas, Qt::Key_Right);
+    check(canvas.selection().focus.utf16_offset == 1,
+          "caret did not stop before the first semantic image atom");
     const QRect before = cursorRect(canvas);
     sendKey(canvas, Qt::Key_Right);
+    const QRect betweenImages = cursorRect(canvas);
+    sendKey(canvas, Qt::Key_Right);
     const QRect afterImages = cursorRect(canvas);
-    check(canvas.selection().focus.utf16_offset == 1,
-          "inline image navigation changed the editor text offset");
+    check(canvas.selection().focus.utf16_offset == 3,
+          "caret did not navigate across both semantic image atoms");
 
     const QImage painted = canvas.viewport()->grab().toImage();
     const QRect redBounds = saturatedColorBounds(painted, true);
@@ -378,17 +397,19 @@ void testViewOnlyInlineImagesKeepFragmentOrder(
     check(redBounds.top() < blueBounds.bottom() &&
               blueBounds.top() < redBounds.bottom(),
           "inline images were stacked after the paragraph instead of sharing its line");
-    check(before.x() < redBounds.left() &&
+    check(before.x() <= redBounds.left() + 2 &&
+              betweenImages.x() >= redBounds.right() - 2 &&
+              betweenImages.x() <= blueBounds.left() + 2 &&
               afterImages.x() >= blueBounds.right() - 2,
-          "caret did not skip the view-only inline objects at their text boundary");
+          "caret positions did not bracket the two semantic image atoms");
 
     sendKey(canvas, Qt::Key_Right, Qt::ShiftModifier);
     check(canvas.selectedText() == QStringLiteral("B") &&
-              canvas.selection().focus.utf16_offset == 2,
-          "selection offsets were corrupted by display-only image slots");
+              canvas.selection().focus.utf16_offset == 4,
+          "selection offsets were corrupted by semantic image atoms");
     sendKey(canvas, Qt::Key_Left);
     check(canvas.selection().anchor == canvas.selection().focus &&
-              canvas.selection().focus.utf16_offset == 1,
+              canvas.selection().focus.utf16_offset == 3,
           "selection did not collapse across an inline image boundary");
     canvas.hide();
 }
@@ -407,45 +428,50 @@ void collapseFindToRight(DocumentCanvas& canvas, const QString& text) {
 
 void testInlineImageAnchorsTrackEditsAndStructure(
     docxstudio::app::SpellChecker& spelling) {
-    QImage red(8, 8, QImage::Format_ARGB32_Premultiplied);
-    red.fill(QColor(255, 0, 0));
+    const auto red = encodedColorPng(Qt::red);
 
     DocumentCanvas insertion(spelling);
     insertion.setEditorDefaults(QStringLiteral("DejaVu Sans"), 16.0, 4);
     insertion.setPageSizePoints(500.0, 300.0);
     insertion.setMarginsPoints(40.0, 40.0, 40.0, 40.0);
     insertion.setDocument(documentWithText(QStringLiteral("ABCD")));
-    const auto insertionParagraph =
-        insertion.snapshot().document.paragraphs().front().id();
-    insertion.setImportedPresentation(
-        {{insertionParagraph, 2, red, 36.0, 24.0,
-          QStringLiteral("tracked")}},
-        {});
+    sendKey(insertion, Qt::Key_Right);
+    sendKey(insertion, Qt::Key_Right);
+    check(insertion.insertInlineImage(red, QStringLiteral("tracked")),
+          "could not insert image for semantic anchor tracking");
+    sendKey(insertion, Qt::Key_Home, Qt::ControlModifier);
     insertion.resize(800, 430);
     insertion.show();
     insertion.setFocus();
     QApplication::processEvents();
 
     insertion.insertText(QStringLiteral("iiiiiiii"));
+    auto insertedSnapshot = insertion.snapshot();
+    check(insertedSnapshot.document.paragraphs().front().text() ==
+              u"iiiiiiiiAB\ufffcCD" &&
+              insertedSnapshot.document.paragraphs().front()
+                      .images().front().utf16_offset == 10,
+          "insertion before an image did not move its semantic atom");
     collapseFindToRight(insertion, QStringLiteral("ii"));
     const QRect shiftedImage = paintedRedBounds(insertion);
     check(shiftedImage.isValid() &&
               cursorRect(insertion).x() < shiftedImage.left(),
           "an insertion before an imported image left its anchor stale");
-    collapseFindToRight(insertion, QStringLiteral("iiiiiiiiAB"));
-    check(cursorRect(insertion).x() >= shiftedImage.right() - 2,
-          "the shifted image was not retained at its original text boundary");
-
     insertion.undo();
-    collapseFindToRight(insertion, QStringLiteral("AB"));
+    insertedSnapshot = insertion.snapshot();
+    check(insertedSnapshot.document.paragraphs().front().text() ==
+              u"AB\ufffcCD" &&
+              insertedSnapshot.document.paragraphs().front()
+                      .images().front().utf16_offset == 2,
+          "undo did not restore the image atom offset");
     const QRect undoneImage = paintedRedBounds(insertion);
-    check(undoneImage.isValid() &&
-              cursorRect(insertion).x() >= undoneImage.right() - 2,
-          "undo did not restore the imported image anchor");
+    check(undoneImage.isValid(), "undo did not render the restored image atom");
     insertion.redo();
-    collapseFindToRight(insertion, QStringLiteral("ii"));
-    check(cursorRect(insertion).x() < paintedRedBounds(insertion).left(),
-          "redo did not restore the shifted imported image anchor");
+    insertedSnapshot = insertion.snapshot();
+    check(insertedSnapshot.document.paragraphs().front().images().front()
+                  .utf16_offset == 10 &&
+              paintedRedBounds(insertion).left() > undoneImage.left() + 10,
+          "redo did not restore the shifted semantic image atom");
     insertion.hide();
 
     DocumentCanvas structure(spelling);
@@ -453,34 +479,42 @@ void testInlineImageAnchorsTrackEditsAndStructure(
     structure.setPageSizePoints(500.0, 300.0);
     structure.setMarginsPoints(40.0, 40.0, 40.0, 40.0);
     structure.setDocument(documentWithText(QStringLiteral("ABCD")));
-    const auto structureParagraph =
-        structure.snapshot().document.paragraphs().front().id();
-    structure.setImportedPresentation(
-        {{structureParagraph, 2, red, 36.0, 24.0,
-          QStringLiteral("structural")}},
-        {});
+    sendKey(structure, Qt::Key_Right);
+    sendKey(structure, Qt::Key_Right);
+    check(structure.insertInlineImage(red, QStringLiteral("structural")),
+          "could not insert image for split/merge tracking");
     structure.resize(800, 430);
     structure.show();
     structure.setFocus();
     QApplication::processEvents();
     const QRect oneLineImage = paintedRedBounds(structure);
 
-    collapseFindToRight(structure, QStringLiteral("A"));
-    sendKey(structure, Qt::Key_Return);
+    sendKey(structure, Qt::Key_Home, Qt::ControlModifier);
     sendKey(structure, Qt::Key_Right);
+    sendKey(structure, Qt::Key_Return);
     const QRect splitImage = paintedRedBounds(structure);
-    check(structure.snapshot().document.paragraphs().size() == 2 &&
+    auto structureSnapshot = structure.snapshot();
+    check(structureSnapshot.document.paragraphs().size() == 2 &&
+              structureSnapshot.document.paragraphs()[0].text() == u"A" &&
+              structureSnapshot.document.paragraphs()[1].text() ==
+                  u"B\ufffcCD" &&
+              structureSnapshot.document.paragraphs()[1].images().size() == 1 &&
+              structureSnapshot.document.paragraphs()[1].images().front()
+                      .utf16_offset == 1 &&
               splitImage.isValid() &&
-              splitImage.top() > oneLineImage.top() + 6 &&
-              cursorRect(structure).x() >= splitImage.right() - 2,
-          "splitting before an imported image did not move its anchor to the new paragraph");
+              splitImage.top() > oneLineImage.top() + 6,
+          "splitting before an image did not move the atom to the new paragraph");
 
-    sendKey(structure, Qt::Key_Home);
     sendKey(structure, Qt::Key_Backspace);
     const QRect mergedImage = paintedRedBounds(structure);
-    check(structure.snapshot().document.paragraphs().size() == 1 &&
+    structureSnapshot = structure.snapshot();
+    check(structureSnapshot.document.paragraphs().size() == 1 &&
+              structureSnapshot.document.paragraphs().front().text() ==
+                  u"AB\ufffcCD" &&
+              structureSnapshot.document.paragraphs().front().images().front()
+                      .utf16_offset == 2 &&
               mergedImage.top() < splitImage.top() - 6,
-          "merging paragraphs did not rebase the imported image anchor");
+          "merging paragraphs did not rebase the semantic image atom");
     structure.undo();
     check(structure.snapshot().document.paragraphs().size() == 2 &&
               paintedRedBounds(structure).top() > mergedImage.top() + 6,
@@ -496,18 +530,20 @@ void testInlineImageAnchorsTrackEditsAndStructure(
     preview.setPageSizePoints(500.0, 300.0);
     preview.setMarginsPoints(40.0, 40.0, 40.0, 40.0);
     preview.setDocument(documentWithText(QStringLiteral("ABCD")));
-    const auto previewParagraph =
-        preview.snapshot().document.paragraphs().front().id();
-    preview.setImportedPresentation(
-        {{previewParagraph, 2, red, 36.0, 24.0,
-          QStringLiteral("preview-tracked")}},
-        {});
+    sendKey(preview, Qt::Key_Right);
+    sendKey(preview, Qt::Key_Right);
+    check(preview.insertInlineImage(red,
+                                    QStringLiteral("preview-tracked")),
+          "could not insert image for preview tracking");
     preview.resize(800, 430);
     preview.show();
     preview.setFocus();
     QApplication::processEvents();
     const QRect previewBaseline = paintedRedBounds(preview);
-    const auto previewRevision = preview.snapshot().revision;
+    const auto previewLive = preview.snapshot();
+    const auto previewRevision = previewLive.revision;
+    const auto previewParagraph =
+        previewLive.document.paragraphs().front().id();
     const std::vector<docxstudio::core::Operation> previewOperations{
         docxstudio::core::InsertText{
             {previewParagraph, 0}, u"iiiiiiii", std::nullopt}};
@@ -521,14 +557,14 @@ void testInlineImageAnchorsTrackEditsAndStructure(
     check(preview.hasPreview() && previewedImage.isValid() &&
               previewedImage.left() > previewBaseline.left() + 10 &&
               preview.snapshot().document.paragraphs().front().text() ==
-                  u"ABCD",
+                  u"AB\ufffcCD",
           "preview did not transform the image anchor without changing live text");
     preview.discardPreview();
     const QRect discardedImage = paintedRedBounds(preview);
     check(!preview.hasPreview() && discardedImage.isValid() &&
               std::abs(discardedImage.left() - previewBaseline.left()) <= 1 &&
               preview.snapshot().document.paragraphs().front().text() ==
-                  u"ABCD",
+                  u"AB\ufffcCD",
           "discarding a preview did not restore the live image anchor");
 
     summary.clear();
@@ -543,10 +579,13 @@ void testInlineImageAnchorsTrackEditsAndStructure(
     check(acceptedImage.isValid() &&
               acceptedImage.left() > previewBaseline.left() + 10 &&
               preview.snapshot().document.paragraphs().front().text() ==
-                  u"iiiiiiiiABCD",
+                  u"iiiiiiiiAB\ufffcCD" &&
+              preview.snapshot().document.paragraphs().front()
+                      .images().front().utf16_offset == 10,
           "accepting a preview did not commit its transformed image anchor");
     preview.undo();
-    check(preview.snapshot().document.paragraphs().front().text() == u"ABCD" &&
+    check(preview.snapshot().document.paragraphs().front().text() ==
+                  u"AB\ufffcCD" &&
               std::abs(paintedRedBounds(preview).left() -
                        previewBaseline.left()) <= 1,
           "undo of an accepted preview did not restore its image anchor");
@@ -557,17 +596,18 @@ void testInlineImageAnchorsTrackEditsAndStructure(
     replacement.setPageSizePoints(500.0, 300.0);
     replacement.setMarginsPoints(40.0, 40.0, 40.0, 40.0);
     replacement.setDocument(documentWithText(QStringLiteral("ABCD")));
-    const auto replacementParagraph =
-        replacement.snapshot().document.paragraphs().front().id();
-    replacement.setImportedPresentation(
-        {{replacementParagraph, 2, red, 36.0, 24.0,
-          QStringLiteral("replacement-tracked")}},
-        {});
+    sendKey(replacement, Qt::Key_Right);
+    sendKey(replacement, Qt::Key_Right);
+    check(replacement.insertInlineImage(
+              red, QStringLiteral("replacement-tracked")),
+          "could not insert image for range-replacement test");
     replacement.resize(800, 430);
     replacement.show();
     replacement.setFocus();
     QApplication::processEvents();
     const QRect replacementBaseline = paintedRedBounds(replacement);
+    const auto replacementParagraph =
+        replacement.snapshot().document.paragraphs().front().id();
     const std::vector<docxstudio::core::Operation> replacementOperations{
         docxstudio::core::ReplaceRange{
             {{replacementParagraph, 1}, {replacementParagraph, 3}},
@@ -580,16 +620,18 @@ void testInlineImageAnchorsTrackEditsAndStructure(
               error) &&
               replacement.acceptPreview(error),
           "could not replace text spanning an imported image anchor");
-    collapseFindToRight(replacement, QStringLiteral("A"));
     const QRect replacementImage = paintedRedBounds(replacement);
     check(replacement.snapshot().document.paragraphs().front().text() ==
-                  u"AXYZD" &&
-              replacementImage.isValid() &&
-              cursorRect(replacement).x() >= replacementImage.right() - 2,
-          "replacement did not preserve the image at the deletion boundary");
+                  u"AXYZCD" &&
+              replacement.snapshot().document.paragraphs().front()
+                  .images().empty() &&
+              !replacementImage.isValid(),
+          "range replacement did not remove the covered image atom");
     replacement.undo();
     check(replacement.snapshot().document.paragraphs().front().text() ==
-                  u"ABCD" &&
+                  u"AB\ufffcCD" &&
+              replacement.snapshot().document.paragraphs().front()
+                  .images().size() == 1 &&
               std::abs(paintedRedBounds(replacement).left() -
                        replacementBaseline.left()) <= 1,
           "undo of image-spanning replacement did not restore its anchor");

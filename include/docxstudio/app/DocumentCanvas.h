@@ -1,7 +1,6 @@
 #pragma once
 
 #include "docxstudio/core/document_session.h"
-
 #include <QAbstractScrollArea>
 #include <QColor>
 #include <QElapsedTimer>
@@ -10,6 +9,7 @@
 #include <QString>
 
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -29,15 +29,16 @@ namespace docxstudio::app {
 class SpellChecker;
 
 struct ImportedInlineImagePresentation {
-    core::NodeId paragraphId;
-    // Position in the editor paragraph's UTF-16 text. Images do not become
-    // editable text characters, so several source-ordered pictures may share
-    // one boundary between two characters.
-    std::size_t utf16Offset{0};
+    ImportedInlineImagePresentation() = default;
+    ImportedInlineImagePresentation(core::NodeId imageId,
+                                    QImage decodedImage)
+        : id(imageId), image(std::move(decodedImage)) {}
+
+    // The semantic ImageAtom owns identity, run order, encoded bytes, format,
+    // accessible name, and geometry. This presentation entry is deliberately
+    // only a decoded-pixel cache keyed by that stable identity.
+    core::NodeId id;
     QImage image;
-    double widthPoints{0.0};
-    double heightPoints{0.0};
-    QString accessibleName;
 };
 
 enum class ImportedCellVerticalAlignment { top, center, bottom };
@@ -85,6 +86,8 @@ class DocumentCanvas final : public QAbstractScrollArea {
 
 public:
     explicit DocumentCanvas(SpellChecker& spelling, QWidget* parent = nullptr);
+    DocumentCanvas(SpellChecker& spelling, core::DocumentSessionLimits limits,
+                   QWidget* parent = nullptr);
     ~DocumentCanvas() override;
 
     void setDocument(core::Document document);
@@ -131,6 +134,15 @@ public:
     void paste();
     void selectAll();
     void insertText(const QString& text);
+    // Inserts a bounded PNG/JPEG as an inline picture at the current body
+    // selection. The picture participates in line layout and remains anchored
+    // to that text boundary as surrounding content changes.
+    bool insertInlineImage(std::vector<std::uint8_t> encodedBytes,
+                           const QString& accessibleName);
+    bool selectInlineImage(core::NodeId imageId);
+    bool deleteSelectedInlineImage();
+    bool resizeSelectedInlineImage(double widthPoints, double heightPoints);
+    std::optional<core::NodeId> selectedInlineImageId() const;
     bool insertEquation(const QString& latex, bool display = false);
     bool insertTable(std::size_t rows, std::size_t columns, bool headerRow);
     bool insertTableRow(bool after);
@@ -283,7 +295,6 @@ private:
         std::optional<core::NodeId> selectedTable;
         std::optional<LineAffinity> lineAffinity;
         std::optional<double> preferredVerticalX;
-        std::vector<ImportedInlineImagePresentation> importedImages;
         double pageWidthPoints;
         double pageHeightPoints;
         double marginTopPoints;
@@ -310,7 +321,18 @@ private:
     CursorState captureEditorState() const;
     void restoreEditorState(const CursorState& state);
     void updateDirtyFlags();
+    void synchronizeCursorHistory();
     void recordLayoutChange(const CursorState& before);
+    void showSelectedImageSizeDialog();
+    bool insertInlineImageWithGeometry(
+        std::vector<std::uint8_t> encodedBytes,
+        const QString& accessibleName,
+        std::optional<std::int64_t> widthEmu,
+        std::optional<std::int64_t> heightEmu);
+    const QImage* decodedInlineImage(const core::ImageAtom& image) const;
+    void reconcileDecodedImageCache();
+    std::optional<std::pair<core::Position, core::ImageAtom>>
+    selectedInlineImage() const;
     bool rejectLiveEditDuringPreview();
     void endTypingGroup() noexcept;
     void resetVerticalNavigation() noexcept;
@@ -398,7 +420,8 @@ private:
     mutable std::vector<std::unique_ptr<ParagraphVisual>> visuals_;
     mutable std::vector<std::unique_ptr<TableVisual>> tableVisuals_;
     mutable std::vector<BlockPlacement> blockPlacements_;
-    std::vector<ImportedInlineImagePresentation> importedImages_;
+    mutable std::map<core::NodeId, QImage> decodedImages_;
+    mutable std::int64_t decodedImageBytes_{0};
     std::vector<ImportedTablePresentation> importedTables_;
     std::optional<core::PreviewId> previewId_;
     core::Revision previewRevision_;

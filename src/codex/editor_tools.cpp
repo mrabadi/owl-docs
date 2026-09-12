@@ -28,6 +28,20 @@ Json readSchema() {
       "maxItems": 256,
       "uniqueItems": true
     },
+    "tableCellTargets": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "tableId": {"type": "string", "minLength": 1},
+          "cellId": {"type": "string", "minLength": 1}
+        },
+        "required": ["tableId", "cellId"]
+      },
+      "maxItems": 256,
+      "uniqueItems": true
+    },
     "includeFormatting": {"type": "boolean", "default": true},
     "maxCharacters": {
       "type": "integer",
@@ -37,6 +51,34 @@ Json readSchema() {
     }
   },
   "required": ["scope"]
+}
+)json");
+}
+
+Json searchSchema() {
+    return parseSchema(R"json(
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "expectedRevision": {"type": "integer", "minimum": 0},
+    "query": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1024,
+      "description": "Length is measured in Unicode code points; result offsets are UTF-16."
+    },
+    "caseSensitive": {"type": "boolean", "default": false},
+    "wholeWord": {"type": "boolean", "default": false},
+    "maxResults": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 500,
+      "default": 100
+    }
+  },
+  "required": ["query"]
 }
 )json");
 }
@@ -213,6 +255,60 @@ Json readOutputSchema() {
 )json");
 }
 
+Json searchOutputSchema() {
+    return parseSchema(R"json(
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "documentId": {"type": "string"},
+    "revision": {"type": "integer", "minimum": 0},
+    "query": {"type": "string"},
+    "caseSensitive": {"type": "boolean"},
+    "wholeWord": {"type": "boolean"},
+    "truncated": {"type": "boolean"},
+    "results": {
+      "type": "array",
+      "maxItems": 500,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "blockId": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Paragraph ID or, for tableCell results, the cell ID."
+          },
+          "blockType": {"type": "string", "enum": ["paragraph", "tableCell"]},
+          "tableId": {"type": "string", "minLength": 1},
+          "cellId": {"type": "string", "minLength": 1},
+          "row": {"type": "integer", "minimum": 0},
+          "column": {"type": "integer", "minimum": 0},
+          "start": {"type": "integer", "minimum": 0},
+          "end": {"type": "integer", "minimum": 0},
+          "context": {"type": "string", "maxLength": 1216},
+          "contextStart": {"type": "integer", "minimum": 0},
+          "contextEnd": {"type": "integer", "minimum": 0}
+        },
+        "required": ["blockId", "blockType", "start", "end", "context", "contextStart", "contextEnd"],
+        "allOf": [
+          {
+            "if": {
+              "properties": {"blockType": {"const": "tableCell"}},
+              "required": ["blockType"]
+            },
+            "then": {"required": ["tableId", "cellId", "row", "column"]}
+          }
+        ]
+      }
+    }
+  },
+  "required": ["documentId", "revision", "query", "caseSensitive", "wholeWord", "truncated", "results"]
+}
+)json");
+}
+
 Json previewOutputSchema() {
     return parseSchema(R"json(
 {
@@ -279,12 +375,20 @@ Json EditorToolDefinition::toDynamicToolSpec() const {
 
 std::vector<EditorToolDefinition> editorV1ToolDefinitions() {
     std::vector<EditorToolDefinition> tools;
-    tools.reserve(3);
+    tools.reserve(4);
     tools.push_back(
         {std::string(kEditorReadTool),
-         "Read a bounded snapshot of the active document. Use the returned "
-         "revision and stable block identifiers when preparing edits.",
+         "Read a bounded snapshot of the active document, including explicit "
+         "table-cell targets returned by search. Use the returned revision "
+         "and stable block identifiers when preparing edits.",
          readSchema(), readOutputSchema(), readAnnotations()});
+    tools.push_back(
+        {std::string(kEditorSearchTool),
+         "Search body paragraphs and table cells in deterministic document "
+         "order. Results contain stable paragraph/cell identifiers, UTF-16 "
+         "grapheme-aligned offsets, and bounded context without changing the "
+         "document.",
+         searchSchema(), searchOutputSchema(), readAnnotations()});
     tools.push_back(
         {std::string(kEditorPreviewTool),
          "Create an atomic, revision-checked preview of semantic document "
@@ -312,7 +416,8 @@ Json editorV1ToolManifest() {
 }
 
 bool isEditorV1Tool(const std::string_view name) noexcept {
-    return name == kEditorReadTool || name == kEditorPreviewTool ||
+    return name == kEditorReadTool || name == kEditorSearchTool ||
+           name == kEditorPreviewTool ||
            name == kEditorFileCapabilityTool;
 }
 

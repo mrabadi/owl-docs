@@ -1950,6 +1950,49 @@ void testUndoRedoCaret(docxstudio::app::SpellChecker& spelling) {
           "redo did not restore the caret position after the redone edit");
 }
 
+void testBoundedCanvasHistoryStaysSynchronized(
+    docxstudio::app::SpellChecker& spelling) {
+    docxstudio::core::DocumentSessionLimits limits;
+    limits.maximum_history_entries = 3;
+    DocumentCanvas canvas(spelling, limits);
+
+    // This local-only layout entry predates the document transactions that
+    // the core will evict. It must be dropped with that unreachable prefix,
+    // otherwise its saved cursor can later be restored against the wrong
+    // document baseline.
+    canvas.setMarginsPoints(64.0, 65.0, 66.0, 67.0);
+    for (const QChar character : QStringLiteral("abcde")) {
+        canvas.insertText(QString(character));
+    }
+    check(onlyText(canvas) == QStringLiteral("abcde"),
+          "bounded-history fixture did not apply its edits");
+
+    canvas.undo();
+    canvas.undo();
+    canvas.undo();
+    check(onlyText(canvas) == QStringLiteral("ab"),
+          "canvas undo history did not retain the same suffix as the core");
+    canvas.undo();
+    check(onlyText(canvas) == QStringLiteral("ab") &&
+              canvas.marginTopPoints() == 64.0 &&
+              canvas.marginLeftPoints() == 67.0,
+          "canvas crossed the core history baseline through a stale cursor entry");
+
+    canvas.redo();
+    canvas.redo();
+    canvas.redo();
+    check(onlyText(canvas) == QStringLiteral("abcde"),
+          "canvas redo history diverged after bounded undo eviction");
+    canvas.redo();
+    check(onlyText(canvas) == QStringLiteral("abcde"),
+          "canvas retained a stale redo entry after the core was exhausted");
+
+    canvas.insertText(QStringLiteral("Z"));
+    canvas.undo();
+    check(onlyText(canvas) == QStringLiteral("abcde"),
+          "a stale bounded-history entry permanently blocked later undo");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1989,6 +2032,7 @@ int main(int argc, char** argv) {
     testTypingUndoGroups(spelling);
     testAltGrPrintableText(spelling);
     testUndoRedoCaret(spelling);
+    testBoundedCanvasHistoryStaysSynchronized(spelling);
 
     std::cout << "editor interaction tests passed\n";
     return 0;

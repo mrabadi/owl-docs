@@ -75,7 +75,7 @@ private:
     void showListProperties();
     void insertTable();
     void insertEquation();
-    void insertImagePlaceholder();
+    void insertImage();
     void showCompatibilityReport();
     void updateWindowTitle();
     void updateTabTitle(DocumentCanvas* canvas);

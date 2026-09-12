@@ -161,6 +161,20 @@
           "maxItems": 256,
           "uniqueItems": true
         },
+        "tableCellTargets": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "tableId": { "type": "string", "minLength": 1 },
+              "cellId": { "type": "string", "minLength": 1 }
+            },
+            "required": ["tableId", "cellId"]
+          },
+          "maxItems": 256,
+          "uniqueItems": true
+        },
         "includeFormatting": { "type": "boolean", "default": true },
         "maxCharacters": { "type": "integer", "minimum": 1, "maximum": 200000, "default": 50000 }
       },
@@ -190,6 +204,72 @@
         }
       },
       "required": ["documentId", "revision", "scope", "truncated", "blocks"]
+    },
+    "searchInput": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "documentId": { "type": "string", "minLength": 1 },
+        "expectedRevision": { "type": "integer", "minimum": 0 },
+        "query": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024,
+          "description": "Length is measured in Unicode code points; result offsets are UTF-16."
+        },
+        "caseSensitive": { "type": "boolean", "default": false },
+        "wholeWord": { "type": "boolean", "default": false },
+        "maxResults": { "type": "integer", "minimum": 1, "maximum": 500, "default": 100 }
+      },
+      "required": ["documentId", "query"]
+    },
+    "searchOutput": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "documentId": { "type": "string" },
+        "revision": { "type": "integer", "minimum": 0 },
+        "query": { "type": "string" },
+        "caseSensitive": { "type": "boolean" },
+        "wholeWord": { "type": "boolean" },
+        "truncated": { "type": "boolean" },
+        "results": {
+          "type": "array",
+          "maxItems": 500,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "blockId": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Paragraph ID or, for tableCell results, the cell ID."
+              },
+              "blockType": { "type": "string", "enum": ["paragraph", "tableCell"] },
+              "tableId": { "type": "string", "minLength": 1 },
+              "cellId": { "type": "string", "minLength": 1 },
+              "row": { "type": "integer", "minimum": 0 },
+              "column": { "type": "integer", "minimum": 0 },
+              "start": { "type": "integer", "minimum": 0 },
+              "end": { "type": "integer", "minimum": 0 },
+              "context": { "type": "string", "maxLength": 1216 },
+              "contextStart": { "type": "integer", "minimum": 0 },
+              "contextEnd": { "type": "integer", "minimum": 0 }
+            },
+            "required": ["blockId", "blockType", "start", "end", "context", "contextStart", "contextEnd"],
+            "allOf": [
+              {
+                "if": {
+                  "properties": { "blockType": { "const": "tableCell" } },
+                  "required": ["blockType"]
+                },
+                "then": { "required": ["tableId", "cellId", "row", "column"] }
+              }
+            ]
+          }
+        }
+      },
+      "required": ["documentId", "revision", "query", "caseSensitive", "wholeWord", "truncated", "results"]
     },
     "previewInput": {
       "type": "object",
@@ -277,9 +357,22 @@
     {
       "type": "function",
       "name": "editor_v1_read",
-      "description": "Read a bounded snapshot of the active document. Use its revision and stable block identifiers when preparing edits.",
+      "description": "Read a bounded snapshot of the active document, including explicit table-cell targets returned by search. Use its revision and stable block identifiers when preparing edits.",
       "inputSchema": { "$ref": "#/$defs/readInput" },
       "outputSchema": { "$ref": "#/$defs/readOutput" },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      }
+    },
+    {
+      "type": "function",
+      "name": "editor_v1_search",
+      "description": "Search body paragraphs and table cells in deterministic document order. Results contain stable paragraph/cell identifiers, UTF-16 grapheme-aligned offsets, and bounded context without changing the document.",
+      "inputSchema": { "$ref": "#/$defs/searchInput" },
+      "outputSchema": { "$ref": "#/$defs/searchOutput" },
       "annotations": {
         "readOnlyHint": true,
         "destructiveHint": false,

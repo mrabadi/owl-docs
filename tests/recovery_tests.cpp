@@ -2,11 +2,16 @@
 #include "docxstudio/app/RecoveryCodec.h"
 
 #include <nlohmann/json.hpp>
+#include <sqlite3.h>
 
+#include <algorithm>
 #include <cstdlib>
+#include <cstdint>
 #include <filesystem>
 #include <iostream>
+#include <iterator>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <vector>
 
@@ -17,6 +22,63 @@ void check(bool condition, const char* message) {
         std::cerr << "FAILED: " << message << '\n';
         std::exit(1);
     }
+}
+
+constexpr std::string_view kOnePixelPngBase64 =
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk"
+    "+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+
+std::vector<std::uint8_t> onePixelPng() {
+    return {
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00,
+        0x00, 0x0d, 0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01,
+        0x00, 0x00, 0x00, 0x01, 0x08, 0x04, 0x00, 0x00, 0x00, 0xb5,
+        0x1c, 0x0c, 0x02, 0x00, 0x00, 0x00, 0x0b, 0x49, 0x44, 0x41,
+        0x54, 0x78, 0xda, 0x63, 0x64, 0xf8, 0x0f, 0x00, 0x01, 0x05,
+        0x01, 0x01, 0x27, 0x18, 0xe3, 0x66, 0x00, 0x00, 0x00, 0x00,
+        0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+    };
+}
+
+std::vector<std::uint8_t> paddedOnePixelJpeg(std::size_t targetBytes) {
+    static constexpr std::uint8_t suffix[] = {
+        // One-component, one-pixel baseline frame.
+        0xff, 0xc0, 0x00, 0x0b, 0x08, 0x00, 0x01, 0x00, 0x01,
+        0x01, 0x01, 0x11, 0x00,
+        // One-component scan, one entropy byte, then EOI.
+        0xff, 0xda, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x3f,
+        0x00, 0x00, 0xff, 0xd9,
+    };
+    constexpr std::size_t minimumBytes = 2U + std::size(suffix);
+    check(targetBytes >= minimumBytes,
+          "padded JPEG target is below the structural minimum");
+
+    std::vector<std::uint8_t> bytes;
+    bytes.reserve(targetBytes);
+    bytes.push_back(0xff);
+    bytes.push_back(0xd8);
+    std::size_t padding = targetBytes - minimumBytes;
+    while (padding != 0U) {
+        check(padding >= 4U,
+              "padded JPEG cannot encode a sub-four-byte remainder");
+        std::size_t segmentBytes = std::min<std::size_t>(padding, 65'537U);
+        const std::size_t remainder = padding - segmentBytes;
+        if (remainder != 0U && remainder < 4U) {
+            segmentBytes -= 4U - remainder;
+        }
+        const auto encodedLength = static_cast<std::uint16_t>(
+            segmentBytes - 2U);
+        bytes.push_back(0xff);
+        bytes.push_back(0xfe);
+        bytes.push_back(static_cast<std::uint8_t>(encodedLength >> 8U));
+        bytes.push_back(static_cast<std::uint8_t>(encodedLength & 0xffU));
+        bytes.insert(bytes.end(), segmentBytes - 4U, 0U);
+        padding -= segmentBytes;
+    }
+    bytes.insert(bytes.end(), std::begin(suffix), std::end(suffix));
+    check(bytes.size() == targetBytes,
+          "padded JPEG builder produced the wrong byte count");
+    return bytes;
 }
 
 docxstudio::core::Document formattedDocument() {
@@ -209,14 +271,410 @@ void codecRoundTrip() {
     check(!RecoveryCodec::decode(invalidIndent, error),
           "recovery codec accepted an out-of-range bullet indentation");
 
-    const auto version = futureVersion.find("\"version\":4");
+    const auto version = futureVersion.find("\"version\":6");
     check(version != std::string::npos, "encoded recovery version was absent");
-    futureVersion.replace(version, std::string("\"version\":4").size(),
-                          "\"version\":5");
+    futureVersion.replace(version, std::string("\"version\":6").size(),
+                          "\"version\":7");
     check(!RecoveryCodec::decode(futureVersion, error),
           "recovery codec accepted an unsupported future version");
     check(!RecoveryCodec::decode("{not-json", error),
           "recovery codec accepted malformed JSON");
+}
+
+void frozenVersion4FixtureAndPreflight() {
+    using namespace docxstudio::app;
+
+    // This is the minimal shape emitted by the version-4 encoder preserved in
+    // repository history. Older v1-v3 encoder implementations are not present
+    // in that history, so this test intentionally does not invent their shapes.
+    constexpr std::string_view frozenVersion4 = R"json({
+        "schema":"docxstudio.recovery",
+        "version":4,
+        "page":{
+            "width_points":612.0,
+            "height_points":792.0,
+            "margin_top_points":72.0,
+            "margin_right_points":72.0,
+            "margin_bottom_points":72.0,
+            "margin_left_points":72.0
+        },
+        "paragraphs":[{
+            "id":"00000000-0000-0001-0000-000000000002",
+            "text_utf16":[65],
+            "format":{},
+            "runs":[],
+            "equations":[]
+        }],
+        "tables":[],
+        "body_blocks":[{
+            "kind":"paragraph",
+            "id":"00000000-0000-0001-0000-000000000002"
+        }]
+    })json";
+
+    std::string error;
+    const auto restored = RecoveryCodec::decode(frozenVersion4, error);
+    check(restored.has_value() &&
+              restored->document.paragraphs().size() == 1 &&
+              restored->document.paragraphs().front().id() ==
+                  docxstudio::core::NodeId{1, 2} &&
+              restored->document.paragraphs().front().text() == u"A",
+          "frozen version-4 recovery fixture did not decode");
+
+    auto deeplyNested = nlohmann::json::parse(frozenVersion4);
+    nlohmann::json nested = 0;
+    for (std::size_t depth = 0; depth < 65U; ++depth) {
+        nested = nlohmann::json::array({std::move(nested)});
+    }
+    deeplyNested["ignored_extension"] = std::move(nested);
+    check(!RecoveryCodec::decode(deeplyNested.dump(), error) &&
+              error.find("nesting") != std::string::npos,
+          "recovery preflight accepted excessive JSON nesting");
+}
+
+void semanticImageRoundTrip() {
+    using namespace docxstudio::app;
+    using namespace docxstudio::core;
+
+    auto paragraph = Paragraph::create(u"AB", NodeId{101, 102});
+    check(static_cast<bool>(paragraph),
+          "could not create semantic image recovery paragraph");
+    auto document = Document::create({std::move(paragraph.value())});
+    check(static_cast<bool>(document),
+          "could not create semantic image recovery document");
+
+    const auto payload = EncodedImagePayload(onePixelPng());
+    const NodeId equationId{103, 104};
+    const NodeId firstImageId{105, 106};
+    const NodeId secondImageId{107, 108};
+    check(static_cast<bool>(document.value().insertEquation(
+              {{101, 102}, 1}, "\\frac{x}{y}", false, equationId)) &&
+              static_cast<bool>(document.value().insertImage(
+                  {{101, 102}, 1}, payload, ImageFormat::png,
+                  "First owl", 914400, 457200, firstImageId)) &&
+              static_cast<bool>(document.value().insertImage(
+                  {{101, 102}, 3}, payload, ImageFormat::png,
+                  "Second owl", 457200, 914400, secondImageId)),
+          "could not build mixed image/equation recovery fixture");
+    check(document.value().paragraphs().front().text() ==
+              u"A\ufffc\ufffc\ufffcB" &&
+              document.value().paragraphs().front().imageAt(1)->id ==
+                  firstImageId &&
+              document.value().paragraphs().front().equationAt(2)->id ==
+                  equationId &&
+              document.value().paragraphs().front().imageAt(3)->id ==
+                  secondImageId,
+          "mixed recovery fixture did not have the intended source order");
+
+    CharacterFormatDelta emphasis;
+    emphasis.bold = PropertyDelta<bool>::set(true);
+    check(static_cast<bool>(document.value().applyCharacterFormat(
+              {{{101, 102}, 1}, {{101, 102}, 4}}, emphasis)),
+          "could not format mixed recovery fixture");
+
+    std::string error;
+    const RecoveryPageLayout page;
+    const auto encoded = RecoveryCodec::encode(
+        {document.value(), page}, error);
+    check(encoded.has_value(),
+          "recovery codec rejected semantic inline images");
+    const auto encodedJson = nlohmann::json::parse(*encoded);
+    check(encodedJson["version"] == RecoveryCodec::currentVersion &&
+              !encodedJson.contains("inline_images") &&
+              encodedJson["paragraphs"][0]["images"].size() == 2,
+          "recovery codec did not write the semantic image schema");
+
+    const auto decoded = RecoveryCodec::decode(*encoded, error);
+    check(decoded && decoded->document == document.value(),
+          "semantic image/equation order or payload changed on recovery");
+    const auto recoveredBytes =
+        decoded->document.findImage(firstImageId)->encoded_payload.bytes();
+    check(recoveredBytes.size() == payload.bytes().size() &&
+              std::equal(recoveredBytes.begin(), recoveredBytes.end(),
+                         payload.bytes().begin()) &&
+              decoded->document.findImage(secondImageId)->width_emu ==
+                  457200,
+          "semantic recovery did not preserve image bytes or geometry");
+}
+
+void legacyImageMigrationAndBoundaries() {
+    using namespace docxstudio::app;
+    using namespace docxstudio::core;
+
+    auto paragraph = Paragraph::create(
+        u"A\U0001f600B", NodeId{201, 202});
+    check(static_cast<bool>(paragraph),
+          "could not create legacy image recovery paragraph");
+    auto document = Document::create({std::move(paragraph.value())});
+    check(static_cast<bool>(document),
+          "could not create legacy image recovery document");
+    const NodeId equationId{203, 204};
+    check(static_cast<bool>(document.value().insertEquation(
+              {{201, 202}, 3}, "x", false, equationId)),
+          "could not create legacy mixed-object fixture");
+    CharacterFormatDelta bold;
+    bold.bold = PropertyDelta<bool>::set(true);
+    CharacterFormatDelta italic;
+    italic.italic = PropertyDelta<bool>::set(true);
+    check(static_cast<bool>(document.value().applyCharacterFormat(
+              {{{201, 202}, 1}, {{201, 202}, 3}}, bold)) &&
+              static_cast<bool>(document.value().applyCharacterFormat(
+                  {{{201, 202}, 3}, {{201, 202}, 4}}, italic)),
+          "could not format legacy image-neighbor fixture");
+
+    std::string error;
+    const auto encoded = RecoveryCodec::encode(
+        {document.value(), {}}, error);
+    check(encoded.has_value(),
+          "could not encode legacy migration base fixture");
+    auto legacy = nlohmann::json::parse(*encoded);
+    legacy["version"] = 5;
+    for (auto& encodedParagraph : legacy["paragraphs"]) {
+        encodedParagraph.erase("images");
+    }
+    const auto legacyImage = [](NodeId id, std::size_t offset,
+                                std::string name) {
+        return nlohmann::json{
+            {"id", id.toString()},
+            {"paragraph_id", NodeId{201, 202}.toString()},
+            {"utf16_offset", offset},
+            {"width_points", 72.0},
+            {"height_points", 36.0},
+            {"accessible_name", std::move(name)},
+            {"format", "png"},
+            {"encoded_base64", kOnePixelPngBase64},
+        };
+    };
+    const NodeId beforeEmoji{205, 206};
+    const NodeId beforeEquationFirst{207, 208};
+    const NodeId beforeEquationSecond{209, 210};
+    legacy["inline_images"] = nlohmann::json::array(
+        {legacyImage(beforeEmoji, 1, "Before emoji"),
+         legacyImage(beforeEquationFirst, 3, "First at tie"),
+         legacyImage(beforeEquationSecond, 3, "Second at tie")});
+
+    const auto migrated = RecoveryCodec::decode(legacy.dump(), error);
+    check(migrated.has_value(),
+          "recovery codec did not migrate a valid version-5 image journal");
+    const auto& restored = migrated->document.paragraphs().front();
+    check(restored.text() ==
+              u"A\ufffc\U0001f600\ufffc\ufffc\ufffcB" &&
+              restored.imageAt(1)->id == beforeEmoji &&
+              restored.imageAt(4)->id == beforeEquationFirst &&
+              restored.imageAt(5)->id == beforeEquationSecond &&
+              restored.equationAt(6)->id == equationId,
+          "legacy image anchors were not migrated in visual source order");
+    check(restored.imageAt(1)->width_emu == 914400 &&
+              restored.imageAt(1)->height_emu == 457200 &&
+              restored.characterFormatAt(2).bold == true &&
+              restored.characterFormatAt(5).italic == true &&
+              restored.characterFormatAt(6).italic == true,
+          "legacy image geometry or following-character formatting changed");
+
+    auto splitSurrogate = legacy;
+    splitSurrogate["inline_images"][0]["utf16_offset"] = 2;
+    check(!RecoveryCodec::decode(splitSurrogate.dump(), error),
+          "recovery codec accepted a legacy image anchor inside a surrogate pair");
+
+    auto missingParagraph = legacy;
+    missingParagraph["inline_images"][0]["paragraph_id"] =
+        NodeId{999, 1000}.toString();
+    check(!RecoveryCodec::decode(missingParagraph.dump(), error),
+          "recovery codec accepted a legacy image with no paragraph");
+}
+
+void semanticImageAdversarialLimits() {
+    using namespace docxstudio::app;
+    using namespace docxstudio::core;
+
+    check(RecoveryCodec::currentVersion == 6,
+          "recovery schema version was not bumped for semantic images");
+    check(kMaximumInlineImagesPerDocument == 512 &&
+              kMaximumEncodedImageBytes == 16U * 1024U * 1024U &&
+              kMaximumDocumentEncodedImageBytes == 32U * 1024U * 1024U &&
+              kMaximumImageAccessibleNameBytes == 4U * 1024U,
+          "recovery tests and the semantic core disagree on image budgets");
+
+    auto paragraph = Paragraph::create(u"XY", NodeId{301, 302});
+    check(static_cast<bool>(paragraph),
+          "could not create image-limit recovery paragraph");
+    auto document = Document::create({std::move(paragraph.value())});
+    check(static_cast<bool>(document),
+          "could not create image-limit recovery document");
+    check(static_cast<bool>(document.value().insertEquation(
+              {{301, 302}, 1}, "z", false, NodeId{303, 304})) &&
+              static_cast<bool>(document.value().insertImage(
+                  {{301, 302}, 2}, EncodedImagePayload(onePixelPng()),
+                  ImageFormat::png, "image", 1000, 1000,
+                  NodeId{305, 306})),
+          "could not build image-limit recovery fixture");
+
+    std::string error;
+    const auto encoded = RecoveryCodec::encode(
+        {document.value(), {}}, error);
+    check(encoded.has_value(),
+          "could not encode image-limit recovery fixture");
+    const auto original = nlohmann::json::parse(*encoded);
+
+    auto exactName = original;
+    exactName["paragraphs"][0]["images"][0]["accessible_name"] =
+        std::string(kMaximumImageAccessibleNameBytes, 'a');
+    check(RecoveryCodec::decode(exactName.dump(), error).has_value(),
+          "recovery codec rejected the exact accessible-name limit");
+
+    auto oversizedName = original;
+    oversizedName["paragraphs"][0]["images"][0]["accessible_name"] =
+        std::string(kMaximumImageAccessibleNameBytes + 1U, 'a');
+    check(!RecoveryCodec::decode(oversizedName.dump(), error),
+          "recovery codec accepted an oversized accessible name");
+
+    auto collidingObjects = original;
+    collidingObjects["paragraphs"][0]["images"][0]["offset"] = 1;
+    check(!RecoveryCodec::decode(collidingObjects.dump(), error),
+          "recovery codec accepted image and equation metadata for one placeholder");
+
+    auto tooManyImages = original;
+    const auto imageTemplate = tooManyImages["paragraphs"][0]["images"][0];
+    tooManyImages["paragraphs"][0]["images"] = nlohmann::json::array();
+    for (std::size_t index = 0;
+         index <= kMaximumInlineImagesPerDocument; ++index) {
+        tooManyImages["paragraphs"][0]["images"].push_back(imageTemplate);
+    }
+    check(!RecoveryCodec::decode(tooManyImages.dump(), error),
+          "recovery codec accepted more than 512 semantic images");
+
+    auto oversizedPayload = original;
+    const std::size_t oversizedDecodedBytes =
+        kMaximumEncodedImageBytes + 1U;
+    const std::size_t oversizedBase64Bytes =
+        ((oversizedDecodedBytes + 2U) / 3U) * 4U;
+    oversizedPayload["paragraphs"][0]["images"][0]["encoded_base64"] =
+        std::string(oversizedBase64Bytes, 'A');
+    check(!RecoveryCodec::decode(oversizedPayload.dump(), error),
+          "recovery codec accepted a payload above the per-image core limit");
+
+    auto mismatchedFormat = original;
+    mismatchedFormat["paragraphs"][0]["images"][0]["format"] = "jpeg";
+    check(!RecoveryCodec::decode(mismatchedFormat.dump(), error),
+          "recovery codec accepted PNG bytes labeled as JPEG");
+
+    auto malformedBase64 = original;
+    malformedBase64["paragraphs"][0]["images"][0]["encoded_base64"] =
+        "AAAA=AAA";
+    check(!RecoveryCodec::decode(malformedBase64.dump(), error),
+          "recovery codec accepted interior base64 padding");
+
+    auto noncanonicalBase64 = original;
+    auto noncanonical = noncanonicalBase64["paragraphs"][0]["images"][0]
+                            ["encoded_base64"]
+                                .get<std::string>();
+    check(noncanonical.size() >= 2U && noncanonical.back() == '=' &&
+              noncanonical[noncanonical.size() - 2U] == 'I',
+          "base64 fixture does not end in the expected padded quartet");
+    // J differs from I only in unused pad bits. A permissive decoder would
+    // produce the same bytes, while a canonical decoder must reject it.
+    noncanonical[noncanonical.size() - 2U] = 'J';
+    noncanonicalBase64["paragraphs"][0]["images"][0]["encoded_base64"] =
+        std::move(noncanonical);
+    check(!RecoveryCodec::decode(noncanonicalBase64.dump(), error),
+          "recovery codec accepted noncanonical base64 pad bits");
+
+    auto crossKindDuplicate = original;
+    crossKindDuplicate["paragraphs"][0]["images"][0]["id"] =
+        crossKindDuplicate["paragraphs"][0]["equations"][0]["id"];
+    check(!RecoveryCodec::decode(crossKindDuplicate.dump(), error),
+          "recovery codec accepted an image/equation NodeId collision");
+
+    auto exactDimension = original;
+    exactDimension["paragraphs"][0]["images"][0]["width_emu"] =
+        kMaximumInlineImageDimensionEmu;
+    check(RecoveryCodec::decode(exactDimension.dump(), error).has_value(),
+          "recovery codec rejected the exact image-dimension limit");
+    auto oversizedDimension = exactDimension;
+    oversizedDimension["paragraphs"][0]["images"][0]["width_emu"] =
+        kMaximumInlineImageDimensionEmu + 1;
+    check(!RecoveryCodec::decode(oversizedDimension.dump(), error),
+          "recovery codec accepted an image beyond the dimension limit");
+
+    auto aggregateParagraph = Paragraph::create({}, NodeId{401, 402});
+    check(static_cast<bool>(aggregateParagraph),
+          "could not create aggregate-limit recovery paragraph");
+    auto aggregateDocument = Document::create(
+        {std::move(aggregateParagraph.value())});
+    check(static_cast<bool>(aggregateDocument),
+          "could not create aggregate-limit recovery document");
+    const EncodedImagePayload maximumPayload(
+        paddedOnePixelJpeg(kMaximumEncodedImageBytes));
+    check(static_cast<bool>(aggregateDocument.value().insertImage(
+              {{401, 402}, 0}, maximumPayload, ImageFormat::jpeg,
+              "First maximum image", 1000, 1000, NodeId{403, 404})) &&
+              static_cast<bool>(aggregateDocument.value().insertImage(
+                  {{401, 402}, 1}, maximumPayload, ImageFormat::jpeg,
+                  "Second maximum image", 1000, 1000,
+                  NodeId{405, 406})),
+          "core rejected the exact 32 MiB aggregate recovery boundary");
+    auto aggregateEncoded = RecoveryCodec::encode(
+        {aggregateDocument.value(), {}}, error);
+    check(aggregateEncoded.has_value(),
+          "recovery codec rejected the exact aggregate byte limit");
+    check(RecoveryCodec::decode(*aggregateEncoded, error).has_value(),
+          "recovery codec could not restore the exact aggregate byte limit");
+
+    auto aggregateOverflow = nlohmann::json::parse(*aggregateEncoded);
+    aggregateEncoded.reset();
+    aggregateOverflow["paragraphs"][0]["text_utf16"].push_back(
+        static_cast<std::uint16_t>(kInlineObjectReplacementCharacter));
+    aggregateOverflow["paragraphs"][0]["images"].push_back(
+        {{"id", NodeId{407, 408}.toString()},
+         {"offset", 2},
+         {"width_emu", 1000},
+         {"height_emu", 1000},
+         {"accessible_name", "Aggregate overflow"},
+         {"format", "png"},
+         {"encoded_base64", kOnePixelPngBase64}});
+    check(!RecoveryCodec::decode(aggregateOverflow.dump(), error),
+          "recovery codec accepted more than 32 MiB of image payloads");
+}
+
+void semanticImageCountBoundary() {
+    using namespace docxstudio::app;
+    using namespace docxstudio::core;
+
+    auto paragraph = Paragraph::create({}, NodeId{501, 502});
+    check(static_cast<bool>(paragraph),
+          "could not create image-count recovery paragraph");
+    auto document = Document::create({std::move(paragraph.value())});
+    check(static_cast<bool>(document),
+          "could not create image-count recovery document");
+    const EncodedImagePayload payload(onePixelPng());
+    for (std::size_t index = 0;
+         index < kMaximumInlineImagesPerDocument; ++index) {
+        const auto inserted = document.value().insertImage(
+            {{501, 502}, index}, payload, ImageFormat::png, "Picture", 1, 1,
+            NodeId{1'000, static_cast<std::uint64_t>(index + 1U)});
+        check(static_cast<bool>(inserted),
+              "core rejected an image at the exact count boundary");
+    }
+
+    std::string error;
+    const auto encoded = RecoveryCodec::encode({document.value(), {}}, error);
+    check(encoded.has_value(),
+          "recovery codec rejected exactly 512 inline images");
+    const auto restored = RecoveryCodec::decode(*encoded, error);
+    check(restored.has_value() &&
+              restored->document.paragraphs().front().images().size() ==
+                  kMaximumInlineImagesPerDocument,
+          "recovery codec did not restore exactly 512 inline images");
+
+    auto oversized = nlohmann::json::parse(*encoded);
+    oversized["paragraphs"][0]["text_utf16"].push_back(
+        static_cast<std::uint16_t>(kInlineObjectReplacementCharacter));
+    auto extraImage = oversized["paragraphs"][0]["images"].front();
+    extraImage["id"] = NodeId{1'000, 10'000}.toString();
+    extraImage["offset"] = kMaximumInlineImagesPerDocument;
+    oversized["paragraphs"][0]["images"].push_back(std::move(extraImage));
+    check(!RecoveryCodec::decode(oversized.dump(), error),
+          "recovery codec accepted 513 inline images");
 }
 
 void storeCrud() {
@@ -227,6 +685,10 @@ void storeCrud() {
     ChatStore store;
     std::string error;
     check(store.open(databasePath.string(), error), "could not open recovery test store");
+    check(store.bindThread("document-1", "thread-old-catalog", error),
+          "could not bind legacy Codex thread");
+    check(store.appendMessage("document-1", "user", "retained history", error),
+          "could not store chat history for catalog migration");
     const RecoveryRecord created{"journal-1", "/original/report.docx", "report.docx",
                                  std::string("one\0two", 7), 0};
     check(store.upsertRecovery(created, error), "could not create recovery record");
@@ -251,6 +713,35 @@ void storeCrud() {
     check(!store.recoveryRecord("journal-1") && store.recoveryRecords().empty(),
           "deleted recovery record remained in the store");
     store.close();
+
+    sqlite3* rawDatabase = nullptr;
+    check(sqlite3_open(databasePath.c_str(), &rawDatabase) == SQLITE_OK,
+          "could not reopen raw store for catalog migration fixture");
+    check(sqlite3_exec(
+              rawDatabase,
+              "UPDATE app_meta SET value='legacy-catalog' "
+              "WHERE key='editor_tool_catalog_version';",
+              nullptr, nullptr, nullptr) == SQLITE_OK,
+          "could not mark the catalog fixture stale");
+    sqlite3_close(rawDatabase);
+
+    check(store.open(databasePath.string(), error),
+          "could not migrate stale editor tool catalog");
+    check(!store.threadForDocument("document-1"),
+          "stale app-server thread mapping survived a tool catalog upgrade");
+    const auto retainedMessages = store.messages("document-1");
+    check(retainedMessages.size() == 1 &&
+              retainedMessages.front().text == "retained history",
+          "tool catalog upgrade discarded local chat history");
+    check(store.bindThread("document-1", "thread-current-catalog", error),
+          "could not bind current-catalog Codex thread");
+    store.close();
+    check(store.open(databasePath.string(), error),
+          "could not reopen current editor tool catalog");
+    check(store.threadForDocument("document-1") ==
+              std::optional<std::string>("thread-current-catalog"),
+          "current-catalog thread mapping was invalidated unnecessarily");
+    store.close();
     std::error_code ignored;
     std::filesystem::remove(databasePath, ignored);
     std::filesystem::remove(databasePath.string() + "-wal", ignored);
@@ -261,6 +752,11 @@ void storeCrud() {
 
 int main() {
     codecRoundTrip();
+    frozenVersion4FixtureAndPreflight();
+    semanticImageRoundTrip();
+    legacyImageMigrationAndBoundaries();
+    semanticImageAdversarialLimits();
+    semanticImageCountBoundary();
     storeCrud();
     std::cout << "recovery tests passed\n";
     return 0;

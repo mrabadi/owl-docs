@@ -1070,7 +1070,15 @@ core::Result<ImportedSemanticDocument> documentFromOoxml(
         }
     }
     std::vector<ImportedInlineImagePresentation> imagePresentations;
-    BoundedRasterCache imageCache;
+    RasterCacheLimits imageLimits;
+    imageLimits.per_image.maximum_encoded_bytes =
+        core::kMaximumEncodedImageBytes;
+    imageLimits.maximum_references = core::kMaximumInlineImagesPerDocument;
+    imageLimits.maximum_unique_images = core::kMaximumInlineImagesPerDocument;
+    BoundedRasterCache imageCache(imageLimits);
+    std::map<std::string, core::EncodedImagePayload> encodedImageCache;
+    std::size_t importedImageCount = 0;
+    std::size_t importedEncodedImageBytes = 0;
     for (std::size_t sourceIndex = 0; sourceIndex < sourceToCore.size();
          ++sourceIndex) {
         if (!sourceToCore[sourceIndex] ||
@@ -1110,18 +1118,53 @@ core::Result<ImportedSemanticDocument> documentFromOoxml(
                         if (!fragment.inline_image) break;
                         const auto& sourceImage = *fragment.inline_image;
                         if (!sourceImage.renderable()) break;
+                        const auto inspection = raster::inspect(
+                            sourceImage.bytes.view(), raster::Format::unknown,
+                            imageLimits.per_image);
+                        if (!inspection.ok()) break;
+                        if (importedImageCount >=
+                                core::kMaximumInlineImagesPerDocument ||
+                            sourceImage.bytes.size() >
+                                core::kMaximumDocumentEncodedImageBytes -
+                                    std::min(
+                                        importedEncodedImageBytes,
+                                        core::kMaximumDocumentEncodedImageBytes)) {
+                            return core::Error{
+                                core::ErrorCode::invalid_operation,
+                                "Imported document exceeds Owl Docs' bounded inline-picture budget"};
+                        }
                         auto decoded = imageCache.decode(
                             sourceImage.package_member,
                             sourceImage.bytes.view());
                         if (!decoded.ok()) break;
-                        imagePresentations.push_back({
-                            *sourceToCore[sourceIndex], semanticOffset,
-                            std::move(decoded.image),
-                            static_cast<double>(sourceImage.width_emu) /
-                                12'700.0,
-                            static_cast<double>(sourceImage.height_emu) /
-                                12'700.0,
-                            fromUtf8(sourceImage.name)});
+                        auto encoded = encodedImageCache.find(
+                            sourceImage.package_member);
+                        if (encoded == encodedImageCache.end()) {
+                            encoded = encodedImageCache.emplace(
+                                sourceImage.package_member,
+                                core::EncodedImagePayload(
+                                    std::vector<std::uint8_t>(
+                                    sourceImage.bytes.view().begin(),
+                                    sourceImage.bytes.view().end())))
+                                          .first;
+                        }
+                        const auto imageId = core::NodeId::generate();
+                        const auto inserted = document.insertImage(
+                            {*sourceToCore[sourceIndex], semanticOffset},
+                            encoded->second,
+                            inspection.format == raster::Format::png
+                                ? core::ImageFormat::png
+                                : core::ImageFormat::jpeg,
+                            sourceImage.name.empty() ? std::string("Picture")
+                                                     : sourceImage.name,
+                            sourceImage.width_emu, sourceImage.height_emu,
+                            imageId);
+                        if (!inserted) return inserted.error();
+                        imagePresentations.emplace_back(
+                            imageId, std::move(decoded.image));
+                        ++importedImageCount;
+                        importedEncodedImageBytes += sourceImage.bytes.size();
+                        ++semanticOffset;
                         break;
                     }
                     case ooxml::FragmentKind::page_break:
@@ -1735,6 +1778,59 @@ std::vector<ooxml::NewParagraph> toOoxmlParagraphs(
             }
         }
 
+        const auto appendImage = [&](const core::ImageAtom& image) {
+            const auto bytes = image.encoded_payload.bytes();
+            if (bytes.empty() || image.width_emu <= 0 ||
+                image.height_emu <= 0 ||
+                image.width_emu > core::kMaximumInlineImageDimensionEmu ||
+                image.height_emu > core::kMaximumInlineImageDimensionEmu) {
+                losses.push_back(QObject::tr(
+                    "A picture lacks a valid PNG/JPEG source or display size"));
+                return;
+            }
+            const QString accessibleName = QString::fromStdString(
+                image.accessible_name);
+            QString safeName;
+            safeName.reserve(std::min<qsizetype>(
+                accessibleName.size(), 120));
+            for (const QChar character : accessibleName) {
+                const ushort value = character.unicode();
+                if (value < 0x20U || value == 0x7fU || value == 0xfffeU ||
+                    value == 0xffffU || character == QLatin1Char('/') ||
+                    character == QLatin1Char('\\')) {
+                    continue;
+                }
+                safeName += character;
+                if (safeName.size() >= 120) break;
+            }
+            if (safeName.trimmed().isEmpty()) {
+                safeName = QObject::tr("Picture");
+            }
+            QByteArray encodedName = safeName.toUtf8();
+            while (encodedName.size() > 240 && !safeName.isEmpty()) {
+                safeName.chop(1);
+                encodedName = safeName.toUtf8();
+            }
+
+            ooxml::NewInlineImage serialized;
+            serialized.format = image.format == core::ImageFormat::png
+                ? raster::Format::png
+                : raster::Format::jpeg;
+            serialized.name = encodedName.toStdString();
+            serialized.width_emu = image.width_emu;
+            serialized.height_emu = image.height_emu;
+            serialized.bytes.assign(bytes.begin(), bytes.end());
+
+            const auto formatOffset = std::min(
+                paragraph.text().size(), image.utf16_offset + 1U);
+            ooxml::NewRun imageRun;
+            imageRun.format = toOoxmlFormat(
+                paragraph.characterFormatAt(formatOffset),
+                defaultFontFamily, defaultFontPointSize);
+            imageRun.inline_image = std::move(serialized);
+            out.runs.push_back(std::move(imageRun));
+        };
+
         std::size_t cursor = 0;
         while (cursor < sourceOffsets.size()) {
             const std::size_t sourceOffset = sourceOffsets[cursor];
@@ -1749,6 +1845,11 @@ std::vector<ooxml::NewParagraph> toOoxmlParagraphs(
                 ++cursor;
                 continue;
             }
+            if (const auto* image = paragraph.imageAt(sourceOffset)) {
+                appendImage(*image);
+                ++cursor;
+                continue;
+            }
             const auto runFormat =
                 paragraph.characterFormatAt(sourceOffset + 1);
             const std::size_t start = cursor;
@@ -1756,6 +1857,7 @@ std::vector<ooxml::NewParagraph> toOoxmlParagraphs(
                 ++cursor;
             } while (cursor < sourceOffsets.size() &&
                      paragraph.equationAt(sourceOffsets[cursor]) == nullptr &&
+                     paragraph.imageAt(sourceOffsets[cursor]) == nullptr &&
                      paragraph.characterFormatAt(sourceOffsets[cursor] + 1) ==
                          runFormat);
             out.runs.push_back({
@@ -2323,7 +2425,7 @@ void MainWindow::registerCommands() {
             static_cast<void>(canvas->deleteSelectedTableColumns());
         }
     });
-    add("insert.image", tr("Picture"), QKeySequence(), [this] { insertImagePlaceholder(); });
+    add("insert.image", tr("Picture"), QKeySequence(), [this] { insertImage(); });
     add("insert.equation", tr("Equation"), QKeySequence(QStringLiteral("Alt+=")), [this] { insertEquation(); });
     add("insert.textBox", tr("Text Box"), QKeySequence(), [this] { statusBar()->showMessage(tr("Text boxes are preserved on import; editing is not in this build."), 5000); });
     add("insert.comment", tr("Comment"), QKeySequence(QStringLiteral("Ctrl+Alt+M")), [this] { statusBar()->showMessage(tr("Comments are scheduled for the business/legal milestone."), 5000); });
@@ -3373,12 +3475,45 @@ void MainWindow::insertEquation() {
     canvas->setFocus();
 }
 
-void MainWindow::insertImagePlaceholder() {
-    auto* canvas = activeCanvas(); if (!canvas) return;
-    const auto path = QFileDialog::getOpenFileName(this, tr("Insert picture"), {}, tr("Images (*.png *.jpg *.jpeg *.webp *.bmp)"));
-    if (path.isEmpty()) return;
-    canvas->insertText(tr("[Image: %1]").arg(QFileInfo(path).fileName()));
-    statusBar()->showMessage(tr("This foundation records an image placeholder; embedded DrawingML is the next compatibility slice."), 7000);
+void MainWindow::insertImage() {
+    auto* canvas = activeCanvas();
+    if (!canvas) return;
+    const auto path = QFileDialog::getOpenFileName(
+        this, tr("Insert Picture"), {},
+        tr("PNG and JPEG pictures (*.png *.jpg *.jpeg)"));
+    if (path.isEmpty()) {
+        canvas->setFocus();
+        return;
+    }
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly)) {
+        QMessageBox::warning(
+            this, tr("Picture could not be inserted"),
+            tr("The selected file could not be opened for reading."));
+        canvas->setFocus();
+        return;
+    }
+    const qint64 maximum = static_cast<qint64>(
+        core::kMaximumEncodedImageBytes);
+    const QByteArray encoded = file.read(maximum + 1);
+    if (encoded.isEmpty() || encoded.size() > maximum || !file.atEnd() ||
+        file.error() != QFileDevice::NoError) {
+        QMessageBox::warning(
+            this, tr("Picture could not be inserted"),
+            tr("The selected file is empty, could not be read completely, or exceeds the 16 MiB encoded-picture limit."));
+        canvas->setFocus();
+        return;
+    }
+    std::vector<std::uint8_t> bytes(
+        reinterpret_cast<const std::uint8_t*>(encoded.constData()),
+        reinterpret_cast<const std::uint8_t*>(encoded.constData()) +
+            encoded.size());
+    if (canvas->insertInlineImage(
+            std::move(bytes), QFileInfo(path).fileName())) {
+        statusBar()->showMessage(
+            tr("Picture inserted in line with text"), 4000);
+    }
+    canvas->setFocus();
 }
 
 void MainWindow::showCompatibilityReport() {
@@ -3622,6 +3757,10 @@ void MainWindow::restoreRecoveryJournals() {
                                                  : state->recoveryDisplayName);
         auto* canvas = createDocumentTab(std::move(recovery->document),
                                          std::move(state), title);
+        // Raster payloads live in semantic image atoms. They are decoded lazily
+        // by DocumentCanvas under the same bounded presentation-cache policy
+        // used for newly inserted and imported pictures.
+        canvas->setImportedPresentation({}, {});
         canvas->setImportedPageLayout(
             page.width_points, page.height_points, page.margin_top_points,
             page.margin_right_points, page.margin_bottom_points,

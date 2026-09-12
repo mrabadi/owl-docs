@@ -432,7 +432,7 @@ int main(int argc, char** argv) {
     for (auto* canvas : inlineImageWindow.findChildren<
              docxstudio::app::DocumentCanvas*>()) {
         if (textOf(*canvas) ==
-            QStringLiteral("BEFORE  MIDDLE  AFTER")) {
+            QStringLiteral("BEFORE \ufffc MIDDLE \ufffc AFTER")) {
             inlineImageCanvas = canvas;
             break;
         }
@@ -449,7 +449,12 @@ int main(int argc, char** argv) {
                             Qt::NoModifier);
     QApplication::sendEvent(inlineImageCanvas, &collapseToEnd);
     QApplication::processEvents();
-    const QRect betweenTextAndFirstImage = cursorRect(*inlineImageCanvas);
+    const QRect beforeFirstImage = cursorRect(*inlineImageCanvas);
+    QKeyEvent moveAcrossImage(QEvent::KeyPress, Qt::Key_Right,
+                              Qt::NoModifier);
+    QApplication::sendEvent(inlineImageCanvas, &moveAcrossImage);
+    QApplication::processEvents();
+    const QRect afterFirstImage = cursorRect(*inlineImageCanvas);
     const QImage mixedPaint =
         inlineImageCanvas->viewport()->grab().toImage();
     const QRect importedRed = saturatedColorBounds(mixedPaint, true);
@@ -460,8 +465,15 @@ int main(int argc, char** argv) {
               importedRed.top() < importedBlue.bottom() &&
               importedBlue.top() < importedRed.bottom(),
           "imported inline pictures lost run order or were vertically stacked");
-    check(betweenTextAndFirstImage.x() >= importedRed.right() - 2 &&
-              betweenTextAndFirstImage.x() < importedBlue.left(),
+    const auto inlineSnapshot = inlineImageCanvas->snapshot();
+    const auto& inlineParagraph =
+        inlineSnapshot.document.paragraphs().front();
+    check(inlineParagraph.images().size() == 2 &&
+              inlineParagraph.images()[0].utf16_offset == 7 &&
+              inlineParagraph.images()[1].utf16_offset == 16 &&
+              beforeFirstImage.x() <= importedRed.left() + 2 &&
+              afterFirstImage.x() >= importedRed.right() - 2 &&
+              afterFirstImage.x() < importedBlue.left(),
           "imported image fragment offsets were not preserved among text runs");
 
     std::cout << "desktop DOCX import tests passed\n";

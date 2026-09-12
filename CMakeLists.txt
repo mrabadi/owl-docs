@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.22)
 
-project(OwlDocs VERSION 0.2.0 LANGUAGES CXX)
+project(OwlDocs VERSION 0.3.0 LANGUAGES CXX)
 
 include(GNUInstallDirs)
 include(CTest)
@@ -8,6 +8,8 @@ find_package(PkgConfig REQUIRED)
 
 option(DOCXSTUDIO_BUILD_APP "Build the Qt desktop application" ON)
 option(DOCXSTUDIO_STRICT_WARNINGS "Treat compiler warnings as errors" OFF)
+set(OWL_DOCS_ICON_GENERATOR_PYTHON "" CACHE FILEPATH
+    "Optional Python interpreter with the pinned Pillow version for icon-generation tests")
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -47,6 +49,7 @@ add_library(docxstudio_raster
 target_include_directories(docxstudio_raster PUBLIC include)
 target_compile_features(docxstudio_raster PUBLIC cxx_std_20)
 docxstudio_warnings(docxstudio_raster)
+target_link_libraries(docxstudio_core PUBLIC docxstudio_raster)
 
 pkg_check_modules(LIBZIP REQUIRED IMPORTED_TARGET libzip)
 pkg_check_modules(PUGIXML REQUIRED IMPORTED_TARGET pugixml)
@@ -185,8 +188,6 @@ if(DOCXSTUDIO_BUILD_APP)
             DESTINATION ${CMAKE_INSTALL_DATADIR}/applications)
     install(FILES packaging/debian/owl-docs.xml
             DESTINATION ${CMAKE_INSTALL_DATADIR}/mime/packages)
-    install(FILES packaging/icons/owl-docs.svg
-            DESTINATION ${CMAKE_INSTALL_DATADIR}/icons/hicolor/scalable/apps)
     foreach(OWL_DOCS_ICON_SIZE 16 24 32 48 64 128 256 512)
         install(FILES
                 packaging/icons/hicolor/${OWL_DOCS_ICON_SIZE}x${OWL_DOCS_ICON_SIZE}/apps/owl-docs.png
@@ -205,6 +206,7 @@ install(FILES
         docs/IMPLEMENTATION_STATUS.md
         docs/M0_CORPUS_EVIDENCE.md
         docs/PRIVACY.md
+        docs/ROADMAP.md
         DESTINATION "${CMAKE_INSTALL_DATAROOTDIR}/doc/owl-docs")
 
 if(BUILD_TESTING)
@@ -333,6 +335,13 @@ if(BUILD_TESTING)
         set_tests_properties(equation_ui_tests PROPERTIES
             ENVIRONMENT "QT_QPA_PLATFORM=offscreen;XDG_DATA_HOME=/tmp/owl-docs-equation-ui-tests")
 
+        add_executable(image_ui_tests tests/image_ui_tests.cpp)
+        target_link_libraries(image_ui_tests PRIVATE docxstudio_app)
+        docxstudio_warnings(image_ui_tests)
+        add_test(NAME image_ui_tests COMMAND image_ui_tests)
+        set_tests_properties(image_ui_tests PROPERTIES
+            ENVIRONMENT "QT_QPA_PLATFORM=offscreen;XDG_DATA_HOME=/tmp/owl-docs-image-ui-tests")
+
         add_executable(print_tests tests/print_tests.cpp)
         target_link_libraries(print_tests PRIVATE docxstudio_app)
         docxstudio_warnings(print_tests)
@@ -395,6 +404,19 @@ if(BUILD_TESTING AND OWL_DOCS_CORPUS_MANIFEST)
             --ephemeral-output
             --minimum-fixtures 100)
     set_tests_properties(public_docx_corpus PROPERTIES TIMEOUT 900)
+endif()
+
+if(BUILD_TESTING AND OWL_DOCS_ICON_GENERATOR_PYTHON)
+    if(NOT EXISTS "${OWL_DOCS_ICON_GENERATOR_PYTHON}")
+        message(FATAL_ERROR
+            "OWL_DOCS_ICON_GENERATOR_PYTHON does not name an existing interpreter")
+    endif()
+    add_test(NAME icon_generation_tests
+        COMMAND "${OWL_DOCS_ICON_GENERATOR_PYTHON}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/generate_app_icons.py"
+                --check)
+    set_tests_properties(icon_generation_tests PROPERTIES
+        LABELS "branding;maintenance")
 endif()
 
 set(CPACK_GENERATOR "DEB")

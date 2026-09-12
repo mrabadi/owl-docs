@@ -20,6 +20,9 @@ namespace docxstudio::app {
 using RasterDecodeLimits = raster::ValidationLimits;
 using RasterImageFormat = raster::Format;
 
+inline constexpr std::int64_t kMaximumAggregateDecodedRasterBytes =
+    256LL * 1024LL * 1024LL;
+
 enum class RasterDecodeStatus {
     decoded,
     invalid_limits,
@@ -59,7 +62,7 @@ struct RasterCacheLimits {
     std::size_t maximum_references{4'096U};
     std::size_t maximum_unique_images{1'024U};
     std::int64_t maximum_aggregate_decoded_bytes{
-        256LL * 1024LL * 1024LL};
+        kMaximumAggregateDecodedRasterBytes};
 };
 
 enum class RasterCacheStatus {

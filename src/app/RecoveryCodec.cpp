@@ -1,4 +1,5 @@
 #include "docxstudio/app/RecoveryCodec.h"
+#include "docxstudio/raster/validation.h"
 
 #include <nlohmann/json.hpp>
 
@@ -8,6 +9,7 @@
 #include <iterator>
 #include <limits>
 #include <set>
+#include <span>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -27,6 +29,307 @@ constexpr std::size_t kMaximumEquations = 1'000'000U;
 // approach the 64 MiB serialized payload ceiling in the worst case.
 constexpr std::size_t kMaximumCodeUnits = 8U * 1024U * 1024U;
 constexpr std::size_t kMaximumEquationSourceBytes = 8U * 1024U * 1024U;
+constexpr std::size_t kMaximumJsonNestingDepth = 64U;
+constexpr std::size_t kMaximumJsonStructuralElements =
+    16U * 1024U * 1024U;
+constexpr std::size_t kMaximumJsonStringBytes = kMaximumPayloadBytes;
+// Valid core formatting runs are non-empty and non-overlapping, so their
+// aggregate count cannot exceed the document's aggregate UTF-16 length.
+constexpr std::size_t kMaximumFormatRuns = kMaximumCodeUnits;
+constexpr double kEmuPerPoint = 12'700.0;
+
+class RecoveryJsonPreflight final : public nlohmann::json_sax<Json> {
+public:
+    bool null() override { return beginValue(); }
+    bool boolean(bool /*value*/) override { return beginValue(); }
+    bool number_integer(number_integer_t /*value*/) override {
+        return beginValue();
+    }
+    bool number_unsigned(number_unsigned_t /*value*/) override {
+        return beginValue();
+    }
+    bool number_float(number_float_t /*value*/,
+                      const string_t& /*token*/) override {
+        return beginValue();
+    }
+    bool string(string_t& value) override {
+        return beginValue() && countString(value.size());
+    }
+    bool binary(binary_t& value) override {
+        return beginValue() && countString(value.size());
+    }
+
+    bool start_object(std::size_t /*elements*/) override {
+        bool runsValue = false;
+        if (!beginValue(&runsValue)) return false;
+        if (frames_.size() >= kMaximumJsonNestingDepth) {
+            error_ = "Recovery snapshot exceeds the JSON nesting limit";
+            return false;
+        }
+        frames_.push_back({ContainerKind::object, false, false});
+        return true;
+    }
+
+    bool key(string_t& value) override {
+        if (frames_.empty() ||
+            frames_.back().kind != ContainerKind::object) {
+            error_ = "Recovery snapshot has invalid JSON structure";
+            return false;
+        }
+        if (!countElement() || !countString(value.size())) return false;
+        frames_.back().pending_runs_value = value == "runs";
+        return true;
+    }
+
+    bool end_object() override {
+        return endContainer(ContainerKind::object);
+    }
+
+    bool start_array(std::size_t /*elements*/) override {
+        bool runsValue = false;
+        if (!beginValue(&runsValue)) return false;
+        if (frames_.size() >= kMaximumJsonNestingDepth) {
+            error_ = "Recovery snapshot exceeds the JSON nesting limit";
+            return false;
+        }
+        frames_.push_back({ContainerKind::array, runsValue, false});
+        return true;
+    }
+
+    bool end_array() override {
+        return endContainer(ContainerKind::array);
+    }
+
+    bool parse_error(std::size_t /*position*/,
+                     const std::string& /*lastToken*/,
+                     const nlohmann::detail::exception& /*exception*/) override {
+        if (error_.empty()) {
+            error_ = "Recovery snapshot is not valid JSON";
+        }
+        return false;
+    }
+
+    [[nodiscard]] const std::string& error() const noexcept { return error_; }
+
+private:
+    enum class ContainerKind { object, array };
+
+    struct Frame {
+        ContainerKind kind{ContainerKind::object};
+        bool format_runs_array{false};
+        bool pending_runs_value{false};
+    };
+
+    bool beginValue(bool* runsValue = nullptr) {
+        if (!countElement()) return false;
+        bool keyedRunsValue = false;
+        if (!frames_.empty()) {
+            auto& parent = frames_.back();
+            if (parent.kind == ContainerKind::object) {
+                keyedRunsValue = parent.pending_runs_value;
+                parent.pending_runs_value = false;
+            } else if (parent.format_runs_array) {
+                if (format_run_count_ >= kMaximumFormatRuns) {
+                    error_ =
+                        "Recovery snapshot exceeds the formatting-run limit";
+                    return false;
+                }
+                ++format_run_count_;
+            }
+        }
+        if (runsValue) *runsValue = keyedRunsValue;
+        return true;
+    }
+
+    bool countElement() {
+        if (structural_element_count_ >=
+            kMaximumJsonStructuralElements) {
+            error_ = "Recovery snapshot exceeds the JSON element limit";
+            return false;
+        }
+        ++structural_element_count_;
+        return true;
+    }
+
+    bool countString(std::size_t bytes) {
+        if (bytes > kMaximumJsonStringBytes - json_string_bytes_) {
+            error_ = "Recovery snapshot exceeds the JSON string-byte limit";
+            return false;
+        }
+        json_string_bytes_ += bytes;
+        return true;
+    }
+
+    bool endContainer(ContainerKind expected) {
+        if (frames_.empty() || frames_.back().kind != expected) {
+            error_ = "Recovery snapshot has invalid JSON structure";
+            return false;
+        }
+        frames_.pop_back();
+        return true;
+    }
+
+    std::vector<Frame> frames_;
+    std::size_t structural_element_count_{0};
+    std::size_t json_string_bytes_{0};
+    std::size_t format_run_count_{0};
+    std::string error_;
+};
+
+bool preflightRecoveryJson(std::string_view payload, std::string& error) {
+    RecoveryJsonPreflight preflight;
+    try {
+        if (!Json::sax_parse(payload.begin(), payload.end(), &preflight)) {
+            error = preflight.error().empty()
+                ? "Recovery snapshot is not valid JSON"
+                : preflight.error();
+            return false;
+        }
+    } catch (const std::exception& exception) {
+        error = std::string("Could not preflight recovery snapshot: ") +
+            exception.what();
+        return false;
+    }
+    return true;
+}
+
+std::string base64Encode(std::span<const std::uint8_t> input) {
+    static constexpr char alphabet[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string output;
+    output.reserve(((input.size() + 2U) / 3U) * 4U);
+    std::size_t index = 0;
+    while (index + 3U <= input.size()) {
+        const std::uint32_t value =
+            (static_cast<std::uint32_t>(input[index]) << 16U) |
+            (static_cast<std::uint32_t>(input[index + 1U]) << 8U) |
+            static_cast<std::uint32_t>(input[index + 2U]);
+        output.push_back(alphabet[(value >> 18U) & 0x3fU]);
+        output.push_back(alphabet[(value >> 12U) & 0x3fU]);
+        output.push_back(alphabet[(value >> 6U) & 0x3fU]);
+        output.push_back(alphabet[value & 0x3fU]);
+        index += 3U;
+    }
+    const std::size_t remaining = input.size() - index;
+    if (remaining == 1U) {
+        const std::uint32_t value =
+            static_cast<std::uint32_t>(input[index]) << 16U;
+        output.push_back(alphabet[(value >> 18U) & 0x3fU]);
+        output.push_back(alphabet[(value >> 12U) & 0x3fU]);
+        output += "==";
+    } else if (remaining == 2U) {
+        const std::uint32_t value =
+            (static_cast<std::uint32_t>(input[index]) << 16U) |
+            (static_cast<std::uint32_t>(input[index + 1U]) << 8U);
+        output.push_back(alphabet[(value >> 18U) & 0x3fU]);
+        output.push_back(alphabet[(value >> 12U) & 0x3fU]);
+        output.push_back(alphabet[(value >> 6U) & 0x3fU]);
+        output.push_back('=');
+    }
+    return output;
+}
+
+int base64Value(char character) noexcept {
+    if (character >= 'A' && character <= 'Z') return character - 'A';
+    if (character >= 'a' && character <= 'z') return character - 'a' + 26;
+    if (character >= '0' && character <= '9') return character - '0' + 52;
+    if (character == '+') return 62;
+    if (character == '/') return 63;
+    return -1;
+}
+
+std::optional<std::vector<std::uint8_t>> base64Decode(
+    std::string_view input, std::size_t maximumBytes) {
+    if (input.empty() || input.size() % 4U != 0U) return std::nullopt;
+    const std::size_t padding =
+        (input.back() == '=' ? 1U : 0U) +
+        (input.size() >= 2U && input[input.size() - 2U] == '=' ? 1U : 0U);
+    if (input.size() / 4U >
+        (std::numeric_limits<std::size_t>::max() - 2U) / 3U) {
+        return std::nullopt;
+    }
+    const std::size_t decodedSize = input.size() / 4U * 3U - padding;
+    if (decodedSize == 0U || decodedSize > maximumBytes) {
+        return std::nullopt;
+    }
+    std::vector<std::uint8_t> output;
+    output.reserve(decodedSize);
+    for (std::size_t index = 0; index < input.size(); index += 4U) {
+        const bool finalGroup = index + 4U == input.size();
+        const int first = base64Value(input[index]);
+        const int second = base64Value(input[index + 1U]);
+        const bool thirdPadding = input[index + 2U] == '=';
+        const bool fourthPadding = input[index + 3U] == '=';
+        const int third = thirdPadding ? 0 : base64Value(input[index + 2U]);
+        const int fourth = fourthPadding ? 0 : base64Value(input[index + 3U]);
+        if (first < 0 || second < 0 || third < 0 || fourth < 0 ||
+            (!finalGroup && (thirdPadding || fourthPadding)) ||
+            (thirdPadding && !fourthPadding) ||
+            (thirdPadding && (second & 0x0f) != 0) ||
+            (fourthPadding && !thirdPadding && (third & 0x03) != 0)) {
+            return std::nullopt;
+        }
+        const std::uint32_t value =
+            (static_cast<std::uint32_t>(first) << 18U) |
+            (static_cast<std::uint32_t>(second) << 12U) |
+            (static_cast<std::uint32_t>(third) << 6U) |
+            static_cast<std::uint32_t>(fourth);
+        output.push_back(static_cast<std::uint8_t>(value >> 16U));
+        if (!thirdPadding) {
+            output.push_back(static_cast<std::uint8_t>(value >> 8U));
+        }
+        if (!fourthPadding) {
+            output.push_back(static_cast<std::uint8_t>(value));
+        }
+    }
+    if (output.size() != decodedSize) return std::nullopt;
+    return output;
+}
+
+const char* imageFormatName(core::ImageFormat format) noexcept {
+    if (format == core::ImageFormat::png) return "png";
+    if (format == core::ImageFormat::jpeg) return "jpeg";
+    return "unknown";
+}
+
+std::optional<core::ImageFormat> parseImageFormat(std::string_view value) {
+    if (value == "png") return core::ImageFormat::png;
+    if (value == "jpeg") return core::ImageFormat::jpeg;
+    return std::nullopt;
+}
+
+raster::Format rasterFormat(core::ImageFormat format) noexcept {
+    if (format == core::ImageFormat::png) return raster::Format::png;
+    if (format == core::ImageFormat::jpeg) return raster::Format::jpeg;
+    return raster::Format::unknown;
+}
+
+bool validEncodedImage(const core::EncodedImagePayload& payload,
+                       core::ImageFormat format) {
+    if (payload.empty() ||
+        payload.size() > core::kMaximumEncodedImageBytes ||
+        rasterFormat(format) == raster::Format::unknown) {
+        return false;
+    }
+    raster::ValidationLimits limits;
+    limits.maximum_encoded_bytes = core::kMaximumEncodedImageBytes;
+    return raster::inspect(payload.bytes(), rasterFormat(format), limits).ok();
+}
+
+std::optional<std::int64_t> pointsToEmu(double points) {
+    if (!std::isfinite(points) || points <= 0.0 ||
+        points > static_cast<double>(
+                     core::kMaximumInlineImageDimensionEmu) /
+                     kEmuPerPoint) {
+        return std::nullopt;
+    }
+    const auto emu = static_cast<std::int64_t>(
+        std::llround(points * kEmuPerPoint));
+    if (emu <= 0 || emu > core::kMaximumInlineImageDimensionEmu) {
+        return std::nullopt;
+    }
+    return emu;
+}
 
 Json encodeUtf16(const std::u16string& value) {
     Json output = Json::array();
@@ -454,12 +757,22 @@ std::optional<std::string> RecoveryCodec::encode(const RecoveryDocument& recover
     std::size_t totalCodeUnits = 0;
     std::size_t totalEquations = 0;
     std::size_t totalEquationBytes = 0;
+    std::size_t totalFormatRuns = 0;
+    std::size_t totalImages = 0;
+    std::size_t totalImageBytes = 0;
+    std::unordered_set<core::NodeId, core::NodeIdHash> imageIds;
     for (const auto& paragraph : recovery.document.paragraphs()) {
         if (paragraph.text().size() > kMaximumCodeUnits - totalCodeUnits) {
             error = "Recovery document text exceeds the size limit";
             return std::nullopt;
         }
         totalCodeUnits += paragraph.text().size();
+        if (paragraph.characterFormats().size() >
+            kMaximumFormatRuns - totalFormatRuns) {
+            error = "Recovery document has too many formatting runs";
+            return std::nullopt;
+        }
+        totalFormatRuns += paragraph.characterFormats().size();
         if (paragraph.equations().size() > kMaximumEquations - totalEquations) {
             error = "Recovery document has too many equations";
             return std::nullopt;
@@ -472,6 +785,31 @@ std::optional<std::string> RecoveryCodec::encode(const RecoveryDocument& recover
                 return std::nullopt;
             }
             totalEquationBytes += equation.canonical_latex.size();
+        }
+        if (paragraph.images().size() >
+            core::kMaximumInlineImagesPerDocument - totalImages) {
+            error = "Recovery document has too many inline pictures";
+            return std::nullopt;
+        }
+        totalImages += paragraph.images().size();
+        for (const auto& image : paragraph.images()) {
+            if (!image.id.isValid() || !imageIds.insert(image.id).second ||
+                image.utf16_offset >= paragraph.text().size() ||
+                paragraph.text()[image.utf16_offset] !=
+                    core::kInlineObjectReplacementCharacter ||
+                image.accessible_name.size() >
+                    core::kMaximumImageAccessibleNameBytes ||
+                image.width_emu <= 0 || image.height_emu <= 0 ||
+                image.width_emu > core::kMaximumInlineImageDimensionEmu ||
+                image.height_emu > core::kMaximumInlineImageDimensionEmu ||
+                image.encoded_payload.size() >
+                    core::kMaximumDocumentEncodedImageBytes - totalImageBytes ||
+                !validEncodedImage(image.encoded_payload, image.format)) {
+                error =
+                    "Recovery inline-picture metadata or payload is invalid";
+                return std::nullopt;
+            }
+            totalImageBytes += image.encoded_payload.size();
         }
     }
     std::size_t totalCells = 0;
@@ -487,6 +825,12 @@ std::optional<std::string> RecoveryCodec::encode(const RecoveryDocument& recover
                 return std::nullopt;
             }
             totalCodeUnits += cell.text.size();
+            if (cell.character_formats.size() >
+                kMaximumFormatRuns - totalFormatRuns) {
+                error = "Recovery document has too many formatting runs";
+                return std::nullopt;
+            }
+            totalFormatRuns += cell.character_formats.size();
         }
     }
     Json root{{"schema", "docxstudio.recovery"}, {"version", currentVersion}};
@@ -510,12 +854,24 @@ std::optional<std::string> RecoveryCodec::encode(const RecoveryDocument& recover
                                  {"latex", equation.canonical_latex},
                                  {"display", equation.display}});
         }
+        Json images = Json::array();
+        for (const auto& image : paragraph.images()) {
+            images.push_back(
+                {{"id", image.id.toString()},
+                 {"offset", image.utf16_offset},
+                 {"width_emu", image.width_emu},
+                 {"height_emu", image.height_emu},
+                 {"accessible_name", image.accessible_name},
+                 {"format", imageFormatName(image.format)},
+                 {"encoded_base64", base64Encode(image.encoded_payload.bytes())}});
+        }
         root["paragraphs"].push_back(
             {{"id", paragraph.id().toString()},
              {"text_utf16", encodeUtf16(paragraph.text())},
              {"format", encodeParagraphFormat(paragraph.format())},
              {"runs", std::move(runs)},
-             {"equations", std::move(equations)}});
+             {"equations", std::move(equations)},
+             {"images", std::move(images)}});
     }
     root["tables"] = Json::array();
     for (const auto& table : recovery.document.tables()) {
@@ -572,12 +928,14 @@ std::optional<RecoveryDocument> RecoveryCodec::decode(std::string_view payload,
         error = "Recovery snapshot is empty or exceeds the size limit";
         return std::nullopt;
     }
-    const Json root = Json::parse(payload.begin(), payload.end(), nullptr, false);
-    if (root.is_discarded() || !root.is_object()) {
-        error = "Recovery snapshot is not valid JSON";
-        return std::nullopt;
-    }
+    if (!preflightRecoveryJson(payload, error)) return std::nullopt;
     try {
+        const Json root = Json::parse(
+            payload.begin(), payload.end(), nullptr, false);
+        if (root.is_discarded() || !root.is_object()) {
+            error = "Recovery snapshot is not valid JSON";
+            return std::nullopt;
+        }
         const int version = root.value("version", 0);
         if (root.value("schema", std::string{}) != "docxstudio.recovery" ||
             version < 1 || version > currentVersion) {
@@ -619,14 +977,105 @@ std::optional<RecoveryDocument> RecoveryCodec::decode(std::string_view payload,
             std::string latex;
             bool display{false};
         };
+        struct PendingImage {
+            core::NodeId paragraph_id;
+            core::NodeId image_id;
+            std::size_t offset{};
+            core::EncodedImagePayload encoded_payload;
+            core::ImageFormat format{core::ImageFormat::png};
+            std::string accessible_name;
+            std::int64_t width_emu{};
+            std::int64_t height_emu{};
+            std::size_t source_order{};
+        };
         std::vector<core::Paragraph> paragraphs;
         std::vector<PendingRun> runs;
         std::vector<PendingParagraphFormat> paragraphFormats;
         std::vector<PendingEquation> equations;
+        std::vector<PendingImage> images;
+        std::unordered_map<core::NodeId, std::vector<std::size_t>,
+                           core::NodeIdHash>
+            legacyImagesByParagraph;
         paragraphs.reserve(paragraphJson.size());
         std::size_t totalCodeUnits = 0;
         std::size_t totalEquations = 0;
         std::size_t totalEquationBytes = 0;
+        std::size_t totalFormatRuns = 0;
+        std::size_t totalImages = 0;
+        std::size_t totalImageBytes = 0;
+        std::unordered_set<core::NodeId, core::NodeIdHash> imageIds;
+
+        // Version 5 stored presentation-only, zero-width image anchors at the
+        // root. Read those journals once, then migrate them into semantic image
+        // atoms after the original equation-bearing text has been restored.
+        if (version == 5) {
+            const auto& encodedImages = root.at("inline_images");
+            if (!encodedImages.is_array() ||
+                encodedImages.size() >
+                    core::kMaximumInlineImagesPerDocument) {
+                error = "Recovery inline-picture list is invalid";
+                return std::nullopt;
+            }
+            images.reserve(encodedImages.size());
+            for (std::size_t sourceOrder = 0;
+                 sourceOrder < encodedImages.size(); ++sourceOrder) {
+                const auto& encodedImage = encodedImages[sourceOrder];
+                if (!encodedImage.is_object()) {
+                    error = "Recovery inline picture is not an object";
+                    return std::nullopt;
+                }
+                const auto imageId = core::NodeId::parse(
+                    encodedImage.at("id").get<std::string>());
+                const auto paragraphId = core::NodeId::parse(
+                    encodedImage.at("paragraph_id").get<std::string>());
+                const auto offset64 =
+                    encodedImage.at("utf16_offset").get<std::uint64_t>();
+                const auto width = pointsToEmu(
+                    encodedImage.at("width_points").get<double>());
+                const auto height = pointsToEmu(
+                    encodedImage.at("height_points").get<double>());
+                const auto accessibleName =
+                    encodedImage.at("accessible_name").get<std::string>();
+                const auto format = parseImageFormat(
+                    encodedImage.at("format").get<std::string>());
+                const auto encodedBase64 =
+                    encodedImage.at("encoded_base64").get<std::string>();
+                const std::size_t remainingDocumentBytes =
+                    core::kMaximumDocumentEncodedImageBytes -
+                    totalImageBytes;
+                auto bytes = base64Decode(
+                    encodedBase64,
+                    std::min(core::kMaximumEncodedImageBytes,
+                             remainingDocumentBytes));
+                if (!imageId || !paragraphId || !format || !width ||
+                    !height || !bytes ||
+                    !imageIds.insert(*imageId).second ||
+                    offset64 > std::numeric_limits<std::size_t>::max() ||
+                    accessibleName.size() >
+                        core::kMaximumImageAccessibleNameBytes) {
+                    error =
+                        "Recovery inline-picture metadata or payload is invalid";
+                    return std::nullopt;
+                }
+                core::EncodedImagePayload encodedPayload(std::move(*bytes));
+                if (!validEncodedImage(encodedPayload, *format)) {
+                    error =
+                        "Recovery inline-picture metadata or payload is invalid";
+                    return std::nullopt;
+                }
+                totalImageBytes += encodedPayload.size();
+                const std::size_t imageIndex = images.size();
+                images.push_back(
+                    {*paragraphId, *imageId,
+                     static_cast<std::size_t>(offset64),
+                     std::move(encodedPayload), *format,
+                     std::move(accessibleName), *width, *height,
+                     sourceOrder});
+                legacyImagesByParagraph[*paragraphId].push_back(imageIndex);
+            }
+            totalImages = images.size();
+        }
+        std::size_t seenLegacyImages = 0;
         for (const auto& encodedParagraph : paragraphJson) {
             if (!encodedParagraph.is_object()) {
                 error = "Recovery paragraph is not an object";
@@ -644,6 +1093,7 @@ std::optional<RecoveryDocument> RecoveryCodec::decode(std::string_view payload,
             }
 
             std::vector<PendingEquation> paragraphEquations;
+            std::vector<PendingImage> paragraphImages;
             if (version >= 2) {
                 const auto& encodedEquations = encodedParagraph.at("equations");
                 if (!encodedEquations.is_array() ||
@@ -692,10 +1142,119 @@ std::optional<RecoveryDocument> RecoveryCodec::decode(std::string_view payload,
                 }
             }
 
+            if (version >= 6) {
+                const auto& encodedImages = encodedParagraph.at("images");
+                if (!encodedImages.is_array() ||
+                    encodedImages.size() >
+                        core::kMaximumInlineImagesPerDocument - totalImages) {
+                    error = "Recovery inline-picture list is invalid";
+                    return std::nullopt;
+                }
+                totalImages += encodedImages.size();
+                paragraphImages.reserve(encodedImages.size());
+                for (std::size_t sourceOrder = 0;
+                     sourceOrder < encodedImages.size(); ++sourceOrder) {
+                    const auto& encodedImage = encodedImages[sourceOrder];
+                    if (!encodedImage.is_object()) {
+                        error = "Recovery inline picture is not an object";
+                        return std::nullopt;
+                    }
+                    const auto imageId = core::NodeId::parse(
+                        encodedImage.at("id").get<std::string>());
+                    const auto offset64 =
+                        encodedImage.at("offset").get<std::uint64_t>();
+                    const auto widthEmu =
+                        encodedImage.at("width_emu").get<std::int64_t>();
+                    const auto heightEmu =
+                        encodedImage.at("height_emu").get<std::int64_t>();
+                    const auto accessibleName =
+                        encodedImage.at("accessible_name").get<std::string>();
+                    const auto format = parseImageFormat(
+                        encodedImage.at("format").get<std::string>());
+                    const auto encodedBase64 =
+                        encodedImage.at("encoded_base64").get<std::string>();
+                    const std::size_t remainingDocumentBytes =
+                        core::kMaximumDocumentEncodedImageBytes -
+                        totalImageBytes;
+                    auto bytes = base64Decode(
+                        encodedBase64,
+                        std::min(core::kMaximumEncodedImageBytes,
+                                 remainingDocumentBytes));
+                    if (!imageId || !format || !bytes ||
+                        !imageIds.insert(*imageId).second ||
+                        offset64 >
+                            std::numeric_limits<std::size_t>::max() ||
+                        offset64 >= text.size() ||
+                        text[static_cast<std::size_t>(offset64)] !=
+                            core::kInlineObjectReplacementCharacter ||
+                        accessibleName.size() >
+                            core::kMaximumImageAccessibleNameBytes ||
+                        widthEmu <= 0 || heightEmu <= 0 ||
+                        widthEmu >
+                            core::kMaximumInlineImageDimensionEmu ||
+                        heightEmu >
+                            core::kMaximumInlineImageDimensionEmu) {
+                        error =
+                            "Recovery inline-picture metadata or payload is invalid";
+                        return std::nullopt;
+                    }
+                    core::EncodedImagePayload encodedPayload(
+                        std::move(*bytes));
+                    if (!validEncodedImage(encodedPayload, *format)) {
+                        error =
+                            "Recovery inline-picture metadata or payload is invalid";
+                        return std::nullopt;
+                    }
+                    totalImageBytes += encodedPayload.size();
+                    paragraphImages.push_back(
+                        {*id, *imageId,
+                         static_cast<std::size_t>(offset64),
+                         std::move(encodedPayload), *format,
+                         std::move(accessibleName), widthEmu, heightEmu,
+                         sourceOrder});
+                }
+                std::sort(
+                    paragraphImages.begin(), paragraphImages.end(),
+                    [](const PendingImage& left, const PendingImage& right) {
+                        return left.offset < right.offset;
+                    });
+            }
+
+            std::set<std::size_t> typedObjectOffsets;
+            for (const auto& equation : paragraphEquations) {
+                if (!typedObjectOffsets.insert(equation.offset).second) {
+                    error = "Recovery inline objects share a placeholder";
+                    return std::nullopt;
+                }
+            }
+            for (const auto& image : paragraphImages) {
+                if (!typedObjectOffsets.insert(image.offset).second) {
+                    error = "Recovery inline objects share a placeholder";
+                    return std::nullopt;
+                }
+            }
+
+            if (version == 5) {
+                const auto legacy = legacyImagesByParagraph.find(*id);
+                if (legacy != legacyImagesByParagraph.end()) {
+                    for (const std::size_t imageIndex : legacy->second) {
+                        if (!core::isUtf16Boundary(
+                                text, images[imageIndex].offset)) {
+                            error =
+                                "Recovery inline-picture anchor is not a UTF-16 boundary";
+                            return std::nullopt;
+                        }
+                        ++seenLegacyImages;
+                    }
+                }
+            }
+
             const auto placeholderCount = static_cast<std::size_t>(std::count(
                 text.begin(), text.end(), core::kInlineObjectReplacementCharacter));
-            if (placeholderCount != paragraphEquations.size()) {
-                error = "Recovery paragraph has orphan equation placeholders";
+            const std::size_t expectedPlaceholders =
+                paragraphEquations.size() + paragraphImages.size();
+            if (placeholderCount != expectedPlaceholders) {
+                error = "Recovery paragraph has orphan inline-object placeholders";
                 return std::nullopt;
             }
             std::u16string plainText;
@@ -713,6 +1272,9 @@ std::optional<RecoveryDocument> RecoveryCodec::decode(std::string_view payload,
             equations.insert(equations.end(),
                              std::make_move_iterator(paragraphEquations.begin()),
                              std::make_move_iterator(paragraphEquations.end()));
+            images.insert(images.end(),
+                          std::make_move_iterator(paragraphImages.begin()),
+                          std::make_move_iterator(paragraphImages.end()));
 
             core::ParagraphFormat paragraphFormat;
             if (!decodeParagraphFormat(encodedParagraph.at("format"), paragraphFormat, error))
@@ -720,10 +1282,13 @@ std::optional<RecoveryDocument> RecoveryCodec::decode(std::string_view payload,
             paragraphFormats.push_back({*id, std::move(paragraphFormat)});
 
             const auto& encodedRuns = encodedParagraph.at("runs");
-            if (!encodedRuns.is_array()) {
+            if (!encodedRuns.is_array() ||
+                encodedRuns.size() >
+                    kMaximumFormatRuns - totalFormatRuns) {
                 error = "Recovery format runs are not an array";
                 return std::nullopt;
             }
+            totalFormatRuns += encodedRuns.size();
             for (const auto& encodedRun : encodedRuns) {
                 const auto start64 = encodedRun.at("start").get<std::uint64_t>();
                 const auto end64 = encodedRun.at("end").get<std::uint64_t>();
@@ -740,19 +1305,73 @@ std::optional<RecoveryDocument> RecoveryCodec::decode(std::string_view payload,
             }
         }
 
+        if (version == 5 && seenLegacyImages != images.size()) {
+            error = "Recovery inline picture references a missing paragraph";
+            return std::nullopt;
+        }
+
         auto document = core::Document::create(std::move(paragraphs));
         if (!document) {
             error = document.error().message;
             return std::nullopt;
         }
-        for (auto& equation : equations) {
-            const auto inserted = document.value().insertEquation(
-                {equation.paragraph_id, equation.offset},
-                std::move(equation.latex), equation.display,
-                equation.equation_id);
-            if (!inserted) {
-                error = inserted.error().message;
-                return std::nullopt;
+        if (version >= 6) {
+            struct PendingObjectRef {
+                core::NodeId paragraph_id;
+                std::size_t offset{};
+                bool image{false};
+                std::size_t index{};
+            };
+            std::vector<PendingObjectRef> objects;
+            objects.reserve(equations.size() + images.size());
+            for (std::size_t index = 0; index < equations.size(); ++index) {
+                objects.push_back({equations[index].paragraph_id,
+                                   equations[index].offset, false, index});
+            }
+            for (std::size_t index = 0; index < images.size(); ++index) {
+                objects.push_back({images[index].paragraph_id,
+                                   images[index].offset, true, index});
+            }
+            std::sort(
+                objects.begin(), objects.end(),
+                [](const PendingObjectRef& left,
+                   const PendingObjectRef& right) {
+                    if (left.paragraph_id != right.paragraph_id) {
+                        return left.paragraph_id < right.paragraph_id;
+                    }
+                    return left.offset < right.offset;
+                });
+            for (const auto& object : objects) {
+                core::Result<void> inserted = [&]() {
+                    if (!object.image) {
+                        auto& equation = equations[object.index];
+                        return document.value().insertEquation(
+                            {equation.paragraph_id, equation.offset},
+                            std::move(equation.latex), equation.display,
+                            equation.equation_id);
+                    }
+                    auto& image = images[object.index];
+                    return document.value().insertImage(
+                        {image.paragraph_id, image.offset},
+                        std::move(image.encoded_payload), image.format,
+                        std::move(image.accessible_name), image.width_emu,
+                        image.height_emu, image.image_id);
+                }();
+                if (!inserted) {
+                    error = inserted.error().message;
+                    return std::nullopt;
+                }
+            }
+        } else {
+            for (auto& equation : equations) {
+                const auto inserted = document.value().insertEquation(
+                    {equation.paragraph_id, equation.offset},
+                    std::move(equation.latex), equation.display,
+                    equation.equation_id);
+                if (!inserted) {
+                    error = inserted.error().message;
+                    return std::nullopt;
+                }
             }
         }
         for (const auto& paragraphFormat : paragraphFormats) {
@@ -770,6 +1389,58 @@ std::optional<RecoveryDocument> RecoveryCodec::decode(std::string_view payload,
             if (!applied) {
                 error = applied.error().message;
                 return std::nullopt;
+            }
+        }
+        if (version == 5) {
+            std::vector<std::size_t> imageOrder(images.size());
+            for (std::size_t index = 0; index < imageOrder.size(); ++index) {
+                imageOrder[index] = index;
+            }
+            std::stable_sort(
+                imageOrder.begin(), imageOrder.end(),
+                [&images](std::size_t leftIndex, std::size_t rightIndex) {
+                    const auto& left = images[leftIndex];
+                    const auto& right = images[rightIndex];
+                    if (left.paragraph_id != right.paragraph_id) {
+                        return left.paragraph_id < right.paragraph_id;
+                    }
+                    if (left.offset != right.offset) {
+                        return left.offset < right.offset;
+                    }
+                    return left.source_order < right.source_order;
+                });
+            core::NodeId currentParagraph;
+            std::size_t insertedInParagraph = 0;
+            for (const std::size_t imageIndex : imageOrder) {
+                auto& image = images[imageIndex];
+                if (image.paragraph_id != currentParagraph) {
+                    currentParagraph = image.paragraph_id;
+                    insertedInParagraph = 0;
+                }
+                const auto* paragraph =
+                    document.value().findParagraph(image.paragraph_id);
+                if (!paragraph) {
+                    error = "Recovery inline picture references a missing paragraph";
+                    return std::nullopt;
+                }
+                const std::size_t targetOffset =
+                    image.offset + insertedInParagraph;
+                const std::size_t formatOffset =
+                    targetOffset < paragraph->text().size()
+                    ? targetOffset + 1U
+                    : targetOffset;
+                const auto characterFormat =
+                    paragraph->characterFormatAt(formatOffset);
+                const auto inserted = document.value().insertImage(
+                    {image.paragraph_id, targetOffset},
+                    std::move(image.encoded_payload), image.format,
+                    std::move(image.accessible_name), image.width_emu,
+                    image.height_emu, image.image_id, characterFormat);
+                if (!inserted) {
+                    error = inserted.error().message;
+                    return std::nullopt;
+                }
+                ++insertedInParagraph;
             }
         }
 
@@ -844,10 +1515,13 @@ std::optional<RecoveryDocument> RecoveryCodec::decode(std::string_view payload,
                         }
                         const auto encodedRuns = encodedCell.find("runs");
                         if (encodedRuns == encodedCell.end() ||
-                            !encodedRuns->is_array()) {
+                            !encodedRuns->is_array() ||
+                            encodedRuns->size() >
+                                kMaximumFormatRuns - totalFormatRuns) {
                             error = "Recovery table cell format runs are not an array";
                             return std::nullopt;
                         }
+                        totalFormatRuns += encodedRuns->size();
                         cellRuns.reserve(encodedRuns->size());
                         for (const auto& encodedRun : *encodedRuns) {
                             if (!encodedRun.is_object()) {

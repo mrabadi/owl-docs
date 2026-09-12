@@ -5,6 +5,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 
 namespace docxstudio::app {
 
@@ -22,13 +23,17 @@ struct RecoveryPageLayout {
 };
 
 struct RecoveryDocument {
+    RecoveryDocument(core::Document sourceDocument,
+                     RecoveryPageLayout sourcePage)
+        : document(std::move(sourceDocument)), page(sourcePage) {}
+
     core::Document document;
     RecoveryPageLayout page;
 };
 
 class RecoveryCodec final {
 public:
-    static constexpr int currentVersion = 4;
+    static constexpr int currentVersion = 6;
 
     [[nodiscard]] static std::optional<std::string> encode(
         const RecoveryDocument& recovery, std::string& error);

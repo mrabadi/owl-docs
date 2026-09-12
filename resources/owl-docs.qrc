@@ -1,6 +1,5 @@
 <RCC>
   <qresource prefix="/icons">
-    <file alias="owl-docs.svg">../packaging/icons/owl-docs.svg</file>
     <file alias="owl-docs-16.png">../packaging/icons/hicolor/16x16/apps/owl-docs.png</file>
     <file alias="owl-docs-24.png">../packaging/icons/hicolor/24x24/apps/owl-docs.png</file>
     <file alias="owl-docs-32.png">../packaging/icons/hicolor/32x32/apps/owl-docs.png</file>

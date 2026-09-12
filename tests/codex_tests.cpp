@@ -467,7 +467,7 @@ void testDynamicToolRegistrationAndThreadResume() {
         started = true;
     });
     const Json startRequest = writtenMessage(*harness.process, 0);
-    CHECK(startRequest.at("params").at("dynamicTools").size() == 3);
+    CHECK(startRequest.at("params").at("dynamicTools").size() == 4);
     CHECK(startRequest.at("params").at("dynamicTools").at(0).at("name") ==
           docxstudio::codex::kEditorReadTool);
     harness.process->emitStdout(
@@ -492,6 +492,7 @@ void testDynamicToolRegistrationAndThreadResume() {
     CHECK(resumeRequest.at("params").at("threadId") == "thread-persisted");
     CHECK(resumeRequest.at("params").at("excludeTurns") == true);
     CHECK(resumeRequest.at("params").at("sandbox") == "read-only");
+    CHECK(!resumeRequest.at("params").contains("dynamicTools"));
     harness.process->emitStdout(
         Json({{"id", resumeId},
               {"result", {{"thread", {{"id", "thread-persisted"},
@@ -502,24 +503,42 @@ void testDynamicToolRegistrationAndThreadResume() {
 
 void testEditorToolSchemas() {
     const auto definitions = docxstudio::codex::editorV1ToolDefinitions();
-    CHECK(definitions.size() == 3);
+    CHECK(definitions.size() == 4);
     CHECK(definitions[0].name == docxstudio::codex::kEditorReadTool);
-    CHECK(definitions[1].name == docxstudio::codex::kEditorPreviewTool);
-    CHECK(definitions[2].name ==
+    CHECK(definitions[1].name == docxstudio::codex::kEditorSearchTool);
+    CHECK(definitions[2].name == docxstudio::codex::kEditorPreviewTool);
+    CHECK(definitions[3].name ==
           docxstudio::codex::kEditorFileCapabilityTool);
     CHECK(definitions[0].annotations.at("readOnlyHint") == true);
-    CHECK(definitions[1].annotations.at("readOnlyHint") == false);
-    CHECK(definitions[1].outputSchema.at("properties")
+    CHECK(definitions[1].annotations.at("readOnlyHint") == true);
+    CHECK(definitions[2].annotations.at("readOnlyHint") == false);
+    CHECK(definitions[2].outputSchema.at("properties")
               .at("committed")
               .at("const") == false);
     const auto& readScopes = definitions[0].inputSchema.at("properties")
                                  .at("scope").at("enum");
     CHECK(std::find(readScopes.begin(), readScopes.end(), "viewport") ==
           readScopes.end());
-    CHECK(!definitions[2].inputSchema.at("properties").contains("path"));
-    CHECK(definitions[2].inputSchema.at("properties")
+    CHECK(definitions[1].inputSchema.at("required").at(0) == "query");
+    CHECK(definitions[0].inputSchema.at("properties")
+              .contains("tableCellTargets"));
+    const auto& tableCellTarget =
+        definitions[0].inputSchema.at("properties")
+            .at("tableCellTargets").at("items");
+    CHECK(tableCellTarget.at("required").at(0) == "tableId");
+    CHECK(tableCellTarget.at("required").at(1) == "cellId");
+    CHECK(definitions[1].inputSchema.at("properties")
+              .at("maxResults").at("maximum") == 500);
+    CHECK(definitions[1].inputSchema.at("properties")
+              .at("caseSensitive").at("type") == "boolean");
+    CHECK(definitions[1].inputSchema.at("properties")
+              .at("wholeWord").at("type") == "boolean");
+    CHECK(definitions[1].outputSchema.at("properties")
+              .at("results").at("maxItems") == 500);
+    CHECK(!definitions[3].inputSchema.at("properties").contains("path"));
+    CHECK(definitions[3].inputSchema.at("properties")
               .contains("capabilityId"));
-    CHECK(definitions[2].inputSchema.dump().find("filesystem path") !=
+    CHECK(definitions[3].inputSchema.dump().find("filesystem path") !=
           std::string::npos);
 
     const Json dynamicSpec = definitions[0].toDynamicToolSpec();
@@ -530,7 +549,9 @@ void testEditorToolSchemas() {
 
     const Json manifest = docxstudio::codex::editorV1ToolManifest();
     CHECK(manifest.at("schemaVersion") == "editor.v1");
-    CHECK(manifest.at("tools").size() == 3);
+    CHECK(manifest.at("tools").size() == 4);
+    CHECK(!docxstudio::codex::kEditorToolCatalogVersion.empty());
+    CHECK(docxstudio::codex::isEditorV1Tool("editor_v1_search"));
     CHECK(docxstudio::codex::isEditorV1Tool("editor_v1_preview"));
     CHECK(!docxstudio::codex::isEditorV1Tool("filesystem_read"));
 }
