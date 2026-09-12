@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.22)
 
-project(OwlDocs VERSION 0.1.9 LANGUAGES CXX)
+project(OwlDocs VERSION 0.2.0 LANGUAGES CXX)
 
 include(GNUInstallDirs)
 include(CTest)
@@ -41,12 +41,19 @@ target_include_directories(docxstudio_math PUBLIC include)
 target_compile_features(docxstudio_math PUBLIC cxx_std_20)
 docxstudio_warnings(docxstudio_math)
 
+add_library(docxstudio_raster
+    src/raster/validation.cpp
+)
+target_include_directories(docxstudio_raster PUBLIC include)
+target_compile_features(docxstudio_raster PUBLIC cxx_std_20)
+docxstudio_warnings(docxstudio_raster)
+
 pkg_check_modules(LIBZIP REQUIRED IMPORTED_TARGET libzip)
 pkg_check_modules(PUGIXML REQUIRED IMPORTED_TARGET pugixml)
 add_library(docxstudio_ooxml src/ooxml/docx_document.cpp)
 target_include_directories(docxstudio_ooxml PUBLIC include)
 target_link_libraries(docxstudio_ooxml PUBLIC
-    docxstudio_math PkgConfig::LIBZIP PkgConfig::PUGIXML)
+    docxstudio_math docxstudio_raster PkgConfig::LIBZIP PkgConfig::PUGIXML)
 target_compile_features(docxstudio_ooxml PUBLIC cxx_std_20)
 docxstudio_warnings(docxstudio_ooxml)
 
@@ -71,6 +78,24 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 endif()
 
 find_package(nlohmann_json CONFIG REQUIRED)
+
+# Developer-only, transport-neutral DOCX preservation corpus runner. Corpus
+# binaries live outside the source tree; see tests/corpus/README.md.
+add_library(docxstudio_corpus STATIC
+    tools/docx_corpus.cpp
+)
+target_include_directories(docxstudio_corpus PUBLIC tools)
+target_link_libraries(docxstudio_corpus PUBLIC
+    docxstudio_ooxml nlohmann_json::nlohmann_json PkgConfig::LIBZIP)
+target_compile_features(docxstudio_corpus PUBLIC cxx_std_20)
+docxstudio_warnings(docxstudio_corpus)
+
+add_executable(owl-docs-corpus-runner
+    tools/docx_corpus_runner.cpp
+)
+target_link_libraries(owl-docs-corpus-runner PRIVATE docxstudio_corpus)
+docxstudio_warnings(owl-docs-corpus-runner)
+
 add_library(docxstudio_codex
     src/codex/transport.cpp
     src/codex/client.cpp
@@ -89,6 +114,7 @@ if(DOCXSTUDIO_BUILD_APP)
 
     add_library(docxstudio_app STATIC
         src/app/MainWindow.cpp
+        src/app/RasterDecoder.cpp
         src/app/EditorPreferences.cpp
         src/app/FontFamilyPicker.cpp
         src/app/ListPropertiesDialog.cpp
@@ -107,6 +133,7 @@ if(DOCXSTUDIO_BUILD_APP)
         src/app/OwlDocsIcon.cpp
         src/app/MathLayout.cpp
         include/docxstudio/app/MainWindow.h
+        include/docxstudio/app/RasterDecoder.h
         include/docxstudio/app/EditorPreferences.h
         include/docxstudio/app/FontFamilyPicker.h
         include/docxstudio/app/ListPropertiesDialog.h
@@ -125,7 +152,7 @@ if(DOCXSTUDIO_BUILD_APP)
     set_target_properties(docxstudio_app PROPERTIES AUTOMOC ON)
     target_include_directories(docxstudio_app PUBLIC include)
     target_link_libraries(docxstudio_app PUBLIC
-        docxstudio_core docxstudio_math docxstudio_ooxml docxstudio_codex docxstudio_worker
+        docxstudio_core docxstudio_math docxstudio_raster docxstudio_ooxml docxstudio_codex docxstudio_worker
         Qt6::Core Qt6::Gui Qt6::Widgets Qt6::PrintSupport
         SQLite::SQLite3 PkgConfig::HUNSPELL
     )
@@ -168,7 +195,25 @@ if(DOCXSTUDIO_BUILD_APP)
     endforeach()
 endif()
 
+# Ship the exact status, compatibility, privacy, architecture, and corpus
+# evidence documents that qualify this engineering release. Keep the package
+# name stable rather than inheriting CMake's mixed-case project name.
+install(FILES
+        README.md
+        docs/ARCHITECTURE.md
+        docs/COMPATIBILITY.md
+        docs/IMPLEMENTATION_STATUS.md
+        docs/M0_CORPUS_EVIDENCE.md
+        docs/PRIVACY.md
+        DESTINATION "${CMAKE_INSTALL_DATAROOTDIR}/doc/owl-docs")
+
 if(BUILD_TESTING)
+    add_executable(docx_corpus_runner_tests
+        tests/docx_corpus_runner_tests.cpp)
+    target_link_libraries(docx_corpus_runner_tests PRIVATE docxstudio_corpus)
+    docxstudio_warnings(docx_corpus_runner_tests)
+    add_test(NAME docx_corpus_runner_tests COMMAND docx_corpus_runner_tests)
+
     add_executable(core_tests tests/core_tests.cpp)
     target_link_libraries(core_tests PRIVATE docxstudio_core)
     docxstudio_warnings(core_tests)
@@ -200,6 +245,13 @@ if(BUILD_TESTING)
         add_test(NAME ooxml_tests COMMAND ooxml_tests)
     endif()
 
+    add_executable(m0_feature_roundtrip_tests
+        tests/m0_feature_roundtrip_tests.cpp)
+    target_link_libraries(m0_feature_roundtrip_tests PRIVATE docxstudio_ooxml)
+    docxstudio_warnings(m0_feature_roundtrip_tests)
+    add_test(NAME m0_feature_roundtrip_tests
+             COMMAND m0_feature_roundtrip_tests)
+
     if(TARGET docxstudio_worker)
         add_executable(worker_tests tests/worker_tests.cpp)
         target_link_libraries(worker_tests PRIVATE docxstudio_worker)
@@ -211,6 +263,11 @@ if(BUILD_TESTING)
     endif()
 
     if(DOCXSTUDIO_BUILD_APP)
+        add_executable(raster_decode_tests tests/raster_decode_tests.cpp)
+        target_link_libraries(raster_decode_tests PRIVATE docxstudio_app)
+        docxstudio_warnings(raster_decode_tests)
+        add_test(NAME raster_decode_tests COMMAND raster_decode_tests)
+
         add_executable(app_smoke_tests tests/app_smoke_tests.cpp)
         target_link_libraries(app_smoke_tests PRIVATE docxstudio_app)
         docxstudio_warnings(app_smoke_tests)
@@ -327,6 +384,17 @@ if(BUILD_TESTING)
         set_tests_properties(branding_tests PROPERTIES
             ENVIRONMENT "QT_QPA_PLATFORM=offscreen;XDG_DATA_HOME=/tmp/owl-docs-branding-tests")
     endif()
+endif()
+
+set(OWL_DOCS_CORPUS_MANIFEST "" CACHE FILEPATH
+    "Optional external owl-docs-corpus-v1 manifest for the 100+ DOCX gate")
+if(BUILD_TESTING AND OWL_DOCS_CORPUS_MANIFEST)
+    add_test(NAME public_docx_corpus
+        COMMAND owl-docs-corpus-runner
+            --manifest "${OWL_DOCS_CORPUS_MANIFEST}"
+            --ephemeral-output
+            --minimum-fixtures 100)
+    set_tests_properties(public_docx_corpus PROPERTIES TIMEOUT 900)
 endif()
 
 set(CPACK_GENERATOR "DEB")

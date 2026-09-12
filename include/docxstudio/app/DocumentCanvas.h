@@ -30,6 +30,10 @@ class SpellChecker;
 
 struct ImportedInlineImagePresentation {
     core::NodeId paragraphId;
+    // Position in the editor paragraph's UTF-16 text. Images do not become
+    // editable text characters, so several source-ordered pictures may share
+    // one boundary between two characters.
+    std::size_t utf16Offset{0};
     QImage image;
     double widthPoints{0.0};
     double heightPoints{0.0};
@@ -115,6 +119,9 @@ public:
     double marginBottomPoints() const noexcept { return marginBottomPoints_; }
     double marginLeftPoints() const noexcept { return marginLeftPoints_; }
     int pageCount() const;
+    // Monotonic diagnostic for proving that screen, print, and PDF consume
+    // an already-computed pagination result instead of silently repaginating.
+    std::uint64_t layoutGeneration() const;
     int currentPageNumber() const;
 
     void undo();
@@ -276,6 +283,7 @@ private:
         std::optional<core::NodeId> selectedTable;
         std::optional<LineAffinity> lineAffinity;
         std::optional<double> preferredVerticalX;
+        std::vector<ImportedInlineImagePresentation> importedImages;
         double pageWidthPoints;
         double pageHeightPoints;
         double marginTopPoints;
@@ -386,6 +394,7 @@ private:
     mutable bool layoutValid_{false};
     mutable bool layoutIsPreview_{false};
     mutable int pageCount_{1};
+    mutable std::uint64_t layoutGeneration_{0};
     mutable std::vector<std::unique_ptr<ParagraphVisual>> visuals_;
     mutable std::vector<std::unique_ptr<TableVisual>> tableVisuals_;
     mutable std::vector<BlockPlacement> blockPlacements_;
@@ -394,6 +403,7 @@ private:
     std::optional<core::PreviewId> previewId_;
     core::Revision previewRevision_;
     std::optional<core::Position> previewCursor_;
+    std::vector<core::Operation> previewOperations_;
     bool previewHasNonTextChanges_{false};
     QTimer* typingGroupTimer_{nullptr};
     bool typingGroupActive_{false};

@@ -8,6 +8,7 @@
 #include "docxstudio/app/FontFamilyPicker.h"
 #include "docxstudio/app/ListPropertiesDialog.h"
 #include "docxstudio/app/OwlDocsIcon.h"
+#include "docxstudio/app/RasterDecoder.h"
 #include "docxstudio/app/RecoveryCodec.h"
 #include "docxstudio/app/RibbonWidget.h"
 #include "docxstudio/codex/editor_tools.hpp"
@@ -18,7 +19,6 @@
 
 #include <QAction>
 #include <QApplication>
-#include <QBuffer>
 #include <QCheckBox>
 #include <QCloseEvent>
 #include <QColorDialog>
@@ -36,7 +36,6 @@
 #include <QFontMetricsF>
 #include <QInputDialog>
 #include <QIcon>
-#include <QImageReader>
 #include <QKeySequence>
 #include <QLabel>
 #include <QLineEdit>
@@ -125,6 +124,11 @@ struct LiteralListMarker {
     qsizetype prefixLength{};
 };
 
+// WordprocessingML native numbering is limited to ilvl 0 through 8. Owl Docs
+// keeps its tenth editor level, but exports that level as literal marker text
+// with standard hanging-indent/tab geometry.
+constexpr std::size_t kNativeOoxmlListLevelCount = 9;
+
 std::optional<LiteralListMarker> literalListMarker(const QString& text) {
     static const QRegularExpression bulletPattern(
         QStringLiteral(R"(^([ \t]*)([\x{2022}\x{25E6}\x{25AA}\x{2023}*-])([ \t]+))"));
@@ -184,6 +188,43 @@ QFont listMetricFont(const core::CharacterFormat& format,
     font.setBold(format.bold.value_or(false));
     font.setItalic(format.italic.value_or(false));
     return font;
+}
+
+ooxml::BasicRunFormat nativeListMarkerFormat(
+    const ooxml::Paragraph& paragraph) {
+    ooxml::BasicRunFormat result =
+        paragraph.runs.empty() ? ooxml::BasicRunFormat{}
+                               : paragraph.runs.front().format;
+    if (!paragraph.numbering) return result;
+    const auto& marker = paragraph.numbering->marker_format;
+    if (marker.font_family) result.font_family = marker.font_family;
+    if (marker.font_size_half_points) {
+        result.font_size_half_points = marker.font_size_half_points;
+    }
+    if (marker.bold) result.bold = marker.bold;
+    if (marker.italic) result.italic = marker.italic;
+    if (marker.underline) result.underline = marker.underline;
+    if (marker.strike) result.strike = marker.strike;
+    if (marker.foreground_rgb) result.foreground_rgb = marker.foreground_rgb;
+    if (marker.highlight_rgb) result.highlight_rgb = marker.highlight_rgb;
+    if (marker.baseline) result.baseline = marker.baseline;
+    return result;
+}
+
+qreal nativeListSpaceAdvance(
+    const ooxml::Paragraph& paragraph, const QString& defaultFontFamily,
+    double defaultFontPointSize) {
+    const auto format = nativeListMarkerFormat(paragraph);
+    QFont font(QString::fromStdString(
+        format.font_family.value_or(defaultFontFamily.toStdString())));
+    font.setPointSizeF(
+        format.font_size_half_points
+            ? static_cast<double>(*format.font_size_half_points) / 2.0
+            : defaultFontPointSize);
+    font.setBold(format.bold.value_or(false));
+    font.setItalic(format.italic.value_or(false));
+    return std::max<qreal>(
+        0.5, QFontMetricsF(font).horizontalAdvance(QLatin1Char(' ')));
 }
 
 qreal listSpaceAdvance(const core::Paragraph& paragraph,
@@ -375,31 +416,6 @@ core::ParagraphFormat importedTableCellParagraphFormat(
     return result;
 }
 
-QImage decodeImportedRaster(const ooxml::InlineImagePayload& source) {
-    constexpr std::size_t kMaximumEncodedBytes = 64U * 1024U * 1024U;
-    constexpr qint64 kMaximumPixels = 64LL * 1024LL * 1024LL;
-    constexpr int kMaximumDimension = 16'384;
-    if (!source.renderable() || source.bytes.size() > kMaximumEncodedBytes) {
-        return {};
-    }
-    const QByteArray encoded(
-        reinterpret_cast<const char*>(source.bytes.data()),
-        static_cast<qsizetype>(source.bytes.size()));
-    QBuffer buffer;
-    buffer.setData(encoded);
-    if (!buffer.open(QIODevice::ReadOnly)) return {};
-    QImageReader reader(&buffer);
-    reader.setAutoTransform(false);
-    reader.setDecideFormatFromContent(true);
-    const QSize pixels = reader.size();
-    if (!pixels.isValid() || pixels.width() > kMaximumDimension ||
-        pixels.height() > kMaximumDimension ||
-        static_cast<qint64>(pixels.width()) * pixels.height() > kMaximumPixels) {
-        return {};
-    }
-    return reader.read();
-}
-
 std::optional<ImportedCellBorderPresentation> importedBorder(
     const std::optional<ooxml::ImportedTableBorder>& source) {
     if (!source || source->width_eighth_points == 0) return std::nullopt;
@@ -527,9 +543,25 @@ core::Result<core::Document> documentFromOoxmlParagraphs(
         QString text;
         QString semanticPrefix;
         if (source.numbering && !source.numbering->marker_text.empty()) {
-            const auto indentation = static_cast<qsizetype>(
-                source.numbering->level *
-                static_cast<std::uint8_t>(std::max(1, tabWidthSpaces)));
+            auto indentation =
+                static_cast<qsizetype>(source.numbering->level) *
+                static_cast<qsizetype>(std::max(1, tabWidthSpaces));
+            if (source.left_indent_twips &&
+                source.first_line_indent_twips &&
+                *source.first_line_indent_twips < 0) {
+                const auto bulletPosition =
+                    static_cast<std::int64_t>(*source.left_indent_twips) +
+                    *source.first_line_indent_twips;
+                const qreal spaceAdvance = nativeListSpaceAdvance(
+                    source, defaultFontFamily, defaultFontPointSize);
+                const auto estimated = static_cast<int>(std::llround(
+                    static_cast<qreal>(bulletPosition) /
+                    (20.0 * spaceAdvance)));
+                if (estimated >= 0 &&
+                    estimated <= core::kMaximumListIndentSpaces) {
+                    indentation = estimated;
+                }
+            }
             semanticPrefix = QString(indentation, QLatin1Char(' ')) +
                              fromUtf8(source.numbering->marker_text) +
                              QLatin1Char('\t');
@@ -539,28 +571,7 @@ core::Result<core::Document> documentFromOoxmlParagraphs(
         std::size_t finalOffset =
             static_cast<std::size_t>(semanticPrefix.size());
         if (!semanticPrefix.isEmpty()) {
-            ooxml::BasicRunFormat markerFormat =
-                source.runs.empty() ? ooxml::BasicRunFormat{}
-                                    : source.runs.front().format;
-            const auto& numberingFormat = source.numbering->marker_format;
-            if (numberingFormat.font_family)
-                markerFormat.font_family = numberingFormat.font_family;
-            if (numberingFormat.font_size_half_points)
-                markerFormat.font_size_half_points =
-                    numberingFormat.font_size_half_points;
-            if (numberingFormat.bold) markerFormat.bold = numberingFormat.bold;
-            if (numberingFormat.italic)
-                markerFormat.italic = numberingFormat.italic;
-            if (numberingFormat.underline)
-                markerFormat.underline = numberingFormat.underline;
-            if (numberingFormat.strike)
-                markerFormat.strike = numberingFormat.strike;
-            if (numberingFormat.foreground_rgb)
-                markerFormat.foreground_rgb = numberingFormat.foreground_rgb;
-            if (numberingFormat.highlight_rgb)
-                markerFormat.highlight_rgb = numberingFormat.highlight_rgb;
-            if (numberingFormat.baseline)
-                markerFormat.baseline = numberingFormat.baseline;
+            auto markerFormat = nativeListMarkerFormat(source);
             styles.push_back(
                 {paragraphIndex, 0, finalOffset, std::move(markerFormat)});
         }
@@ -699,9 +710,9 @@ core::Result<core::Document> documentFromOoxmlParagraphs(
     std::map<std::pair<std::size_t, std::size_t>, ListMetrics> metrics;
     std::vector<ListGroup> groups;
     std::map<std::int32_t, std::size_t> nativeNumberingGroups;
-    std::optional<LiteralListMarker::Kind> previousKind;
+    LiteralListMarker::Kind previousKind{LiteralListMarker::Kind::bullet};
+    bool hasPreviousKind{false};
     std::optional<std::size_t> currentGroup;
-    bool previousWasNative = false;
     tabWidthSpaces = std::max(1, tabWidthSpaces);
     for (std::size_t index = 0; index < document.paragraphs().size(); ++index) {
         const auto& paragraph = document.paragraphs()[index];
@@ -711,9 +722,8 @@ core::Result<core::Document> documentFromOoxmlParagraphs(
         auto marker = literalListMarker(text);
         markers.push_back(marker);
         if (!marker) {
-            previousKind.reset();
+            hasPreviousKind = false;
             currentGroup.reset();
-            previousWasNative = false;
             continue;
         }
         if (index < sourceParagraphs.size() &&
@@ -723,21 +733,25 @@ core::Result<core::Document> documentFromOoxmlParagraphs(
                 *sourceParagraphs[index].numbering_id, groups.size());
             if (inserted) groups.emplace_back();
             currentGroup = found->second;
-            previousWasNative = true;
-        } else if (previousWasNative || !previousKind ||
-                   *previousKind != marker->kind ||
+        } else if (!hasPreviousKind || previousKind != marker->kind ||
                    !currentGroup) {
             groups.emplace_back();
             currentGroup = groups.size() - 1;
-            previousWasNative = false;
         }
         previousKind = marker->kind;
+        hasPreviousKind = true;
         listGroups[index] = currentGroup;
-        const auto level = std::min<std::size_t>(
-            core::kListLevelCount - 1,
-            static_cast<std::size_t>(
-                indentationColumns(marker->indent, tabWidthSpaces) /
-                tabWidthSpaces));
+        const auto level =
+            index < sourceParagraphs.size() &&
+                    sourceParagraphs[index].numbering
+                ? std::min<std::size_t>(
+                      core::kListLevelCount - 1,
+                      sourceParagraphs[index].numbering->level)
+                : std::min<std::size_t>(
+                      core::kListLevelCount - 1,
+                      static_cast<std::size_t>(
+                          indentationColumns(marker->indent, tabWidthSpaces) /
+                          tabWidthSpaces));
         auto& itemMetrics = metrics[{*currentGroup, level}];
         const auto markerOffset =
             static_cast<std::size_t>(marker->indent.size());
@@ -785,9 +799,13 @@ core::Result<core::Document> documentFromOoxmlParagraphs(
             bulletIndentSpaces > core::kMaximumListIndentSpaces) {
             continue;
         }
-        const auto level = std::min<std::size_t>(
-            core::kListLevelCount - 1,
-            static_cast<std::size_t>(bulletIndentSpaces / tabWidthSpaces));
+        const auto level = source.numbering
+            ? std::min<std::size_t>(
+                  core::kListLevelCount - 1, source.numbering->level)
+            : std::min<std::size_t>(
+                  core::kListLevelCount - 1,
+                  static_cast<std::size_t>(
+                      bulletIndentSpaces / tabWidthSpaces));
         const auto metric = metrics.find({*listGroups[index], level});
         if (metric == metrics.end() || metric->second.spaceAdvance <= 0.0) {
             continue;
@@ -799,10 +817,19 @@ core::Result<core::Document> documentFromOoxmlParagraphs(
         const qreal storedIndentWidth = listTextAdvance(
             paragraph, 0, marker.indent, defaultFontFamily,
             defaultFontPointSize);
-        const auto baseLeft =
+        std::int64_t baseLeft =
             static_cast<std::int64_t>(*source.left_indent_twips) +
-            static_cast<std::int64_t>(*source.first_line_indent_twips) +
-            std::llround((storedIndentWidth - bulletOffset) * 20.0);
+            static_cast<std::int64_t>(*source.first_line_indent_twips);
+        if (source.numbering) {
+            // A native numbering marker is generated at left - hanging; its
+            // leading spaces exist only in the editor's semantic facade.
+            baseLeft -= std::llround(bulletOffset * 20.0);
+            if (std::abs(baseLeft) <= 2) baseLeft = 0;
+        } else {
+            // Literal-marker DOCX text physically contains its indentation.
+            baseLeft +=
+                std::llround((storedIndentWidth - bulletOffset) * 20.0);
+        }
         const auto textOffsetTwips =
             static_cast<std::int64_t>(*tab) - baseLeft;
         const qreal gapWidth =
@@ -820,8 +847,11 @@ core::Result<core::Document> documentFromOoxmlParagraphs(
             bulletOffset + metric->second.maximumMarkerWidth +
             static_cast<qreal>(textIndentSpaces) *
                 metric->second.spaceAdvance;
+        // Converting arbitrary OOXML twips to integer space equivalents
+        // necessarily rounds by as much as half a space. Allow that bounded
+        // quantization while still rejecting unrelated hanging-indent text.
         const qreal tolerance =
-            std::max<qreal>(0.15, metric->second.spaceAdvance * 0.2);
+            std::max<qreal>(0.15, metric->second.spaceAdvance * 0.55);
         if (std::abs(static_cast<qreal>(textOffsetTwips) / 20.0 -
                      expectedTextOffset) > tolerance ||
             *tab == 0 || *tab > kMaximumTabStopTwips) {
@@ -1028,32 +1058,75 @@ core::Result<ImportedSemanticDocument> documentFromOoxml(
 
     std::vector<std::optional<core::NodeId>> sourceToCore(
         sourceParagraphs.size());
+    std::vector<std::optional<std::size_t>> sourceToSemanticIndex(
+        sourceParagraphs.size());
     for (std::size_t index = 0;
          index < sourceIndices.size() && index < document.paragraphs().size();
          ++index) {
         if (sourceIndices[index] < sourceToCore.size()) {
             sourceToCore[sourceIndices[index]] =
                 document.paragraphs()[index].id();
+            sourceToSemanticIndex[sourceIndices[index]] = index;
         }
     }
     std::vector<ImportedInlineImagePresentation> imagePresentations;
+    BoundedRasterCache imageCache;
     for (std::size_t sourceIndex = 0; sourceIndex < sourceToCore.size();
          ++sourceIndex) {
-        if (!sourceToCore[sourceIndex]) continue;
+        if (!sourceToCore[sourceIndex] ||
+            !sourceToSemanticIndex[sourceIndex]) {
+            continue;
+        }
+        const auto semanticIndex = *sourceToSemanticIndex[sourceIndex];
+        std::size_t semanticOffset = semanticIndex <
+                static_cast<std::size_t>(sourceTextPrefixes.size())
+            ? static_cast<std::size_t>(
+                  sourceTextPrefixes[static_cast<qsizetype>(semanticIndex)]
+                      .size())
+            : 0U;
         for (const auto& run : sourceParagraphs[sourceIndex].runs) {
             for (const auto& fragment : run.fragments) {
-                if (fragment.kind != ooxml::FragmentKind::inline_image ||
-                    !fragment.inline_image) {
-                    continue;
+                switch (fragment.kind) {
+                    case ooxml::FragmentKind::text: {
+                        QString fragmentText = fromUtf8(fragment.text);
+                        fragmentText.replace(QStringLiteral("\r\n"),
+                                             QStringLiteral("\n"));
+                        fragmentText.replace(QLatin1Char('\r'),
+                                             QLatin1Char('\n'));
+                        fragmentText.replace(QLatin1Char('\n'),
+                                             QChar::LineSeparator);
+                        semanticOffset += static_cast<std::size_t>(
+                            fragmentText.size());
+                        break;
+                    }
+                    case ooxml::FragmentKind::tab:
+                    case ooxml::FragmentKind::line_break:
+                        ++semanticOffset;
+                        break;
+                    case ooxml::FragmentKind::equation:
+                        if (fragment.equation) ++semanticOffset;
+                        break;
+                    case ooxml::FragmentKind::inline_image: {
+                        if (!fragment.inline_image) break;
+                        const auto& sourceImage = *fragment.inline_image;
+                        if (!sourceImage.renderable()) break;
+                        auto decoded = imageCache.decode(
+                            sourceImage.package_member,
+                            sourceImage.bytes.view());
+                        if (!decoded.ok()) break;
+                        imagePresentations.push_back({
+                            *sourceToCore[sourceIndex], semanticOffset,
+                            std::move(decoded.image),
+                            static_cast<double>(sourceImage.width_emu) /
+                                12'700.0,
+                            static_cast<double>(sourceImage.height_emu) /
+                                12'700.0,
+                            fromUtf8(sourceImage.name)});
+                        break;
+                    }
+                    case ooxml::FragmentKind::page_break:
+                        break;
                 }
-                const auto& sourceImage = *fragment.inline_image;
-                QImage image = decodeImportedRaster(sourceImage);
-                if (image.isNull()) continue;
-                imagePresentations.push_back({
-                    *sourceToCore[sourceIndex], std::move(image),
-                    static_cast<double>(sourceImage.width_emu) / 12'700.0,
-                    static_cast<double>(sourceImage.height_emu) / 12'700.0,
-                    fromUtf8(sourceImage.name)});
             }
         }
     }
@@ -1370,19 +1443,103 @@ ooxml::DocumentDefaults toOoxmlDocumentDefaults(
     return defaults;
 }
 
+ooxml::BasicNumberFormat ooxmlNumberFormatForLevel(std::size_t level) {
+    switch (level % 5U) {
+        case 0: return ooxml::BasicNumberFormat::decimal;
+        case 1: return ooxml::BasicNumberFormat::upper_letter;
+        case 2: return ooxml::BasicNumberFormat::upper_roman;
+        case 3: return ooxml::BasicNumberFormat::lower_letter;
+        default: return ooxml::BasicNumberFormat::lower_roman;
+    }
+}
+
+std::optional<std::int32_t> listMarkerStart(
+    const QString& marker, ooxml::BasicNumberFormat format) {
+    if (marker.size() < 2) return std::nullopt;
+    const QString value = marker.first(marker.size() - 1);
+    bool valid = false;
+    qulonglong ordinal = 0;
+    if (format == ooxml::BasicNumberFormat::decimal) {
+        ordinal = value.toULongLong(&valid);
+    } else if (format == ooxml::BasicNumberFormat::upper_letter ||
+               format == ooxml::BasicNumberFormat::lower_letter) {
+        valid = !value.isEmpty();
+        const bool upper =
+            format == ooxml::BasicNumberFormat::upper_letter;
+        for (const QChar character : value) {
+            const ushort first = upper ? static_cast<ushort>('A')
+                                       : static_cast<ushort>('a');
+            const ushort last = upper ? static_cast<ushort>('Z')
+                                      : static_cast<ushort>('z');
+            const ushort code = character.unicode();
+            if (code < first || code > last ||
+                ordinal > (std::numeric_limits<qulonglong>::max() - 26U) /
+                              26U) {
+                valid = false;
+                break;
+            }
+            ordinal = ordinal * 26U +
+                      static_cast<qulonglong>(code - first) + 1U;
+        }
+    } else if (format == ooxml::BasicNumberFormat::upper_roman ||
+               format == ooxml::BasicNumberFormat::lower_roman) {
+        const QString upperValue = value.toUpper();
+        const auto romanValue = [](QChar character) -> unsigned int {
+            switch (character.unicode()) {
+                case 'I': return 1;
+                case 'V': return 5;
+                case 'X': return 10;
+                case 'L': return 50;
+                case 'C': return 100;
+                case 'D': return 500;
+                case 'M': return 1000;
+                default: return 0;
+            }
+        };
+        valid = !upperValue.isEmpty();
+        for (qsizetype index = 0; valid && index < upperValue.size(); ++index) {
+            const unsigned int current = romanValue(upperValue.at(index));
+            const unsigned int next = index + 1 < upperValue.size()
+                ? romanValue(upperValue.at(index + 1))
+                : 0U;
+            if (current == 0U) {
+                valid = false;
+            } else if (current < next) {
+                ordinal += static_cast<qulonglong>(next - current);
+                ++index;
+            } else {
+                ordinal += current;
+            }
+        }
+    }
+    if (!valid || ordinal == 0 ||
+        ordinal > static_cast<qulonglong>(
+                      std::numeric_limits<std::int32_t>::max())) {
+        return std::nullopt;
+    }
+    return static_cast<std::int32_t>(ordinal);
+}
+
 std::vector<ooxml::NewParagraph> toOoxmlParagraphs(
     const core::DocumentSnapshot& snapshot, QStringList& losses,
     const QString& defaultFontFamily, double defaultFontPointSize) {
     struct ExportListMetrics {
         qreal maximumMarkerWidth{};
         qreal spaceAdvance{};
+        std::int32_t start{1};
+        bool hasStart{false};
     };
     using ExportListKey = std::pair<core::NodeId, std::uint8_t>;
     std::map<ExportListKey, ExportListMetrics> listMetrics;
+    std::map<core::NodeId, std::int32_t> nativeListIds;
+    std::int32_t nextNativeListId = 1;
     for (const auto& paragraph : snapshot.document.paragraphs()) {
         const auto& format = paragraph.format();
         if (!format.list_id || !format.list_level || !format.list_layout) {
             continue;
+        }
+        if (!nativeListIds.contains(*format.list_id)) {
+            nativeListIds.emplace(*format.list_id, nextNativeListId++);
         }
         const auto marker = literalListMarker(QString::fromUtf16(
             paragraph.text().data(),
@@ -1390,6 +1547,14 @@ std::vector<ooxml::NewParagraph> toOoxmlParagraphs(
         if (!marker) continue;
         auto& itemMetrics =
             listMetrics[{*format.list_id, *format.list_level}];
+        if (!itemMetrics.hasStart &&
+            marker->kind == LiteralListMarker::Kind::numbered) {
+            const auto start = listMarkerStart(
+                marker->marker,
+                ooxmlNumberFormatForLevel(*format.list_level));
+            if (start) itemMetrics.start = *start;
+            itemMetrics.hasStart = true;
+        }
         itemMetrics.maximumMarkerWidth = std::max(
             itemMetrics.maximumMarkerWidth,
             listTextAdvance(
@@ -1487,20 +1652,17 @@ std::vector<ooxml::NewParagraph> toOoxmlParagraphs(
                     bulletOffset + metric->second.maximumMarkerWidth +
                     static_cast<qreal>(levelLayout.text_indent_spaces) *
                         metric->second.spaceAdvance;
-                const auto markerOffset =
-                    static_cast<std::size_t>(marker->indent.size());
-                const qreal storedSpaceAdvance = listSpaceAdvance(
-                    paragraph, markerOffset + 1, defaultFontFamily,
-                    defaultFontPointSize);
-                const qreal storedIndentWidth =
-                    static_cast<qreal>(levelLayout.bullet_indent_spaces) *
-                    storedSpaceAdvance;
+                const bool nativeNumberingLevel =
+                    level < kNativeOoxmlListLevelCount;
                 const std::int64_t baseLeft =
                     out.left_indent_twips.value_or(0);
                 const std::int64_t left =
                     baseLeft + std::llround(textOffset * 20.0);
                 const std::int64_t hanging = std::llround(
-                    (textOffset - bulletOffset + storedIndentWidth) * 20.0);
+                    (nativeNumberingLevel
+                         ? textOffset - bulletOffset
+                         : textOffset) *
+                    20.0);
                 if (left > 0 && left <= 31'680 && hanging > 0 &&
                     hanging <= std::numeric_limits<std::int32_t>::max() &&
                     left <= std::numeric_limits<std::int32_t>::max()) {
@@ -1509,8 +1671,43 @@ std::vector<ooxml::NewParagraph> toOoxmlParagraphs(
                         -static_cast<std::int32_t>(hanging);
                     out.left_tab_stops_twips = {
                         static_cast<std::uint32_t>(left)};
-                    normalizedListIndent =
-                        levelLayout.bullet_indent_spaces;
+                    if (nativeNumberingLevel) {
+                        normalizedListIndent =
+                            levelLayout.bullet_indent_spaces;
+                        ooxml::NewNumbering numbering;
+                        numbering.num_id = nativeListIds.at(*format.list_id);
+                        numbering.level = *format.list_level;
+                        numbering.start = metric->second.start;
+                        numbering.text_indent_twips =
+                            static_cast<std::uint32_t>(left);
+                        numbering.hanging_indent_twips =
+                            static_cast<std::uint32_t>(hanging);
+                        numbering.tab_stop_twips =
+                            static_cast<std::uint32_t>(left);
+                        if (marker->kind == LiteralListMarker::Kind::bullet) {
+                            numbering.format =
+                                ooxml::BasicNumberFormat::bullet;
+                            numbering.level_text =
+                                marker->marker.toUtf8().toStdString();
+                        } else {
+                            numbering.format =
+                                ooxmlNumberFormatForLevel(level);
+                            const QChar delimiter = marker->marker.isEmpty()
+                                ? QLatin1Char('.')
+                                : marker->marker.back();
+                            numbering.level_text =
+                                (QStringLiteral("%") +
+                                 QString::number(level + 1U) + delimiter)
+                                    .toUtf8()
+                                    .toStdString();
+                        }
+                        out.numbering = std::move(numbering);
+                        // Numbering-level geometry is authoritative in
+                        // numbering.xml. Direct pPr ind/tabs would override it.
+                        out.left_indent_twips.reset();
+                        out.first_line_indent_twips.reset();
+                        out.left_tab_stops_twips.clear();
+                    }
                 } else {
                     losses.push_back(QObject::tr(
                         "A list text stop exceeds the DOCX paragraph range"));
@@ -1521,27 +1718,12 @@ std::vector<ooxml::NewParagraph> toOoxmlParagraphs(
         QString serializedText = paragraphText;
         std::vector<std::size_t> sourceOffsets;
         sourceOffsets.reserve(static_cast<std::size_t>(serializedText.size()));
-        if (normalizedListIndent && marker) {
+        if (normalizedListIndent && marker && out.numbering) {
             serializedText.clear();
-            const auto markerOffset =
-                static_cast<std::size_t>(marker->indent.size());
-            const auto markerLength =
-                static_cast<std::size_t>(marker->marker.size());
             const auto prefixLength =
                 static_cast<std::size_t>(marker->prefixLength);
             serializedText.reserve(
-                *normalizedListIndent + marker->marker.size() + 1 +
                 paragraphText.size() - marker->prefixLength);
-            for (int index = 0; index < *normalizedListIndent; ++index) {
-                serializedText += QLatin1Char(' ');
-                sourceOffsets.push_back(markerOffset);
-            }
-            serializedText += marker->marker;
-            for (std::size_t index = 0; index < markerLength; ++index) {
-                sourceOffsets.push_back(markerOffset + index);
-            }
-            serializedText += QLatin1Char('\t');
-            sourceOffsets.push_back(markerOffset + markerLength);
             serializedText += paragraphText.mid(marker->prefixLength);
             for (std::size_t index = prefixLength; index < text.size();
                  ++index) {

@@ -442,7 +442,7 @@ void testEditedTableFormattingSurvivesSaveAndReopen() {
           "the reopened empty cell did not retain formatting for later typing");
 }
 
-void testLiteralListGeometrySurvivesSaveAndReopen() {
+void testNativeListGeometrySurvivesSaveAndReopen() {
     namespace core = docxstudio::core;
     namespace ooxml = docxstudio::ooxml;
 
@@ -473,7 +473,7 @@ void testLiteralListGeometrySurvivesSaveAndReopen() {
 
     QTemporaryDir output;
     check(output.isValid(), "could not create list DOCX test directory");
-    const QString path = output.filePath(QStringLiteral("literal-list.docx"));
+    const QString path = output.filePath(QStringLiteral("native-list.docx"));
     auto* saveAs = window.findChild<QAction*>(QStringLiteral("file.saveAs"));
     check(saveAs != nullptr, "could not reach Save As for the list document");
     bool selectedDestination = false;
@@ -487,7 +487,7 @@ void testLiteralListGeometrySurvivesSaveAndReopen() {
     });
     saveAs->trigger();
     check(selectedDestination && QFileInfo::exists(path),
-          "literal list document was not saved");
+          "native list document was not saved");
 
     ooxml::Error error;
     auto package = ooxml::DocxDocument::open(
@@ -506,21 +506,41 @@ void testLiteralListGeometrySurvivesSaveAndReopen() {
                       *paragraph.left_indent_twips,
               "saved list paragraph lacks a matching text tab and hanging indent");
     }
-    check(package->paragraphs()[0].plainText() == "  9.\talpha" &&
-              package->paragraphs()[1].plainText() ==
-                  "       A.\tbeta wraps onto another visual line",
-          "list save changed the literal level marker or separator");
+    const auto& firstPackageParagraph = package->paragraphs()[0];
+    const auto& secondPackageParagraph = package->paragraphs()[1];
+    check(firstPackageParagraph.plainText() == "alpha" &&
+              secondPackageParagraph.plainText() ==
+                  "beta wraps onto another visual line",
+          "native list markers were duplicated into paragraph text");
+    check(firstPackageParagraph.numbering && secondPackageParagraph.numbering &&
+              firstPackageParagraph.numbering->num_id ==
+                  secondPackageParagraph.numbering->num_id &&
+              firstPackageParagraph.numbering->level == 0 &&
+              secondPackageParagraph.numbering->level == 1 &&
+              firstPackageParagraph.numbering->marker_text == "9." &&
+              secondPackageParagraph.numbering->marker_text == "A.",
+          "native list identity, level, start, or marker was not recovered");
 
     const QByteArray xml = zipMember(path, "word/document.xml");
-    check(xml.count("<w:tabs>") == 2 &&
-              xml.count("w:val=\"left\"") == 2 &&
-              xml.count("w:hanging=") == 2 &&
-              xml.count("<w:tab/>") == 2,
-          "list DOCX does not contain two explicit semantic text stops");
+    check(xml.count("<w:numPr>") == 2 &&
+              xml.count("<w:ilvl ") == 2 &&
+              xml.count("<w:numId ") == 2 &&
+              xml.count("<w:tab/>") == 0,
+          "list DOCX does not attach native numPr semantics to each paragraph");
+    const QByteArray numbering = zipMember(path, "word/numbering.xml");
+    check(numbering.count("<w:lvl ") == 2 &&
+              numbering.contains("<w:start w:val=\"9\"/>") &&
+              numbering.contains("<w:numFmt w:val=\"decimal\"/>") &&
+              numbering.contains("<w:numFmt w:val=\"upperLetter\"/>") &&
+              numbering.contains("<w:lvlText w:val=\"%1.\"/>") &&
+              numbering.contains("<w:lvlText w:val=\"%2.\"/>") &&
+              numbering.count("w:val=\"num\"") == 2 &&
+              numbering.count("w:hanging=") == 2,
+          "numbering.xml lacks the list formats, starts, or level geometry");
 
     docxstudio::app::MainWindow reopened;
     check(reopened.openPath(path),
-          "Owl Docs could not reopen its literal-list DOCX");
+          "Owl Docs could not reopen its native-list DOCX");
     auto* imported = listCanvas(reopened, QStringLiteral("beta wraps"));
     check(imported != nullptr, "reopened list was not mapped to the editor");
     snapshot = imported->snapshot();
@@ -531,7 +551,7 @@ void testLiteralListGeometrySurvivesSaveAndReopen() {
     check(fromUtf16(first.text()) == QStringLiteral("  9.\talpha") &&
               fromUtf16(second.text()) ==
                   QStringLiteral("       A.\tbeta wraps onto another visual line"),
-          "reopening added or removed literal list indentation");
+          "reopening native numbering changed the editor list presentation");
     check(first.format().list_id && second.format().list_id &&
               first.format().list_id == second.format().list_id &&
               first.format().list_level == 0 &&
@@ -647,23 +667,66 @@ void testNumberedLevelStylesSurviveSaveAndReopen() {
                                 : error.message.c_str());
     check(package->paragraphs().size() == expectedTexts.size(),
           "saved numbered-level package has the wrong paragraph count");
+    constexpr std::size_t kNativeLevelCount = 9;
     for (std::size_t index = 0; index < expectedTexts.size(); ++index) {
-        check(QString::fromUtf8(package->paragraphs()[index].plainText()) ==
-                  expectedTexts[index],
-              "saving changed a level-dependent numbered marker");
-        check(package->paragraphs()[index].left_indent_twips.has_value() &&
-                  package->paragraphs()[index]
-                          .first_line_indent_twips.value_or(0) < 0 &&
-                  package->paragraphs()[index].left_tab_stops_twips.size() == 1,
-              "a level-dependent numbered item lost its DOCX text stop");
+        const auto& importedParagraph = package->paragraphs()[index];
+        const QString expectedBody =
+            QStringLiteral("level %1 item %2")
+                .arg(paragraphLevels[index] + 1U)
+                .arg((index % kItemsPerLevel) + 1U);
+        const bool nativeLevel =
+            paragraphLevels[index] < kNativeLevelCount;
+        check(QString::fromUtf8(importedParagraph.plainText()) ==
+                  (nativeLevel ? expectedBody : expectedTexts[index]),
+              "saving changed native or tenth-level fallback text");
+        if (nativeLevel) {
+            const QString importedMarker = importedParagraph.numbering
+                ? QString::fromUtf8(importedParagraph.numbering->marker_text)
+                : QString{};
+            const QString expectedMarker =
+                markers[paragraphLevels[index]][index % kItemsPerLevel];
+            check(importedParagraph.numbering.has_value() &&
+                      importedMarker == expectedMarker &&
+                      importedParagraph.numbering->level ==
+                          paragraphLevels[index],
+                  "saving changed a native level-dependent numbered marker");
+        } else {
+            check(!importedParagraph.numbering.has_value(),
+                  "the tenth editor level was emitted as invalid native numbering");
+        }
+        check(importedParagraph.left_indent_twips.has_value() &&
+                  importedParagraph.first_line_indent_twips.value_or(0) < 0 &&
+                  importedParagraph.left_tab_stops_twips.size() == 1 &&
+                  static_cast<std::int64_t>(
+                      importedParagraph.left_tab_stops_twips.front()) ==
+                      *importedParagraph.left_indent_twips,
+              "a native numbered item lost its level text geometry");
+        if (nativeLevel && index > 0) {
+            check(importedParagraph.numbering->num_id ==
+                      package->paragraphs()[0].numbering->num_id,
+                  "one numbered list was serialized as multiple numId values");
+        }
     }
 
     const QByteArray xml = zipMember(path, "word/document.xml");
-    check(xml.count("<w:tabs>") ==
-                  static_cast<qsizetype>(expectedTexts.size()) &&
+    check(xml.count("<w:numPr>") ==
+                  static_cast<qsizetype>(kNativeLevelCount * kItemsPerLevel) &&
               xml.count("<w:tab/>") ==
-                  static_cast<qsizetype>(expectedTexts.size()),
-          "numbered-level DOCX did not retain every semantic text stop");
+                  static_cast<qsizetype>(kItemsPerLevel) &&
+              !xml.contains("w:ilvl=\"9\"") && !xml.contains("%10"),
+          "numbered-level DOCX did not use the standards-valid tenth-level fallback");
+    const QByteArray numbering = zipMember(path, "word/numbering.xml");
+    check(numbering.count("<w:lvl ") ==
+                  static_cast<qsizetype>(kNativeLevelCount) &&
+              numbering.count("<w:num w:numId=") == 1 &&
+              numbering.count("<w:numFmt w:val=\"decimal\"/>") == 2 &&
+              numbering.count("<w:numFmt w:val=\"upperLetter\"/>") == 2 &&
+              numbering.count("<w:numFmt w:val=\"upperRoman\"/>") == 2 &&
+              numbering.count("<w:numFmt w:val=\"lowerLetter\"/>") == 2 &&
+              numbering.count("<w:numFmt w:val=\"lowerRoman\"/>") == 1 &&
+              !numbering.contains("w:ilvl=\"9\"") &&
+              !numbering.contains("%10"),
+          "numbering.xml exceeded the nine-level native format limit");
 
     docxstudio::app::MainWindow reopened;
     check(reopened.openPath(path),
@@ -700,7 +763,7 @@ int main(int argc, char** argv) {
     testCombinedNativeReopenKeepsSemanticOrder();
     testTableOnlyImportUsesTrailingEditSurface();
     testEditedTableFormattingSurvivesSaveAndReopen();
-    testLiteralListGeometrySurvivesSaveAndReopen();
+    testNativeListGeometrySurvivesSaveAndReopen();
     testNumberedLevelStylesSurviveSaveAndReopen();
     std::cout << "combined DOCX round-trip tests passed\n";
     return 0;

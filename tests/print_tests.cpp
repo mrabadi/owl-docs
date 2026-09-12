@@ -80,7 +80,12 @@ docxstudio::core::Document softPaginatedDocument(int paragraphCount) {
 
 std::optional<QString> runPdfTool(const QString& executable,
                                   const QStringList& arguments) {
-    const QString program = QStandardPaths::findExecutable(executable);
+    QString program = QStandardPaths::findExecutable(
+        executable,
+        {QStringLiteral("/usr/bin"), QStringLiteral("/bin")});
+    if (program.isEmpty()) {
+        program = QStandardPaths::findExecutable(executable);
+    }
     if (program.isEmpty()) return std::nullopt;
     QProcess process;
     process.start(program, arguments);
@@ -138,6 +143,10 @@ int main(int argc, char** argv) {
     QApplication application(argc, argv);
     QCoreApplication::setOrganizationName(QStringLiteral("OwlDocsTests"));
     QCoreApplication::setApplicationName(QStringLiteral("PrintTests"));
+    check(QFileInfo::exists(QStringLiteral("/usr/bin/pdfinfo")),
+          "pdfinfo is required for pagination conformance tests");
+    check(QFileInfo::exists(QStringLiteral("/usr/bin/pdftotext")),
+          "pdftotext is required for searchable-PDF conformance tests");
 
     docxstudio::app::SpellChecker spelling;
     docxstudio::app::DocumentCanvas canvas(spelling);
@@ -213,27 +222,30 @@ int main(int argc, char** argv) {
 
     const QString flowPdfPath =
         output.filePath(QStringLiteral("shared-soft-pagination.pdf"));
+    const std::uint64_t layoutGenerationBeforeExport =
+        flowCanvas.layoutGeneration();
     error.clear();
     check(flowCanvas.exportPdf(flowPdfPath, error),
           "soft-paginated PDF export failed");
+    check(flowCanvas.layoutGeneration() == layoutGenerationBeforeExport,
+          "PDF export rebuilt pagination instead of consuming the screen layout");
     checkPdfHeader(flowPdfPath);
-    if (const auto count = pdfPageCount(flowPdfPath)) {
-        check(*count == flowPageCount,
-              "exported PDF page count diverged from canvas pagination");
-    }
-    if (!QStandardPaths::findExecutable(QStringLiteral("pdftotext")).isEmpty()) {
-        for (int page = 1; page <= flowPageCount; ++page) {
-            const auto pageText = pdfPageText(flowPdfPath, page);
-            check(pageText.has_value(),
-                  "could not extract one page of the shared-pagination PDF");
-            for (int index = 0; index < kFlowParagraphCount; ++index) {
-                const bool exportedOnPage =
-                    pageText->contains(flowMarker(index));
-                const bool canvasAssignedToPage =
-                    markerPages[static_cast<std::size_t>(index)] == page;
-                check(exportedOnPage == canvasAssignedToPage,
-                      "screen and PDF assigned a flow marker to different pages");
-            }
+    const auto exportedPageCount = pdfPageCount(flowPdfPath);
+    check(exportedPageCount.has_value(),
+          "pdfinfo could not read the shared-pagination PDF");
+    check(*exportedPageCount == flowPageCount,
+          "exported PDF page count diverged from canvas pagination");
+    for (int page = 1; page <= flowPageCount; ++page) {
+        const auto pageText = pdfPageText(flowPdfPath, page);
+        check(pageText.has_value(),
+              "could not extract one page of the shared-pagination PDF");
+        for (int index = 0; index < kFlowParagraphCount; ++index) {
+            const bool exportedOnPage =
+                pageText->contains(flowMarker(index));
+            const bool canvasAssignedToPage =
+                markerPages[static_cast<std::size_t>(index)] == page;
+            check(exportedOnPage == canvasAssignedToPage,
+                  "screen and PDF assigned a flow marker to different pages");
         }
     }
 

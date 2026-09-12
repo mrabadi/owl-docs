@@ -33,6 +33,18 @@ constexpr int kChildOutputDescriptor = 4;
 constexpr int kRelocatedDescriptorMinimum = 64;
 constexpr auto kMaximumTimeout = std::chrono::hours(24);
 
+#if defined(__SANITIZE_ADDRESS__)
+constexpr bool kAddressSanitizerBuild = true;
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer)
+constexpr bool kAddressSanitizerBuild = true;
+#else
+constexpr bool kAddressSanitizerBuild = false;
+#endif
+#else
+constexpr bool kAddressSanitizerBuild = false;
+#endif
+
 class UniqueDescriptor {
 public:
     UniqueDescriptor() = default;
@@ -508,6 +520,16 @@ ParserClientResult parseValidatedDescriptor(
     std::array<char*, 4> arguments{
         helper_path.data(), input_argument.data(), output_argument.data(), nullptr};
     std::array<char*, 1> empty_environment{nullptr};
+    // LeakSanitizer cannot inspect a child after the worker deliberately sets
+    // PR_SET_DUMPABLE to zero. Keep the production environment empty, while
+    // giving instrumented test helpers one controlled option that disables
+    // only the incompatible exit-time leak pass. ASan and UBSan remain active
+    // while the parser handles the document inside its normal seccomp policy.
+    char sanitizer_option[] = "ASAN_OPTIONS=detect_leaks=0";
+    std::array<char*, 2> sanitizer_environment{sanitizer_option, nullptr};
+    char* const* child_environment = kAddressSanitizerBuild
+        ? sanitizer_environment.data()
+        : empty_environment.data();
     pid_t process_id = -1;
     const auto deadline = std::chrono::steady_clock::now() + options.timeout;
     const int spawn_error = ::posix_spawn(
@@ -516,7 +538,7 @@ ParserClientResult parseValidatedDescriptor(
         actions.get(),
         attributes.get(),
         arguments.data(),
-        empty_environment.data());
+        child_environment);
     if (spawn_error != 0) {
         result.status = ParserClientStatus::spawn_failed;
         result.native_error = spawn_error;

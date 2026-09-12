@@ -6,7 +6,7 @@
 #include <QFont>
 
 #ifndef DOCXSTUDIO_VERSION
-#define DOCXSTUDIO_VERSION "0.1.9-dev"
+#define DOCXSTUDIO_VERSION "0.2.0-dev"
 #endif
 
 int main(int argc, char** argv) {

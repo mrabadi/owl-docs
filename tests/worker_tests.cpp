@@ -573,6 +573,63 @@ ParserClientOptions clientOptions(
     return options;
 }
 
+void checkSandboxedFuzzResult(const std::filesystem::path& path) {
+    const auto result = docxstudio::worker::parseDocxFileWithWorker(
+        path, clientOptions(parserWorkerPath(), std::chrono::seconds(2)));
+    check(result.transportOk(),
+          result.error.empty() ? "sandboxed fuzz worker transport failed"
+                               : result.error);
+    check(result.worker_exit.available && result.worker_exit.exited &&
+              result.worker_exit.exit_code == 0,
+          "sandboxed fuzz worker did not exit cleanly");
+    const auto status = static_cast<std::uint16_t>(result.response.status);
+    check(status <= static_cast<std::uint16_t>(ParserStatus::internal_error),
+          "sandboxed fuzz worker returned an invalid parser status");
+    check(result.response.error.size() <= 1024,
+          "sandboxed fuzz worker returned an unbounded diagnostic");
+    check(result.response.paragraphs.size() <= 2,
+          "sandboxed fuzz worker returned unbounded paragraph output");
+}
+
+void testMalformedInputsThroughSandboxedChild(
+    const TemporaryDirectory& temporary) {
+    const auto malformed_xml = temporary.file("sandboxed-malformed-xml.docx");
+    createDocxWithDocument(
+        malformed_xml,
+        "<w:document xmlns:w=\"http://schemas.openxmlformats.org/"
+        "wordprocessingml/2006/main\"><w:body><w:p></w:body></w:document>");
+    checkSandboxedFuzzResult(malformed_xml);
+
+    const auto seed_path = temporary.file("sandboxed-zip-seed.docx");
+    createDocx(seed_path);
+    const auto seed = readBytes(seed_path);
+    const std::array<std::size_t, 6> truncation_sizes{
+        0, 1, 4, 22, seed.size() / 2, seed.size() - 1};
+    for (std::size_t index = 0; index < truncation_sizes.size(); ++index) {
+        const auto path = temporary.file(
+            "sandboxed-zip-truncation-" + std::to_string(index) + ".docx");
+        writeBytes(path, std::vector<std::uint8_t>(
+                             seed.begin(),
+                             seed.begin() + static_cast<std::ptrdiff_t>(
+                                                truncation_sizes[index])));
+        checkSandboxedFuzzResult(path);
+    }
+
+    std::uint32_t state = 0x53414e44U;
+    for (std::size_t index = 0; index < 16; ++index) {
+        state = state * 1664525U + 1013904223U;
+        auto mutated = seed;
+        const std::size_t offset =
+            static_cast<std::size_t>(state) % mutated.size();
+        mutated[offset] ^= static_cast<std::uint8_t>(
+            1U << static_cast<unsigned>((state >> 24U) & 7U));
+        const auto path = temporary.file(
+            "sandboxed-zip-mutation-" + std::to_string(index) + ".docx");
+        writeBytes(path, mutated);
+        checkSandboxedFuzzResult(path);
+    }
+}
+
 void testSpawnedParserClient(const TemporaryDirectory& temporary) {
     const std::filesystem::path helper = parserWorkerPath();
     check(std::filesystem::exists(helper), "built parser helper is missing");
@@ -714,6 +771,7 @@ int main(int argc, char** argv) {
         testWorkerPackageAndMediaLimits(temporary);
         testMalformedPackageAndXml(temporary);
         testDeterministicZipFuzzSmoke(temporary);
+        testMalformedInputsThroughSandboxedChild(temporary);
         testSpawnedParserClient(temporary);
         testDescriptorClientDoesNotNeedDocumentPath(temporary);
         testClientTimeoutAndReap(temporary);

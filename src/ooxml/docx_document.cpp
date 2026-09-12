@@ -45,12 +45,20 @@ constexpr std::string_view kWordprocessingDrawingNamespace =
     "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing";
 constexpr std::string_view kDrawingMainNamespace =
     "http://schemas.openxmlformats.org/drawingml/2006/main";
+constexpr std::string_view kStrictDrawingMainNamespace =
+    "http://purl.oclc.org/ooxml/drawingml/main";
+constexpr std::string_view kDrawingPictureNamespace =
+    "http://schemas.openxmlformats.org/drawingml/2006/picture";
 constexpr std::string_view kOfficeRelationshipsNamespace =
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
 constexpr std::string_view kStrictOfficeRelationshipsNamespace =
     "http://purl.oclc.org/ooxml/officeDocument/relationships";
 constexpr std::string_view kDocumentRelationshipsPart =
     "word/_rels/document.xml.rels";
+constexpr std::int64_t kMaximumInlineExtentEmu = 3'600'000'000LL;
+// ECMA-376/ISO 29500 numbering levels are zero-based ilvl 0 through 8.
+constexpr std::uint8_t kMaximumNativeNumberingLevel = 8;
+constexpr std::size_t kNativeNumberingLevelCount = 9;
 
 struct BasicTableStyleDescriptor {
     BasicTableStyle style;
@@ -167,6 +175,7 @@ struct ParsedPackage {
     std::vector<Paragraph> paragraphs;
     std::vector<ImportedBodyBlock> body_blocks;
     std::optional<PageSettings> page_settings;
+    std::vector<ImportedSection> sections;
     std::vector<SpanLocation> spans;
     CompatibilityReport compatibility;
 };
@@ -410,6 +419,17 @@ bool isNamespacedElement(const pugi::xml_node& node,
     return node.type() == pugi::node_element &&
            localName(node.name()) == expected_local_name &&
            namespaceUri(node) == expected_namespace;
+}
+
+bool isDrawingElement(const pugi::xml_node& node,
+                      std::string_view expected_local_name) {
+    if (node.type() != pugi::node_element ||
+        localName(node.name()) != expected_local_name) {
+        return false;
+    }
+    const auto uri = namespaceUri(node);
+    return uri == kDrawingMainNamespace ||
+           uri == kStrictDrawingMainNamespace;
 }
 
 std::optional<std::string> namespacedAttribute(
@@ -964,15 +984,21 @@ void collectContentForParagraph(
     }
 }
 
+std::optional<InlineImagePayload> parseInlineImage(
+    const pugi::xml_node& drawing);
+
 bool directRunStructureSupported(const pugi::xml_node& run) {
     for (pugi::xml_node child : run.children()) {
         if (ignorableNode(child)) {
             continue;
         }
+        const bool supported_drawing =
+            isWordElement(child, "drawing") &&
+            parseInlineImage(child).has_value();
         if (child.type() != pugi::node_element ||
             !(isWordElement(child, "rPr") || isWordElement(child, "t") ||
               isWordElement(child, "tab") || isWordElement(child, "br") ||
-              isWordElement(child, "cr"))) {
+              isWordElement(child, "cr") || supported_drawing)) {
             return false;
         }
     }
@@ -1259,28 +1285,30 @@ void parseBasicRunProperties(
                          recognized;
             const std::optional<std::string> ascii = wordAttribute(property, "ascii");
             const std::optional<std::string> high_ansi = wordAttribute(property, "hAnsi");
-            if (ascii.has_value()) {
+            const auto ascii_theme = wordAttribute(property, "asciiTheme");
+            const auto high_ansi_theme = wordAttribute(property, "hAnsiTheme");
+            const auto resolved_ascii_theme = ascii_theme
+                ? themeLatinFont(theme, *ascii_theme)
+                : std::nullopt;
+            const auto resolved_high_ansi_theme = high_ansi_theme
+                ? themeLatinFont(theme, *high_ansi_theme)
+                : std::nullopt;
+            if (resolved_ascii_theme) {
+                format.font_family = resolved_ascii_theme;
+            } else if (resolved_high_ansi_theme) {
+                format.font_family = resolved_high_ansi_theme;
+            } else if (ascii.has_value()) {
                 format.font_family = ascii;
             } else if (high_ansi.has_value()) {
                 format.font_family = high_ansi;
             } else {
-                const auto ascii_theme = wordAttribute(property, "asciiTheme");
-                const auto high_ansi_theme = wordAttribute(property, "hAnsiTheme");
-                if (ascii_theme) {
-                    format.font_family = themeLatinFont(theme, *ascii_theme);
-                } else if (high_ansi_theme) {
-                    format.font_family = themeLatinFont(theme, *high_ansi_theme);
-                }
                 if (!format.font_family) recognized = false;
             }
             if (ascii.has_value() && high_ansi.has_value() && ascii != high_ansi) {
                 recognized = false;
             }
-            const auto ascii_theme = wordAttribute(property, "asciiTheme");
-            const auto high_ansi_theme = wordAttribute(property, "hAnsiTheme");
-            if (!ascii && !high_ansi && ascii_theme && high_ansi_theme &&
-                themeLatinFont(theme, *ascii_theme) !=
-                    themeLatinFont(theme, *high_ansi_theme)) {
+            if (ascii_theme && high_ansi_theme &&
+                resolved_ascii_theme != resolved_high_ansi_theme) {
                 recognized = false;
             }
         } else if (isWordElement(property, "rStyle")) {
@@ -1383,6 +1411,11 @@ void parseRunFormat(const pugi::xml_node& run_node, Run& run,
     }
 }
 
+std::optional<PageSettings> parsePageSettingsFromSection(
+    const pugi::xml_node& section);
+std::optional<SectionBreakKind> parseSectionBreakKind(
+    const pugi::xml_node& section);
+
 void parseParagraphFormat(const pugi::xml_node& paragraph_node,
                           Paragraph& paragraph,
                           const ThemeData* theme = nullptr) {
@@ -1440,7 +1473,8 @@ void parseParagraphFormat(const pugi::xml_node& paragraph_node,
                     bool parsed = true;
                     const auto value = parseUnsignedIntegerAttribute(
                         child, "val", parsed);
-                    if (!value || *value > 9U) {
+                    if (!value ||
+                        *value > kMaximumNativeNumberingLevel) {
                         recognized = false;
                     } else {
                         paragraph.numbering_level =
@@ -1603,6 +1637,43 @@ void parseParagraphFormat(const pugi::xml_node& paragraph_node,
                     property, *paragraph.paragraph_mark_format, recognized,
                     theme);
             }
+        } else if (isWordElement(property, "sectPr")) {
+            // Section properties terminate this paragraph but are exposed by
+            // the ordered sections() view rather than as paragraph format.
+            const auto section_page = parsePageSettingsFromSection(property);
+            recognized = section_page.has_value() &&
+                         parseSectionBreakKind(property).has_value();
+            for (const pugi::xml_node child : property.children()) {
+                if (ignorableNode(child)) continue;
+                if (isWordElement(child, "type")) {
+                    recognized = recognized &&
+                        hasOnlyIgnorableChildren(child) &&
+                        hasOnlyWordAttributes(child, {"val"});
+                } else if (isWordElement(child, "pgSz")) {
+                    const auto orientation = wordAttribute(child, "orient");
+                    const bool supported_orientation =
+                        !orientation ||
+                        (section_page &&
+                         ((*orientation == "landscape" &&
+                           section_page->width_twips >
+                               section_page->height_twips) ||
+                          (*orientation == "portrait" &&
+                           section_page->width_twips <=
+                               section_page->height_twips)));
+                    recognized = recognized && supported_orientation &&
+                        hasOnlyIgnorableChildren(child) &&
+                        hasOnlyWordAttributes(child, {"w", "h", "orient"});
+                } else if (isWordElement(child, "pgMar")) {
+                    recognized = recognized &&
+                        hasOnlyIgnorableChildren(child) &&
+                        hasOnlyWordAttributes(
+                            child,
+                            {"top", "right", "bottom", "left", "header",
+                             "footer", "gutter"});
+                } else {
+                    recognized = false;
+                }
+            }
         } else {
             recognized = false;
         }
@@ -1612,7 +1683,7 @@ void parseParagraphFormat(const pugi::xml_node& paragraph_node,
 
 std::optional<std::uint32_t> drawingColorValue(const pugi::xml_node& node) {
     for (const auto child : node.children()) {
-        if (isNamespacedElement(child, "srgbClr", kDrawingMainNamespace)) {
+        if (isDrawingElement(child, "srgbClr")) {
             const std::string_view encoded = child.attribute("val").value();
             if (encoded.size() != 6) return std::nullopt;
             std::uint32_t rgb = 0;
@@ -1624,7 +1695,7 @@ std::optional<std::uint32_t> drawingColorValue(const pugi::xml_node& node) {
             }
             return std::nullopt;
         }
-        if (isNamespacedElement(child, "sysClr", kDrawingMainNamespace)) {
+        if (isDrawingElement(child, "sysClr")) {
             const std::string_view encoded = child.attribute("lastClr").value();
             if (encoded.size() != 6) return std::nullopt;
             std::uint32_t rgb = 0;
@@ -1653,20 +1724,20 @@ ThemeData parseThemeData(std::string_view xml, const OpenOptions& options) {
         return theme;
     }
     const auto root = document.document_element();
-    if (!isNamespacedElement(root, "theme", kDrawingMainNamespace)) {
+    if (!isDrawingElement(root, "theme")) {
         return theme;
     }
     for (const auto elements : root.children()) {
-        if (!isNamespacedElement(
-                elements, "themeElements", kDrawingMainNamespace)) {
+        if (!isDrawingElement(elements, "themeElements")) {
             continue;
         }
         for (const auto scheme : elements.children()) {
-            if (isNamespacedElement(
-                    scheme, "clrScheme", kDrawingMainNamespace)) {
+            if (isDrawingElement(scheme, "clrScheme")) {
                 for (const auto color : scheme.children()) {
                     if (color.type() != pugi::node_element ||
-                        namespaceUri(color) != kDrawingMainNamespace) {
+                        (namespaceUri(color) != kDrawingMainNamespace &&
+                         namespaceUri(color) !=
+                             kStrictDrawingMainNamespace)) {
                         continue;
                     }
                     if (const auto value = drawingColorValue(color)) {
@@ -1674,17 +1745,15 @@ ThemeData parseThemeData(std::string_view xml, const OpenOptions& options) {
                             std::string(localName(color.name())), *value);
                     }
                 }
-            } else if (isNamespacedElement(
-                           scheme, "fontScheme", kDrawingMainNamespace)) {
+            } else if (isDrawingElement(scheme, "fontScheme")) {
                 for (const auto font_set : scheme.children()) {
-                    const bool major = isNamespacedElement(
-                        font_set, "majorFont", kDrawingMainNamespace);
-                    const bool minor = isNamespacedElement(
-                        font_set, "minorFont", kDrawingMainNamespace);
+                    const bool major =
+                        isDrawingElement(font_set, "majorFont");
+                    const bool minor =
+                        isDrawingElement(font_set, "minorFont");
                     if (!major && !minor) continue;
                     for (const auto font : font_set.children()) {
-                        if (!isNamespacedElement(
-                                font, "latin", kDrawingMainNamespace)) {
+                        if (!isDrawingElement(font, "latin")) {
                             continue;
                         }
                         const std::string family =
@@ -1790,7 +1859,7 @@ std::optional<NumberLevelDefinition> parseNumberLevel(
         level_index, 10);
     if (parsed_level.ec != std::errc{} ||
         parsed_level.ptr != encoded_level->data() + encoded_level->size() ||
-        level_index > 9U) {
+        level_index > kMaximumNativeNumberingLevel) {
         return std::nullopt;
     }
 
@@ -1799,6 +1868,7 @@ std::optional<NumberLevelDefinition> parseNumberLevel(
     std::optional<BasicNumberFormat> format;
     bool saw_start = false;
     bool saw_text = false;
+    bool saw_level_justification = false;
     for (const auto child : level.children()) {
         if (isWordElement(child, "start")) {
             const auto start = parseSignedIntegerAttribute(
@@ -1832,6 +1902,24 @@ std::optional<NumberLevelDefinition> parseNumberLevel(
             } else {
                 recognized = false;
             }
+        } else if (isWordElement(child, "lvlJc")) {
+            const auto value = wordAttribute(child, "val");
+            const bool supported_justification =
+                !saw_level_justification &&
+                hasOnlyIgnorableChildren(child) &&
+                hasOnlyWordAttributes(child, {"val"}) && value &&
+                *value == "left";
+            recognized = recognized && supported_justification;
+            saw_level_justification = true;
+        } else if (isWordElement(child, "pStyle") ||
+                   isWordElement(child, "pPr") ||
+                   isWordElement(child, "rPr")) {
+            // Parsed where relevant below, or presentation-neutral for the
+            // supported marker/indent subset.
+        } else {
+            // Restart rules, legal-number coercion, legacy layout, and other
+            // level semantics must not be silently reported as editable.
+            recognized = false;
         }
     }
     if (!format || !saw_text) recognized = false;
@@ -1902,7 +1990,7 @@ void parseNumberingData(std::string_view xml, const OpenOptions& options,
                         level_index, 10);
                     if (parsed_level.ec != std::errc{} ||
                         parsed_level.ptr != encoded->data() + encoded->size() ||
-                        level_index > 9U) {
+                        level_index > kMaximumNativeNumberingLevel) {
                         continue;
                     }
                     for (const auto override_value : property.children()) {
@@ -2057,8 +2145,8 @@ std::string formattedNumber(std::int32_t value, BasicNumberFormat format) {
 void assignNumberingMarkers(std::vector<Paragraph>& paragraphs,
                             const ImportContext& context) {
     struct CounterState {
-        std::array<std::int32_t, 10> values{};
-        std::array<bool, 10> initialized{};
+        std::array<std::int32_t, kNativeNumberingLevelCount> values{};
+        std::array<bool, kNativeNumberingLevelCount> initialized{};
     };
     std::unordered_map<std::int32_t, CounterState> counters;
     for (auto& paragraph : paragraphs) {
@@ -2094,10 +2182,18 @@ void assignNumberingMarkers(std::vector<Paragraph>& paragraphs,
 
         std::string marker = paragraph.numbering->level_text;
         if (paragraph.numbering->format == BasicNumberFormat::bullet) {
-            marker = "\xe2\x80\xa2";
+            const std::string& source_marker =
+                paragraph.numbering->level_text;
+            static const std::set<std::string> supported_bullets{
+                "\xe2\x80\xa2", "\xe2\x97\xa6", "\xe2\x96\xaa",
+                "\xe2\x80\xa3", "*", "-"};
+            marker = supported_bullets.contains(source_marker)
+                ? source_marker
+                : "\xe2\x80\xa2";
         } else {
-            for (std::size_t placeholder_level = 0;
-                 placeholder_level < 9; ++placeholder_level) {
+            for (std::size_t placeholder_count = state.values.size();
+                 placeholder_count > 0; --placeholder_count) {
+                const std::size_t placeholder_level = placeholder_count - 1;
                 const std::string placeholder =
                     "%" + std::to_string(placeholder_level + 1);
                 std::size_t position = 0;
@@ -2138,7 +2234,6 @@ std::optional<std::int64_t> parsePositiveInt64Attribute(
     // 100 metres is far beyond a useful page object but still leaves ample
     // room for unusual OOXML fixtures. Bounding geometry here prevents later
     // conversions from overflowing.
-    constexpr std::int64_t kMaximumInlineExtentEmu = 3'600'000'000LL;
     if (parsed.ec != std::errc{} ||
         parsed.ptr != encoded.data() + encoded.size() || value <= 0 ||
         value > kMaximumInlineExtentEmu) {
@@ -2338,26 +2433,9 @@ std::optional<std::uint32_t> parseUnsignedTwips(const pugi::xml_node& node,
     return value;
 }
 
-std::optional<PageSettings> parseBodyPageSettings(std::string_view document_xml) {
-    pugi::xml_document document;
-    if (!document.load_buffer(document_xml.data(), document_xml.size(),
-                              pugi::parse_default, pugi::encoding_auto)) {
-        return std::nullopt;
-    }
-    const pugi::xml_node root = document.document_element();
-    pugi::xml_node body;
-    for (pugi::xml_node child : root.children()) {
-        if (isWordElement(child, "body")) {
-            body = child;
-            break;
-        }
-    }
-    if (!body) return std::nullopt;
-    pugi::xml_node section;
-    for (pugi::xml_node child : body.children()) {
-        if (isWordElement(child, "sectPr")) section = child;
-    }
-    if (!section) return std::nullopt;
+std::optional<PageSettings> parsePageSettingsFromSection(
+    const pugi::xml_node& section) {
+    if (!isWordElement(section, "sectPr")) return std::nullopt;
     PageSettings page;
     bool found = false;
     for (pugi::xml_node child : section.children()) {
@@ -2389,6 +2467,85 @@ std::optional<PageSettings> parseBodyPageSettings(std::string_view document_xml)
         static_cast<std::uint64_t>(page.margin_left_twips) + page.margin_right_twips <
             page.width_twips;
     return found && valid ? std::optional<PageSettings>(page) : std::nullopt;
+}
+
+std::optional<SectionBreakKind> parseSectionBreakKind(
+    const pugi::xml_node& section) {
+    for (const pugi::xml_node child : section.children()) {
+        if (!isWordElement(child, "type")) continue;
+        const auto value = wordAttribute(child, "val");
+        if (!value || *value == "nextPage") {
+            return SectionBreakKind::next_page;
+        }
+        if (*value == "continuous") return SectionBreakKind::continuous;
+        if (*value == "evenPage") return SectionBreakKind::even_page;
+        if (*value == "oddPage") return SectionBreakKind::odd_page;
+        return std::nullopt;
+    }
+    // CT_SectPr defaults to a next-page section when w:type is absent.
+    return SectionBreakKind::next_page;
+}
+
+pugi::xml_node paragraphSectionProperties(const pugi::xml_node& paragraph) {
+    for (const pugi::xml_node child : paragraph.children()) {
+        if (!isWordElement(child, "pPr")) continue;
+        for (const pugi::xml_node property : child.children()) {
+            if (isWordElement(property, "sectPr")) return property;
+        }
+    }
+    return {};
+}
+
+std::vector<ImportedSection> parseBodySections(
+    std::string_view document_xml) {
+    pugi::xml_document document;
+    if (!document.load_buffer(document_xml.data(), document_xml.size(),
+                              pugi::parse_default, pugi::encoding_auto)) {
+        return {};
+    }
+    pugi::xml_node body;
+    for (const pugi::xml_node child : document.document_element().children()) {
+        if (isWordElement(child, "body")) {
+            body = child;
+            break;
+        }
+    }
+    if (!body) return {};
+
+    std::vector<ImportedSection> sections;
+    std::size_t first_block = 0;
+    std::size_t block_count = 0;
+    bool saw_body_section = false;
+    for (const pugi::xml_node child : body.children()) {
+        if (ignorableNode(child)) continue;
+        pugi::xml_node section;
+        if (isWordElement(child, "sectPr")) {
+            if (saw_body_section) return {};
+            saw_body_section = true;
+            section = child;
+        } else {
+            if (saw_body_section) return {};
+            ++block_count;
+            if (isWordElement(child, "p")) {
+                section = paragraphSectionProperties(child);
+            }
+        }
+        if (!section) continue;
+        const auto page = parsePageSettingsFromSection(section);
+        const auto break_kind = parseSectionBreakKind(section);
+        if (!page || !break_kind) return {};
+        sections.push_back(ImportedSection{
+            first_block, block_count - first_block, *page, *break_kind});
+        first_block = block_count;
+    }
+    if (!saw_body_section || first_block != block_count) return {};
+    return sections;
+}
+
+std::optional<PageSettings> parseBodyPageSettings(std::string_view document_xml) {
+    const auto sections = parseBodySections(document_xml);
+    if (sections.empty()) return std::nullopt;
+    return sections.back().page;
 }
 
 struct XmlNodeHash {
@@ -2428,12 +2585,13 @@ bool parseBooleanLexical(std::string_view value, bool& parsed) {
     return false;
 }
 
-bool paragraphContainsEquation(const Paragraph& paragraph) {
+bool paragraphContainsFragment(
+    const Paragraph& paragraph, FragmentKind kind) {
     for (const auto& run : paragraph.runs) {
         if (std::any_of(
                 run.fragments.begin(), run.fragments.end(),
-                [](const RunFragment& fragment) {
-                    return fragment.kind == FragmentKind::equation;
+                [kind](const RunFragment& fragment) {
+                    return fragment.kind == kind;
                 })) {
             return true;
         }
@@ -2727,8 +2885,15 @@ std::optional<ImportedTableBlock> parseSimpleImportedTable(
                 reason = "a cell paragraph could not be mapped to parsed text";
                 return std::nullopt;
             }
-            if (paragraphContainsEquation(paragraphs[source->second])) {
+            if (paragraphContainsFragment(
+                    paragraphs[source->second], FragmentKind::equation)) {
                 reason = "equations inside table cells are preserved view-only";
+                return std::nullopt;
+            }
+            if (paragraphContainsFragment(
+                    paragraphs[source->second], FragmentKind::inline_image)) {
+                reason =
+                    "inline images inside table cells are preserved view-only";
                 return std::nullopt;
             }
             imported_cell.source_paragraph_index = source->second;
@@ -3253,6 +3418,62 @@ std::optional<std::string> safeDocumentRelationshipTarget(
     return member;
 }
 
+struct AuxiliaryPartTargets {
+    std::optional<std::string> styles;
+    std::optional<std::string> numbering;
+    std::optional<std::string> theme;
+};
+
+AuxiliaryPartTargets auxiliaryPartTargets(
+    std::string_view relationships_xml, const OpenOptions& options) {
+    AuxiliaryPartTargets targets;
+    if (relationships_xml.empty()) return targets;
+    pugi::xml_document relationships;
+    if (!relationships.load_buffer(
+            relationships_xml.data(), relationships_xml.size(),
+            pugi::parse_default, pugi::encoding_auto) ||
+        !::docxstudio::xml::inspectComplexity(
+             relationships, options.max_xml_depth, options.max_xml_nodes)
+             .accepted()) {
+        return targets;
+    }
+    const auto root = relationships.document_element();
+    const std::string root_namespace = namespaceUri(root);
+    constexpr std::string_view transitional_package_relationships =
+        "http://schemas.openxmlformats.org/package/2006/relationships";
+    constexpr std::string_view strict_package_relationships =
+        "http://purl.oclc.org/ooxml/package/relationships";
+    if (localName(root.name()) != "Relationships" ||
+        (root_namespace != transitional_package_relationships &&
+         root_namespace != strict_package_relationships)) {
+        return targets;
+    }
+    for (const auto relationship : root.children()) {
+        if (!isNamespacedElement(
+                relationship, "Relationship", root_namespace) ||
+            std::string_view(relationship.attribute("TargetMode").value()) ==
+                "External") {
+            continue;
+        }
+        const std::string_view type = relationship.attribute("Type").value();
+        if (!(type.starts_with(kOfficeRelationshipsNamespace) ||
+              type.starts_with(kStrictOfficeRelationshipsNamespace))) {
+            continue;
+        }
+        const auto target = safeDocumentRelationshipTarget(
+            relationship.attribute("Target").value());
+        if (!target) continue;
+        if (type.ends_with("/styles")) {
+            targets.styles = *target;
+        } else if (type.ends_with("/numbering")) {
+            targets.numbering = *target;
+        } else if (type.ends_with("/theme")) {
+            targets.theme = *target;
+        }
+    }
+    return targets;
+}
+
 std::string imageContentTypeForMember(std::string_view member) {
     const auto dot = member.find_last_of('.');
     if (dot == std::string_view::npos) return {};
@@ -3349,8 +3570,17 @@ void resolveInlineImages(ParsedPackage& parsed, const OpenOptions& options) {
         }
     }
 
-    constexpr std::uint64_t kMaximumRenderedImageBytes = 64ULL * 1024ULL * 1024ULL;
-    std::unordered_map<std::string, std::vector<std::uint8_t>> cached_bytes;
+    constexpr std::uint64_t kMaximumRenderedImageBytes =
+        64ULL * 1024ULL * 1024ULL;
+    constexpr std::uint64_t kMaximumAggregateRenderedImageBytes =
+        256ULL * 1024ULL * 1024ULL;
+    constexpr std::size_t kMaximumResolvedImageReferences = 4'096U;
+    constexpr std::size_t kMaximumUniqueRenderedImages = 1'024U;
+    std::unordered_map<
+        std::string,
+        std::shared_ptr<const std::vector<std::uint8_t>>> cached_bytes;
+    std::uint64_t aggregate_cached_bytes = 0U;
+    std::size_t attempted_references = 0U;
     for (auto& paragraph : parsed.paragraphs) {
         for (auto& run : paragraph.runs) {
             for (auto& fragment : run.fragments) {
@@ -3358,6 +3588,11 @@ void resolveInlineImages(ParsedPackage& parsed, const OpenOptions& options) {
                     !fragment.inline_image) {
                     continue;
                 }
+                if (attempted_references >=
+                    kMaximumResolvedImageReferences) {
+                    continue;
+                }
+                ++attempted_references;
                 auto& image = *fragment.inline_image;
                 const auto related = image_members.find(image.relationship_id);
                 if (related == image_members.end()) continue;
@@ -3374,22 +3609,34 @@ void resolveInlineImages(ParsedPackage& parsed, const OpenOptions& options) {
                 }
                 auto cached = cached_bytes.find(related->second);
                 if (cached == cached_bytes.end()) {
+                    if (cached_bytes.size() >=
+                            kMaximumUniqueRenderedImages ||
+                        package_entry->member.uncompressed_size >
+                            kMaximumAggregateRenderedImageBytes -
+                                aggregate_cached_bytes) {
+                        continue;
+                    }
                     std::string contents;
                     if (!readEntry(
                             archive, package_entry->index,
                             std::min(options.max_member_uncompressed_bytes,
                                      kMaximumRenderedImageBytes),
                             contents, &ignored_error)) {
+                        cached_bytes.emplace(related->second, nullptr);
                         continue;
                     }
+                    auto shared_contents =
+                        std::make_shared<const std::vector<std::uint8_t>>(
+                            contents.begin(), contents.end());
                     cached = cached_bytes.emplace(
-                        related->second,
-                        std::vector<std::uint8_t>(contents.begin(), contents.end()))
-                                 .first;
+                        related->second, std::move(shared_contents)).first;
+                    aggregate_cached_bytes +=
+                        static_cast<std::uint64_t>(contents.size());
                 }
+                if (!cached->second) continue;
                 image.package_member = related->second;
                 image.content_type = imageContentTypeForMember(related->second);
-                image.bytes = cached->second;
+                image.bytes = SharedImageBytes(cached->second);
             }
         }
     }
@@ -3426,6 +3673,7 @@ bool inspectPackage(
     std::optional<std::size_t> document_index;
     std::optional<std::size_t> content_types_index;
     std::optional<std::size_t> root_relationships_index;
+    std::optional<std::size_t> document_relationships_index;
     std::optional<std::size_t> styles_index;
     std::optional<std::size_t> numbering_index;
     std::optional<std::size_t> theme_index;
@@ -3502,6 +3750,8 @@ bool inspectPackage(
             content_types_index = static_cast<std::size_t>(index);
         } else if (name == kRootRelationshipsPart) {
             root_relationships_index = static_cast<std::size_t>(index);
+        } else if (name == kDocumentRelationshipsPart) {
+            document_relationships_index = static_cast<std::size_t>(index);
         } else if (name == "word/styles.xml") {
             styles_index = static_cast<std::size_t>(index);
         } else if (name == "word/numbering.xml") {
@@ -3560,6 +3810,41 @@ bool inspectPackage(
             error)) {
         zip_discard(archive);
         return false;
+    }
+    std::string document_relationships_xml;
+    if (document_relationships_index &&
+        !readEntry(
+            archive,
+            static_cast<zip_uint64_t>(*document_relationships_index),
+            options.max_document_xml_bytes,
+            document_relationships_xml,
+            error)) {
+        zip_discard(archive);
+        return false;
+    }
+    const auto related_parts = auxiliaryPartTargets(
+        document_relationships_xml, options);
+    const auto related_index = [&](const std::optional<std::string>& name)
+        -> std::optional<std::size_t> {
+        if (!name) return std::nullopt;
+        const auto found = std::find_if(
+            parsed.entries.begin(), parsed.entries.end(),
+            [&name](const EntryRecord& entry) {
+                return entry.member.name == *name;
+            });
+        return found == parsed.entries.end()
+            ? std::nullopt
+            : std::optional<std::size_t>(
+                  static_cast<std::size_t>(found->index));
+    };
+    if (const auto related = related_index(related_parts.styles)) {
+        styles_index = related;
+    }
+    if (const auto related = related_index(related_parts.numbering)) {
+        numbering_index = related;
+    }
+    if (const auto related = related_index(related_parts.theme)) {
+        theme_index = related;
     }
     std::string styles_xml;
     std::string numbering_xml;
@@ -3634,6 +3919,7 @@ bool inspectPackage(
         return false;
     }
     resolveInlineImages(parsed, options);
+    parsed.sections = parseBodySections(parsed.document_xml);
     parsed.page_settings = parseBodyPageSettings(parsed.document_xml);
 
     const bool global_blocker = std::any_of(
@@ -4345,6 +4631,108 @@ bool addBufferMember(
     return true;
 }
 
+struct AuthoredImagePart {
+    const NewInlineImage* image{nullptr};
+    std::string relationship_id;
+    std::string package_member;
+    std::string relationship_target;
+    std::string content_type;
+};
+
+bool validateNewInlineImage(
+    const NewInlineImage& image, std::size_t paragraph_index,
+    LossReport& loss, Error* error) {
+    IssueCode issue_code = IssueCode::invalid_utf8;
+    std::string detail;
+    const bool valid_name = !image.name.empty() && image.name.size() <= 255U &&
+        isValidUtf8XmlText(image.name, issue_code, detail) &&
+        image.name != "." && image.name != ".." &&
+        image.name.find('/') == std::string::npos &&
+        image.name.find('\\') == std::string::npos;
+    const bool valid_extent = image.width_emu > 0 && image.height_emu > 0 &&
+        image.width_emu <= kMaximumInlineExtentEmu &&
+        image.height_emu <= kMaximumInlineExtentEmu;
+    const bool valid_size = !image.bytes.empty() &&
+        image.bytes.size() <= NewInlineImage::maximum_encoded_bytes;
+    const bool supported_format =
+        image.format == RasterImageFormat::png ||
+        image.format == RasterImageFormat::jpeg;
+    raster::ValidationLimits raster_limits;
+    raster_limits.maximum_encoded_bytes =
+        NewInlineImage::maximum_encoded_bytes;
+    const auto raster_inspection = supported_format
+        ? raster::inspect(image.bytes, image.format, raster_limits)
+        : raster::Inspection{};
+    const bool valid_encoding = supported_format && raster_inspection.ok();
+    if (valid_name && valid_extent && valid_size && valid_encoding) return true;
+
+    std::string message;
+    if (!valid_name) {
+        message = detail.empty()
+            ? "Inline image name must be safe metadata, not a path"
+            : detail;
+    } else if (!valid_extent) {
+        message = "Inline image display dimensions are outside the supported range";
+    } else if (!valid_size) {
+        message = "Inline image encoded bytes are empty or exceed 64 MiB";
+    } else if (!supported_format) {
+        message = "Inline image format is unsupported";
+    } else {
+        message = image.format == RasterImageFormat::png
+            ? "Inline image bytes do not match a supported bounded PNG"
+            : "Inline image bytes do not match a supported bounded JPEG";
+    }
+    loss.issues.push_back(blockingIssue(
+        detail.empty() ? IssueCode::structural_rewrite_required : issue_code,
+        message, paragraph_index));
+    setError(error, ErrorCode::unsafe_edit, message);
+    return false;
+}
+
+bool collectParagraphImages(
+    const NewParagraph& paragraph, std::size_t paragraph_index,
+    std::vector<AuthoredImagePart>& images, LossReport& loss, Error* error) {
+    for (const auto& run : paragraph.runs) {
+        if (!run.inline_image) continue;
+        if (!validateNewInlineImage(
+                *run.inline_image, paragraph_index, loss, error)) {
+            return false;
+        }
+        const std::size_t number = images.size() + 1U;
+        const bool png = run.inline_image->format == RasterImageFormat::png;
+        const std::string extension = png ? "png" : "jpg";
+        images.push_back(AuthoredImagePart{
+            &*run.inline_image,
+            "rIdImage" + std::to_string(number),
+            "word/media/image" + std::to_string(number) + "." + extension,
+            "media/image" + std::to_string(number) + "." + extension,
+            png ? "image/png" : "image/jpeg"});
+    }
+    return true;
+}
+
+bool collectBodyImages(
+    const NewDocumentBody& body, std::vector<AuthoredImagePart>& images,
+    LossReport& loss, Error* error) {
+    std::size_t paragraph_index = 0;
+    for (const auto& block : body.blocks) {
+        if (const auto* paragraph = std::get_if<NewParagraph>(&block)) {
+            if (!collectParagraphImages(
+                    *paragraph, paragraph_index++, images, loss, error)) {
+                return false;
+            }
+            continue;
+        }
+        for (const auto& paragraph : std::get<NewTable>(block).cell_paragraphs) {
+            if (!collectParagraphImages(
+                    paragraph, paragraph_index++, images, loss, error)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 bool writeNewArchive(
     const std::filesystem::path& path,
     std::string_view content_types,
@@ -4352,7 +4740,9 @@ bool writeNewArchive(
     std::string_view document_relationships,
     std::string_view styles_xml,
     std::string_view settings_xml,
+    std::string_view numbering_xml,
     std::string_view document_xml,
+    const std::vector<AuthoredImagePart>& images,
     Error* error) {
     int open_error = 0;
     zip_t* archive = zip_open(path.c_str(), ZIP_CREATE | ZIP_TRUNCATE, &open_error);
@@ -4367,9 +4757,22 @@ bool writeNewArchive(
         !addBufferMember(
             archive, "word/_rels/document.xml.rels", document_relationships, error) ||
         !addBufferMember(archive, "word/styles.xml", styles_xml, error) ||
-        !addBufferMember(archive, "word/settings.xml", settings_xml, error)) {
+        !addBufferMember(archive, "word/settings.xml", settings_xml, error) ||
+        (!numbering_xml.empty() &&
+         !addBufferMember(
+             archive, "word/numbering.xml", numbering_xml, error))) {
         zip_discard(archive);
         return false;
+    }
+    for (const auto& part : images) {
+        const std::string_view contents(
+            reinterpret_cast<const char*>(part.image->bytes.data()),
+            part.image->bytes.size());
+        if (!addBufferMember(
+                archive, part.package_member, contents, error)) {
+            zip_discard(archive);
+            return false;
+        }
     }
     if (zip_close(archive) != 0) {
         const std::string message = zipArchiveError(archive);
@@ -4701,16 +5104,52 @@ bool validateBasicRunFormat(
     return true;
 }
 
+void appendInlineImageDrawing(
+    std::ostringstream& output, const NewRun& run,
+    const AuthoredImagePart& part, std::size_t image_number) {
+    const auto& image = *part.image;
+    const std::string name = escapeXmlAttribute(image.name);
+    output << "<w:r>";
+    appendBasicRunProperties(output, run.format);
+    output
+        << "<w:drawing><wp:inline distT=\"0\" distB=\"0\" distL=\"0\" distR=\"0\">"
+           "<wp:extent cx=\""
+        << image.width_emu << "\" cy=\"" << image.height_emu
+        << "\"/><wp:effectExtent l=\"0\" t=\"0\" r=\"0\" b=\"0\"/>"
+           "<wp:docPr id=\""
+        << image_number << "\" name=\"" << name
+        << "\"/><wp:cNvGraphicFramePr><a:graphicFrameLocks noChangeAspect=\"1\"/>"
+           "</wp:cNvGraphicFramePr><a:graphic><a:graphicData uri=\""
+        << kDrawingPictureNamespace
+        << "\"><pic:pic><pic:nvPicPr><pic:cNvPr id=\"0\" name=\""
+        << name
+        << "\"/><pic:cNvPicPr/></pic:nvPicPr><pic:blipFill><a:blip r:embed=\""
+        << part.relationship_id
+        << "\"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill>"
+           "<pic:spPr><a:xfrm><a:off x=\"0\" y=\"0\"/><a:ext cx=\""
+        << image.width_emu << "\" cy=\"" << image.height_emu
+        << "\"/></a:xfrm><a:prstGeom prst=\"rect\"><a:avLst/>"
+           "</a:prstGeom></pic:spPr></pic:pic></a:graphicData></a:graphic>"
+           "</wp:inline></w:drawing></w:r>";
+}
+
 bool buildNewDocumentXml(
     const std::vector<NewParagraph>& paragraphs,
     const PageSettings& page,
     std::string& xml,
     LossReport& loss,
-    Error* error) {
+    Error* error,
+    const std::vector<AuthoredImagePart>& images,
+    std::size_t& image_index) {
     std::ostringstream document;
     document << "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
              << "<w:document xmlns:w=\"" << kWordNamespace
-             << "\" xmlns:m=\"" << kOfficeMathNamespace << "\"><w:body>";
+             << "\" xmlns:m=\"" << kOfficeMathNamespace
+             << "\" xmlns:r=\"" << kOfficeRelationshipsNamespace
+             << "\" xmlns:wp=\"" << kWordprocessingDrawingNamespace
+             << "\" xmlns:a=\"" << kDrawingMainNamespace
+             << "\" xmlns:pic=\"" << kDrawingPictureNamespace
+             << "\"><w:body>";
 
     for (std::size_t paragraph_index = 0; paragraph_index < paragraphs.size(); ++paragraph_index) {
         const NewParagraph& paragraph = paragraphs[paragraph_index];
@@ -4724,6 +5163,7 @@ bool buildNewDocumentXml(
             paragraph.line_spacing_rule.has_value() || paragraph.keep_with_next.has_value() ||
             paragraph.keep_lines.has_value() || paragraph.page_break_before.has_value() ||
             !paragraph.left_tab_stops_twips.empty() ||
+            paragraph.numbering.has_value() ||
             paragraph.paragraph_mark_format.has_value();
         if (paragraph.line_spacing_rule.has_value() && !paragraph.line_spacing.has_value()) {
             const std::string message =
@@ -4746,6 +5186,39 @@ bool buildNewDocumentXml(
                 error)) {
             return false;
         }
+        if (paragraph.numbering) {
+            const auto& numbering = *paragraph.numbering;
+            IssueCode issue_code = IssueCode::invalid_utf8;
+            std::string detail;
+            const bool valid_template =
+                !numbering.level_text.empty() &&
+                isValidUtf8XmlText(
+                    numbering.level_text, issue_code, detail);
+            const bool valid_numbering =
+                numbering.num_id > 0 &&
+                numbering.level <= kMaximumNativeNumberingLevel &&
+                numbering.start >= 0 && valid_template &&
+                numbering.text_indent_twips > 0 &&
+                numbering.text_indent_twips <= 31680U &&
+                numbering.hanging_indent_twips > 0 &&
+                numbering.hanging_indent_twips <=
+                    numbering.text_indent_twips &&
+                (!numbering.tab_stop_twips ||
+                 (*numbering.tab_stop_twips > 0 &&
+                  *numbering.tab_stop_twips <= 31680U));
+            if (!valid_numbering) {
+                const std::string message = detail.empty()
+                    ? "Native list numbering has an invalid ID, level, template, or indentation"
+                    : detail;
+                loss.issues.push_back(blockingIssue(
+                    detail.empty()
+                        ? IssueCode::structural_rewrite_required
+                        : issue_code,
+                    message, paragraph_index));
+                setError(error, ErrorCode::unsafe_edit, message);
+                return false;
+            }
+        }
         if (has_paragraph_format) document << "<w:pPr>";
         const auto write_on_off = [&](std::string_view name,
                                       const std::optional<bool>& value) {
@@ -4759,6 +5232,13 @@ bool buildNewDocumentXml(
         write_on_off("keepNext", paragraph.keep_with_next);
         write_on_off("keepLines", paragraph.keep_lines);
         write_on_off("pageBreakBefore", paragraph.page_break_before);
+        if (paragraph.numbering) {
+            document << "<w:numPr><w:ilvl w:val=\""
+                     << static_cast<unsigned int>(paragraph.numbering->level)
+                     << "\"/><w:numId w:val=\""
+                     << paragraph.numbering->num_id
+                     << "\"/></w:numPr>";
+        }
         if (!paragraph.left_tab_stops_twips.empty()) {
             std::uint32_t previous = 0;
             document << "<w:tabs>";
@@ -4862,6 +5342,15 @@ bool buildNewDocumentXml(
                 return false;
             }
 
+            if (run.equation.has_value() && run.inline_image.has_value()) {
+                const std::string message =
+                    "A run cannot contain both an equation and an inline image";
+                loss.issues.push_back(blockingIssue(
+                    IssueCode::structural_rewrite_required, message,
+                    paragraph_index));
+                setError(error, ErrorCode::unsafe_edit, message);
+                return false;
+            }
             if (run.equation.has_value()) {
                 if (!run.text.empty()) {
                     const std::string message =
@@ -4885,6 +5374,27 @@ bool buildNewDocumentXml(
                 continue;
             }
 
+            if (run.inline_image.has_value()) {
+                if (!run.text.empty()) {
+                    const std::string message =
+                        "An inline image run cannot also contain ordinary text";
+                    loss.issues.push_back(blockingIssue(
+                        IssueCode::structural_rewrite_required, message,
+                        paragraph_index));
+                    setError(error, ErrorCode::unsafe_edit, message);
+                    return false;
+                }
+                if (image_index >= images.size()) {
+                    setError(error, ErrorCode::save_validation_failed,
+                             "Inline image catalog and document traversal differ");
+                    return false;
+                }
+                appendInlineImageDrawing(
+                    document, run, images[image_index], image_index + 1U);
+                ++image_index;
+                continue;
+            }
+
             document << "<w:r>";
             appendBasicRunProperties(document, run.format);
             appendWordRunContents(document, run.text);
@@ -4893,8 +5403,11 @@ bool buildNewDocumentXml(
         document << "</w:p>";
     }
     document << "<w:sectPr><w:pgSz w:w=\"" << page.width_twips
-             << "\" w:h=\"" << page.height_twips << "\"/>"
-             << "<w:pgMar w:top=\"" << page.margin_top_twips
+             << "\" w:h=\"" << page.height_twips << "\"";
+    if (page.width_twips > page.height_twips) {
+        document << " w:orient=\"landscape\"";
+    }
+    document << "/><w:pgMar w:top=\"" << page.margin_top_twips
              << "\" w:right=\"" << page.margin_right_twips
              << "\" w:bottom=\"" << page.margin_bottom_twips
              << "\" w:left=\"" << page.margin_left_twips << "\" "
@@ -4909,9 +5422,13 @@ bool appendNewParagraphFragment(
     const NewParagraph& paragraph,
     const PageSettings& page,
     LossReport& loss,
-    Error* error) {
+    Error* error,
+    const std::vector<AuthoredImagePart>& images,
+    std::size_t& image_index) {
     std::string wrapped;
-    if (!buildNewDocumentXml({paragraph}, page, wrapped, loss, error)) {
+    if (!buildNewDocumentXml(
+            {paragraph}, page, wrapped, loss, error, images,
+            image_index)) {
         return false;
     }
     constexpr std::string_view body_marker = "<w:body>";
@@ -4934,17 +5451,26 @@ bool buildNewDocumentXml(
     const PageSettings& page,
     std::string& xml,
     LossReport& loss,
-    Error* error) {
+    Error* error,
+    const std::vector<AuthoredImagePart>& images,
+    std::size_t& image_index) {
     std::ostringstream document;
     document << "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
              << "<w:document xmlns:w=\"" << kWordNamespace
-             << "\" xmlns:m=\"" << kOfficeMathNamespace << "\"><w:body>";
+             << "\" xmlns:m=\"" << kOfficeMathNamespace
+             << "\" xmlns:r=\"" << kOfficeRelationshipsNamespace
+             << "\" xmlns:wp=\"" << kWordprocessingDrawingNamespace
+             << "\" xmlns:a=\"" << kDrawingMainNamespace
+             << "\" xmlns:pic=\"" << kDrawingPictureNamespace
+             << "\"><w:body>";
 
     for (std::size_t block_index = 0; block_index < body.blocks.size();
          ++block_index) {
         const auto& block = body.blocks[block_index];
         if (const auto* paragraph = std::get_if<NewParagraph>(&block)) {
-            if (!appendNewParagraphFragment(document, *paragraph, page, loss, error)) {
+            if (!appendNewParagraphFragment(
+                    document, *paragraph, page, loss, error, images,
+                    image_index)) {
                 return false;
             }
             continue;
@@ -5126,7 +5652,8 @@ bool buildNewDocumentXml(
                     }
                 }
                 if (!appendNewParagraphFragment(
-                        document, cell_paragraph, page, loss, error)) {
+                        document, cell_paragraph, page, loss, error, images,
+                        image_index)) {
                     return false;
                 }
                 document << "</w:tc>";
@@ -5137,14 +5664,318 @@ bool buildNewDocumentXml(
     }
 
     document << "<w:sectPr><w:pgSz w:w=\"" << page.width_twips
-             << "\" w:h=\"" << page.height_twips << "\"/>"
-             << "<w:pgMar w:top=\"" << page.margin_top_twips
+             << "\" w:h=\"" << page.height_twips << "\"";
+    if (page.width_twips > page.height_twips) {
+        document << " w:orient=\"landscape\"";
+    }
+    document << "/><w:pgMar w:top=\"" << page.margin_top_twips
              << "\" w:right=\"" << page.margin_right_twips
              << "\" w:bottom=\"" << page.margin_bottom_twips
              << "\" w:left=\"" << page.margin_left_twips << "\" "
                 "w:header=\"720\" w:footer=\"720\" w:gutter=\"0\"/>"
              << "</w:sectPr></w:body></w:document>";
     xml = document.str();
+    return true;
+}
+
+bool validPageSettings(const PageSettings& page) {
+    return page.width_twips >= 1440 && page.height_twips >= 1440 &&
+           page.width_twips <= 63360 && page.height_twips <= 63360 &&
+           static_cast<std::uint64_t>(page.margin_top_twips) +
+                   page.margin_bottom_twips <
+               page.height_twips &&
+           static_cast<std::uint64_t>(page.margin_left_twips) +
+                   page.margin_right_twips <
+               page.width_twips;
+}
+
+std::string_view sectionBreakName(SectionBreakKind kind) {
+    switch (kind) {
+        case SectionBreakKind::next_page: return "nextPage";
+        case SectionBreakKind::continuous: return "continuous";
+        case SectionBreakKind::even_page: return "evenPage";
+        case SectionBreakKind::odd_page: return "oddPage";
+    }
+    return {};
+}
+
+std::string sectionPropertiesXml(const NewSection& section) {
+    std::ostringstream xml;
+    xml << "<w:sectPr><w:type w:val=\""
+        << sectionBreakName(section.break_kind)
+        << "\"/><w:pgSz w:w=\"" << section.page.width_twips
+        << "\" w:h=\"" << section.page.height_twips << "\"";
+    if (section.page.width_twips > section.page.height_twips) {
+        xml << " w:orient=\"landscape\"";
+    }
+    xml << "/><w:pgMar w:top=\"" << section.page.margin_top_twips
+        << "\" w:right=\"" << section.page.margin_right_twips
+        << "\" w:bottom=\"" << section.page.margin_bottom_twips
+        << "\" w:left=\"" << section.page.margin_left_twips
+        << "\" w:header=\"720\" w:footer=\"720\" w:gutter=\"0\"/>"
+           "</w:sectPr>";
+    return xml.str();
+}
+
+bool extractGeneratedBody(std::string_view wrapped, std::string& body,
+                          Error* error) {
+    constexpr std::string_view body_marker = "<w:body>";
+    constexpr std::string_view section_marker = "<w:sectPr>";
+    const auto body_start = wrapped.find(body_marker);
+    const auto section_start = wrapped.rfind(section_marker);
+    if (body_start == std::string_view::npos ||
+        section_start == std::string_view::npos ||
+        section_start < body_start + body_marker.size()) {
+        setError(error, ErrorCode::save_validation_failed,
+                 "Could not compose a section body");
+        return false;
+    }
+    body.assign(wrapped.substr(
+        body_start + body_marker.size(),
+        section_start - body_start - body_marker.size()));
+    return true;
+}
+
+bool attachSectionToTerminalParagraph(
+    std::string& body, std::string_view section_xml, Error* error) {
+    constexpr std::string_view paragraph_start = "<w:p>";
+    constexpr std::string_view paragraph_end = "</w:p>";
+    constexpr std::string_view properties_start = "<w:pPr>";
+    constexpr std::string_view properties_end = "</w:pPr>";
+    const auto start = body.rfind(paragraph_start);
+    const auto end = body.rfind(paragraph_end);
+    if (start == std::string::npos || end == std::string::npos || start > end) {
+        setError(error, ErrorCode::save_validation_failed,
+                 "A non-final section has no terminating paragraph");
+        return false;
+    }
+    const auto properties = body.find(properties_start, start);
+    if (properties != std::string::npos && properties < end) {
+        const auto close = body.find(properties_end, properties);
+        if (close == std::string::npos || close > end) {
+            setError(error, ErrorCode::save_validation_failed,
+                     "A terminating paragraph has malformed properties");
+            return false;
+        }
+        body.insert(close, section_xml);
+    } else {
+        body.insert(
+            start + paragraph_start.size(),
+            std::string(properties_start) + std::string(section_xml) +
+                std::string(properties_end));
+    }
+    return true;
+}
+
+bool buildNewSectionedDocumentXml(
+    const NewSectionedDocumentBody& body, std::string& xml,
+    LossReport& loss, Error* error,
+    const std::vector<AuthoredImagePart>& images) {
+    if (body.sections.size() < 2U) {
+        const std::string message =
+            "Multi-section authoring requires at least two sections";
+        loss.issues.push_back(blockingIssue(
+            IssueCode::structural_rewrite_required, message));
+        setError(error, ErrorCode::unsafe_edit, message);
+        return false;
+    }
+
+    std::ostringstream document;
+    document << "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+             << "<w:document xmlns:w=\"" << kWordNamespace
+             << "\" xmlns:m=\"" << kOfficeMathNamespace
+             << "\" xmlns:r=\"" << kOfficeRelationshipsNamespace
+             << "\" xmlns:wp=\"" << kWordprocessingDrawingNamespace
+             << "\" xmlns:a=\"" << kDrawingMainNamespace
+             << "\" xmlns:pic=\"" << kDrawingPictureNamespace
+             << "\"><w:body>";
+
+    std::size_t image_index = 0;
+    for (std::size_t index = 0; index < body.sections.size(); ++index) {
+        const auto& section = body.sections[index];
+        const auto break_name = sectionBreakName(section.break_kind);
+        if (!validPageSettings(section.page) || break_name.empty() ||
+            section.body.blocks.empty()) {
+            const std::string message =
+                "Each section requires a valid page, break kind, and body";
+            loss.issues.push_back(blockingIssue(
+                IssueCode::structural_rewrite_required, message, index));
+            setError(error, ErrorCode::unsafe_edit, message);
+            return false;
+        }
+        const bool final_section = index + 1U == body.sections.size();
+        if (!final_section &&
+            !std::holds_alternative<NewParagraph>(
+                section.body.blocks.back())) {
+            const std::string message =
+                "A non-final section must end in a paragraph";
+            loss.issues.push_back(blockingIssue(
+                IssueCode::structural_rewrite_required, message, index));
+            setError(error, ErrorCode::unsafe_edit, message);
+            return false;
+        }
+
+        std::string wrapped;
+        if (!buildNewDocumentXml(
+                section.body, section.page, wrapped, loss, error, images,
+                image_index)) {
+            return false;
+        }
+        std::string section_body;
+        if (!extractGeneratedBody(wrapped, section_body, error)) return false;
+        if (!final_section &&
+            !attachSectionToTerminalParagraph(
+                section_body, sectionPropertiesXml(section), error)) {
+            return false;
+        }
+        document << section_body;
+    }
+    document << sectionPropertiesXml(body.sections.back())
+             << "</w:body></w:document>";
+    if (image_index != images.size()) {
+        setError(error, ErrorCode::save_validation_failed,
+                 "Inline image catalog and section traversal differ");
+        return false;
+    }
+    xml = document.str();
+    return true;
+}
+
+std::string_view numberFormatName(BasicNumberFormat format) {
+    switch (format) {
+        case BasicNumberFormat::bullet: return "bullet";
+        case BasicNumberFormat::decimal: return "decimal";
+        case BasicNumberFormat::upper_letter: return "upperLetter";
+        case BasicNumberFormat::lower_letter: return "lowerLetter";
+        case BasicNumberFormat::upper_roman: return "upperRoman";
+        case BasicNumberFormat::lower_roman: return "lowerRoman";
+    }
+    return "decimal";
+}
+
+std::string_view numberSuffixName(BasicNumberSuffix suffix) {
+    switch (suffix) {
+        case BasicNumberSuffix::tab: return "tab";
+        case BasicNumberSuffix::space: return "space";
+        case BasicNumberSuffix::nothing: return "nothing";
+    }
+    return "tab";
+}
+
+using NewNumberingCatalog =
+    std::map<std::int32_t, std::map<std::uint8_t, NewNumbering>>;
+
+bool addNewNumberingToCatalog(
+    const NewParagraph& paragraph, NewNumberingCatalog& catalog,
+    LossReport& loss, Error* error) {
+    if (!paragraph.numbering) return true;
+    const auto& numbering = *paragraph.numbering;
+    auto& levels = catalog[numbering.num_id];
+    const auto [found, inserted] = levels.emplace(numbering.level, numbering);
+    if (!inserted && found->second != numbering) {
+        const std::string message =
+            "Paragraphs in one native list use conflicting definitions for the same level";
+        loss.issues.push_back(blockingIssue(
+            IssueCode::structural_rewrite_required, message));
+        setError(error, ErrorCode::unsafe_edit, message);
+        return false;
+    }
+    return true;
+}
+
+bool collectNewNumbering(
+    const NewDocumentBody& body, NewNumberingCatalog& catalog,
+    LossReport& loss, Error* error) {
+    for (const auto& block : body.blocks) {
+        if (const auto* paragraph = std::get_if<NewParagraph>(&block)) {
+            if (!addNewNumberingToCatalog(
+                    *paragraph, catalog, loss, error)) {
+                return false;
+            }
+            continue;
+        }
+        const auto& table = std::get<NewTable>(block);
+        for (const auto& paragraph : table.cell_paragraphs) {
+            if (!addNewNumberingToCatalog(
+                    paragraph, catalog, loss, error)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+void buildNewNumberingXmlFromCatalog(
+    const NewNumberingCatalog& catalog, std::string& xml) {
+    if (catalog.empty()) {
+        xml.clear();
+        return;
+    }
+
+    std::ostringstream numbering;
+    numbering
+        << "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+           "<w:numbering xmlns:w=\""
+        << kWordNamespace << "\">";
+    std::map<std::int32_t, std::int32_t> abstract_ids;
+    std::int32_t next_abstract_id = 0;
+    for (const auto& [num_id, levels] : catalog) {
+        const auto abstract_id = next_abstract_id++;
+        abstract_ids.emplace(num_id, abstract_id);
+        numbering << "<w:abstractNum w:abstractNumId=\"" << abstract_id
+                  << "\"><w:multiLevelType w:val=\"hybridMultilevel\"/>";
+        for (const auto& [level, definition] : levels) {
+            numbering << "<w:lvl w:ilvl=\""
+                      << static_cast<unsigned int>(level)
+                      << "\"><w:start w:val=\"" << definition.start
+                      << "\"/><w:numFmt w:val=\""
+                      << numberFormatName(definition.format)
+                      << "\"/><w:suff w:val=\""
+                      << numberSuffixName(definition.suffix)
+                      << "\"/><w:lvlText w:val=\""
+                      << escapeXmlAttribute(definition.level_text)
+                      << "\"/><w:lvlJc w:val=\"left\"/><w:pPr>";
+            if (definition.tab_stop_twips) {
+                numbering << "<w:tabs><w:tab w:val=\"num\" w:pos=\""
+                          << *definition.tab_stop_twips
+                          << "\"/></w:tabs>";
+            }
+            numbering << "<w:ind w:left=\""
+                      << definition.text_indent_twips
+                      << "\" w:hanging=\""
+                      << definition.hanging_indent_twips
+                      << "\"/></w:pPr></w:lvl>";
+        }
+        numbering << "</w:abstractNum>";
+    }
+    for (const auto& [num_id, abstract_id] : abstract_ids) {
+        numbering << "<w:num w:numId=\"" << num_id
+                  << "\"><w:abstractNumId w:val=\"" << abstract_id
+                  << "\"/></w:num>";
+    }
+    numbering << "</w:numbering>";
+    xml = numbering.str();
+}
+
+bool buildNewNumberingXml(
+    const NewDocumentBody& body, std::string& xml, LossReport& loss,
+    Error* error) {
+    NewNumberingCatalog catalog;
+    if (!collectNewNumbering(body, catalog, loss, error)) return false;
+    buildNewNumberingXmlFromCatalog(catalog, xml);
+    return true;
+}
+
+bool buildNewNumberingXml(
+    const NewSectionedDocumentBody& body, std::string& xml,
+    LossReport& loss, Error* error) {
+    NewNumberingCatalog catalog;
+    for (const auto& section : body.sections) {
+        if (!collectNewNumbering(section.body, catalog, loss, error)) {
+            return false;
+        }
+    }
+    buildNewNumberingXmlFromCatalog(catalog, xml);
     return true;
 }
 
@@ -5179,6 +6010,62 @@ constexpr std::string_view kNewDocumentRelationships =
     "Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/settings\" "
     "Target=\"settings.xml\"/>"
     "</Relationships>";
+
+std::string newContentTypes(
+    bool has_numbering, const std::vector<AuthoredImagePart>& images) {
+    std::string result(kNewContentTypes);
+    constexpr std::string_view closing = "</Types>";
+    const auto position = result.rfind(closing);
+    if (position != std::string::npos && has_numbering) {
+        result.insert(
+            position,
+            "<Override PartName=\"/word/numbering.xml\" "
+            "ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml\"/>");
+    }
+    const bool has_png = std::any_of(
+        images.begin(), images.end(), [](const auto& image) {
+            return image.content_type == "image/png";
+        });
+    const bool has_jpeg = std::any_of(
+        images.begin(), images.end(), [](const auto& image) {
+            return image.content_type == "image/jpeg";
+        });
+    const auto updated_position = result.rfind(closing);
+    if (updated_position != std::string::npos && has_png) {
+        result.insert(updated_position,
+                      "<Default Extension=\"png\" ContentType=\"image/png\"/>");
+    }
+    const auto jpeg_position = result.rfind(closing);
+    if (jpeg_position != std::string::npos && has_jpeg) {
+        result.insert(jpeg_position,
+                      "<Default Extension=\"jpg\" ContentType=\"image/jpeg\"/>");
+    }
+    return result;
+}
+
+std::string newDocumentRelationships(
+    bool has_numbering, const std::vector<AuthoredImagePart>& images) {
+    std::string result(kNewDocumentRelationships);
+    constexpr std::string_view closing = "</Relationships>";
+    const auto position = result.rfind(closing);
+    if (position != std::string::npos && has_numbering) {
+        result.insert(
+            position,
+            "<Relationship Id=\"rId3\" "
+            "Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/numbering\" "
+            "Target=\"numbering.xml\"/>");
+    }
+    for (const auto& image : images) {
+        const auto image_position = result.rfind(closing);
+        if (image_position == std::string::npos) break;
+        result.insert(
+            image_position,
+            "<Relationship Id=\"" + image.relationship_id +
+                "\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/image\" Target=\"" +
+                image.relationship_target + "\"/>");
+    }
+    return result;
+}
 
 std::string buildNewStylesXml(const DocumentDefaults& defaults) {
     const std::string family = escapeXmlAttribute(defaults.font_family);
@@ -5340,6 +6227,10 @@ const std::vector<ImportedBodyBlock>& DocxDocument::bodyBlocks() const noexcept 
 
 const std::optional<PageSettings>& DocxDocument::bodyPageSettings() const noexcept {
     return impl_->package.page_settings;
+}
+
+const std::vector<ImportedSection>& DocxDocument::sections() const noexcept {
+    return impl_->package.sections;
 }
 
 const CompatibilityReport& DocxDocument::compatibility() const noexcept {
@@ -5566,14 +6457,7 @@ SaveResult DocxDocument::writeNew(
     const PageSettings& page,
     const DocumentDefaults& defaults) {
     SaveResult result;
-    const bool page_valid =
-        page.width_twips >= 1440 && page.height_twips >= 1440 &&
-        page.width_twips <= 63360 && page.height_twips <= 63360 &&
-        static_cast<std::uint64_t>(page.margin_top_twips) + page.margin_bottom_twips <
-            page.height_twips &&
-        static_cast<std::uint64_t>(page.margin_left_twips) + page.margin_right_twips <
-            page.width_twips;
-    if (!page_valid) {
+    if (!validPageSettings(page)) {
         const std::string message =
             "Page size or margins are outside the supported range";
         result.loss_report.issues.push_back(blockingIssue(
@@ -5601,12 +6485,35 @@ SaveResult DocxDocument::writeNew(
         return result;
     }
     Error save_error;
-    std::string document_xml;
-    if (!buildNewDocumentXml(body, page, document_xml,
-                             result.loss_report, &save_error)) {
+    std::vector<AuthoredImagePart> images;
+    if (!collectBodyImages(
+            body, images, result.loss_report, &save_error)) {
         result.error = std::move(save_error);
         return result;
     }
+    std::string document_xml;
+    std::size_t image_index = 0;
+    if (!buildNewDocumentXml(body, page, document_xml,
+                             result.loss_report, &save_error, images,
+                             image_index) ||
+        image_index != images.size()) {
+        if (save_error.code == ErrorCode::none) {
+            setError(&save_error, ErrorCode::save_validation_failed,
+                     "Inline image catalog and document traversal differ");
+        }
+        result.error = std::move(save_error);
+        return result;
+    }
+    std::string numbering_xml;
+    if (!buildNewNumberingXml(
+            body, numbering_xml, result.loss_report, &save_error)) {
+        result.error = std::move(save_error);
+        return result;
+    }
+    const bool has_numbering = !numbering_xml.empty();
+    const std::string content_types = newContentTypes(has_numbering, images);
+    const std::string document_relationships =
+        newDocumentRelationships(has_numbering, images);
 
     auto temporary = AtomicTempFile::create(target, 0600U, &save_error);
     if (!temporary.has_value()) {
@@ -5616,16 +6523,98 @@ SaveResult DocxDocument::writeNew(
     if (!temporary->closeDescriptor(&save_error) ||
         !writeNewArchive(
             temporary->path(),
-            kNewContentTypes,
+            content_types,
             kNewRootRelationships,
-            kNewDocumentRelationships,
+            document_relationships,
             buildNewStylesXml(defaults),
             buildNewSettingsXml(defaults),
+            numbering_xml,
             document_xml,
+            images,
             &save_error) ||
         !temporary->syncClosedFile(&save_error) ||
         !validateSavedPackage(
             temporary->path(), nullptr, document_xml, nullptr, OpenOptions{}, &save_error)) {
+        result.error = std::move(save_error);
+        return result;
+    }
+    if (!temporary->commit(target, &save_error)) {
+        result.error = std::move(save_error);
+        return result;
+    }
+    result.saved = true;
+    result.byte_identical_to_opened_file = false;
+    result.preserved_member_count = 0;
+    return result;
+}
+
+SaveResult DocxDocument::writeNew(
+    const std::filesystem::path& target,
+    const NewSectionedDocumentBody& body,
+    const DocumentDefaults& defaults) {
+    SaveResult result;
+    IssueCode defaults_issue = IssueCode::invalid_utf8;
+    std::string defaults_detail;
+    const bool defaults_valid =
+        !defaults.font_family.empty() &&
+        isValidUtf8XmlText(defaults.font_family, defaults_issue,
+                           defaults_detail) &&
+        defaults.font_size_half_points >= 2 &&
+        defaults.font_size_half_points <= 3276 &&
+        defaults.default_tab_stop_twips >= 1 &&
+        defaults.default_tab_stop_twips <= 31680;
+    if (!defaults_valid) {
+        const std::string message = defaults_detail.empty()
+            ? "Document defaults contain an invalid font, size, or tab stop"
+            : defaults_detail;
+        result.loss_report.issues.push_back(blockingIssue(
+            IssueCode::structural_rewrite_required, message));
+        result.error = Error{ErrorCode::unsafe_edit, message};
+        return result;
+    }
+
+    Error save_error;
+    std::vector<AuthoredImagePart> images;
+    for (const auto& section : body.sections) {
+        if (!collectBodyImages(
+                section.body, images, result.loss_report, &save_error)) {
+            result.error = std::move(save_error);
+            return result;
+        }
+    }
+    std::string document_xml;
+    if (!buildNewSectionedDocumentXml(
+            body, document_xml, result.loss_report, &save_error, images)) {
+        result.error = std::move(save_error);
+        return result;
+    }
+    std::string numbering_xml;
+    if (!buildNewNumberingXml(
+            body, numbering_xml, result.loss_report, &save_error)) {
+        result.error = std::move(save_error);
+        return result;
+    }
+    const bool has_numbering = !numbering_xml.empty();
+    const std::string content_types =
+        newContentTypes(has_numbering, images);
+    const std::string document_relationships =
+        newDocumentRelationships(has_numbering, images);
+
+    auto temporary = AtomicTempFile::create(target, 0600U, &save_error);
+    if (!temporary.has_value()) {
+        result.error = std::move(save_error);
+        return result;
+    }
+    if (!temporary->closeDescriptor(&save_error) ||
+        !writeNewArchive(
+            temporary->path(), content_types, kNewRootRelationships,
+            document_relationships, buildNewStylesXml(defaults),
+            buildNewSettingsXml(defaults), numbering_xml, document_xml,
+            images, &save_error) ||
+        !temporary->syncClosedFile(&save_error) ||
+        !validateSavedPackage(
+            temporary->path(), nullptr, document_xml, nullptr,
+            OpenOptions{}, &save_error)) {
         result.error = std::move(save_error);
         return result;
     }

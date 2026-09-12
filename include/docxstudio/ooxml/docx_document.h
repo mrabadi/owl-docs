@@ -1,11 +1,14 @@
 #pragma once
 
+#include "docxstudio/raster/validation.h"
+
 #include <cstddef>
 #include <compare>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <utility>
 #include <variant>
@@ -128,10 +131,65 @@ struct EquationPayload {
     auto operator<=>(const EquationPayload&) const = default;
 };
 
+// Value-like, immutable byte storage shared by every DrawingML reference to
+// one package member. Copying paragraphs or snapshots therefore cannot copy a
+// large media member once per reference.
+class SharedImageBytes {
+public:
+    using Storage = std::vector<std::uint8_t>;
+
+    SharedImageBytes() = default;
+    explicit SharedImageBytes(Storage bytes)
+        : storage_(bytes.empty()
+                       ? nullptr
+                       : std::make_shared<const Storage>(std::move(bytes))) {}
+    explicit SharedImageBytes(std::shared_ptr<const Storage> bytes)
+        : storage_(std::move(bytes)) {}
+
+    [[nodiscard]] bool empty() const noexcept {
+        return !storage_ || storage_->empty();
+    }
+    [[nodiscard]] std::size_t size() const noexcept {
+        return storage_ ? storage_->size() : 0U;
+    }
+    [[nodiscard]] const std::uint8_t* data() const noexcept {
+        return storage_ ? storage_->data() : nullptr;
+    }
+    [[nodiscard]] std::span<const std::uint8_t> view() const noexcept {
+        return {data(), size()};
+    }
+    [[nodiscard]] bool sharesStorageWith(
+        const SharedImageBytes& other) const noexcept {
+        return storage_ && storage_ == other.storage_;
+    }
+
+    bool operator==(const SharedImageBytes& other) const {
+        return values() == other.values();
+    }
+    auto operator<=>(const SharedImageBytes& other) const {
+        return values() <=> other.values();
+    }
+    friend bool operator==(const SharedImageBytes& left,
+                           const Storage& right) {
+        return left.values() == right;
+    }
+    friend bool operator==(const Storage& left,
+                           const SharedImageBytes& right) {
+        return left == right.values();
+    }
+
+private:
+    [[nodiscard]] const Storage& values() const {
+        static const Storage empty_storage;
+        return storage_ ? *storage_ : empty_storage;
+    }
+
+    std::shared_ptr<const Storage> storage_;
+};
+
 // Raster drawings are decoded by the UI toolkit, never by the OOXML parser.
-// Keeping the original package bytes here makes this transport neutral while
-// allowing the editor to render a safe, bounded inline preview without
-// fetching an external relationship.
+// Keeping shared original package bytes here makes this transport neutral
+// while allowing a bounded preview without fetching external relationships.
 struct InlineImagePayload {
     std::string relationship_id;
     std::string package_member;
@@ -139,7 +197,7 @@ struct InlineImagePayload {
     std::string name;
     std::int64_t width_emu{0};
     std::int64_t height_emu{0};
-    std::vector<std::uint8_t> bytes;
+    SharedImageBytes bytes;
 
     [[nodiscard]] bool renderable() const noexcept {
         return width_emu > 0 && height_emu > 0 && !bytes.empty();
@@ -338,21 +396,64 @@ struct OpenOptions {
     std::uint64_t max_xml_nodes{1'000'000};
 };
 
+using RasterImageFormat = raster::Format;
+
+// Authored pictures are byte-owned and transport neutral. The writer chooses
+// all OPC member names and relationship IDs; callers cannot smuggle package
+// paths or external relationships through this surface.
+struct NewInlineImage {
+    static constexpr std::size_t maximum_encoded_bytes =
+        64ULL * 1024ULL * 1024ULL;
+
+    RasterImageFormat format{RasterImageFormat::png};
+    std::string name;
+    std::int64_t width_emu{0};
+    std::int64_t height_emu{0};
+    std::vector<std::uint8_t> bytes;
+
+    auto operator<=>(const NewInlineImage&) const = default;
+};
+
 struct NewRun {
     NewRun() = default;
     NewRun(std::string new_text, BasicRunFormat new_format,
-           std::optional<EquationPayload> new_equation = std::nullopt)
+           std::optional<EquationPayload> new_equation = std::nullopt,
+           std::optional<NewInlineImage> new_inline_image = std::nullopt)
         : text(std::move(new_text)),
           format(std::move(new_format)),
-          equation(std::move(new_equation)) {}
+          equation(std::move(new_equation)),
+          inline_image(std::move(new_inline_image)) {}
 
     std::string text;
     BasicRunFormat format;
     // When present this run represents exactly one equation and text must be
     // empty. Paragraph run order is therefore the inline content order.
     std::optional<EquationPayload> equation;
+    // When present this run represents exactly one bounded internal raster
+    // picture. It is mutually exclusive with both text and equation.
+    std::optional<NewInlineImage> inline_image;
 
     auto operator<=>(const NewRun&) const = default;
+};
+
+// Native WordprocessingML numbering attached to an authored paragraph.
+// Positive num_id values identify one list instance across paragraphs. The
+// writer emits a matching numbering.xml definition and stores only numPr in
+// document.xml; marker text must therefore not be duplicated in NewRun text.
+// OOXML permits levels 0 through 8. The editor's tenth visual level is written
+// as interoperable literal marker text and must not be represented here.
+struct NewNumbering {
+    std::int32_t num_id{0};
+    std::uint8_t level{0};
+    BasicNumberFormat format{BasicNumberFormat::decimal};
+    std::int32_t start{1};
+    std::string level_text{"%1."};
+    BasicNumberSuffix suffix{BasicNumberSuffix::tab};
+    std::uint32_t text_indent_twips{720};
+    std::uint32_t hanging_indent_twips{360};
+    std::optional<std::uint32_t> tab_stop_twips{720};
+
+    auto operator<=>(const NewNumbering&) const = default;
 };
 
 struct NewParagraph {
@@ -374,6 +475,7 @@ struct NewParagraph {
     std::optional<bool> keep_lines;
     std::optional<bool> page_break_before;
     std::vector<std::uint32_t> left_tab_stops_twips;
+    std::optional<NewNumbering> numbering;
     // Written as w:pPr/w:rPr. Use this for an empty table cell's insertion
     // format instead of relying on a zero-length w:r alone.
     std::optional<BasicRunFormat> paragraph_mark_format;
@@ -430,6 +532,33 @@ struct PageSettings {
     std::uint32_t margin_left_twips{1440};
 
     auto operator<=>(const PageSettings&) const = default;
+};
+
+enum class SectionBreakKind { next_page, continuous, even_page, odd_page };
+
+struct ImportedSection {
+    // Half-open range into bodyBlocks(). The paragraph carrying a non-final
+    // section property belongs to the section which it terminates.
+    std::size_t first_body_block_index{0};
+    std::size_t body_block_count{0};
+    PageSettings page;
+    SectionBreakKind break_kind{SectionBreakKind::next_page};
+
+    auto operator<=>(const ImportedSection&) const = default;
+};
+
+struct NewSection {
+    NewDocumentBody body;
+    PageSettings page;
+    // OOXML stores the section-start kind in this section's sectPr. For a
+    // non-final section, its last body block must currently be a paragraph.
+    SectionBreakKind break_kind{SectionBreakKind::next_page};
+
+    auto operator<=>(const NewSection&) const = default;
+};
+
+struct NewSectionedDocumentBody {
+    std::vector<NewSection> sections;
 };
 
 // Defaults written into the standard Word styles/settings parts. Callers can
@@ -514,6 +643,14 @@ public:
         const PageSettings& page = {},
         const DocumentDefaults& defaults = {});
 
+    // Ordered multi-section authoring. Non-final section properties are
+    // written on the terminating paragraph and final properties on w:body,
+    // matching native WordprocessingML structure.
+    [[nodiscard]] static SaveResult writeNew(
+        const std::filesystem::path& target,
+        const NewSectionedDocumentBody& body,
+        const DocumentDefaults& defaults = {});
+
     ~DocxDocument();
     DocxDocument(DocxDocument&&) noexcept;
     DocxDocument& operator=(DocxDocument&&) noexcept;
@@ -525,6 +662,7 @@ public:
     [[nodiscard]] const std::vector<Paragraph>& paragraphs() const noexcept;
     [[nodiscard]] const std::vector<ImportedBodyBlock>& bodyBlocks() const noexcept;
     [[nodiscard]] const std::optional<PageSettings>& bodyPageSettings() const noexcept;
+    [[nodiscard]] const std::vector<ImportedSection>& sections() const noexcept;
     [[nodiscard]] const CompatibilityReport& compatibility() const noexcept;
     [[nodiscard]] bool dirty() const noexcept;
 

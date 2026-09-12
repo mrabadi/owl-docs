@@ -1,0 +1,17 @@
+{
+  "schema": "owl-docs-corpus-v1",
+  "minimumFixtureCount": 1,
+  "fixtures": [
+    {
+      "id": "replace-with-a-stable-id",
+      "path": "fixtures/example.docx",
+      "license": "replace-with-license-or-private-test-only",
+      "provenanceUrl": "local-authorized:replace-with-a-non-sensitive-description",
+      "sourceRevision": "replace-with-an-immutable-revision-or-local-version",
+      "sha256": "replace-with-64-lowercase-hex-characters",
+      "checks": [
+        "exact-copy"
+      ]
+    }
+  ]
+}

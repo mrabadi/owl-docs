@@ -32,6 +32,18 @@ void setError(
 
 #if defined(__linux__)
 
+#if defined(__SANITIZE_ADDRESS__)
+constexpr bool kAddressSanitizerBuild = true;
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer)
+constexpr bool kAddressSanitizerBuild = true;
+#else
+constexpr bool kAddressSanitizerBuild = false;
+#endif
+#else
+constexpr bool kAddressSanitizerBuild = false;
+#endif
+
 rlim_t boundedLimit(std::uint64_t requested) {
     constexpr auto maximum = static_cast<std::uint64_t>(std::numeric_limits<rlim_t>::max());
     return static_cast<rlim_t>(std::min(requested, maximum));
@@ -75,7 +87,14 @@ bool installResourceLimits(const SandboxLimits& limits, SandboxError* error) {
             "Address-space and CPU limits must be non-zero and the descriptor limit must be at least three");
         return false;
     }
-    return lowerLimit(RLIMIT_AS, limits.address_space_bytes, "RLIMIT_AS", error) &&
+    // ASan reserves a very large sparse shadow address range before main().
+    // Lowering RLIMIT_AS in an instrumented test child makes the sanitizer
+    // itself fail to mmap before the sandbox can be exercised. Production
+    // builds always retain the configured address-space ceiling; sanitizer
+    // builds retain every other limit plus the seccomp policy.
+    const bool address_space_limited = kAddressSanitizerBuild ||
+        lowerLimit(RLIMIT_AS, limits.address_space_bytes, "RLIMIT_AS", error);
+    return address_space_limited &&
            lowerLimit(RLIMIT_CPU, limits.cpu_seconds, "RLIMIT_CPU", error) &&
            lowerLimit(RLIMIT_FSIZE, limits.output_file_bytes, "RLIMIT_FSIZE", error) &&
            lowerLimit(RLIMIT_NOFILE, limits.open_file_descriptors, "RLIMIT_NOFILE", error) &&

@@ -1,0 +1,17 @@
+{
+  "schema": "owl-docs-public-corpus-sources-v1",
+  "sources": [
+    {
+      "id": "libreoffice-ooxmlexport",
+      "project": "LibreOffice core",
+      "repositoryUrl": "https://github.com/LibreOffice/core",
+      "sourceRevision": "2776654bbb109af114a44fe00ec9771e4ad2d99d",
+      "subtree": "sw/qa/extras/ooxmlexport/data",
+      "indexUrl": "https://api.github.com/repos/LibreOffice/core/contents/sw/qa/extras/ooxmlexport/data?ref=2776654bbb109af114a44fe00ec9771e4ad2d99d",
+      "license": "MPL-2.0",
+      "licenseUrl": "https://raw.githubusercontent.com/LibreOffice/core/2776654bbb109af114a44fe00ec9771e4ad2d99d/COPYING.MPL",
+      "selection": "Select regular files whose names end in .docx (ASCII case-insensitive), exclude names beginning Encrypted_ because password-encrypted OOXML is an explicit product boundary, sort by repository path, and take the first requested number.",
+      "redistribution": "Corpus binaries are fetched into an external developer cache and are not distributed with Owl Docs."
+    }
+  ]
+}

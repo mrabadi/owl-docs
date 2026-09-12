@@ -475,6 +475,138 @@ bool operationsHaveNonTextChanges(const core::Document& base,
     return false;
 }
 
+void reanchorImagesForInsertion(
+    std::vector<ImportedInlineImagePresentation>& images,
+    const core::Position& position, std::size_t insertedLength) {
+    if (insertedLength == 0) return;
+    for (auto& image : images) {
+        if (image.paragraphId == position.paragraph_id &&
+            image.utf16Offset > position.utf16_offset) {
+            image.utf16Offset += insertedLength;
+        }
+    }
+}
+
+bool reanchorImagesForReplacement(
+    std::vector<ImportedInlineImagePresentation>& images,
+    const core::Document& document, const core::Range& range,
+    std::size_t replacementLength) {
+    const auto normalizedResult = document.normalizeRange(range);
+    if (!normalizedResult) return false;
+    const auto& normalized = normalizedResult.value();
+    const auto startOffset = normalized.start.utf16_offset;
+    const auto endOffset = normalized.end.utf16_offset;
+
+    if (normalized.start_paragraph_index ==
+        normalized.end_paragraph_index) {
+        for (auto& image : images) {
+            if (image.paragraphId != normalized.start.paragraph_id ||
+                image.utf16Offset <= startOffset) {
+                continue;
+            }
+            if (image.utf16Offset >= endOffset) {
+                image.utf16Offset = startOffset + replacementLength +
+                    image.utf16Offset - endOffset;
+            } else {
+                // A view-only object inside deleted text is preserved at the
+                // start boundary rather than silently discarded or misplaced.
+                image.utf16Offset = startOffset;
+            }
+        }
+        return true;
+    }
+
+    for (auto& image : images) {
+        const auto paragraphIndex = document.paragraphIndex(image.paragraphId);
+        if (!paragraphIndex ||
+            *paragraphIndex < normalized.start_paragraph_index ||
+            *paragraphIndex > normalized.end_paragraph_index) {
+            continue;
+        }
+        if (*paragraphIndex == normalized.start_paragraph_index) {
+            if (image.utf16Offset > startOffset) {
+                image.utf16Offset = startOffset;
+            }
+            continue;
+        }
+
+        const bool retainedEndSuffix =
+            *paragraphIndex == normalized.end_paragraph_index &&
+            image.utf16Offset >= endOffset;
+        image.paragraphId = normalized.start.paragraph_id;
+        image.utf16Offset = retainedEndSuffix
+            ? startOffset + replacementLength + image.utf16Offset - endOffset
+            : startOffset;
+    }
+    return true;
+}
+
+std::optional<std::vector<ImportedInlineImagePresentation>>
+reanchoredImportedImages(
+    const core::Document& base,
+    const std::vector<ImportedInlineImagePresentation>& source,
+    const std::vector<core::Operation>& operations) {
+    auto images = source;
+    auto working = base;
+    core::DocumentSession simulation(base);
+    for (const auto& operation : operations) {
+        const bool anchorsValid = std::visit(
+            [&](const auto& typed) {
+                using Type = std::decay_t<decltype(typed)>;
+                if constexpr (std::is_same_v<Type, core::InsertText>) {
+                    reanchorImagesForInsertion(
+                        images, typed.position, typed.text.size());
+                } else if constexpr (
+                    std::is_same_v<Type, core::InsertEquation>) {
+                    reanchorImagesForInsertion(images, typed.position, 1);
+                } else if constexpr (
+                    std::is_same_v<Type, core::DeleteRange>) {
+                    return reanchorImagesForReplacement(
+                        images, working, typed.range, 0);
+                } else if constexpr (
+                    std::is_same_v<Type, core::ReplaceRange>) {
+                    return reanchorImagesForReplacement(
+                        images, working, typed.range, typed.text.size());
+                } else if constexpr (
+                    std::is_same_v<Type, core::SplitParagraph>) {
+                    for (auto& image : images) {
+                        if (image.paragraphId == typed.position.paragraph_id &&
+                            image.utf16Offset > typed.position.utf16_offset) {
+                            image.paragraphId = typed.new_paragraph_id;
+                            image.utf16Offset -= typed.position.utf16_offset;
+                        }
+                    }
+                } else if constexpr (
+                    std::is_same_v<Type, core::MergeWithNextParagraph>) {
+                    const auto firstIndex = working.paragraphIndex(
+                        typed.paragraph_id);
+                    if (!firstIndex ||
+                        *firstIndex + 1 >= working.paragraphs().size()) {
+                        return false;
+                    }
+                    const auto& first = working.paragraphs()[*firstIndex];
+                    const auto& second = working.paragraphs()[*firstIndex + 1];
+                    for (auto& image : images) {
+                        if (image.paragraphId == second.id()) {
+                            image.paragraphId = first.id();
+                            image.utf16Offset += first.text().size();
+                        }
+                    }
+                }
+                return true;
+            },
+            operation);
+        if (!anchorsValid) return std::nullopt;
+        const auto simulationSnapshot = simulation.snapshot();
+        const auto applied = simulation.applyBatch(
+            simulationSnapshot.revision,
+            std::span<const core::Operation>(&operation, 1));
+        if (!applied) return std::nullopt;
+        working = simulation.snapshot().document;
+    }
+    return images;
+}
+
 struct PlainTextListMarker {
     enum class Kind { bullet, numbered };
 
@@ -923,6 +1055,8 @@ struct DocumentCanvas::EquationVisual {
 
 struct ParagraphImageVisual {
     QImage image;
+    std::size_t coreUtf16Offset{};
+    std::size_t layoutUtf16Offset{};
     QRectF rect;
     int pageIndex{};
 };
@@ -934,6 +1068,34 @@ struct DocumentCanvas::ParagraphVisual {
     std::vector<VisualLine> lines;
     std::vector<EquationVisual> equations;
     std::vector<ParagraphImageVisual> images;
+
+    [[nodiscard]] int layoutOffsetForCore(std::size_t offset) const {
+        offset = std::min(offset, static_cast<std::size_t>(text.size()));
+        std::size_t result = offset;
+        for (const auto& image : images) {
+            if (image.coreUtf16Offset > offset) break;
+            ++result;
+        }
+        return static_cast<int>(std::min<std::size_t>(
+            result, static_cast<std::size_t>(std::numeric_limits<int>::max())));
+    }
+
+    [[nodiscard]] std::size_t coreOffsetForLayout(int offset) const {
+        const auto layoutSize = static_cast<std::size_t>(
+            layout ? layout->text().size() : text.size());
+        const int maximum = static_cast<int>(std::min<std::size_t>(
+            layoutSize,
+            static_cast<std::size_t>(std::numeric_limits<int>::max())));
+        const std::size_t bounded = static_cast<std::size_t>(
+            std::clamp(offset, 0, maximum));
+        std::size_t imageCount = 0;
+        for (const auto& image : images) {
+            if (image.layoutUtf16Offset >= bounded) break;
+            ++imageCount;
+        }
+        return std::min(
+            static_cast<std::size_t>(text.size()), bounded - imageCount);
+    }
 };
 
 struct DocumentCanvas::TableCellVisual {
@@ -991,6 +1153,7 @@ struct DocumentCanvas::Hit {
     bool valid{false};
     int lineStart{};
     int lineEnd{};
+    int layoutLineStart{};
     std::optional<TableCursor> tableCursor;
     std::optional<core::NodeId> tableHandle;
 };
@@ -1059,6 +1222,7 @@ void DocumentCanvas::setDocument(core::Document document) {
     previewId_.reset();
     previewRevision_ = {};
     previewCursor_.reset();
+    previewOperations_.clear();
     previewHasNonTextChanges_ = false;
     undoCursorHistory_.clear();
     redoCursorHistory_.clear();
@@ -1241,6 +1405,11 @@ int DocumentCanvas::pageCount() const {
     return pageCount_;
 }
 
+std::uint64_t DocumentCanvas::layoutGeneration() const {
+    ensureLayout();
+    return layoutGeneration_;
+}
+
 int DocumentCanvas::currentPageNumber() const {
     ensureLayout();
     int page = 0;
@@ -1298,7 +1467,7 @@ DocumentCanvas::CursorState DocumentCanvas::captureEditorState() const {
     return CursorState{
         selection_, typingFormat_, tableCursor_, tableSelectionAnchor_,
         tableCellSelection_, selectedTable_,
-        lineAffinity_, preferredVerticalX_,
+        lineAffinity_, preferredVerticalX_, importedImages_,
         pageWidthPoints_, pageHeightPoints_,
         marginTopPoints_, marginRightPoints_, marginBottomPoints_,
         marginLeftPoints_, currentStateId_, currentNonTextStateId_,
@@ -1315,6 +1484,7 @@ void DocumentCanvas::restoreEditorState(const CursorState& state) {
     selectedTable_ = state.selectedTable;
     lineAffinity_ = state.lineAffinity;
     preferredVerticalX_ = state.preferredVerticalX;
+    importedImages_ = state.importedImages;
     pageWidthPoints_ = state.pageWidthPoints;
     pageHeightPoints_ = state.pageHeightPoints;
     marginTopPoints_ = state.marginTopPoints;
@@ -1546,12 +1716,19 @@ void DocumentCanvas::ensureLayout() const {
 }
 
 void DocumentCanvas::rebuildLayout() const {
-    auto snap = session_->snapshot();
+    const auto liveSnapshot = session_->snapshot();
+    auto snap = liveSnapshot;
+    auto displayImages = importedImages_;
     bool preview = false;
     if (previewId_) {
         const auto previewSnapshot = session_->previewSnapshot(*previewId_);
         if (previewSnapshot) {
             snap = {previewSnapshot.value().revision, previewSnapshot.value().document};
+            if (const auto previewImages = reanchoredImportedImages(
+                    liveSnapshot.document, importedImages_,
+                    previewOperations_)) {
+                displayImages = *previewImages;
+            }
             preview = true;
         }
     }
@@ -1614,24 +1791,80 @@ void DocumentCanvas::rebuildLayout() const {
         visual->id = paragraph.id();
         visual->text = fromUtf16(paragraph.text());
         std::vector<const ImportedInlineImagePresentation*> paragraphImages;
-        for (const auto& image : importedImages_) {
+        for (const auto& image : displayImages) {
             if (image.paragraphId == paragraph.id() && !image.image.isNull() &&
                 image.widthPoints > 0.0 && image.heightPoints > 0.0) {
                 paragraphImages.push_back(&image);
             }
         }
+        std::stable_sort(
+            paragraphImages.begin(), paragraphImages.end(),
+            [](const auto* left, const auto* right) {
+                return left->utf16Offset < right->utf16Offset;
+            });
         core::CharacterFormat defaultFormat;
         defaultFormat.font_family = defaultFontFamily_.toStdString();
         defaultFormat.font_size_half_points = static_cast<std::int32_t>(
             std::lround(defaultFontPointSize_ * 2.0));
 
+        const double leftIndent = emuToPoints(paragraphFormat.left_indent_emu);
+        const double rightIndent = emuToPoints(paragraphFormat.right_indent_emu);
+        const double firstIndent = emuToPoints(
+            paragraphFormat.first_line_indent_emu);
+        const double baseWidth = std::max(
+            36.0, pageWidthPoints_ - marginLeftPoints_ -
+                      marginRightPoints_ - leftIndent - rightIndent);
+        const double pageContentHeight = std::max(
+            18.0, pageHeightPoints_ - marginTopPoints_ -
+                      marginBottomPoints_);
+
+        QString layoutText = visual->text;
+        visual->images.reserve(paragraphImages.size());
+        for (const auto* importedImage : paragraphImages) {
+            const auto coreOffset = std::min(
+                importedImage->utf16Offset,
+                static_cast<std::size_t>(visual->text.size()));
+            const double fitScale = std::min(
+                {1.0, baseWidth / importedImage->widthPoints,
+                 pageContentHeight / importedImage->heightPoints});
+            const double width = importedImage->widthPoints * fitScale;
+            const double height = importedImage->heightPoints * fitScale;
+            const auto layoutOffset = coreOffset + visual->images.size();
+            layoutText.insert(static_cast<qsizetype>(layoutOffset),
+                              QChar(0x00a0));
+            visual->images.push_back(
+                {importedImage->image, coreOffset, layoutOffset,
+                 QRectF(0.0, 0.0, width, height), 0});
+        }
+
         QList<QTextLayout::FormatRange> ranges;
         for (const auto& run : paragraph.characterFormats()) {
             QTextLayout::FormatRange range;
-            range.start = static_cast<int>(run.start);
-            range.length = static_cast<int>(run.end - run.start);
+            range.start = visual->layoutOffsetForCore(run.start);
+            range.length = std::max(
+                0, visual->layoutOffsetForCore(run.end) - range.start);
             range.format = qtFormat(run.format, defaultFontFamily_,
                                     defaultFontPointSize_);
+            if (range.length > 0) ranges.push_back(range);
+        }
+        for (const auto& image : visual->images) {
+            const auto characterFormat = paragraph.characterFormatAt(
+                std::min(paragraph.text().size(),
+                         image.coreUtf16Offset + 1U));
+            QFont spacerFont = fontFrom(
+                characterFormat, defaultFontFamily_, defaultFontPointSize_);
+            const qreal naturalWidth = std::max<qreal>(
+                0.1, QFontMetricsF(spacerFont).horizontalAdvance(
+                         QChar(0x00a0)));
+            spacerFont.setWordSpacing(std::max<qreal>(
+                0.0, image.rect.width() - naturalWidth));
+
+            QTextLayout::FormatRange range;
+            range.start = static_cast<int>(image.layoutUtf16Offset);
+            range.length = 1;
+            range.format = qtFormat(characterFormat, defaultFontFamily_,
+                                    defaultFontPointSize_);
+            range.format.setFont(spacerFont);
             ranges.push_back(range);
         }
 
@@ -1664,8 +1897,11 @@ void DocumentCanvas::rebuildLayout() const {
             // non-breaking space with equation-sized word spacing. Unlike a
             // stretched glyph run, this preserves the following text run in
             // Qt's PDF backend. The vector equation is painted over the blank
-            // slot below, so caret and selection offsets remain 1:1 with OOXML.
-            visual->text[static_cast<qsizetype>(equation.utf16_offset)] =
+            // slot below. Imported pictures add display-only positions, so
+            // ParagraphVisual translates between editor and layout offsets.
+            const auto layoutOffset = static_cast<std::size_t>(
+                visual->layoutOffsetForCore(equation.utf16_offset));
+            layoutText[static_cast<qsizetype>(layoutOffset)] =
                 QChar(0x00a0);
             QFont spacerFont = equationFont;
             const QFontMetricsF scaledMetrics(spacerFont);
@@ -1675,14 +1911,14 @@ void DocumentCanvas::rebuildLayout() const {
                 0.0, metrics.width - naturalWidth));
 
             QTextLayout::FormatRange range;
-            range.start = static_cast<int>(equation.utf16_offset);
+            range.start = static_cast<int>(layoutOffset);
             range.length = 1;
             range.format = qtFormat(characterFormat, defaultFontFamily_,
                                     defaultFontPointSize_);
             range.format.setFont(spacerFont);
             ranges.push_back(range);
             visual->equations.push_back(
-                {equation.utf16_offset, std::move(equationLayout), metrics,
+                {layoutOffset, std::move(equationLayout), metrics,
                  fromArgb(characterFormat.foreground_argb.value_or(
                      kDefaultTextArgb))});
         }
@@ -1720,32 +1956,30 @@ void DocumentCanvas::rebuildLayout() const {
                 // separator a real tab stop in the display-only string.
                 for (qsizetype index = 0;
                      index < marker->indent.size(); ++index) {
-                    visual->text[index] = QChar(0x2060);
+                    layoutText[visual->layoutOffsetForCore(
+                        static_cast<std::size_t>(index))] = QChar(0x2060);
                 }
                 const qsizetype separatorStart =
                     marker->indent.size() + marker->marker.size();
                 for (qsizetype index = 0;
                      index < marker->separator.size(); ++index) {
-                    visual->text[separatorStart + index] =
+                    layoutText[visual->layoutOffsetForCore(
+                        static_cast<std::size_t>(separatorStart + index))] =
                         index == 0 ? QChar(QLatin1Char('\t'))
                                    : QChar(0x2060);
                 }
             }
         }
 
-        // Keep a real, invisible layout line for every empty paragraph so its
-        // caret, hit target, IME rectangle, and tab origin all exist. For an
-        // image-only imported paragraph the line is an anchor only and does
-        // not consume vertical space; the picture therefore retains its
-        // exact OOXML position without making the cursor disappear.
-        const bool imageOnlyParagraph =
-            visual->text.isEmpty() && !paragraphImages.empty();
-        const QString layoutText = visual->text.isEmpty()
+        // Keep a real, invisible layout line for every truly empty paragraph
+        // so its caret, hit target, IME rectangle, and tab origin all exist.
+        // An image-only paragraph already contains display-only inline slots.
+        const QString finalLayoutText = layoutText.isEmpty()
             ? QString(QChar(0x2060))
-            : visual->text;
+            : layoutText;
         visual->layout = std::make_unique<QTextLayout>(
-            layoutText, fontFrom(defaultFormat, defaultFontFamily_,
-                                 defaultFontPointSize_));
+            finalLayoutText, fontFrom(defaultFormat, defaultFontFamily_,
+                                      defaultFontPointSize_));
         visual->layout->setFormats(ranges);
         QTextOption option;
         option.setWrapMode(QTextOption::WrapAtWordBoundaryOrAnywhere);
@@ -1765,13 +1999,8 @@ void DocumentCanvas::rebuildLayout() const {
         if (!listTabs.isEmpty()) option.setTabs(listTabs);
         visual->layout->setTextOption(option);
 
-        const double leftIndent = emuToPoints(paragraphFormat.left_indent_emu);
-        const double rightIndent = emuToPoints(paragraphFormat.right_indent_emu);
-        const double firstIndent = emuToPoints(paragraphFormat.first_line_indent_emu);
-        const double baseWidth = std::max(36.0, pageWidthPoints_ - marginLeftPoints_ -
-                                                   marginRightPoints_ - leftIndent - rightIndent);
         bool firstLine = true;
-        if (!layoutText.isEmpty()) {
+        if (!finalLayoutText.isEmpty()) {
             visual->layout->beginLayout();
             while (true) {
                 QTextLine line = visual->layout->createLine();
@@ -1796,11 +2025,21 @@ void DocumentCanvas::rebuildLayout() const {
                             equationDescent, equation.metrics.descent);
                     }
                 }
+                qreal imageAscent = 0.0;
+                for (const auto& image : visual->images) {
+                    if (image.layoutUtf16Offset >= lineStart &&
+                        image.layoutUtf16Offset < lineEnd) {
+                        imageAscent = std::max<qreal>(
+                            imageAscent, image.rect.height());
+                    }
+                }
+                const qreal contentAscent = std::max(
+                    equationAscent, imageAscent);
                 const double topPadding = std::max<double>(
-                    0.0, equationAscent - line.ascent());
+                    0.0, contentAscent - line.ascent());
                 const double naturalAdvance = std::max<double>(
                     line.height(),
-                    std::max<qreal>(line.ascent(), equationAscent) +
+                    std::max<qreal>(line.ascent(), contentAscent) +
                         std::max<qreal>(line.descent(), equationDescent) +
                         line.leading());
                 double advance = naturalAdvance;
@@ -1823,49 +2062,25 @@ void DocumentCanvas::rebuildLayout() const {
                 }
                 line.setPosition(QPointF(
                     marginLeftPoints_ + leftIndent + extra, y + topPadding));
+                for (auto& image : visual->images) {
+                    if (image.layoutUtf16Offset < lineStart ||
+                        image.layoutUtf16Offset >= lineEnd) {
+                        continue;
+                    }
+                    const qreal x = line.cursorToX(
+                        static_cast<int>(image.layoutUtf16Offset));
+                    image.rect.moveTo(
+                        x, line.y() + line.ascent() - image.rect.height());
+                    image.pageIndex = page;
+                }
                 visual->lines.push_back({line, page, paragraphIndexValue});
-                if (!imageOnlyParagraph) y += advance;
+                y += advance;
                 firstLine = false;
             }
             visual->layout->endLayout();
         }
-        if (visual->lines.empty() && paragraphImages.empty()) {
+        if (visual->lines.empty() && visual->images.empty()) {
             y += 14.0;
-        }
-        for (const auto* importedImage : paragraphImages) {
-            const double imageLeftIndent = emuToPoints(
-                paragraphFormat.left_indent_emu);
-            const double imageRightIndent = emuToPoints(
-                paragraphFormat.right_indent_emu);
-            const double availableWidth = std::max(
-                18.0, pageWidthPoints_ - marginLeftPoints_ -
-                          marginRightPoints_ - imageLeftIndent -
-                          imageRightIndent);
-            const double fitScale = std::min(
-                1.0, availableWidth / importedImage->widthPoints);
-            const double width = importedImage->widthPoints * fitScale;
-            const double height = importedImage->heightPoints * fitScale;
-            if (y + height > pageBottom && y > marginTopPoints_) {
-                ++page;
-                y = marginTopPoints_;
-            }
-            double x = marginLeftPoints_ + imageLeftIndent;
-            switch (paragraphFormat.alignment.value_or(
-                core::ParagraphAlignment::left)) {
-                case core::ParagraphAlignment::center:
-                    x += (availableWidth - width) / 2.0;
-                    break;
-                case core::ParagraphAlignment::right:
-                    x += availableWidth - width;
-                    break;
-                case core::ParagraphAlignment::left:
-                case core::ParagraphAlignment::justified:
-                case core::ParagraphAlignment::distributed:
-                    break;
-            }
-            visual->images.push_back(
-                {importedImage->image, QRectF(x, y, width, height), page});
-            y += height;
         }
         const double contentBottom = y;
         // No implicit paragraph gap: an unspecified format is true single
@@ -1877,15 +2092,16 @@ void DocumentCanvas::rebuildLayout() const {
         if (!visual->lines.empty()) {
             firstPage = visual->lines.front().pageIndex;
             top = visual->lines.front().line.y();
-        } else if (!visual->images.empty()) {
+        }
+        if (!visual->images.empty() &&
+            visual->images.front().pageIndex <= firstPage) {
             firstPage = visual->images.front().pageIndex;
-            top = visual->images.front().rect.top();
+            top = std::min(top, visual->images.front().rect.top());
         }
         int lastPage = page;
+        if (!visual->lines.empty()) lastPage = visual->lines.back().pageIndex;
         if (!visual->images.empty()) {
-            lastPage = visual->images.back().pageIndex;
-        } else if (!visual->lines.empty()) {
-            lastPage = visual->lines.back().pageIndex;
+            lastPage = std::max(lastPage, visual->images.back().pageIndex);
         }
         const double blockBottom = contentBottom;
         blockPlacements_.push_back({paragraph.id(), core::BodyBlockKind::paragraph,
@@ -2369,6 +2585,7 @@ void DocumentCanvas::rebuildLayout() const {
     layoutRevision_ = snap.revision;
     layoutIsPreview_ = preview;
     layoutValid_ = true;
+    ++layoutGeneration_;
     updateScrollBars();
 }
 
@@ -2589,10 +2806,14 @@ void DocumentCanvas::renderPage(QPainter& painter, int pageIndexValue,
                     int start = visualLine.line.textStart();
                     int end = start + visualLine.line.textLength();
                     if (visualLine.paragraphIndex == range.start_paragraph_index) {
-                        start = std::max(start, static_cast<int>(range.start.utf16_offset));
+                        start = std::max(
+                            start, paragraph.layoutOffsetForCore(
+                                       range.start.utf16_offset));
                     }
                     if (visualLine.paragraphIndex == range.end_paragraph_index) {
-                        end = std::min(end, static_cast<int>(range.end.utf16_offset));
+                        end = std::min(
+                            end, paragraph.layoutOffsetForCore(
+                                     range.end.utf16_offset));
                     }
                     if (end > start) {
                         fillSelectionBackground(
@@ -2634,8 +2855,12 @@ void DocumentCanvas::renderPage(QPainter& painter, int pageIndexValue,
                 misspelling.setWidthF(0.8);
                 painter.setPen(misspelling);
                 for (const auto& word : paragraphSpellingWords) {
-                    if (word.end <= spellingLineStart ||
-                        word.start >= spellingLineEnd ||
+                    const auto wordStart = static_cast<std::size_t>(
+                        paragraph.layoutOffsetForCore(word.start));
+                    const auto wordEnd = static_cast<std::size_t>(
+                        paragraph.layoutOffsetForCore(word.end));
+                    if (wordEnd <= spellingLineStart ||
+                        wordStart >= spellingLineEnd ||
                         spelling_.isCorrect(word.text) ||
                         suppressSpellingWord(
                             PendingSpellingWord::Container::bodyParagraph,
@@ -2643,8 +2868,8 @@ void DocumentCanvas::renderPage(QPainter& painter, int pageIndexValue,
                         continue;
                     }
                     const auto start = std::max(
-                        word.start, spellingLineStart);
-                    const auto end = std::min(word.end, spellingLineEnd);
+                        wordStart, spellingLineStart);
+                    const auto end = std::min(wordEnd, spellingLineEnd);
                     const qreal x1 = visualLine.line.cursorToX(
                         static_cast<int>(start));
                     const qreal x2 = visualLine.line.cursorToX(
@@ -2724,8 +2949,18 @@ void DocumentCanvas::renderPage(QPainter& painter, int pageIndexValue,
                selection_.anchor == selection_.focus) {
         const auto* caretLine = visualLineForCaret();
         if (caretLine && caretLine->pageIndex == pageIndexValue) {
+            int layoutOffset = static_cast<int>(
+                selection_.focus.utf16_offset);
+            const auto owner = std::find_if(
+                visuals_.begin(), visuals_.end(), [this](const auto& item) {
+                    return item->id == selection_.focus.paragraph_id;
+                });
+            if (owner != visuals_.end()) {
+                layoutOffset = (*owner)->layoutOffsetForCore(
+                    selection_.focus.utf16_offset);
+            }
             const qreal x = caretLine->line.cursorToX(
-                static_cast<int>(selection_.focus.utf16_offset));
+                layoutOffset);
             painter.setPen(QPen(Qt::black, 0.9));
             painter.drawLine(QPointF(x, caretLine->line.y()),
                              QPointF(x, caretLine->line.y() +
@@ -2763,6 +2998,14 @@ bool DocumentCanvas::apply(std::vector<core::Operation> operations,
     }
     resetVerticalNavigation();
     const auto snap = session_->snapshot();
+    const auto reanchoredImages = reanchoredImportedImages(
+        snap.document, importedImages_, operations);
+    if (!reanchoredImages) {
+        endTypingGroup();
+        emit operationFailed(tr(
+            "The edit could not safely preserve an imported picture anchor."));
+        return false;
+    }
     const bool hasNonTextChanges = operationsHaveNonTextChanges(
         snap.document, operations);
     const auto result = session_->applyBatch(
@@ -2801,6 +3044,7 @@ bool DocumentCanvas::apply(std::vector<core::Operation> operations,
         preferredVerticalX_.reset();
     }
     if (result.value().changed) {
+        importedImages_ = *reanchoredImages;
         currentStateId_ = nextStateId_++;
         if (hasNonTextChanges) {
             currentNonTextStateId_ = nextNonTextStateId_++;
@@ -4469,9 +4713,9 @@ void DocumentCanvas::moveHorizontal(bool forward, bool extend, bool byWord) {
                         const int lineStart = line.line.textStart();
                         const int lineEnd =
                             lineStart + line.line.textLength();
-                        const int anchor = static_cast<int>(
+                        const int anchor = (*visual)->layoutOffsetForCore(
                             selection_.anchor.utf16_offset);
-                        const int focus = static_cast<int>(
+                        const int focus = (*visual)->layoutOffsetForCore(
                             selection_.focus.utf16_offset);
                         if (anchor < lineStart || anchor > lineEnd ||
                             focus < lineStart || focus > lineEnd) {
@@ -4513,13 +4757,25 @@ void DocumentCanvas::moveHorizontal(bool forward, bool extend, bool byWord) {
                 return item->id == position.paragraph_id;
             });
         if (visual != visuals_.end() && (*visual)->layout) {
-            const int oldOffset = static_cast<int>(position.utf16_offset);
-            const int adjacent = forward
-                ? (*visual)->layout->rightCursorPosition(oldOffset)
-                : (*visual)->layout->leftCursorPosition(oldOffset);
-            if (adjacent >= static_cast<int>(contentStart) &&
-                adjacent <= text.size() && adjacent != oldOffset) {
-                position.utf16_offset = static_cast<std::size_t>(adjacent);
+            const int oldLayoutOffset = (*visual)->layoutOffsetForCore(
+                position.utf16_offset);
+            int adjacentLayoutOffset = oldLayoutOffset;
+            std::size_t adjacentCoreOffset = position.utf16_offset;
+            do {
+                const int next = forward
+                    ? (*visual)->layout->rightCursorPosition(
+                          adjacentLayoutOffset)
+                    : (*visual)->layout->leftCursorPosition(
+                          adjacentLayoutOffset);
+                if (next == adjacentLayoutOffset) break;
+                adjacentLayoutOffset = next;
+                adjacentCoreOffset = (*visual)->coreOffsetForLayout(
+                    adjacentLayoutOffset);
+            } while (adjacentCoreOffset == position.utf16_offset);
+            if (adjacentCoreOffset >= contentStart &&
+                adjacentCoreOffset <= static_cast<std::size_t>(text.size()) &&
+                adjacentCoreOffset != position.utf16_offset) {
+                position.utf16_offset = adjacentCoreOffset;
                 setCursor(position, extend);
                 return;
             }
@@ -4575,9 +4831,10 @@ void DocumentCanvas::moveVertical(bool down, bool extend) {
         const auto* paragraph = lines[i].second;
         const int start = line->line.textStart();
         const int end = start + line->line.textLength();
+        const int layoutCaret = paragraph->layoutOffsetForCore(
+            selection_.focus.utf16_offset);
         if (paragraph->id != selection_.focus.paragraph_id ||
-            static_cast<int>(selection_.focus.utf16_offset) < start ||
-            static_cast<int>(selection_.focus.utf16_offset) > end) continue;
+            layoutCaret < start || layoutCaret > end) continue;
         if (!fallback) {
             fallback = i;
         }
@@ -4596,8 +4853,10 @@ void DocumentCanvas::moveVertical(bool down, bool extend) {
                             : static_cast<int>(*source) - 1;
     if (target < 0 || target >= static_cast<int>(lines.size())) return;
     const auto* sourceLine = lines[*source].first;
+    const auto* sourceParagraph = lines[*source].second;
     const qreal x = preferredVerticalX_.value_or(sourceLine->line.cursorToX(
-        static_cast<int>(selection_.focus.utf16_offset)));
+        sourceParagraph->layoutOffsetForCore(
+            selection_.focus.utf16_offset)));
     const auto targetIndex = static_cast<std::size_t>(target);
     const auto* targetLine = lines[targetIndex].first;
     const auto* targetParagraph = lines[targetIndex].second;
@@ -4608,8 +4867,7 @@ void DocumentCanvas::moveVertical(bool down, bool extend) {
     preferredVerticalX_ = x;
     setCursor(
         {targetParagraph->id,
-         std::min(static_cast<std::size_t>(std::max(0, offset)),
-                  static_cast<std::size_t>(targetParagraph->text.size()))},
+         targetParagraph->coreOffsetForLayout(offset)},
         extend, true);
 }
 
@@ -4719,6 +4977,60 @@ void DocumentCanvas::keyPressEvent(QKeyEvent* event) {
         const qsizetype selectionStart = std::min(anchor, caret);
         const qsizetype selectionEnd = std::max(anchor, caret);
         const bool hasCellSelection = selectionStart != selectionEnd;
+        ensureLayout();
+        const TableCellVisual* activeCellVisual = nullptr;
+        for (const auto& tableVisual : tableVisuals_) {
+            if (tableVisual->id != cursor.tableId) continue;
+            const auto found = std::find_if(
+                tableVisual->cells.begin(), tableVisual->cells.end(),
+                [&cursor](const TableCellVisual& visual) {
+                    return visual.row == cursor.row &&
+                           visual.column == cursor.column;
+                });
+            if (found != tableVisual->cells.end()) {
+                activeCellVisual = &*found;
+            }
+            break;
+        }
+        const auto collapsedCellOffset =
+            [activeCellVisual, anchor, caret, selectionStart, selectionEnd](
+                bool right) {
+                const qsizetype fallback = right ? selectionEnd : selectionStart;
+                if (!activeCellVisual) return fallback;
+                for (const auto& line : activeCellVisual->lines) {
+                    const int lineStart = line.textStart();
+                    const int lineEnd = lineStart + line.textLength();
+                    if (anchor < lineStart || anchor > lineEnd ||
+                        caret < lineStart || caret > lineEnd) {
+                        continue;
+                    }
+                    const qreal anchorX = line.cursorToX(
+                        static_cast<int>(anchor));
+                    const qreal caretX = line.cursorToX(
+                        static_cast<int>(caret));
+                    if (qFuzzyCompare(anchorX + 1.0, caretX + 1.0)) {
+                        return fallback;
+                    }
+                    return right
+                        ? (anchorX > caretX ? anchor : caret)
+                        : (anchorX < caretX ? anchor : caret);
+                }
+                return fallback;
+            };
+        const auto adjacentCellOffset =
+            [activeCellVisual, caret](bool right) {
+                if (!activeCellVisual || !activeCellVisual->layout) {
+                    return caret;
+                }
+                const int adjacent = right
+                    ? activeCellVisual->layout->rightCursorPosition(
+                          static_cast<int>(caret))
+                    : activeCellVisual->layout->leftCursorPosition(
+                          static_cast<int>(caret));
+                return adjacent < 0
+                    ? caret
+                    : static_cast<qsizetype>(adjacent);
+            };
         const auto moveCellCaret =
             [this, cursor](std::size_t offset, bool extend) {
                 if (!extend) {
@@ -4814,43 +5126,39 @@ void DocumentCanvas::keyPressEvent(QKeyEvent* event) {
                 return;
             }
             case Qt::Key_Left: {
-                qsizetype next = hasCellSelection &&
-                                          !(event->modifiers() & Qt::ShiftModifier)
-                                      ? selectionStart
-                                      : 0;
+                const bool extend =
+                    event->modifiers() & Qt::ShiftModifier;
+                qsizetype next = hasCellSelection && !extend
+                    ? collapsedCellOffset(false)
+                    : adjacentCellOffset(false);
                 if (!hasCellSelection &&
                     event->modifiers() & Qt::ControlModifier) {
-                    next = previousWordStart(cellText, caret);
-                } else if (!hasCellSelection && caret > 0) {
-                    QTextBoundaryFinder finder(QTextBoundaryFinder::Grapheme,
-                                               cellText);
-                    finder.setPosition(caret);
-                    next = finder.toPreviousBoundary();
-                    if (next < 0) next = caret - 1;
+                    next = cellText.isRightToLeft()
+                        ? nextWordStart(cellText, caret)
+                        : previousWordStart(cellText, caret);
                 }
                 static_cast<void>(moveCellCaret(
-                    static_cast<std::size_t>(next),
-                    event->modifiers() & Qt::ShiftModifier));
+                    static_cast<std::size_t>(std::clamp<qsizetype>(
+                        next, 0, cellText.size())),
+                    extend));
                 return;
             }
             case Qt::Key_Right: {
-                qsizetype next = hasCellSelection &&
-                                          !(event->modifiers() & Qt::ShiftModifier)
-                                      ? selectionEnd
-                                      : cellText.size();
+                const bool extend =
+                    event->modifiers() & Qt::ShiftModifier;
+                qsizetype next = hasCellSelection && !extend
+                    ? collapsedCellOffset(true)
+                    : adjacentCellOffset(true);
                 if (!hasCellSelection &&
                     event->modifiers() & Qt::ControlModifier) {
-                    next = nextWordStart(cellText, caret);
-                } else if (!hasCellSelection && caret < cellText.size()) {
-                    QTextBoundaryFinder finder(QTextBoundaryFinder::Grapheme,
-                                               cellText);
-                    finder.setPosition(caret);
-                    next = finder.toNextBoundary();
-                    if (next < 0) next = caret + 1;
+                    next = cellText.isRightToLeft()
+                        ? previousWordStart(cellText, caret)
+                        : nextWordStart(cellText, caret);
                 }
                 static_cast<void>(moveCellCaret(
-                    static_cast<std::size_t>(next),
-                    event->modifiers() & Qt::ShiftModifier));
+                    static_cast<std::size_t>(std::clamp<qsizetype>(
+                        next, 0, cellText.size())),
+                    extend));
                 return;
             }
             case Qt::Key_Up:
@@ -5163,13 +5471,17 @@ DocumentCanvas::Hit DocumentCanvas::hitTest(const QPoint& viewportPoint) const {
         if (best < 0) break;
     }
     if (!nearest || !owner) return {};
-    const int offset = nearest->line.xToCursor(point.x(), QTextLine::CursorBetweenCharacters);
-    return {{owner->id,
-             std::min(static_cast<std::size_t>(std::max(0, offset)),
-                      static_cast<std::size_t>(owner->text.size()))}, true,
-            nearest->line.textStart(),
-            nearest->line.textStart() + nearest->line.textLength(),
-            std::nullopt, std::nullopt};
+    const int offset = nearest->line.xToCursor(
+        point.x(), QTextLine::CursorBetweenCharacters);
+    Hit hit;
+    hit.position = {owner->id, owner->coreOffsetForLayout(offset)};
+    hit.valid = true;
+    hit.lineStart = static_cast<int>(owner->coreOffsetForLayout(
+        nearest->line.textStart()));
+    hit.lineEnd = static_cast<int>(owner->coreOffsetForLayout(
+        nearest->line.textStart() + nearest->line.textLength()));
+    hit.layoutLineStart = nearest->line.textStart();
+    return hit;
 }
 
 void DocumentCanvas::mousePressEvent(QMouseEvent* event) {
@@ -5274,7 +5586,7 @@ void DocumentCanvas::mousePressEvent(QMouseEvent* event) {
                   static_cast<std::size_t>(std::max(0, hit.lineStart))},
                  {hit.position.paragraph_id,
                   static_cast<std::size_t>(std::max(hit.lineStart, lineEnd))}},
-                {hit.position.paragraph_id, hit.lineStart});
+                {hit.position.paragraph_id, hit.layoutLineStart});
             selecting_ = false;
             event->accept();
             return;
@@ -5282,7 +5594,7 @@ void DocumentCanvas::mousePressEvent(QMouseEvent* event) {
         if (hit.valid) {
             preferredVerticalX_.reset();
             lineAffinity_ = LineAffinity{hit.position.paragraph_id,
-                                         hit.lineStart};
+                                         hit.layoutLineStart};
             setCursor(hit.position, event->modifiers() & Qt::ShiftModifier,
                       true);
             selecting_ = true;
@@ -5345,10 +5657,10 @@ void DocumentCanvas::mouseDoubleClickEvent(QMouseEvent* event) {
         core::Range wordRange;
         if (!wordAt(hit.position, &wordRange).isEmpty()) {
             selectRange(wordRange,
-                        {hit.position.paragraph_id, hit.lineStart});
+                        {hit.position.paragraph_id, hit.layoutLineStart});
         } else {
             lineAffinity_ = LineAffinity{hit.position.paragraph_id,
-                                         hit.lineStart};
+                                         hit.layoutLineStart};
             setCursor(hit.position, false, true);
         }
     }
@@ -5422,7 +5734,7 @@ void DocumentCanvas::mouseMoveEvent(QMouseEvent* event) {
         if (hit.valid) {
             preferredVerticalX_.reset();
             lineAffinity_ = LineAffinity{hit.position.paragraph_id,
-                                         hit.lineStart};
+                                         hit.layoutLineStart};
             setCursor(hit.position, true, true);
         }
     }
@@ -5472,7 +5784,8 @@ void DocumentCanvas::contextMenuEvent(QContextMenuEvent* event) {
     } else if (hit.valid) {
         // Context actions must target the list under the pointer, not a stale
         // caret or selection elsewhere in the document.
-        lineAffinity_ = LineAffinity{hit.position.paragraph_id, hit.lineStart};
+        lineAffinity_ = LineAffinity{hit.position.paragraph_id,
+                                     hit.layoutLineStart};
         setCursor(hit.position, false, true);
     }
     core::Range wordRange;
@@ -6451,6 +6764,12 @@ bool DocumentCanvas::createOperationsPreview(
                     .arg(live.revision.value());
         return false;
     }
+    if (!reanchoredImportedImages(
+            live.document, importedImages_, operations)) {
+        error = tr(
+            "The preview could not safely preserve an imported picture anchor.");
+        return false;
+    }
     const auto created = session_->createPreview(expectedRevision);
     if (!created) {
         error = errorText(created.error());
@@ -6470,6 +6789,7 @@ bool DocumentCanvas::createOperationsPreview(
     }
     previewId_ = created.value().id;
     previewRevision_ = applied.value().revision;
+    previewOperations_ = operations;
     previewCursor_.reset();
     previewHasNonTextChanges_ = operationsHaveNonTextChanges(
         live.document, operations);
@@ -6506,6 +6826,13 @@ bool DocumentCanvas::acceptPreview(QString& error) {
     }
     const auto live = session_->snapshot();
     const CursorState before = captureEditorState();
+    const auto reanchoredImages = reanchoredImportedImages(
+        live.document, importedImages_, previewOperations_);
+    if (!reanchoredImages) {
+        error = tr(
+            "The preview could not safely preserve an imported picture anchor.");
+        return false;
+    }
     const auto accepted = session_->acceptPreview(*previewId_, live.revision, previewRevision_);
     if (!accepted) {
         error = errorText(accepted.error());
@@ -6545,8 +6872,10 @@ bool DocumentCanvas::acceptPreview(QString& error) {
     previewId_.reset();
     previewRevision_ = {};
     previewCursor_.reset();
+    previewOperations_.clear();
     previewHasNonTextChanges_ = false;
     if (accepted.value().changed) {
+        importedImages_ = *reanchoredImages;
         currentStateId_ = nextStateId_++;
         if (acceptedNonTextChanges) {
             currentNonTextStateId_ = nextNonTextStateId_++;
@@ -6578,6 +6907,7 @@ void DocumentCanvas::discardPreview() {
     }
     previewRevision_ = {};
     previewCursor_.reset();
+    previewOperations_.clear();
     previewHasNonTextChanges_ = false;
 }
 
@@ -6613,11 +6943,12 @@ const DocumentCanvas::VisualLine* DocumentCanvas::visualLineForCaret() const {
     const VisualLine* fallback = nullptr;
     for (const auto& paragraph : visuals_) {
         if (paragraph->id != selection_.focus.paragraph_id) continue;
+        const int layoutCaret = paragraph->layoutOffsetForCore(
+            selection_.focus.utf16_offset);
         for (const auto& visualLine : paragraph->lines) {
             const int start = visualLine.line.textStart();
             const int end = start + visualLine.line.textLength();
-            if (static_cast<int>(selection_.focus.utf16_offset) < start ||
-                static_cast<int>(selection_.focus.utf16_offset) > end) {
+            if (layoutCaret < start || layoutCaret > end) {
                 continue;
             }
             if (!fallback) {
@@ -6683,11 +7014,20 @@ QRectF DocumentCanvas::caretRectInContent() const {
     }
     const auto* visualLine = visualLineForCaret();
     if (!visualLine) return {};
+    int layoutOffset = static_cast<int>(selection_.focus.utf16_offset);
+    const auto owner = std::find_if(
+        visuals_.begin(), visuals_.end(), [this](const auto& item) {
+            return item->id == selection_.focus.paragraph_id;
+        });
+    if (owner != visuals_.end()) {
+        layoutOffset = (*owner)->layoutOffsetForCore(
+            selection_.focus.utf16_offset);
+    }
     const double top = kCanvasPaddingPixels + visualLine->pageIndex *
         (pageHeightPoints_ * scale + kPageGapPixels) -
         verticalScrollBar()->value();
     return QRectF(left + visualLine->line.cursorToX(
-                            static_cast<int>(selection_.focus.utf16_offset)) * scale,
+                            layoutOffset) * scale,
                   top + visualLine->line.y() * scale, 2.0,
                   visualLine->line.height() * scale);
 }

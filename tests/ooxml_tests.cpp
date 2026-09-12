@@ -202,6 +202,40 @@ std::string extractElement(
         begin, closing_begin + closing_tag.size() - begin));
 }
 
+void checkAuthoredNumberingLevelOrder(
+    std::string_view xml, std::size_t expected_levels) {
+    std::size_t cursor = 0;
+    std::size_t levels = 0;
+    while ((cursor = xml.find("<w:lvl ", cursor)) != std::string_view::npos) {
+        const auto end = xml.find("</w:lvl>", cursor);
+        check(end != std::string_view::npos,
+              "authored numbering level is not closed");
+        const auto level = xml.substr(cursor, end - cursor);
+        const auto start = level.find("<w:start ");
+        const auto format = level.find("<w:numFmt ");
+        const auto suffix = level.find("<w:suff ");
+        const auto text = level.find("<w:lvlText ");
+        const auto justification = level.find("<w:lvlJc ");
+        const auto properties = level.find("<w:pPr>");
+        check(start != std::string_view::npos &&
+                  format != std::string_view::npos &&
+                  suffix != std::string_view::npos &&
+                  text != std::string_view::npos &&
+                  justification != std::string_view::npos &&
+                  properties != std::string_view::npos &&
+                  start < format && format < suffix && suffix < text &&
+                  text < justification && justification < properties,
+              "authored CT_Lvl children are not in schema sequence order");
+        ++levels;
+        cursor = end + std::string_view("</w:lvl>").size();
+    }
+    check(levels == expected_levels,
+          "authored numbering.xml has an unexpected level count");
+    check(xml.find("w:ilvl=\"9\"") == std::string_view::npos &&
+              xml.find("%10") == std::string_view::npos,
+          "authored numbering.xml exceeds the nine-level OOXML limit");
+}
+
 void testInlineImagePageBreakAndTablePresentation(
     const TemporaryDirectory& temporary) {
     const auto path = temporary.file("presentation.docx");
@@ -347,6 +381,171 @@ void testInlineImagePageBreakAndTablePresentation(
           "table presentation changed across supported edit/save/reopen");
 }
 
+void testInlineImageTableCellIsPreservedViewOnly(
+    const TemporaryDirectory& temporary) {
+    const auto path = temporary.file("image-table-cell.docx");
+    const auto output = temporary.file("image-table-cell-edited.docx");
+    const std::string document_xml =
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+        "<w:document "
+        "xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\" "
+        "xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" "
+        "xmlns:wp=\"http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing\" "
+        "xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\">"
+        "<w:body><w:tbl><w:tblGrid><w:gridCol w:w=\"2400\"/>"
+        "</w:tblGrid><w:tr><w:tc><w:p><w:r><w:drawing><wp:inline>"
+        "<wp:extent cx=\"914400\" cy=\"457200\"/>"
+        "<wp:docPr id=\"1\" name=\"Cell image\"/>"
+        "<a:graphic><a:graphicData><a:blip r:embed=\"rIdCellImage\"/>"
+        "</a:graphicData></a:graphic></wp:inline></w:drawing></w:r>"
+        "</w:p></w:tc></w:tr></w:tbl>"
+        "<w:p><w:r><w:t>Editable tail</w:t></w:r></w:p>"
+        "<w:sectPr/></w:body></w:document>";
+    createPackage(path, document_xml);
+    const std::string relationships =
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+        "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">"
+        "<Relationship Id=\"rIdCellImage\" "
+        "Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/image\" "
+        "Target=\"media/cell.png\"/>"
+        "</Relationships>";
+    const std::string image_bytes("\x89PNG\r\n\x1a\ncell-image", 18);
+    appendMembers(
+        path,
+        {{"word/_rels/document.xml.rels", relationships},
+         {"word/media/cell.png", image_bytes}});
+
+    Error error;
+    auto document = DocxDocument::open(path, &error);
+    check(document != nullptr, error.message);
+    check(document->paragraphs().size() == 2 &&
+              document->bodyBlocks().size() == 2,
+          "image-table fixture structure changed on import");
+    const auto* unsupported = std::get_if<ImportedUnsupportedBodyBlock>(
+        &document->bodyBlocks()[0]);
+    check(unsupported != nullptr && unsupported->element_name == "w:tbl" &&
+              unsupported->reason.find("inline images inside table cells") !=
+                  std::string::npos &&
+              unsupported->fallback_paragraph_indices ==
+                  std::vector<std::size_t>{0},
+          "table with an inline image cell was exposed as semantically editable");
+    check(document->compatibility().classification ==
+              CompatibilityClass::safe_text_patch &&
+              std::any_of(
+                  document->compatibility().issues.begin(),
+                  document->compatibility().issues.end(),
+                  [](const auto& issue) {
+                      return issue.code == IssueCode::unsupported_body_content &&
+                             issue.detail.find(
+                                 "inline images inside table cells") !=
+                                 std::string::npos;
+                  }),
+          "image-bearing table was not reported as preserved view-only");
+
+    const auto& image_fragment =
+        document->paragraphs()[0].runs[0].fragments[0];
+    check(image_fragment.kind == FragmentKind::inline_image &&
+              image_fragment.inline_image &&
+              image_fragment.inline_image->bytes.size() == image_bytes.size(),
+          "view-only cell image payload was not retained");
+    const auto& tail_fragment =
+        document->paragraphs()[1].runs[0].fragments[0];
+    check(tail_fragment.text_span_id.has_value(),
+          "text outside the view-only table is not patchable");
+    const auto original_table = extractElement(
+        readMember(path, "word/document.xml"), "<w:tbl>", "</w:tbl>");
+    const auto edit = document->replaceText(
+        *tail_fragment.text_span_id, "Edited outside table");
+    check(edit.accepted,
+          edit.error ? edit.error->message
+                     : "unrelated text edit was refused");
+    const auto save = document->saveAs(output);
+    check(save.saved,
+          save.error ? save.error->message
+                     : "image-table preservation save failed");
+    check(extractElement(
+              readMember(output, "word/document.xml"),
+              "<w:tbl>", "</w:tbl>") == original_table &&
+              readMember(output, "word/_rels/document.xml.rels") ==
+                  relationships &&
+              readMember(output, "word/media/cell.png") == image_bytes,
+          "unrelated text edit changed the view-only image table or media");
+
+    error = {};
+    auto reopened = DocxDocument::open(output, &error);
+    check(reopened != nullptr, error.message);
+    check(std::holds_alternative<ImportedUnsupportedBodyBlock>(
+              reopened->bodyBlocks()[0]) &&
+              reopened->paragraphs()[1].plainText() ==
+                  "Edited outside table",
+          "image table lost view-only status or unrelated edit on reopen");
+}
+
+void testRepeatedImageReferencesShareBoundedStorage(
+    const TemporaryDirectory& temporary) {
+    constexpr std::size_t reference_count = 4'100U;
+    const auto path = temporary.file("repeated-image-references.docx");
+    std::string document_xml =
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+        "<w:document "
+        "xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\" "
+        "xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" "
+        "xmlns:wp=\"http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing\" "
+        "xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\">"
+        "<w:body>";
+    constexpr std::string_view drawing =
+        "<w:p><w:r><w:drawing><wp:inline>"
+        "<wp:extent cx=\"914400\" cy=\"914400\"/>"
+        "<wp:docPr id=\"1\" name=\"Shared\"/>"
+        "<a:graphic><a:graphicData><a:blip r:embed=\"rIdShared\"/>"
+        "</a:graphicData></a:graphic></wp:inline>"
+        "</w:drawing></w:r></w:p>";
+    document_xml.reserve(document_xml.size() +
+                         drawing.size() * reference_count + 64U);
+    for (std::size_t index = 0; index < reference_count; ++index) {
+        document_xml.append(drawing);
+    }
+    document_xml.append("<w:sectPr/></w:body></w:document>");
+    createPackage(path, document_xml);
+    static const std::string relationships =
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+        "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">"
+        "<Relationship Id=\"rIdShared\" "
+        "Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/image\" "
+        "Target=\"media/shared.png\"/>"
+        "</Relationships>";
+    const std::string image_bytes("\x89PNG\r\n\x1a\nshared", 14);
+    appendMembers(
+        path,
+        {{"word/_rels/document.xml.rels", relationships},
+         {"word/media/shared.png", image_bytes}});
+
+    Error error;
+    auto document = DocxDocument::open(path, &error);
+    check(document != nullptr, error.message);
+    check(document->paragraphs().size() == reference_count,
+          "repeated-image fixture paragraph count differs");
+    const auto image_at = [&document](std::size_t index)
+        -> const docxstudio::ooxml::InlineImagePayload& {
+        const auto& fragment =
+            document->paragraphs()[index].runs[0].fragments[0];
+        check(fragment.inline_image.has_value(),
+              "repeated DrawingML image was not parsed");
+        return *fragment.inline_image;
+    };
+    const auto& first = image_at(0U);
+    const auto& second = image_at(1U);
+    const auto& last_resolved = image_at(4'095U);
+    const auto& first_beyond_limit = image_at(4'096U);
+    check(first.bytes.size() == image_bytes.size() &&
+              first.bytes.sharesStorageWith(second.bytes) &&
+              first.bytes.sharesStorageWith(last_resolved.bytes),
+          "repeated image references copied their package-member bytes");
+    check(first_beyond_limit.bytes.empty() &&
+              first_beyond_limit.package_member.empty(),
+          "OOXML image-reference resolution limit was not enforced");
+}
+
 void testStylesThemesAndNativeNumberingImport(
     const TemporaryDirectory& temporary) {
     const auto path = temporary.file("styles-numbering.docx");
@@ -395,7 +594,8 @@ void testStylesThemesAndNativeNumberingImport(
         "<w:style w:type=\"paragraph\" w:styleId=\"HeadingSample\">"
         "<w:name w:val=\"Heading Sample\"/><w:basedOn w:val=\"Normal\"/>"
         "<w:pPr><w:jc w:val=\"center\"/><w:keepNext/></w:pPr>"
-        "<w:rPr><w:rFonts w:asciiTheme=\"majorHAnsi\" "
+        "<w:rPr><w:rFonts w:ascii=\"Fallback Serif\" "
+        "w:hAnsi=\"Fallback Serif\" w:asciiTheme=\"majorHAnsi\" "
         "w:hAnsiTheme=\"majorHAnsi\"/><w:b/>"
         "<w:color w:val=\"112233\" w:themeColor=\"accent1\"/>"
         "</w:rPr></w:style>"
@@ -407,8 +607,8 @@ void testStylesThemesAndNativeNumberingImport(
         "<w:numbering xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">"
         "<w:abstractNum w:abstractNumId=\"7\">"
         "<w:lvl w:ilvl=\"0\"><w:start w:val=\"3\"/>"
-        "<w:numFmt w:val=\"decimal\"/><w:lvlText w:val=\"%1.\"/>"
-        "<w:suff w:val=\"tab\"/><w:pPr><w:tabs>"
+        "<w:numFmt w:val=\"decimal\"/><w:suff w:val=\"tab\"/>"
+        "<w:lvlText w:val=\"%1.\"/><w:pPr><w:tabs>"
         "<w:tab w:val=\"num\" w:pos=\"720\"/></w:tabs>"
         "<w:ind w:left=\"720\" w:hanging=\"360\"/></w:pPr></w:lvl>"
         "<w:lvl w:ilvl=\"1\"><w:start w:val=\"1\"/>"
@@ -418,11 +618,25 @@ void testStylesThemesAndNativeNumberingImport(
         "<w:ind w:left=\"1080\" w:hanging=\"360\"/></w:pPr></w:lvl>"
         "</w:abstractNum><w:num w:numId=\"5\">"
         "<w:abstractNumId w:val=\"7\"/></w:num></w:numbering>";
+    const std::string document_relationships =
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+        "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">"
+        "<Relationship Id=\"rStyles\" "
+        "Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles\" "
+        "Target=\"styles-main.xml\"/>"
+        "<Relationship Id=\"rNumbering\" "
+        "Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/numbering\" "
+        "Target=\"lists/main.xml\"/>"
+        "<Relationship Id=\"rTheme\" "
+        "Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/theme\" "
+        "Target=\"themes/main.xml\"/>"
+        "</Relationships>";
     appendMembers(
         path,
-        {{"word/theme/theme1.xml", theme_xml},
-         {"word/styles.xml", styles_xml},
-         {"word/numbering.xml", numbering_xml}});
+        {{"word/_rels/document.xml.rels", document_relationships},
+         {"word/themes/main.xml", theme_xml},
+         {"word/styles-main.xml", styles_xml},
+         {"word/lists/main.xml", numbering_xml}});
 
     Error error;
     auto document = DocxDocument::open(path, &error);
@@ -471,6 +685,189 @@ void testStylesThemesAndNativeNumberingImport(
               first.runs[0].format.font_size_half_points == 20 &&
               first.runs[0].format.bold == false,
           "document defaults and explicit false style values were not inherited");
+}
+
+void testNumberingLevelJustificationIsConservative(
+    const TemporaryDirectory& temporary) {
+    const auto path = temporary.file("numbering-level-justification.docx");
+    const auto copy = temporary.file("numbering-level-justification-copy.docx");
+    const std::string document_xml =
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+        "<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">"
+        "<w:body>"
+        "<w:p><w:pPr><w:numPr><w:ilvl w:val=\"0\"/>"
+        "<w:numId w:val=\"5\"/></w:numPr></w:pPr>"
+        "<w:r><w:t>Left marker</w:t></w:r></w:p>"
+        "<w:p><w:pPr><w:numPr><w:ilvl w:val=\"0\"/>"
+        "<w:numId w:val=\"6\"/></w:numPr></w:pPr>"
+        "<w:r><w:t>Right marker</w:t></w:r></w:p>"
+        "<w:sectPr/></w:body></w:document>";
+    createPackage(path, document_xml);
+    const std::string numbering_xml =
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+        "<w:numbering xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">"
+        "<w:abstractNum w:abstractNumId=\"7\"><w:lvl w:ilvl=\"0\">"
+        "<w:start w:val=\"1\"/><w:numFmt w:val=\"decimal\"/>"
+        "<w:lvlText w:val=\"%1.\"/><w:lvlJc w:val=\"left\"/>"
+        "<w:pPr><w:ind w:left=\"720\" w:hanging=\"360\"/></w:pPr>"
+        "</w:lvl></w:abstractNum>"
+        "<w:abstractNum w:abstractNumId=\"8\"><w:lvl w:ilvl=\"0\">"
+        "<w:start w:val=\"1\"/><w:numFmt w:val=\"decimal\"/>"
+        "<w:lvlText w:val=\"%1.\"/><w:lvlJc w:val=\"right\"/>"
+        "<w:pPr><w:ind w:left=\"720\" w:hanging=\"360\"/></w:pPr>"
+        "</w:lvl></w:abstractNum>"
+        "<w:num w:numId=\"5\"><w:abstractNumId w:val=\"7\"/></w:num>"
+        "<w:num w:numId=\"6\"><w:abstractNumId w:val=\"8\"/></w:num>"
+        "</w:numbering>";
+    const std::string relationships =
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+        "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">"
+        "<Relationship Id=\"rNumbering\" "
+        "Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/numbering\" "
+        "Target=\"numbering.xml\"/>"
+        "</Relationships>";
+    appendMembers(
+        path,
+        {{"word/_rels/document.xml.rels", relationships},
+         {"word/numbering.xml", numbering_xml}});
+
+    Error error;
+    auto document = DocxDocument::open(path, &error);
+    check(document != nullptr, error.message);
+    check(document->paragraphs().size() == 2,
+          "numbering-justification fixture paragraph count changed");
+    const auto& left = document->paragraphs()[0];
+    const auto& right = document->paragraphs()[1];
+    check(left.numbering && left.numbering->marker_text == "1." &&
+              left.format_is_basic,
+          "supported left-aligned list marker was not parsed");
+    check(!right.numbering && right.numbering_id == 6 &&
+              !right.format_is_basic,
+          "right-aligned list marker was silently treated as left-aligned");
+    check(document->compatibility().classification ==
+              CompatibilityClass::safe_text_patch &&
+              std::any_of(
+                  document->compatibility().issues.begin(),
+                  document->compatibility().issues.end(),
+                  [](const auto& issue) {
+                      return issue.code == IssueCode::unsupported_formatting &&
+                             issue.paragraph_index == 1;
+                  }),
+          "unsupported list-level justification was not reported conservatively");
+
+    const auto original = readBytes(path);
+    const auto save = document->saveAs(copy);
+    check(save.saved && save.byte_identical_to_opened_file &&
+              readBytes(copy) == original,
+          "unsupported list-level justification was not preserved exactly");
+}
+
+void testNativeNumberingWriting(const TemporaryDirectory& temporary) {
+    const auto path = temporary.file("native-numbering.docx");
+
+    docxstudio::ooxml::NewNumbering topLevel;
+    topLevel.num_id = 11;
+    topLevel.level = 0;
+    topLevel.format = docxstudio::ooxml::BasicNumberFormat::decimal;
+    topLevel.start = 3;
+    topLevel.level_text = "%1)";
+    topLevel.suffix = docxstudio::ooxml::BasicNumberSuffix::tab;
+    topLevel.text_indent_twips = 720;
+    topLevel.hanging_indent_twips = 360;
+    topLevel.tab_stop_twips = 720;
+
+    NewParagraph first{{NewRun{"First body", {}}}};
+    first.numbering = topLevel;
+    NewParagraph second{{NewRun{"Second body", {}}}};
+    second.numbering = topLevel;
+
+    auto nestedLevel = topLevel;
+    nestedLevel.level = 1;
+    nestedLevel.format =
+        docxstudio::ooxml::BasicNumberFormat::lower_letter;
+    nestedLevel.start = 1;
+    nestedLevel.level_text = "%1.%2)";
+    nestedLevel.text_indent_twips = 1080;
+    nestedLevel.tab_stop_twips = 1080;
+    NewParagraph nested{{NewRun{"Nested body", {}}}};
+    nested.numbering = nestedLevel;
+
+    const auto save = DocxDocument::writeNew(
+        path, NewDocumentBody{{first, second, nested}});
+    check(save.saved,
+          save.error ? save.error->message
+                     : "native-numbering DOCX was not saved");
+
+    const std::string contentTypes = readMember(path, "[Content_Types].xml");
+    const std::string relationships =
+        readMember(path, "word/_rels/document.xml.rels");
+    const std::string documentXml = readMember(path, "word/document.xml");
+    const std::string numberingXml = readMember(path, "word/numbering.xml");
+    checkAuthoredNumberingLevelOrder(numberingXml, 2);
+    check(contentTypes.find("/word/numbering.xml") != std::string::npos &&
+              relationships.find(
+                  "relationships/numbering\" Target=\"numbering.xml\"") !=
+                  std::string::npos,
+          "native numbering package metadata was not emitted");
+    check(countOccurrences(documentXml, "<w:numPr>") == 3 &&
+              countOccurrences(documentXml, "<w:numId w:val=\"11\"/>") == 3 &&
+              documentXml.find("<w:tab/>") == std::string::npos &&
+              documentXml.find(">3)</w:t>") == std::string::npos &&
+              documentXml.find(">First body</w:t>") != std::string::npos,
+          "document.xml duplicated native markers or omitted numPr");
+    check(countOccurrences(numberingXml, "<w:lvl ") == 2 &&
+              numberingXml.find("<w:start w:val=\"3\"/>") !=
+                  std::string::npos &&
+              numberingXml.find("<w:numFmt w:val=\"decimal\"/>") !=
+                  std::string::npos &&
+              numberingXml.find("<w:numFmt w:val=\"lowerLetter\"/>") !=
+                  std::string::npos &&
+              numberingXml.find("<w:lvlText w:val=\"%1.%2)\"/>") !=
+                  std::string::npos &&
+              numberingXml.find("<w:tab w:val=\"num\" w:pos=\"1080\"/>") !=
+                  std::string::npos,
+          "numbering.xml lost formats, templates, starts, or geometry");
+
+    Error error;
+    auto reopened = DocxDocument::open(path, &error);
+    check(reopened != nullptr, error.message);
+    check(reopened->paragraphs().size() == 3 &&
+              reopened->paragraphs()[0].plainText() == "First body" &&
+              reopened->paragraphs()[1].plainText() == "Second body" &&
+              reopened->paragraphs()[2].plainText() == "Nested body",
+          "native-numbering body text changed on reopen");
+    check(reopened->paragraphs()[0].numbering &&
+              reopened->paragraphs()[1].numbering &&
+              reopened->paragraphs()[2].numbering &&
+              reopened->paragraphs()[0].numbering->marker_text == "3)" &&
+              reopened->paragraphs()[1].numbering->marker_text == "4)" &&
+              reopened->paragraphs()[2].numbering->marker_text == "4.a)" &&
+              reopened->paragraphs()[2].numbering->level == 1 &&
+              reopened->paragraphs()[2].left_indent_twips == 1080 &&
+              reopened->paragraphs()[2].first_line_indent_twips == -360,
+          "native numbering semantics did not survive write/reopen");
+
+    NewParagraph conflict{{NewRun{"Conflict", {}}}};
+    auto conflictingDefinition = topLevel;
+    conflictingDefinition.start = 9;
+    conflict.numbering = conflictingDefinition;
+    const auto rejected = DocxDocument::writeNew(
+        temporary.file("conflicting-native-numbering.docx"),
+        NewDocumentBody{{first, conflict}});
+    check(!rejected.saved && rejected.loss_report.hasBlockers(),
+          "conflicting definitions for one native list level were accepted");
+
+    NewParagraph invalidTenth{{NewRun{"Invalid native level", {}}}};
+    auto tenthLevel = topLevel;
+    tenthLevel.level = 9;
+    tenthLevel.level_text = "%10.";
+    invalidTenth.numbering = tenthLevel;
+    const auto invalidTenthSave = DocxDocument::writeNew(
+        temporary.file("invalid-tenth-native-level.docx"),
+        NewDocumentBody{{invalidTenth}});
+    check(!invalidTenthSave.saved &&
+              invalidTenthSave.loss_report.hasBlockers(),
+          "an out-of-schema tenth native numbering level was accepted");
 }
 
 void testUnsafeImageRelationshipsAreNotLoaded(
@@ -623,8 +1020,10 @@ void testNewDocumentCreation(const TemporaryDirectory& temporary) {
           "superscript was not parsed");
     check(document->bodyPageSettings() == page, "body page settings were not parsed");
     const std::string xml = readMember(path, "word/document.xml");
-    check(xml.find("<w:pgSz w:w=\"15840\" w:h=\"12240\"/>") != std::string::npos,
-          "page size was not serialized");
+    check(xml.find(
+              "<w:pgSz w:w=\"15840\" w:h=\"12240\" w:orient=\"landscape\"/>") !=
+              std::string::npos,
+          "page size or landscape orientation was not serialized");
     check(xml.find("w:top=\"720\" w:right=\"900\" w:bottom=\"720\" w:left=\"900\"") !=
               std::string::npos,
           "page margins were not serialized");
@@ -1643,7 +2042,11 @@ int main() {
     try {
         TemporaryDirectory temporary;
         testInlineImagePageBreakAndTablePresentation(temporary);
+        testInlineImageTableCellIsPreservedViewOnly(temporary);
+        testRepeatedImageReferencesShareBoundedStorage(temporary);
         testStylesThemesAndNativeNumberingImport(temporary);
+        testNumberingLevelJustificationIsConservative(temporary);
+        testNativeNumberingWriting(temporary);
         testUnsafeImageRelationshipsAreNotLoaded(temporary);
         testNewDocumentCreation(temporary);
         testSemanticTableWriting(temporary);
