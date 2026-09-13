@@ -6,6 +6,8 @@
 #include <QElapsedTimer>
 #include <QImage>
 #include <QPoint>
+#include <QPointF>
+#include <QRectF>
 #include <QString>
 
 #include <cstdint>
@@ -143,6 +145,13 @@ public:
     bool deleteSelectedInlineImage();
     bool resizeSelectedInlineImage(double widthPoints, double heightPoints);
     std::optional<core::NodeId> selectedInlineImageId() const;
+    std::optional<core::ImageLayout> selectedImageLayout() const;
+    QString selectedImageAccessibleName() const;
+    bool setSelectedImageLayout(const core::ImageLayout& layout);
+    bool setSelectedImageAccessibleName(const QString& accessibleName);
+    void showSelectedImageSizeDialog();
+    void showSelectedImageAltTextDialog();
+    void showSelectedImageLayoutDialog();
     bool insertEquation(const QString& latex, bool display = false);
     bool insertTable(std::size_t rows, std::size_t columns, bool headerRow);
     bool insertTableRow(bool after);
@@ -255,6 +264,21 @@ private:
     struct TableVisual;
     struct BlockPlacement;
     struct Hit;
+    enum class ImageResizeHandle {
+        right,
+        bottom_right,
+        bottom,
+    };
+    struct ImageResizeDrag {
+        core::NodeId imageId;
+        ImageResizeHandle handle{ImageResizeHandle::bottom_right};
+        QPointF startPoint;
+        QRectF originalRect;
+        QRectF previewRect;
+        int pageIndex{};
+        double originalWidthPoints{};
+        double originalHeightPoints{};
+    };
     struct TableCursor {
         core::NodeId tableId;
         std::size_t row{};
@@ -323,12 +347,12 @@ private:
     void updateDirtyFlags();
     void synchronizeCursorHistory();
     void recordLayoutChange(const CursorState& before);
-    void showSelectedImageSizeDialog();
     bool insertInlineImageWithGeometry(
         std::vector<std::uint8_t> encodedBytes,
         const QString& accessibleName,
         std::optional<std::int64_t> widthEmu,
-        std::optional<std::int64_t> heightEmu);
+        std::optional<std::int64_t> heightEmu,
+        core::ImageLayout layout = {});
     const QImage* decodedInlineImage(const core::ImageAtom& image) const;
     void reconcileDecodedImageCache();
     std::optional<std::pair<core::Position, core::ImageAtom>>
@@ -444,6 +468,7 @@ private:
     bool draggingTable_{false};
     bool tableDropTargetValid_{false};
     std::optional<core::NodeId> tableDropBefore_;
+    std::optional<ImageResizeDrag> imageResizeDrag_;
     std::optional<LineAffinity> lineAffinity_;
     std::optional<double> preferredVerticalX_;
     std::vector<CursorHistoryEntry> undoCursorHistory_;

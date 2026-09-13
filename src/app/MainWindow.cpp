@@ -18,6 +18,7 @@
 #include "docxstudio/worker/client.h"
 
 #include <QAction>
+#include <QActionGroup>
 #include <QApplication>
 #include <QCheckBox>
 #include <QCloseEvent>
@@ -615,7 +616,14 @@ core::Result<core::Document> documentFromOoxmlParagraphs(
                 styles.push_back({paragraphIndex, start, end, run.format});
             }
         }
-        auto created = core::Paragraph::create(text.toStdU16String());
+        core::CharacterFormat paragraphMarkFormat;
+        if (source.paragraph_mark_format) {
+            paragraphMarkFormat = importedCharacterFormat(
+                *source.paragraph_mark_format);
+        }
+        auto created = core::Paragraph::create(
+            text.toStdU16String(), core::NodeId::generate(),
+            std::move(paragraphMarkFormat));
         if (!created) return created.error();
         paragraphs.push_back(std::move(created.value()));
     }
@@ -1149,16 +1157,44 @@ core::Result<ImportedSemanticDocument> documentFromOoxml(
                                           .first;
                         }
                         const auto imageId = core::NodeId::generate();
+                        core::ImageLayout imageLayout;
+                        switch (sourceImage.layout.placement) {
+                            case ooxml::ImagePlacement::inline_with_text:
+                                imageLayout.placement =
+                                    core::ImagePlacement::inline_with_text;
+                                break;
+                            case ooxml::ImagePlacement::square:
+                                imageLayout.placement =
+                                    core::ImagePlacement::square;
+                                break;
+                            case ooxml::ImagePlacement::top_and_bottom:
+                                imageLayout.placement =
+                                    core::ImagePlacement::top_and_bottom;
+                                break;
+                        }
+                        imageLayout.distance_top_emu =
+                            sourceImage.layout.distance_top_emu;
+                        imageLayout.distance_right_emu =
+                            sourceImage.layout.distance_right_emu;
+                        imageLayout.distance_bottom_emu =
+                            sourceImage.layout.distance_bottom_emu;
+                        imageLayout.distance_left_emu =
+                            sourceImage.layout.distance_left_emu;
+                        imageLayout.move_with_text =
+                            sourceImage.layout.move_with_text;
                         const auto inserted = document.insertImage(
                             {*sourceToCore[sourceIndex], semanticOffset},
                             encoded->second,
                             inspection.format == raster::Format::png
                                 ? core::ImageFormat::png
                                 : core::ImageFormat::jpeg,
-                            sourceImage.name.empty() ? std::string("Picture")
-                                                     : sourceImage.name,
+                            sourceImage.accessible_name.empty()
+                                ? (sourceImage.name.empty()
+                                       ? std::string("Picture")
+                                       : sourceImage.name)
+                                : sourceImage.accessible_name,
                             sourceImage.width_emu, sourceImage.height_emu,
-                            imageId);
+                            imageId, std::nullopt, imageLayout);
                         if (!inserted) return inserted.error();
                         imagePresentations.emplace_back(
                             imageId, std::move(decoded.image));
@@ -1257,16 +1293,14 @@ core::Result<ImportedSemanticDocument> documentFromOoxml(
                 cellId = core::NodeId::generate();
             }
             core::CharacterFormat defaultCellFormat;
-            if (text.isEmpty()) {
-                if (sourceParagraphs[sourceIndex]
-                        .paragraph_mark_format.has_value()) {
-                    defaultCellFormat = importedCharacterFormat(
-                        *sourceParagraphs[sourceIndex]
-                             .paragraph_mark_format);
-                } else if (!sourceParagraphs[sourceIndex].runs.empty()) {
-                    defaultCellFormat = importedCharacterFormat(
-                        sourceParagraphs[sourceIndex].runs.back().format);
-                }
+            if (sourceParagraphs[sourceIndex]
+                    .paragraph_mark_format.has_value()) {
+                defaultCellFormat = importedCharacterFormat(
+                    *sourceParagraphs[sourceIndex].paragraph_mark_format);
+            } else if (text.isEmpty() &&
+                       !sourceParagraphs[sourceIndex].runs.empty()) {
+                defaultCellFormat = importedCharacterFormat(
+                    sourceParagraphs[sourceIndex].runs.back().format);
             }
             semanticCells.emplace_back(
                 cellId, text.toStdU16String(), presentation.formats,
@@ -1303,15 +1337,11 @@ QStringList currentTexts(const core::DocumentSnapshot& snapshot) {
     return result;
 }
 
-ooxml::BasicRunFormat toOoxmlFormat(
-    const core::CharacterFormat& format,
-    const QString& defaultFontFamily = QStringLiteral("Carlito"),
-    double defaultFontPointSize = 11.0) {
+ooxml::BasicRunFormat toOoxmlSparseFormat(
+    const core::CharacterFormat& format) {
     ooxml::BasicRunFormat result;
-    result.font_family = format.font_family.value_or(
-        defaultFontFamily.toStdString());
-    result.font_size_half_points = format.font_size_half_points.value_or(
-        static_cast<std::int32_t>(std::lround(defaultFontPointSize * 2.0)));
+    result.font_family = format.font_family;
+    result.font_size_half_points = format.font_size_half_points;
     result.bold = format.bold;
     result.italic = format.italic;
     if (format.underline.has_value()) {
@@ -1330,6 +1360,21 @@ ooxml::BasicRunFormat toOoxmlFormat(
             case core::BaselinePosition::subscript:
                 result.baseline = ooxml::BasicBaseline::subscript; break;
         }
+    }
+    return result;
+}
+
+ooxml::BasicRunFormat toOoxmlFormat(
+    const core::CharacterFormat& format,
+    const QString& defaultFontFamily = QStringLiteral("Carlito"),
+    double defaultFontPointSize = 11.0) {
+    auto result = toOoxmlSparseFormat(format);
+    if (!result.font_family) {
+        result.font_family = defaultFontFamily.toStdString();
+    }
+    if (!result.font_size_half_points) {
+        result.font_size_half_points = static_cast<std::int32_t>(
+            std::lround(defaultFontPointSize * 2.0));
     }
     return result;
 }
@@ -1428,9 +1473,11 @@ ooxml::NewParagraph toOoxmlTableCellParagraph(
         return toOoxmlFormat(
             source, defaultFontFamily, defaultFontPointSize);
     };
-    if (cell.text.empty()) {
+    if (cell.text.empty() || !cell.default_character_format.empty()) {
         output.paragraph_mark_format =
             exportCharacterFormat(cell.default_character_format);
+    }
+    if (cell.text.empty()) {
         return output;
     }
     const QString text = QString::fromUtf16(
@@ -1674,6 +1721,10 @@ std::vector<ooxml::NewParagraph> toOoxmlParagraphs(
         out.keep_with_next = format.keep_with_next;
         out.keep_lines = format.keep_lines;
         out.page_break_before = format.page_break_before;
+        if (!paragraph.paragraphMarkCharacterFormat().empty()) {
+            out.paragraph_mark_format = toOoxmlSparseFormat(
+                paragraph.paragraphMarkCharacterFormat());
+        }
 
         const auto& text = paragraph.text();
         const QString paragraphText = QString::fromUtf16(
@@ -1820,6 +1871,30 @@ std::vector<ooxml::NewParagraph> toOoxmlParagraphs(
             serialized.width_emu = image.width_emu;
             serialized.height_emu = image.height_emu;
             serialized.bytes.assign(bytes.begin(), bytes.end());
+            serialized.accessible_name = image.accessible_name;
+            switch (image.layout.placement) {
+                case core::ImagePlacement::inline_with_text:
+                    serialized.layout.placement =
+                        ooxml::ImagePlacement::inline_with_text;
+                    break;
+                case core::ImagePlacement::square:
+                    serialized.layout.placement =
+                        ooxml::ImagePlacement::square;
+                    break;
+                case core::ImagePlacement::top_and_bottom:
+                    serialized.layout.placement =
+                        ooxml::ImagePlacement::top_and_bottom;
+                    break;
+            }
+            serialized.layout.distance_top_emu =
+                image.layout.distance_top_emu;
+            serialized.layout.distance_right_emu =
+                image.layout.distance_right_emu;
+            serialized.layout.distance_bottom_emu =
+                image.layout.distance_bottom_emu;
+            serialized.layout.distance_left_emu =
+                image.layout.distance_left_emu;
+            serialized.layout.move_with_text = image.layout.move_with_text;
 
             const auto formatOffset = std::min(
                 paragraph.text().size(), image.utf16_offset + 1U);
@@ -2293,10 +2368,15 @@ MainWindow::MainWindow(QWidget* parent)
             ribbon_->setFontPointSize(canvas->currentFontPointSize());
             ribbon_->setTextColor(canvas->currentTextColor());
             ribbon_->setTableContext(canvas->selectedTableId().has_value());
+            const auto pictureLayout = canvas->selectedImageLayout();
+            ribbon_->setPictureContext(
+                pictureLayout.has_value(),
+                pictureLayout.value_or(core::ImageLayout{}).placement);
             canvas->refreshCursorFormat();
         } else {
             ribbon_->setListContext(false, 1);
             ribbon_->setTableContext(false);
+            ribbon_->setPictureContext(false);
         }
     });
     newDocument();
@@ -2426,6 +2506,59 @@ void MainWindow::registerCommands() {
         }
     });
     add("insert.image", tr("Picture"), QKeySequence(), [this] { insertImage(); });
+    add("picture.size", tr("Picture Size…"), QKeySequence(), [this] {
+        if (auto* canvas = activeCanvas()) {
+            canvas->showSelectedImageSizeDialog();
+        }
+    });
+    add("picture.altText", tr("Alt Text…"), QKeySequence(), [this] {
+        if (auto* canvas = activeCanvas()) {
+            canvas->showSelectedImageAltTextDialog();
+        }
+    });
+    add("picture.layoutOptions", tr("Layout Options…"), QKeySequence(),
+        [this] {
+            if (auto* canvas = activeCanvas()) {
+                canvas->showSelectedImageLayoutDialog();
+            }
+        });
+    const auto setPicturePlacement = [this](core::ImagePlacement placement) {
+        auto* canvas = activeCanvas();
+        if (!canvas) return;
+        auto layout = canvas->selectedImageLayout();
+        if (!layout) return;
+        layout->placement = placement;
+        if (placement == core::ImagePlacement::inline_with_text) {
+            layout->move_with_text = true;
+        }
+        static_cast<void>(canvas->setSelectedImageLayout(*layout));
+    };
+    auto* wrapInline = add(
+        "picture.wrapInline", tr("In Line with Text"), QKeySequence(),
+        [setPicturePlacement] {
+            setPicturePlacement(core::ImagePlacement::inline_with_text);
+        }, true);
+    auto* wrapSquare = add(
+        "picture.wrapSquare", tr("Square"), QKeySequence(),
+        [setPicturePlacement] {
+            setPicturePlacement(core::ImagePlacement::square);
+        }, true);
+    auto* wrapTopBottom = add(
+        "picture.wrapTopBottom", tr("Top and Bottom"), QKeySequence(),
+        [setPicturePlacement] {
+            setPicturePlacement(core::ImagePlacement::top_and_bottom);
+        }, true);
+    auto* pictureWrapGroup = new QActionGroup(this);
+    pictureWrapGroup->setExclusive(true);
+    pictureWrapGroup->addAction(wrapInline);
+    pictureWrapGroup->addAction(wrapSquare);
+    pictureWrapGroup->addAction(wrapTopBottom);
+    add("picture.delete", tr("Delete Picture"), QKeySequence(),
+        [this] {
+            if (auto* canvas = activeCanvas()) {
+                static_cast<void>(canvas->deleteSelectedInlineImage());
+            }
+        });
     add("insert.equation", tr("Equation"), QKeySequence(QStringLiteral("Alt+=")), [this] { insertEquation(); });
     add("insert.textBox", tr("Text Box"), QKeySequence(), [this] { statusBar()->showMessage(tr("Text boxes are preserved on import; editing is not in this build."), 5000); });
     add("insert.comment", tr("Comment"), QKeySequence(QStringLiteral("Ctrl+Alt+M")), [this] { statusBar()->showMessage(tr("Comments are scheduled for the business/legal milestone."), 5000); });
@@ -2516,6 +2649,9 @@ void MainWindow::registerCommands() {
              "table.insertRowAbove", "table.insertRowBelow",
              "table.insertColumnLeft", "table.insertColumnRight",
              "table.deleteRows", "table.deleteColumns",
+             "picture.size", "picture.altText", "picture.layoutOptions",
+             "picture.wrapInline", "picture.wrapSquare",
+             "picture.wrapTopBottom", "picture.delete",
              "layout.orientation", "layout.columns", "layout.lineSpacing",
              "layout.paragraphSpacing", "review.spelling", "review.comment",
              "review.trackChanges", "review.acceptChange", "review.rejectChange",
@@ -2780,6 +2916,10 @@ DocumentCanvas* MainWindow::createDocumentTab(core::Document document,
     connect(canvas, &DocumentCanvas::selectionChanged, this, [this, canvas] {
         if (canvas == activeCanvas()) {
             ribbon_->setTableContext(canvas->selectedTableId().has_value());
+            const auto pictureLayout = canvas->selectedImageLayout();
+            ribbon_->setPictureContext(
+                pictureLayout.has_value(),
+                pictureLayout.value_or(core::ImageLayout{}).placement);
         }
     });
     connect(canvas, &DocumentCanvas::listPropertiesRequested,
@@ -2795,6 +2935,10 @@ DocumentCanvas* MainWindow::createDocumentTab(core::Document document,
     ribbon_->setTextColor(canvas->currentTextColor());
     ribbon_->setHighlightColor(canvas->currentHighlightColor());
     ribbon_->setTableContext(canvas->selectedTableId().has_value());
+    const auto pictureLayout = canvas->selectedImageLayout();
+    ribbon_->setPictureContext(
+        pictureLayout.has_value(),
+        pictureLayout.value_or(core::ImageLayout{}).placement);
     canvas->refreshCursorFormat();
     canvas->setFocus();
     updateWindowTitle();

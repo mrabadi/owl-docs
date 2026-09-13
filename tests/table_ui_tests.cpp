@@ -430,6 +430,142 @@ void testRectangularCellFormattingAndUndo(
     }
 }
 
+void testEmptyCellFormattingSurvivesNavigation(
+    docxstudio::app::SpellChecker& spelling) {
+    DocumentCanvas canvas(spelling);
+    check(canvas.insertTable(1, 2, false),
+          "could not create empty-cell insertion-format fixture");
+    const auto initial = canvas.snapshot();
+    const auto tableId = initial.document.tables().front().id();
+    check(canvas.activateTableCell(tableId, 0, 0),
+          "could not activate empty-cell insertion-format fixture");
+
+    const QString requestedFamily = QStringLiteral("DejaVu Serif");
+    constexpr double requestedPoints = 17.5;
+    const QColor requestedColor(QStringLiteral("#3157a4"));
+    canvas.setFontFamily(requestedFamily);
+    canvas.setFontPointSize(requestedPoints);
+    canvas.setForeground(requestedColor);
+    canvas.toggleItalic();
+
+    auto snapshot = canvas.snapshot();
+    const auto* table = snapshot.document.findTable(tableId);
+    const auto* firstCell = table ? table->cell(0, 0) : nullptr;
+    check(firstCell && firstCell->text.empty() &&
+              firstCell->default_character_format.font_family ==
+                  requestedFamily.toStdString() &&
+              firstCell->default_character_format.font_size_half_points == 35 &&
+              firstCell->default_character_format.foreground_argb ==
+                  static_cast<std::uint32_t>(requestedColor.rgba()) &&
+              firstCell->default_character_format.italic == true,
+          "formatting an empty table cell was not stored durably");
+
+    sendKey(canvas, Qt::Key_Tab);
+    sendKey(canvas, Qt::Key_Backtab, Qt::ShiftModifier);
+    canvas.refreshCursorFormat();
+    check(canvas.currentFontFamily() == requestedFamily &&
+              std::abs(canvas.currentFontPointSize() - requestedPoints) < 0.01 &&
+              canvas.currentTextColor().rgba() == requestedColor.rgba(),
+          "returning to an empty table cell reset its insertion format");
+
+    canvas.insertText(QStringLiteral("Styled"));
+    snapshot = canvas.snapshot();
+    table = snapshot.document.findTable(tableId);
+    firstCell = table ? table->cell(0, 0) : nullptr;
+    const auto typedFormat = firstCell
+        ? firstCell->characterFormatAt(firstCell->text.size())
+        : docxstudio::core::CharacterFormat{};
+    check(firstCell && firstCell->text == u"Styled" &&
+              typedFormat.font_family == requestedFamily.toStdString() &&
+              typedFormat.font_size_half_points == 35 &&
+              typedFormat.foreground_argb ==
+                  static_cast<std::uint32_t>(requestedColor.rgba()) &&
+              typedFormat.italic == true,
+          "typing after returning to an empty cell did not use its stored format");
+
+    canvas.undo();
+    snapshot = canvas.snapshot();
+    table = snapshot.document.findTable(tableId);
+    firstCell = table ? table->cell(0, 0) : nullptr;
+    check(firstCell && firstCell->text.empty() &&
+              firstCell->default_character_format.font_family ==
+                  requestedFamily.toStdString(),
+          "undoing empty-cell typing also discarded its insertion format");
+
+    // Cover the legacy/import transition where the visible characters are
+    // styled but the end-of-cell marker is sparse. Deleting all text must
+    // promote the visible style before navigation.
+    using docxstudio::core::Document;
+    using docxstudio::core::FormatRun;
+    using docxstudio::core::NodeId;
+    using docxstudio::core::Paragraph;
+    using docxstudio::core::Table;
+    using docxstudio::core::TableCell;
+    auto bodyParagraph = Paragraph::create(u"");
+    check(static_cast<bool>(bodyParagraph),
+          "could not create table deletion fixture body paragraph");
+    auto deletionDocument = Document::create(
+        std::vector<Paragraph>{std::move(bodyParagraph.value())});
+    check(static_cast<bool>(deletionDocument),
+          "could not create table deletion fixture document");
+    docxstudio::core::CharacterFormat legacyFormat;
+    legacyFormat.font_family = requestedFamily.toStdString();
+    legacyFormat.font_size_half_points = 35;
+    legacyFormat.foreground_argb =
+        static_cast<std::uint32_t>(requestedColor.rgba());
+    legacyFormat.italic = true;
+    const auto deletionTableId = NodeId::generate();
+    std::vector<TableCell> deletionCells;
+    deletionCells.emplace_back(
+        NodeId::generate(), u"Styled",
+        std::vector<FormatRun>{{0, 6, legacyFormat}});
+    deletionCells.emplace_back(NodeId::generate(), u"");
+    auto deletionTable = Table::restore(
+        1, 2, false, deletionTableId, std::move(deletionCells));
+    check(static_cast<bool>(deletionTable) &&
+              static_cast<bool>(deletionDocument.value().insertTable(
+                  std::nullopt, std::move(deletionTable.value()))),
+          "could not create table deletion fixture");
+
+    DocumentCanvas deletionCanvas(spelling);
+    deletionCanvas.setDocument(std::move(deletionDocument.value()));
+    check(deletionCanvas.activateTableCell(deletionTableId, 0, 0, 6),
+          "could not activate styled deletion fixture cell");
+    sendKey(deletionCanvas, Qt::Key_Home, Qt::ShiftModifier);
+    sendKey(deletionCanvas, Qt::Key_Delete);
+    snapshot = deletionCanvas.snapshot();
+    table = snapshot.document.findTable(deletionTableId);
+    firstCell = table ? table->cell(0, 0) : nullptr;
+    check(firstCell && firstCell->text.empty() &&
+              firstCell->default_character_format.font_family ==
+                  requestedFamily.toStdString() &&
+              firstCell->default_character_format.font_size_half_points == 35 &&
+              firstCell->default_character_format.foreground_argb ==
+                  static_cast<std::uint32_t>(requestedColor.rgba()) &&
+              firstCell->default_character_format.italic == true,
+          "deleting all styled cell text did not promote its insertion format");
+
+    sendKey(deletionCanvas, Qt::Key_Tab);
+    sendKey(deletionCanvas, Qt::Key_Backtab, Qt::ShiftModifier);
+    deletionCanvas.refreshCursorFormat();
+    check(deletionCanvas.currentFontFamily() == requestedFamily &&
+              std::abs(deletionCanvas.currentFontPointSize() -
+                       requestedPoints) < 0.01 &&
+              deletionCanvas.currentTextColor().rgba() ==
+                  requestedColor.rgba(),
+          "returning to a deletion-created empty cell reset its format");
+    deletionCanvas.insertText(QStringLiteral("Again"));
+    snapshot = deletionCanvas.snapshot();
+    table = snapshot.document.findTable(deletionTableId);
+    firstCell = table ? table->cell(0, 0) : nullptr;
+    check(firstCell && firstCell->text == u"Again" &&
+              firstCell->characterFormatAt(5).font_family ==
+                  requestedFamily.toStdString() &&
+              firstCell->characterFormatAt(5).foreground_argb ==
+                  static_cast<std::uint32_t>(requestedColor.rgba()),
+          "typing after returning to a deletion-created empty cell lost its format");
+}
+
 void testTableRowAndColumnCommandsAndUndo(
     docxstudio::app::SpellChecker& spelling) {
     DocumentCanvas insertionCanvas(spelling);
@@ -1590,6 +1726,7 @@ int main(int argc, char** argv) {
     testCanvasTableEditing(spelling);
     testActiveCellAndRectangularSelectionPainting(spelling);
     testRectangularCellFormattingAndUndo(spelling);
+    testEmptyCellFormattingSurvivesNavigation(spelling);
     testTableRowAndColumnCommandsAndUndo(spelling);
     testTableStylePalettesRenderAndUndo(spelling);
     testImportedStylePrecedenceAndStableCellPresentation(spelling);

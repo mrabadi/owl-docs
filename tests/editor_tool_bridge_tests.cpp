@@ -123,6 +123,35 @@ int main(int argc, char** argv) {
     check(read.at("blocks").at(0).at("text") == "Helo world", "read returned wrong text");
     check(read.at("blocks").at(0).at("id") == blockId, "read returned unstable block id");
 
+    docxstudio::app::DocumentCanvas emptyFormatCanvas(spelling);
+    emptyFormatCanvas.setFontFamily(QStringLiteral("DejaVu Serif"));
+    emptyFormatCanvas.setFontPointSize(19.0);
+    emptyFormatCanvas.setForeground(QColor(QStringLiteral("#3157a4")));
+    emptyFormatCanvas.toggleBold();
+    const auto emptyFormatSnapshot = emptyFormatCanvas.snapshot();
+    error.clear();
+    const auto emptyFormatRead = docxstudio::app::invokeEditorTool(
+        emptyFormatCanvas, documentId,
+        QString::fromLatin1(docxstudio::codex::kEditorReadTool.data(),
+                            static_cast<qsizetype>(
+                                docxstudio::codex::kEditorReadTool.size())),
+        {{"documentId", documentId.toStdString()},
+         {"expectedRevision", emptyFormatSnapshot.revision.value()},
+         {"scope", "document"},
+         {"includeFormatting", true}},
+        summary, error);
+    const auto& paragraphMarkStyle = emptyFormatRead.at("blocks")
+                                         .at(0)
+                                         .at("attributes")
+                                         .at("paragraphMarkStyle");
+    check(error.isEmpty() &&
+              emptyFormatRead.at("blocks").at(0).at("text") == "" &&
+              paragraphMarkStyle.at("fontFamily") == "DejaVu Serif" &&
+              paragraphMarkStyle.at("fontSizePoints") == 19.0 &&
+              paragraphMarkStyle.at("foregroundColor") == "#3157A4" &&
+              paragraphMarkStyle.at("bold") == true,
+          "editor read omitted durable empty-paragraph insertion formatting");
+
     const QString readTool = QString::fromLatin1(
         docxstudio::codex::kEditorReadTool.data(),
         static_cast<qsizetype>(docxstudio::codex::kEditorReadTool.size()));
@@ -172,6 +201,11 @@ int main(int argc, char** argv) {
     const auto png = bridgePng();
     check(imageCanvas.insertInlineImage(png, QStringLiteral("chart.png")),
           "could not insert bridge metadata image");
+    const docxstudio::core::ImageLayout bridgeLayout{
+        docxstudio::core::ImagePlacement::square,
+        100, 200, 300, 400, false};
+    check(imageCanvas.setSelectedImageLayout(bridgeLayout),
+          "could not set bridge metadata image layout");
     const auto imageSnapshot = imageCanvas.snapshot();
     const auto& imageAtom =
         imageSnapshot.document.paragraphs().front().images().front();
@@ -196,6 +230,12 @@ int main(int argc, char** argv) {
               images.at(0).at("mimeType") == "image/png" &&
               images.at(0).at("widthEmu") == imageAtom.width_emu &&
               images.at(0).at("heightEmu") == imageAtom.height_emu &&
+              images.at(0).at("layout").at("placement") == "square" &&
+              images.at(0).at("layout").at("distanceTopEmu") == 100 &&
+              images.at(0).at("layout").at("distanceRightEmu") == 200 &&
+              images.at(0).at("layout").at("distanceBottomEmu") == 300 &&
+              images.at(0).at("layout").at("distanceLeftEmu") == 400 &&
+              images.at(0).at("layout").at("moveWithText") == false &&
               images.at(0).at("encodedBytes") == png.size() &&
               !images.at(0).contains("bytes") &&
               !images.at(0).contains("path"),

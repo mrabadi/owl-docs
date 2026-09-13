@@ -271,10 +271,10 @@ void codecRoundTrip() {
     check(!RecoveryCodec::decode(invalidIndent, error),
           "recovery codec accepted an out-of-range bullet indentation");
 
-    const auto version = futureVersion.find("\"version\":6");
+    const auto version = futureVersion.find("\"version\":8");
     check(version != std::string::npos, "encoded recovery version was absent");
-    futureVersion.replace(version, std::string("\"version\":6").size(),
-                          "\"version\":7");
+    futureVersion.replace(version, std::string("\"version\":8").size(),
+                          "\"version\":9");
     check(!RecoveryCodec::decode(futureVersion, error),
           "recovery codec accepted an unsupported future version");
     check(!RecoveryCodec::decode("{not-json", error),
@@ -347,14 +347,20 @@ void semanticImageRoundTrip() {
     const NodeId equationId{103, 104};
     const NodeId firstImageId{105, 106};
     const NodeId secondImageId{107, 108};
+    const ImageLayout squareLayout{
+        ImagePlacement::square, 12, 34, 56, 78, false};
+    const ImageLayout topBottomLayout{
+        ImagePlacement::top_and_bottom, 90, 0, 123, 0, true};
     check(static_cast<bool>(document.value().insertEquation(
               {{101, 102}, 1}, "\\frac{x}{y}", false, equationId)) &&
               static_cast<bool>(document.value().insertImage(
                   {{101, 102}, 1}, payload, ImageFormat::png,
-                  "First owl", 914400, 457200, firstImageId)) &&
+                  "First owl", 914400, 457200, firstImageId, std::nullopt,
+                  squareLayout)) &&
               static_cast<bool>(document.value().insertImage(
                   {{101, 102}, 3}, payload, ImageFormat::png,
-                  "Second owl", 457200, 914400, secondImageId)),
+                  "Second owl", 457200, 914400, secondImageId, std::nullopt,
+                  topBottomLayout)),
           "could not build mixed image/equation recovery fixture");
     check(document.value().paragraphs().front().text() ==
               u"A\ufffc\ufffc\ufffcB" &&
@@ -381,7 +387,15 @@ void semanticImageRoundTrip() {
     const auto encodedJson = nlohmann::json::parse(*encoded);
     check(encodedJson["version"] == RecoveryCodec::currentVersion &&
               !encodedJson.contains("inline_images") &&
-              encodedJson["paragraphs"][0]["images"].size() == 2,
+              encodedJson["paragraphs"][0]["images"].size() == 2 &&
+              encodedJson["paragraphs"][0]["images"][0]["layout"]
+                         ["placement"] == "square" &&
+              encodedJson["paragraphs"][0]["images"][0]["layout"]
+                         ["distance_left_emu"] == 78 &&
+              encodedJson["paragraphs"][0]["images"][0]["layout"]
+                         ["move_with_text"] == false &&
+              encodedJson["paragraphs"][0]["images"][1]["layout"]
+                         ["placement"] == "top-and-bottom",
           "recovery codec did not write the semantic image schema");
 
     const auto decoded = RecoveryCodec::decode(*encoded, error);
@@ -393,8 +407,116 @@ void semanticImageRoundTrip() {
               std::equal(recoveredBytes.begin(), recoveredBytes.end(),
                          payload.bytes().begin()) &&
               decoded->document.findImage(secondImageId)->width_emu ==
-                  457200,
-          "semantic recovery did not preserve image bytes or geometry");
+                  457200 &&
+              decoded->document.findImage(firstImageId)->layout ==
+                  squareLayout &&
+              decoded->document.findImage(secondImageId)->layout ==
+                  topBottomLayout,
+          "semantic recovery did not preserve image bytes, geometry, or layout");
+
+    auto version6 = encodedJson;
+    version6["version"] = 6;
+    for (auto& encodedImage : version6["paragraphs"][0]["images"]) {
+        encodedImage.erase("layout");
+    }
+    const auto migratedVersion6 = RecoveryCodec::decode(version6.dump(), error);
+    check(migratedVersion6 &&
+              migratedVersion6->document.findImage(firstImageId)->layout ==
+                  ImageLayout{} &&
+              migratedVersion6->document.findImage(secondImageId)->layout ==
+                  ImageLayout{},
+          "version-6 semantic images did not migrate to default layout");
+}
+
+void paragraphMarkCharacterFormatRoundTrip() {
+    using namespace docxstudio::app;
+    using namespace docxstudio::core;
+
+    CharacterFormat emptyMark;
+    emptyMark.font_family = "Carlito";
+    emptyMark.font_size_half_points = 27;
+    emptyMark.bold = false;
+    emptyMark.italic = true;
+    emptyMark.underline = UnderlineStyle::wavy;
+    emptyMark.strike = false;
+    emptyMark.foreground_argb = 0xff123456U;
+    emptyMark.highlight_argb = 0xfffedcbaU;
+    emptyMark.baseline = BaselinePosition::subscript;
+    emptyMark.language = "en-US";
+
+    CharacterFormat nonemptyMark;
+    nonemptyMark.bold = true;
+    nonemptyMark.foreground_argb = 0xff654321U;
+
+    auto empty = Paragraph::create({}, NodeId{601, 602}, emptyMark);
+    auto nonempty = Paragraph::create(
+        u"Body text", NodeId{603, 604}, nonemptyMark);
+    check(empty && nonempty,
+          "could not create paragraph-mark recovery fixture");
+    auto document = Document::create(
+        {std::move(empty.value()), std::move(nonempty.value())});
+    check(static_cast<bool>(document),
+          "could not create paragraph-mark recovery document");
+
+    std::string error;
+    const auto encoded = RecoveryCodec::encode(
+        {document.value(), {}}, error);
+    check(encoded.has_value(),
+          "recovery codec did not encode paragraph-mark formatting");
+    const auto encodedJson = nlohmann::json::parse(*encoded);
+    check(encodedJson["version"] == 8 &&
+              encodedJson["paragraphs"][0]
+                         ["paragraph_mark_character_format"]
+                         ["font_family"] == "Carlito" &&
+              encodedJson["paragraphs"][0]
+                         ["paragraph_mark_character_format"]
+                         ["bold"] == false &&
+              encodedJson["paragraphs"][0]
+                         ["paragraph_mark_character_format"]
+                         ["underline"] == "wavy" &&
+              encodedJson["paragraphs"][1]
+                         ["paragraph_mark_character_format"]
+                         ["foreground_argb"] == 0xff654321U,
+          "recovery JSON omitted paragraph-mark character properties");
+
+    const auto decoded = RecoveryCodec::decode(*encoded, error);
+    check(decoded && decoded->document == document.value() &&
+              decoded->document.paragraphs()[0].characterFormatAt(0) ==
+                  emptyMark &&
+              decoded->document.paragraphs()[1]
+                      .paragraphMarkCharacterFormat() == nonemptyMark,
+          "recovery round trip changed paragraph-mark formatting");
+
+    auto version7 = encodedJson;
+    version7["version"] = 7;
+    for (auto& paragraph : version7["paragraphs"]) {
+        paragraph.erase("paragraph_mark_character_format");
+    }
+    const auto migrated = RecoveryCodec::decode(version7.dump(), error);
+    check(migrated &&
+              migrated->document.paragraphs()[0]
+                  .paragraphMarkCharacterFormat().empty() &&
+              migrated->document.paragraphs()[1]
+                  .paragraphMarkCharacterFormat().empty(),
+          "version-7 paragraphs did not migrate to an empty mark format");
+
+    auto missingCurrent = encodedJson;
+    missingCurrent["paragraphs"][0].erase(
+        "paragraph_mark_character_format");
+    const auto missing = RecoveryCodec::decode(
+        missingCurrent.dump(), error);
+    check(missing &&
+              missing->document.paragraphs()[0]
+                  .paragraphMarkCharacterFormat().empty() &&
+              missing->document.paragraphs()[1]
+                      .paragraphMarkCharacterFormat() == nonemptyMark,
+          "missing paragraph-mark recovery data did not default safely");
+
+    auto invalid = encodedJson;
+    invalid["paragraphs"][0]["paragraph_mark_character_format"]
+           ["font_size_half_points"] = 0;
+    check(!RecoveryCodec::decode(invalid.dump(), error),
+          "recovery codec accepted an invalid paragraph-mark format");
 }
 
 void legacyImageMigrationAndBoundaries() {
@@ -487,8 +609,8 @@ void semanticImageAdversarialLimits() {
     using namespace docxstudio::app;
     using namespace docxstudio::core;
 
-    check(RecoveryCodec::currentVersion == 6,
-          "recovery schema version was not bumped for semantic images");
+    check(RecoveryCodec::currentVersion == 8,
+          "recovery schema version was not bumped for paragraph-mark formatting");
     check(kMaximumInlineImagesPerDocument == 512 &&
               kMaximumEncodedImageBytes == 16U * 1024U * 1024U &&
               kMaximumDocumentEncodedImageBytes == 32U * 1024U * 1024U &&
@@ -515,6 +637,65 @@ void semanticImageAdversarialLimits() {
     check(encoded.has_value(),
           "could not encode image-limit recovery fixture");
     const auto original = nlohmann::json::parse(*encoded);
+
+    auto exactLayout = original;
+    exactLayout["paragraphs"][0]["images"][0]["layout"] = {
+        {"placement", "square"},
+        {"distance_top_emu", kMaximumImageWrapDistanceEmu},
+        {"distance_right_emu", 2},
+        {"distance_bottom_emu", 3},
+        {"distance_left_emu", 4},
+        {"move_with_text", false}};
+    const auto exactLayoutDecoded =
+        RecoveryCodec::decode(exactLayout.dump(), error);
+    check(exactLayoutDecoded &&
+              exactLayoutDecoded->document.findImage(NodeId{305, 306})
+                      ->layout.distance_top_emu ==
+                  kMaximumImageWrapDistanceEmu,
+          "recovery codec rejected the exact image-wrap-distance limit");
+
+    auto partialLayout = original;
+    partialLayout["paragraphs"][0]["images"][0]["layout"] = {
+        {"placement", "top-and-bottom"}};
+    const auto partialLayoutDecoded =
+        RecoveryCodec::decode(partialLayout.dump(), error);
+    check(partialLayoutDecoded &&
+              partialLayoutDecoded->document.findImage(NodeId{305, 306})
+                      ->layout ==
+                  ImageLayout{ImagePlacement::top_and_bottom, 0, 0, 0, 0,
+                              true},
+          "missing recovery image-layout fields did not use safe defaults");
+
+    auto unknownPlacement = original;
+    unknownPlacement["paragraphs"][0]["images"][0]["layout"]
+                    ["placement"] = "behind-text";
+    check(!RecoveryCodec::decode(unknownPlacement.dump(), error),
+          "recovery codec accepted an unknown image placement");
+
+    auto negativeDistance = original;
+    negativeDistance["paragraphs"][0]["images"][0]["layout"]
+                    ["distance_left_emu"] = -1;
+    check(!RecoveryCodec::decode(negativeDistance.dump(), error),
+          "recovery codec accepted a negative image wrap distance");
+
+    auto oversizedDistance = original;
+    oversizedDistance["paragraphs"][0]["images"][0]["layout"]
+                     ["distance_right_emu"] =
+        kMaximumImageWrapDistanceEmu + 1;
+    check(!RecoveryCodec::decode(oversizedDistance.dump(), error),
+          "recovery codec accepted an oversized image wrap distance");
+
+    auto fixedInline = original;
+    fixedInline["paragraphs"][0]["images"][0]["layout"]
+               ["move_with_text"] = false;
+    check(!RecoveryCodec::decode(fixedInline.dump(), error),
+          "recovery codec accepted a fixed-position inline image");
+
+    auto malformedMove = original;
+    malformedMove["paragraphs"][0]["images"][0]["layout"]
+                 ["move_with_text"] = "true";
+    check(!RecoveryCodec::decode(malformedMove.dump(), error),
+          "recovery codec accepted a non-Boolean move-with-text value");
 
     auto exactName = original;
     exactName["paragraphs"][0]["images"][0]["accessible_name"] =
@@ -754,6 +935,7 @@ int main() {
     codecRoundTrip();
     frozenVersion4FixtureAndPreflight();
     semanticImageRoundTrip();
+    paragraphMarkCharacterFormatRoundTrip();
     legacyImageMigrationAndBoundaries();
     semanticImageAdversarialLimits();
     semanticImageCountBoundary();

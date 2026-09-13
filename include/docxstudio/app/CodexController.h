@@ -20,13 +20,16 @@ class CodexController final : public QObject {
     Q_OBJECT
 
 public:
+    using ProcessFactory =
+        std::function<std::unique_ptr<codex::Process>()>;
     using EditorToolHandler = std::function<codex::Json(
         const QString& documentKey,
         const QString& tool,
         const codex::Json& arguments,
         QString& error)>;
 
-    explicit CodexController(QObject* parent = nullptr);
+    explicit CodexController(QObject* parent = nullptr,
+                             ProcessFactory processFactory = {});
     ~CodexController() override;
 
     void enable();
@@ -88,6 +91,7 @@ private:
     std::shared_ptr<codex::MessageTransport> transport_;
     std::unique_ptr<codex::Client> client_;
     std::unique_ptr<QTemporaryDir> documentSandbox_;
+    ProcessFactory processFactory_;
     std::vector<codex::ModelInfo> models_;
     EditorToolHandler editorToolHandler_;
     std::unordered_map<std::string, std::string> threadIds_;

@@ -381,6 +381,95 @@ void testInlineImagePageBreakAndTablePresentation(
           "table presentation changed across supported edit/save/reopen");
 }
 
+void testUnsupportedAnchorIsOpaqueAndPreserved(
+    const TemporaryDirectory& temporary) {
+    const auto path = temporary.file("unsupported-anchor.docx");
+    const auto output = temporary.file("unsupported-anchor-edited.docx");
+    const std::string anchor =
+        "<wp:anchor distT=\"10\" distB=\"20\" distL=\"30\" distR=\"40\" "
+        "simplePos=\"0\" relativeHeight=\"0\" behindDoc=\"0\" locked=\"0\" "
+        "layoutInCell=\"1\" allowOverlap=\"0\">"
+        "<wp:simplePos x=\"0\" y=\"0\"/>"
+        "<wp:positionH relativeFrom=\"character\"><wp:posOffset>0</wp:posOffset>"
+        "</wp:positionH><wp:positionV relativeFrom=\"paragraph\">"
+        "<wp:posOffset>0</wp:posOffset></wp:positionV>"
+        "<wp:extent cx=\"914400\" cy=\"457200\"/>"
+        "<wp:effectExtent l=\"0\" t=\"0\" r=\"0\" b=\"0\"/>"
+        // Tight wrapping requires a polygon that Picture Layout v1 cannot
+        // represent. It must therefore stay raw and preservation-only.
+        "<wp:wrapTight wrapText=\"bothSides\"><wp:wrapPolygon edited=\"0\">"
+        "<wp:start x=\"0\" y=\"0\"/><wp:lineTo x=\"1\" y=\"1\"/>"
+        "</wp:wrapPolygon></wp:wrapTight>"
+        "<wp:docPr id=\"1\" name=\"Opaque owl\" descr=\"Do not flatten\"/>"
+        "<a:graphic><a:graphicData "
+        "uri=\"http://schemas.openxmlformats.org/drawingml/2006/picture\">"
+        "<pic:pic><pic:blipFill><a:blip r:embed=\"rIdOpaque\"/>"
+        "</pic:blipFill></pic:pic></a:graphicData></a:graphic>"
+        "</wp:anchor>";
+    const std::string document_xml =
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+        "<w:document "
+        "xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\" "
+        "xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" "
+        "xmlns:wp=\"http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing\" "
+        "xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\" "
+        "xmlns:pic=\"http://schemas.openxmlformats.org/drawingml/2006/picture\">"
+        "<w:body><w:p><w:r><w:drawing>" + anchor +
+        "</w:drawing></w:r><w:r><w:t>Editable tail</w:t></w:r></w:p>"
+        "<w:sectPr/></w:body></w:document>";
+    createPackage(path, document_xml);
+    const std::string relationships =
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+        "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">"
+        "<Relationship Id=\"rIdOpaque\" "
+        "Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/image\" "
+        "Target=\"media/opaque.png\"/></Relationships>";
+    const std::string image_bytes("\x89PNG\r\n\x1a\nopaque-anchor", 21);
+    appendMembers(
+        path,
+        {{"word/_rels/document.xml.rels", relationships},
+         {"word/media/opaque.png", image_bytes}});
+
+    Error error;
+    auto document = DocxDocument::open(path, &error);
+    check(document != nullptr, error.message);
+    check(document->compatibility().classification ==
+              CompatibilityClass::safe_text_patch,
+          "unsupported anchor was exposed as a fully editable picture");
+    std::optional<docxstudio::ooxml::TextSpanId> editable_span;
+    bool exposed_picture = false;
+    for (const auto& run : document->paragraphs().front().runs) {
+        for (const auto& fragment : run.fragments) {
+            exposed_picture = exposed_picture ||
+                fragment.kind == FragmentKind::inline_image;
+            if (fragment.kind == FragmentKind::text &&
+                fragment.text == "Editable tail") {
+                editable_span = fragment.text_span_id;
+            }
+        }
+    }
+    check(!exposed_picture && editable_span.has_value(),
+          "unsupported anchor was flattened or blocked adjacent text editing");
+    const auto edit = document->replaceText(*editable_span, "Changed tail");
+    check(edit.accepted,
+          edit.error ? edit.error->message
+                     : "safe edit beside opaque anchor was refused");
+    const auto save = document->saveAs(output);
+    check(save.saved,
+          save.error ? save.error->message
+                     : "opaque-anchor preservation save failed");
+    const std::string saved_xml = readMember(output, "word/document.xml");
+    check(extractElement(saved_xml, "<wp:anchor", "</wp:anchor>") ==
+              anchor &&
+              saved_xml.find("<w:t>Changed tail</w:t>") !=
+                  std::string::npos,
+          "unsupported anchor changed or adjacent text edit was lost");
+    check(readMember(output, "word/media/opaque.png") == image_bytes &&
+              readMember(output, "word/_rels/document.xml.rels") ==
+                  relationships,
+          "opaque anchor media or relationship bytes changed");
+}
+
 void testInlineImageTableCellIsPreservedViewOnly(
     const TemporaryDirectory& temporary) {
     const auto path = temporary.file("image-table-cell.docx");
@@ -1499,36 +1588,67 @@ void testFormattedTableCellsAndStyles(const TemporaryDirectory& temporary) {
           "equation inside the basic editable table subset was accepted");
 }
 
-void testBodyParagraphMarkFormattingIsPreservedOnly(
+void testBodyParagraphMarkFormattingRoundTrip(
     const TemporaryDirectory& temporary) {
     const auto path = temporary.file("body-paragraph-mark.docx");
-    createPackage(
-        path,
-        documentWithBody(
-            "<w:p><w:pPr><w:rPr><w:b w:val=\"0\"/>"
-            "</w:rPr></w:pPr><w:r><w:t>Body text</w:t></w:r></w:p>"));
+    docxstudio::ooxml::BasicRunFormat markFormat;
+    markFormat.font_family = "Carlito";
+    markFormat.font_size_half_points = 27;
+    markFormat.bold = false;
+    markFormat.italic = true;
+    markFormat.underline = true;
+    markFormat.strike = false;
+    markFormat.foreground_rgb = 0x123456U;
+    markFormat.highlight_rgb = 0xfedcbaU;
+    markFormat.baseline = docxstudio::ooxml::BasicBaseline::subscript;
+    NewParagraph authored;
+    authored.paragraph_mark_format = markFormat;
+    const auto save = DocxDocument::writeNew(path, {authored});
+    check(save.saved,
+          save.error ? save.error->message
+                     : "body paragraph-mark DOCX was not saved");
+    const std::string xml = readMember(path, "word/document.xml");
+    check(xml.find("<w:p><w:pPr><w:rPr>") != std::string::npos &&
+              xml.find("<w:color w:val=\"123456\"/>") !=
+                  std::string::npos &&
+              xml.find("<w:sz w:val=\"27\"/>") != std::string::npos &&
+              xml.find("<w:vertAlign w:val=\"subscript\"/>") !=
+                  std::string::npos &&
+              xml.find("<w:r>") == std::string::npos,
+          "body insertion formatting was not written on the paragraph mark");
 
     Error error;
     auto opened = DocxDocument::open(path, &error);
     check(opened != nullptr, error.message);
     check(opened->paragraphs().size() == 1 &&
-              opened->paragraphs()[0].paragraph_mark_format.has_value() &&
-              opened->paragraphs()[0].paragraph_mark_format->bold == false,
-          "direct body paragraph-mark formatting was not parsed for preservation");
+              opened->paragraphs()[0].plainText().empty() &&
+              opened->paragraphs()[0].runs.empty() &&
+              opened->paragraphs()[0].paragraph_mark_format == markFormat,
+          "body paragraph-mark formatting changed after save and reopen");
     check(opened->compatibility().classification ==
-              CompatibilityClass::safe_text_patch &&
-              std::any_of(
+              CompatibilityClass::basic_body_text_patch &&
+              std::none_of(
                   opened->compatibility().issues.begin(),
                   opened->compatibility().issues.end(),
                   [](const auto& issue) {
-                      return issue.severity ==
-                                 docxstudio::ooxml::IssueSeverity::warning &&
-                             issue.code == IssueCode::unsupported_formatting &&
-                             issue.detail.find(
-                                 "Direct body paragraph-mark formatting") !=
-                                 std::string::npos;
+                      return issue.detail.find("paragraph-mark formatting") !=
+                          std::string::npos;
                   }),
-          "direct body paragraph-mark formatting was silently classified as regeneratable");
+          "supported body paragraph-mark formatting was misclassified");
+
+    const auto importedPath = temporary.file("imported-paragraph-mark.docx");
+    createPackage(
+        importedPath,
+        documentWithBody(
+            "<w:p><w:pPr><w:rPr><w:b w:val=\"0\"/>"
+            "</w:rPr></w:pPr><w:r><w:t>Body text</w:t></w:r></w:p>"));
+    auto imported = DocxDocument::open(importedPath, &error);
+    check(imported != nullptr && imported->paragraphs().size() == 1 &&
+              imported->paragraphs()[0].paragraph_mark_format.has_value() &&
+              imported->paragraphs()[0].paragraph_mark_format->bold == false &&
+              imported->compatibility().classification ==
+                  CompatibilityClass::basic_body_text_patch,
+          "imported body paragraph-mark formatting was not editable");
 }
 
 void testUnknownImportedTableStyleIsRetained(
@@ -2042,6 +2162,7 @@ int main() {
     try {
         TemporaryDirectory temporary;
         testInlineImagePageBreakAndTablePresentation(temporary);
+        testUnsupportedAnchorIsOpaqueAndPreserved(temporary);
         testInlineImageTableCellIsPreservedViewOnly(temporary);
         testRepeatedImageReferencesShareBoundedStorage(temporary);
         testStylesThemesAndNativeNumberingImport(temporary);
@@ -2051,7 +2172,7 @@ int main() {
         testNewDocumentCreation(temporary);
         testSemanticTableWriting(temporary);
         testFormattedTableCellsAndStyles(temporary);
-        testBodyParagraphMarkFormattingIsPreservedOnly(temporary);
+        testBodyParagraphMarkFormattingRoundTrip(temporary);
         testUnknownImportedTableStyleIsRetained(temporary);
         testExternalSimpleTableAndAdvancedFallback(temporary);
         testNativeOfficeMathRoundTrip(temporary);

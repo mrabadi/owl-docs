@@ -564,6 +564,41 @@ void testHighlightRemoval(docxstudio::app::SpellChecker& spelling) {
     typing.insertText(QStringLiteral("plain"));
     check(!formatAt(typing, 1).highlight_argb.has_value(),
           "No Highlight at a collapsed caret did not clear future typing");
+
+    DocumentCanvas transientTyping(spelling);
+    transientTyping.insertText(QStringLiteral("x"));
+    transientTyping.selectAll();
+    transientTyping.setHighlight(yellow);
+    sendKey(transientTyping, Qt::Key_End);
+    const auto beforeTransientClear = transientTyping.snapshot();
+    transientTyping.clearHighlight();
+    check(transientTyping.snapshot().revision ==
+              beforeTransientClear.revision,
+          "clearing a transient caret format created an invisible document edit");
+    transientTyping.insertText(QStringLiteral("p"));
+    check(formatAt(transientTyping, 1).highlight_argb ==
+              static_cast<std::uint32_t>(yellow.rgba()) &&
+              !formatAt(transientTyping, 2).highlight_argb.has_value(),
+          "typing after transient No Highlight inherited the adjacent highlight");
+
+    DocumentCanvas transientEnter(spelling);
+    transientEnter.insertText(QStringLiteral("x"));
+    transientEnter.selectAll();
+    transientEnter.setHighlight(yellow);
+    sendKey(transientEnter, Qt::Key_End);
+    transientEnter.clearHighlight();
+    sendKey(transientEnter, Qt::Key_Return);
+    auto entered = transientEnter.snapshot();
+    check(entered.document.paragraphs().size() == 2 &&
+              entered.document.paragraphs()[1].text().empty() &&
+              entered.document.paragraphs()[1]
+                  .paragraphMarkCharacterFormat().empty(),
+          "Enter after transient No Highlight reintroduced the adjacent highlight");
+    transientEnter.insertText(QStringLiteral("p"));
+    entered = transientEnter.snapshot();
+    check(!entered.document.paragraphs()[1]
+               .characterFormatAt(1).highlight_argb.has_value(),
+          "typing on a new line after transient No Highlight was highlighted");
 }
 
 void testColorAdjustmentUndoGrouping(docxstudio::app::SpellChecker& spelling) {
@@ -665,6 +700,357 @@ void testCollapsedBoldToggle(docxstudio::app::SpellChecker& spelling) {
           "bold-toggle typing produced incorrect text");
     check(formatAt(canvas, 2).bold == false,
           "second collapsed-caret bold toggle did not turn bold off");
+
+    DocumentCanvas nonempty(spelling);
+    nonempty.insertText(QStringLiteral("plain"));
+    const auto beforeTransientToggle = nonempty.snapshot();
+    nonempty.toggleBold();
+    const auto afterTransientToggle = nonempty.snapshot();
+    check(afterTransientToggle.revision == beforeTransientToggle.revision &&
+              afterTransientToggle.document == beforeTransientToggle.document &&
+              afterTransientToggle.document.paragraphs().front()
+                  .paragraphMarkCharacterFormat().empty(),
+          "collapsed formatting in non-empty text created an invisible document edit");
+    nonempty.insertText(QStringLiteral("B"));
+    check(formatAt(nonempty, 6).bold == true,
+          "transient non-empty caret formatting did not affect later typing");
+}
+
+void testEmptyParagraphTypingFormatSurvivesNavigation(
+    docxstudio::app::SpellChecker& spelling) {
+    DocumentCanvas canvas(spelling);
+    canvas.resize(900, 520);
+    canvas.show();
+    canvas.setFocus();
+    QApplication::processEvents();
+
+    QString ribbonFamily;
+    double ribbonPointSize = 0.0;
+    QColor ribbonTextColor;
+    bool ribbonBold = false;
+    bool ribbonItalic = false;
+    bool ribbonUnderline = false;
+    QObject::connect(
+        &canvas, &DocumentCanvas::cursorFormatChanged,
+        [&ribbonFamily, &ribbonPointSize, &ribbonTextColor](
+            const QString& family, double pointSize, const QColor& color) {
+            ribbonFamily = family;
+            ribbonPointSize = pointSize;
+            ribbonTextColor = color;
+        });
+    QObject::connect(
+        &canvas, &DocumentCanvas::cursorStyleChanged,
+        [&ribbonBold, &ribbonItalic, &ribbonUnderline](
+            bool bold, bool italic, bool underline, bool, bool, bool) {
+            ribbonBold = bold;
+            ribbonItalic = italic;
+            ribbonUnderline = underline;
+        });
+
+    canvas.insertText(QStringLiteral("Anchor"));
+    QApplication::processEvents();
+    const QPoint firstParagraphPoint = inputMethodCursorRect(canvas).center();
+    sendKey(canvas, Qt::Key_Return);
+    auto snapshot = canvas.snapshot();
+    check(snapshot.document.paragraphs().size() == 2 &&
+              snapshot.document.paragraphs()[1].text().empty(),
+          "Enter did not create the empty paragraph format fixture");
+    const auto firstParagraphId = snapshot.document.paragraphs()[0].id();
+    const auto emptyParagraphId = snapshot.document.paragraphs()[1].id();
+
+    const QString chosenFamily = QStringLiteral("DejaVu Serif");
+    constexpr double chosenPointSize = 19.0;
+    const QColor chosenColor(QStringLiteral("#3157a4"));
+    const QColor chosenHighlight(QStringLiteral("#f6d32d"));
+    canvas.setFontFamily(chosenFamily);
+    canvas.setFontPointSize(chosenPointSize);
+    canvas.setForeground(chosenColor);
+    canvas.setHighlight(chosenHighlight);
+    canvas.toggleBold();
+    canvas.toggleItalic();
+    canvas.toggleUnderline();
+    QApplication::processEvents();
+
+    snapshot = canvas.snapshot();
+    const auto& emptyMark = snapshot.document.paragraphs()[1]
+                                .paragraphMarkCharacterFormat();
+    check(emptyMark.font_family == chosenFamily.toStdString() &&
+              emptyMark.font_size_half_points == 38 &&
+              emptyMark.foreground_argb ==
+                  static_cast<std::uint32_t>(chosenColor.rgba()) &&
+              emptyMark.highlight_argb ==
+                  static_cast<std::uint32_t>(chosenHighlight.rgba()) &&
+              emptyMark.bold == true && emptyMark.italic == true &&
+              emptyMark.underline ==
+                  docxstudio::core::UnderlineStyle::single,
+          "formatting an empty paragraph was not stored in its paragraph mark");
+    const QPoint emptyParagraphPoint = inputMethodCursorRect(canvas).center();
+
+    // Exercise the reported failure path with real hit-tested mouse clicks:
+    // leave the empty paragraph, then return to it.
+    sendMouseEvent(canvas, QEvent::MouseButtonPress, firstParagraphPoint,
+                   Qt::LeftButton, Qt::LeftButton);
+    sendMouseEvent(canvas, QEvent::MouseButtonRelease, firstParagraphPoint,
+                   Qt::LeftButton, Qt::NoButton);
+    QApplication::processEvents();
+    check(canvas.selection().focus.paragraph_id == firstParagraphId,
+          "the away click did not leave the formatted empty paragraph");
+
+    sendMouseEvent(canvas, QEvent::MouseButtonPress, emptyParagraphPoint,
+                   Qt::LeftButton, Qt::LeftButton);
+    sendMouseEvent(canvas, QEvent::MouseButtonRelease, emptyParagraphPoint,
+                   Qt::LeftButton, Qt::NoButton);
+    QApplication::processEvents();
+    check(canvas.selection().focus.paragraph_id == emptyParagraphId &&
+              canvas.selection().focus.utf16_offset == 0,
+          "the return click did not restore the empty paragraph caret");
+
+    canvas.refreshCursorFormat();
+    check(canvas.currentFontFamily() == chosenFamily &&
+              canvas.currentFontPointSize() == chosenPointSize &&
+              canvas.currentTextColor().rgba() == chosenColor.rgba() &&
+              canvas.currentHighlightColor().rgba() ==
+                  chosenHighlight.rgba(),
+          "current typing format was lost after returning to the empty paragraph");
+    check(ribbonFamily == chosenFamily &&
+              ribbonPointSize == chosenPointSize &&
+              ribbonTextColor.rgba() == chosenColor.rgba() && ribbonBold &&
+              ribbonItalic && ribbonUnderline,
+          "cursor format signals did not restore the ribbon state for the empty paragraph");
+
+    canvas.insertText(QStringLiteral("Styled"));
+    snapshot = canvas.snapshot();
+    check(snapshot.document.paragraphs()[1].text() == u"Styled",
+          "typing after returning to the empty paragraph inserted incorrectly");
+    const auto insertedFormat =
+        snapshot.document.paragraphs()[1].characterFormatAt(6);
+    check(insertedFormat.font_family == chosenFamily.toStdString() &&
+              insertedFormat.font_size_half_points == 38 &&
+              insertedFormat.foreground_argb ==
+                  static_cast<std::uint32_t>(chosenColor.rgba()) &&
+              insertedFormat.highlight_argb ==
+                  static_cast<std::uint32_t>(chosenHighlight.rgba()) &&
+              insertedFormat.bold == true && insertedFormat.italic == true &&
+              insertedFormat.underline ==
+                  docxstudio::core::UnderlineStyle::single,
+          "text inserted after returning did not consume the paragraph-mark format");
+
+    sendKey(canvas, Qt::Key_Return);
+    const auto afterEnter = canvas.snapshot();
+    check(afterEnter.document.paragraphs().size() == 3 &&
+              afterEnter.document.paragraphs()[2].text().empty(),
+          "Enter after styled text did not create a new empty paragraph");
+    const auto inheritedMark = afterEnter.document.paragraphs()[2]
+                                   .paragraphMarkCharacterFormat();
+    check(inheritedMark.font_family == chosenFamily.toStdString() &&
+              inheritedMark.font_size_half_points == 38 &&
+              inheritedMark.foreground_argb ==
+                  static_cast<std::uint32_t>(chosenColor.rgba()) &&
+              inheritedMark.highlight_argb ==
+                  static_cast<std::uint32_t>(chosenHighlight.rgba()) &&
+              inheritedMark.bold == true && inheritedMark.italic == true &&
+              inheritedMark.underline ==
+                  docxstudio::core::UnderlineStyle::single,
+          "Enter-created paragraph did not inherit the active typing format");
+
+    canvas.undo();
+    check(canvas.snapshot().document.paragraphs().size() == 2,
+          "Undo did not remove the styled Enter-created paragraph");
+    canvas.redo();
+    const auto afterRedo = canvas.snapshot();
+    check(afterRedo.document.paragraphs().size() == 3 &&
+              afterRedo.document.paragraphs()[2]
+                      .paragraphMarkCharacterFormat() == inheritedMark,
+          "Redo did not restore the inherited empty-paragraph format");
+    canvas.insertText(QStringLiteral("Next"));
+    const auto finalSnapshot = canvas.snapshot();
+    check(finalSnapshot.document.paragraphs()[2].text() == u"Next" &&
+              finalSnapshot.document.paragraphs()[2]
+                      .characterFormatAt(4) == inheritedMark,
+          "typing after redo did not use the restored inherited format");
+    canvas.hide();
+
+    // Imported and legacy content can have styled characters but a sparse
+    // paragraph mark. Deleting all text must promote the visible style before
+    // the user navigates away, otherwise returning to the empty line resets
+    // the ribbon and subsequent typing.
+    auto deletionDocument = documentWithParagraphs(
+        {QStringLiteral("Styled"), QStringLiteral("Anchor")});
+    const auto deletionParagraphId =
+        deletionDocument.paragraphs()[0].id();
+    const auto deletionAnchorId = deletionDocument.paragraphs()[1].id();
+    docxstudio::core::CharacterFormatDelta importedStyle;
+    importedStyle.font_family =
+        docxstudio::core::PropertyDelta<std::string>::set(
+            chosenFamily.toStdString());
+    importedStyle.font_size_half_points =
+        docxstudio::core::PropertyDelta<std::int32_t>::set(38);
+    importedStyle.foreground_argb =
+        docxstudio::core::PropertyDelta<std::uint32_t>::set(
+            static_cast<std::uint32_t>(chosenColor.rgba()));
+    importedStyle.highlight_argb =
+        docxstudio::core::PropertyDelta<std::uint32_t>::set(
+            static_cast<std::uint32_t>(chosenHighlight.rgba()));
+    importedStyle.bold =
+        docxstudio::core::PropertyDelta<bool>::set(true);
+    importedStyle.italic =
+        docxstudio::core::PropertyDelta<bool>::set(true);
+    importedStyle.underline = docxstudio::core::PropertyDelta<
+        docxstudio::core::UnderlineStyle>::set(
+            docxstudio::core::UnderlineStyle::single);
+    check(static_cast<bool>(deletionDocument.applyCharacterFormat(
+              {{deletionParagraphId, 0}, {deletionParagraphId, 6}},
+              importedStyle)),
+          "could not create styled deletion-to-empty fixture");
+    check(deletionDocument.paragraphs()[0]
+              .paragraphMarkCharacterFormat().empty(),
+          "deletion-to-empty fixture unexpectedly began with a styled mark");
+
+    DocumentCanvas deletionCanvas(spelling);
+    deletionCanvas.resize(900, 520);
+    deletionCanvas.setDocument(std::move(deletionDocument));
+    deletionCanvas.show();
+    deletionCanvas.setFocus();
+    QApplication::processEvents();
+    const QPoint deletionParagraphPoint =
+        inputMethodCursorRect(deletionCanvas).center();
+    sendKey(deletionCanvas, Qt::Key_Down);
+    check(deletionCanvas.selection().focus.paragraph_id == deletionAnchorId,
+          "could not navigate to the deletion fixture's anchor paragraph");
+    const QPoint deletionAnchorPoint =
+        inputMethodCursorRect(deletionCanvas).center();
+    sendMouseEvent(deletionCanvas, QEvent::MouseButtonPress,
+                   deletionParagraphPoint, Qt::LeftButton, Qt::LeftButton);
+    sendMouseEvent(deletionCanvas, QEvent::MouseButtonRelease,
+                   deletionParagraphPoint, Qt::LeftButton, Qt::NoButton);
+    sendKey(deletionCanvas, Qt::Key_End);
+    sendKey(deletionCanvas, Qt::Key_Home, Qt::ShiftModifier);
+    sendKey(deletionCanvas, Qt::Key_Delete);
+
+    auto deletedSnapshot = deletionCanvas.snapshot();
+    check(deletedSnapshot.document.paragraphs()[0].text().empty() &&
+              deletedSnapshot.document.paragraphs()[0]
+                      .paragraphMarkCharacterFormat()
+                      .font_family == chosenFamily.toStdString() &&
+              deletedSnapshot.document.paragraphs()[0]
+                      .paragraphMarkCharacterFormat()
+                      .foreground_argb ==
+                  static_cast<std::uint32_t>(chosenColor.rgba()),
+          "deleting all styled text did not promote its insertion format");
+    check(deletionCanvas.hasNonTextChanges(),
+          "paragraph-mark promotion was not classified for safe DOCX saving");
+    const QPoint emptiedParagraphPoint =
+        inputMethodCursorRect(deletionCanvas).center();
+    sendMouseEvent(deletionCanvas, QEvent::MouseButtonPress,
+                   deletionAnchorPoint, Qt::LeftButton, Qt::LeftButton);
+    sendMouseEvent(deletionCanvas, QEvent::MouseButtonRelease,
+                   deletionAnchorPoint, Qt::LeftButton, Qt::NoButton);
+    sendMouseEvent(deletionCanvas, QEvent::MouseButtonPress,
+                   emptiedParagraphPoint, Qt::LeftButton, Qt::LeftButton);
+    sendMouseEvent(deletionCanvas, QEvent::MouseButtonRelease,
+                   emptiedParagraphPoint, Qt::LeftButton, Qt::NoButton);
+    deletionCanvas.refreshCursorFormat();
+    check(deletionCanvas.currentFontFamily() == chosenFamily &&
+              deletionCanvas.currentFontPointSize() == chosenPointSize &&
+              deletionCanvas.currentTextColor().rgba() ==
+                  chosenColor.rgba() &&
+              deletionCanvas.currentHighlightColor().rgba() ==
+                  chosenHighlight.rgba(),
+          "returning to a deletion-created empty line reset its format");
+    deletionCanvas.insertText(QStringLiteral("Again"));
+    deletedSnapshot = deletionCanvas.snapshot();
+    check(deletedSnapshot.document.paragraphs()[0].text() == u"Again" &&
+              deletedSnapshot.document.paragraphs()[0]
+                      .characterFormatAt(5) ==
+                  deletedSnapshot.document.paragraphs()[0]
+                      .paragraphMarkCharacterFormat(),
+          "typing after returning to a deletion-created empty line lost its format");
+    deletionCanvas.hide();
+
+    const auto verifyTransientSingleCharacterDeletion =
+        [&](Qt::Key deletionKey) {
+            auto transientDocument = documentWithParagraphs(
+                {QStringLiteral("x"), QStringLiteral("Anchor")});
+            const auto transientParagraphId =
+                transientDocument.paragraphs()[0].id();
+            const auto transientAnchorId =
+                transientDocument.paragraphs()[1].id();
+            DocumentCanvas transientCanvas(spelling);
+            transientCanvas.resize(900, 520);
+            transientCanvas.setDocument(std::move(transientDocument));
+            transientCanvas.show();
+            transientCanvas.setFocus();
+            QApplication::processEvents();
+            const QPoint firstPoint =
+                inputMethodCursorRect(transientCanvas).center();
+            sendKey(transientCanvas, Qt::Key_Down);
+            check(transientCanvas.selection().focus.paragraph_id ==
+                      transientAnchorId,
+                  "could not reach transient-deletion anchor paragraph");
+            const QPoint anchorPoint =
+                inputMethodCursorRect(transientCanvas).center();
+            sendMouseEvent(transientCanvas, QEvent::MouseButtonPress,
+                           firstPoint, Qt::LeftButton, Qt::LeftButton);
+            sendMouseEvent(transientCanvas, QEvent::MouseButtonRelease,
+                           firstPoint, Qt::LeftButton, Qt::NoButton);
+            if (deletionKey == Qt::Key_Backspace) {
+                sendKey(transientCanvas, Qt::Key_End);
+            }
+
+            transientCanvas.setFontFamily(chosenFamily);
+            transientCanvas.setFontPointSize(chosenPointSize);
+            transientCanvas.setForeground(chosenColor);
+            transientCanvas.setHighlight(chosenHighlight);
+            transientCanvas.toggleBold();
+            transientCanvas.toggleItalic();
+            transientCanvas.toggleUnderline();
+            sendKey(transientCanvas, deletionKey);
+
+            auto transientSnapshot = transientCanvas.snapshot();
+            const auto transientMark =
+                transientSnapshot.document.paragraphs()[0]
+                    .paragraphMarkCharacterFormat();
+            check(transientSnapshot.document.paragraphs()[0].id() ==
+                      transientParagraphId &&
+                      transientSnapshot.document.paragraphs()[0].text().empty() &&
+                      transientMark.font_family == chosenFamily.toStdString() &&
+                      transientMark.font_size_half_points == 38 &&
+                      transientMark.foreground_argb ==
+                          static_cast<std::uint32_t>(chosenColor.rgba()) &&
+                      transientMark.highlight_argb ==
+                          static_cast<std::uint32_t>(chosenHighlight.rgba()) &&
+                      transientMark.bold == true && transientMark.italic == true &&
+                      transientMark.underline ==
+                          docxstudio::core::UnderlineStyle::single,
+                  "single-character deletion lost the transient caret format");
+
+            sendMouseEvent(transientCanvas, QEvent::MouseButtonPress,
+                           anchorPoint, Qt::LeftButton, Qt::LeftButton);
+            sendMouseEvent(transientCanvas, QEvent::MouseButtonRelease,
+                           anchorPoint, Qt::LeftButton, Qt::NoButton);
+            sendMouseEvent(transientCanvas, QEvent::MouseButtonPress,
+                           firstPoint, Qt::LeftButton, Qt::LeftButton);
+            sendMouseEvent(transientCanvas, QEvent::MouseButtonRelease,
+                           firstPoint, Qt::LeftButton, Qt::NoButton);
+            transientCanvas.refreshCursorFormat();
+            check(transientCanvas.currentFontFamily() == chosenFamily &&
+                      transientCanvas.currentFontPointSize() ==
+                          chosenPointSize &&
+                      transientCanvas.currentTextColor().rgba() ==
+                          chosenColor.rgba() &&
+                      transientCanvas.currentHighlightColor().rgba() ==
+                          chosenHighlight.rgba(),
+                  "returning after single-character deletion reset the transient format");
+            transientCanvas.insertText(QStringLiteral("T"));
+            transientSnapshot = transientCanvas.snapshot();
+            check(transientSnapshot.document.paragraphs()[0].text() == u"T" &&
+                      transientSnapshot.document.paragraphs()[0]
+                              .characterFormatAt(1) == transientMark,
+                  "typing after single-character deletion did not use its promoted format");
+            transientCanvas.hide();
+        };
+    verifyTransientSingleCharacterDeletion(Qt::Key_Backspace);
+    verifyTransientSingleCharacterDeletion(Qt::Key_Delete);
 }
 
 void testBaselineToggle(docxstudio::app::SpellChecker& spelling) {
@@ -977,6 +1363,88 @@ void testAdversarialListEditing(docxstudio::app::SpellChecker& spelling) {
     emptyExit.redo();
     check(!emptyExit.snapshot().document.paragraphs()[1].format().list_id,
           "Redo did not clear empty-item list metadata");
+
+    // A visually empty list item still contains its marker text. Formatting
+    // chosen at that caret is therefore transient until the marker is removed;
+    // every way of leaving the item must promote that active format into the
+    // resulting empty paragraph mark so navigation cannot reset it.
+    const auto verifyEmptyListExitFormat =
+        [&spelling](int exitKind, bool clearBold) {
+            DocumentCanvas formatExit(spelling);
+            formatExit.insertText(QStringLiteral("Anchor"));
+            sendKey(formatExit, Qt::Key_Return);
+
+            const QString family = QStringLiteral("DejaVu Serif");
+            const QColor foreground(QStringLiteral("#3157a4"));
+            const QColor highlight(QStringLiteral("#f6d32d"));
+            if (clearBold) {
+                formatExit.toggleBold();
+                formatExit.toggleBullets();
+                formatExit.toggleBold();
+            } else {
+                formatExit.toggleBullets();
+                formatExit.setFontFamily(family);
+                formatExit.setFontPointSize(19.0);
+                formatExit.setForeground(foreground);
+                formatExit.setHighlight(highlight);
+                formatExit.toggleBold();
+                formatExit.toggleItalic();
+                formatExit.toggleUnderline();
+            }
+
+            if (exitKind == 0) {
+                sendKey(formatExit, Qt::Key_Return);
+            } else if (exitKind == 1) {
+                sendKey(formatExit, Qt::Key_Backspace);
+            } else {
+                formatExit.toggleBullets();
+            }
+
+            auto snapshot = formatExit.snapshot();
+            check(snapshot.document.paragraphs().size() == 2 &&
+                      snapshot.document.paragraphs()[1].text().empty() &&
+                      !snapshot.document.paragraphs()[1].format().list_id,
+                  "leaving a formatted empty list item did not produce an ordinary empty paragraph");
+            const auto emptyParagraphId =
+                snapshot.document.paragraphs()[1].id();
+            const auto mark = snapshot.document.paragraphs()[1]
+                                  .paragraphMarkCharacterFormat();
+            if (clearBold) {
+                check(mark.bold == false,
+                      "leaving an empty list item lost an explicit formatting clear");
+            } else {
+                check(mark.font_family == family.toStdString() &&
+                          mark.font_size_half_points == 38 &&
+                          mark.foreground_argb ==
+                              static_cast<std::uint32_t>(foreground.rgba()) &&
+                          mark.highlight_argb ==
+                              static_cast<std::uint32_t>(highlight.rgba()) &&
+                          mark.bold == true && mark.italic == true &&
+                          mark.underline ==
+                              docxstudio::core::UnderlineStyle::single,
+                      "leaving an empty list item lost the active caret format");
+            }
+
+            sendKey(formatExit, Qt::Key_Up);
+            sendKey(formatExit, Qt::Key_Down);
+            check(formatExit.selection().focus.paragraph_id == emptyParagraphId,
+                  "could not return to the empty paragraph after leaving a list");
+            formatExit.insertText(QStringLiteral("X"));
+            snapshot = formatExit.snapshot();
+            const auto inserted = snapshot.document.paragraphs()[1]
+                                      .characterFormatAt(1);
+            if (clearBold) {
+                check(inserted.bold == false,
+                      "typing after returning to an exited list item lost its explicit formatting clear");
+            } else {
+                check(inserted == mark,
+                      "typing after returning to an exited list item did not use its stored format");
+            }
+        };
+    for (int exitKind = 0; exitKind < 3; ++exitKind) {
+        verifyEmptyListExitFormat(exitKind, false);
+        verifyEmptyListExitFormat(exitKind, true);
+    }
 
     // Tab/Shift+Tab should transform every selected item together, preserve a
     // single list identity, and undo/redo as one operation.
@@ -2009,6 +2477,7 @@ int main(int argc, char** argv) {
     testColorAdjustmentUndoGrouping(spelling);
     testImportedColorInheritance(spelling);
     testCollapsedBoldToggle(spelling);
+    testEmptyParagraphTypingFormatSurvivesNavigation(spelling);
     testBaselineToggle(spelling);
     testFontSizeCommit(spelling);
     testBreakKeys(spelling);

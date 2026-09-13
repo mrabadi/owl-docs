@@ -139,6 +139,10 @@ Result<void> validateImageMetadata(const ImageAtom& image) {
     if (!dimensions_validation) {
         return dimensions_validation.error();
     }
+    const auto layout_validation = image.layout.validate();
+    if (!layout_validation) {
+        return layout_validation.error();
+    }
     return {};
 }
 
@@ -170,6 +174,34 @@ Error bodyBlockMissing(NodeId id) {
 }
 
 }  // namespace
+
+Result<void> ImageLayout::validate() const {
+    switch (placement) {
+        case ImagePlacement::inline_with_text:
+        case ImagePlacement::square:
+        case ImagePlacement::top_and_bottom:
+            break;
+        default:
+            return Error{ErrorCode::invalid_operation,
+                         "Image placement is unsupported"};
+    }
+
+    const auto valid_distance = [](std::int64_t distance) {
+        return distance >= 0 && distance <= kMaximumImageWrapDistanceEmu;
+    };
+    if (!valid_distance(distance_top_emu) ||
+        !valid_distance(distance_right_emu) ||
+        !valid_distance(distance_bottom_emu) ||
+        !valid_distance(distance_left_emu)) {
+        return Error{ErrorCode::invalid_operation,
+                     "Image wrap distances must be non-negative and within the geometry limit"};
+    }
+    if (placement == ImagePlacement::inline_with_text && !move_with_text) {
+        return Error{ErrorCode::invalid_operation,
+                     "Inline images must move with text"};
+    }
+    return {};
+}
 
 EncodedImagePayload::EncodedImagePayload()
     : storage_(std::make_shared<const std::vector<std::uint8_t>>()) {}
@@ -447,6 +479,11 @@ Result<void> Table::setCellText(
         replacement_format = old_formats[prefix - 1];
     } else if (old_suffix_start < old_formats.size()) {
         replacement_format = old_formats[old_suffix_start];
+    } else if (text.empty() && !old_formats.empty()) {
+        // A whole-cell deletion leaves only the cell's paragraph mark. Carry
+        // the first deleted character's format into that durable insertion
+        // point when the caller did not supply an explicit active format.
+        replacement_format = old_formats.front();
     }
 
     std::vector<CharacterFormat> updated_formats;
@@ -460,6 +497,9 @@ Result<void> Table::setCellText(
         updated_formats.end(),
         old_formats.begin() + static_cast<std::ptrdiff_t>(old_suffix_start),
         old_formats.end());
+    if (text.empty() && !cell.text.empty()) {
+        cell.default_character_format = replacement_format;
+    }
     setCellContent(cell, std::move(text), std::move(updated_formats));
     return {};
 }
@@ -656,9 +696,15 @@ Result<void> Table::deleteColumns(std::size_t index, std::size_t count) {
 
 Paragraph::Paragraph() : id_(NodeId::generate()) {}
 
-Paragraph::Paragraph(NodeId id, std::u16string text) : id_(id), text_(std::move(text)) {}
+Paragraph::Paragraph(NodeId id, std::u16string text,
+                     CharacterFormat paragraph_mark_character_format)
+    : id_(id), text_(std::move(text)),
+      paragraph_mark_character_format_(
+          std::move(paragraph_mark_character_format)) {}
 
-Result<Paragraph> Paragraph::create(std::u16string text, NodeId id) {
+Result<Paragraph> Paragraph::create(
+    std::u16string text, NodeId id,
+    CharacterFormat paragraph_mark_character_format) {
     if (!id.isValid()) {
         return Error{ErrorCode::invalid_node_id, "Paragraph NodeId cannot be zero"};
     }
@@ -673,7 +719,13 @@ Result<Paragraph> Paragraph::create(std::u16string text, NodeId id) {
         return Error{ErrorCode::invalid_operation,
                      "Paragraph text cannot contain an orphan inline-object placeholder"};
     }
-    return Paragraph(id, std::move(text));
+    const auto mark_format_validation =
+        paragraph_mark_character_format.validate();
+    if (!mark_format_validation) {
+        return mark_format_validation.error();
+    }
+    return Paragraph(id, std::move(text),
+                     std::move(paragraph_mark_character_format));
 }
 
 std::vector<CharacterFormat> Paragraph::denseFormats() const {
@@ -710,7 +762,7 @@ void Paragraph::setContent(std::u16string text, std::vector<CharacterFormat> for
 
 CharacterFormat Paragraph::characterFormatAt(std::size_t utf16_offset) const {
     if (text_.empty()) {
-        return {};
+        return paragraph_mark_character_format_;
     }
     const auto index = utf16_offset == 0 ? 0 : std::min(utf16_offset - 1, text_.size() - 1);
     for (const auto& run : character_formats_) {
@@ -905,6 +957,13 @@ Result<void> Paragraph::erase(std::size_t start, std::size_t end) {
         return {};
     }
     auto formats = denseFormats();
+    std::optional<CharacterFormat> emptied_format;
+    if (start == 0 && end == text_.size() && !formats.empty()) {
+        // Once all text is gone, its first character is the most useful
+        // durable insertion context. Without this promotion, navigating away
+        // from the newly empty paragraph would expose a stale paragraph mark.
+        emptied_format = formats.front();
+    }
     formats.erase(formats.begin() + static_cast<std::ptrdiff_t>(start),
                   formats.begin() + static_cast<std::ptrdiff_t>(end));
     auto updated_text = text_;
@@ -928,6 +987,9 @@ Result<void> Paragraph::erase(std::size_t start, std::size_t end) {
         }
     }
     setContent(std::move(updated_text), std::move(formats));
+    if (text_.empty() && emptied_format) {
+        paragraph_mark_character_format_ = std::move(*emptied_format);
+    }
     equations_ = std::move(updated_equations);
     images_ = std::move(updated_images);
     return {};
@@ -942,7 +1004,20 @@ Result<void> Paragraph::applyFormat(std::size_t start, std::size_t end,
     if (!delta_validation) {
         return delta_validation.error();
     }
-    if (start == end || delta.empty()) {
+    if (delta.empty()) {
+        return {};
+    }
+    if (start == end) {
+        if (!text_.empty()) {
+            return {};
+        }
+        auto candidate = paragraph_mark_character_format_;
+        delta.applyTo(candidate);
+        const auto validation = candidate.validate();
+        if (!validation) {
+            return validation.error();
+        }
+        paragraph_mark_character_format_ = std::move(candidate);
         return {};
     }
 
@@ -1067,6 +1142,11 @@ Result<Document> Document::create(std::vector<Paragraph> paragraphs) {
         const auto paragraph_validation = paragraph.format().validate();
         if (!paragraph_validation) {
             return paragraph_validation.error();
+        }
+        const auto mark_format_validation =
+            paragraph.paragraphMarkCharacterFormat().validate();
+        if (!mark_format_validation) {
+            return mark_format_validation.error();
         }
         for (const auto& run : paragraph.characterFormats()) {
             if (run.start >= run.end || run.end > paragraph.text().size()) {
@@ -1234,7 +1314,8 @@ Result<void> Document::insertImage(
     const Position& position, EncodedImagePayload encoded_payload,
     ImageFormat image_format, std::string accessible_name,
     std::int64_t width_emu, std::int64_t height_emu, NodeId image_id,
-    const std::optional<CharacterFormat>& character_format) {
+    const std::optional<CharacterFormat>& character_format,
+    ImageLayout layout) {
     const auto position_validation = validatePosition(position);
     if (!position_validation) {
         return position_validation.error();
@@ -1249,7 +1330,8 @@ Result<void> Document::insertImage(
     }
     ImageAtom image{image_id, position.utf16_offset,
                     std::move(encoded_payload), image_format,
-                    std::move(accessible_name), width_emu, height_emu};
+                    std::move(accessible_name), width_emu, height_emu,
+                    layout};
     const auto metadata_validation = validateImageMetadata(image);
     if (!metadata_validation) {
         return metadata_validation.error();
@@ -1315,10 +1397,69 @@ Result<void> Document::resizeImage(NodeId image_id, std::int64_t width_emu,
                  "Image not found: " + image_id.toString()};
 }
 
-Result<void> Document::deleteRange(const Range& range) {
+Result<void> Document::setImageLayout(NodeId image_id, ImageLayout layout) {
+    if (!image_id.isValid()) {
+        return Error{ErrorCode::invalid_node_id,
+                     "Image NodeId cannot be zero"};
+    }
+    const auto layout_validation = layout.validate();
+    if (!layout_validation) {
+        return layout_validation.error();
+    }
+    for (auto& paragraph : paragraphs_) {
+        const auto found = std::find_if(
+            paragraph.images_.begin(), paragraph.images_.end(),
+            [image_id](const ImageAtom& image) {
+                return image.id == image_id;
+            });
+        if (found != paragraph.images_.end()) {
+            found->layout = layout;
+            return {};
+        }
+    }
+    return Error{ErrorCode::invalid_operation,
+                 "Image not found: " + image_id.toString()};
+}
+
+Result<void> Document::setImageAccessibleName(
+    NodeId image_id, std::string accessible_name) {
+    if (!image_id.isValid()) {
+        return Error{ErrorCode::invalid_node_id,
+                     "Image NodeId cannot be zero"};
+    }
+    if (accessible_name.size() > kMaximumImageAccessibleNameBytes) {
+        return Error{ErrorCode::invalid_operation,
+                     "Image accessible name exceeds the size limit"};
+    }
+    if (!isValidUtf8(accessible_name)) {
+        return Error{ErrorCode::invalid_operation,
+                     "Image accessible name is not valid UTF-8"};
+    }
+    for (auto& paragraph : paragraphs_) {
+        const auto found = std::find_if(
+            paragraph.images_.begin(), paragraph.images_.end(),
+            [image_id](const ImageAtom& image) {
+                return image.id == image_id;
+            });
+        if (found != paragraph.images_.end()) {
+            found->accessible_name = std::move(accessible_name);
+            return {};
+        }
+    }
+    return Error{ErrorCode::invalid_operation,
+                 "Image not found: " + image_id.toString()};
+}
+
+Result<void> Document::deleteRange(
+    const Range& range,
+    const std::optional<CharacterFormat>& empty_paragraph_format) {
     const auto normalized_result = normalizeRange(range);
     if (!normalized_result) {
         return normalized_result.error();
+    }
+    if (empty_paragraph_format) {
+        const auto validation = empty_paragraph_format->validate();
+        if (!validation) return validation.error();
     }
     const auto normalized = normalized_result.value();
     if (normalized.empty()) {
@@ -1326,8 +1467,15 @@ Result<void> Document::deleteRange(const Range& range) {
     }
 
     if (normalized.start_paragraph_index == normalized.end_paragraph_index) {
-        return paragraphs_[normalized.start_paragraph_index].erase(normalized.start.utf16_offset,
-                                                                    normalized.end.utf16_offset);
+        auto& paragraph = paragraphs_[normalized.start_paragraph_index];
+        const auto erased = paragraph.erase(normalized.start.utf16_offset,
+                                             normalized.end.utf16_offset);
+        if (!erased) return erased.error();
+        if (paragraph.text_.empty() && empty_paragraph_format) {
+            paragraph.paragraph_mark_character_format_ =
+                *empty_paragraph_format;
+        }
+        return {};
     }
 
 
@@ -1363,6 +1511,21 @@ Result<void> Document::deleteRange(const Range& range) {
                           last_formats.begin() + static_cast<std::ptrdiff_t>(normalized.end.utf16_offset),
                           last_formats.end());
 
+    auto joined_empty_format = first.paragraph_mark_character_format_;
+    if (joined.empty()) {
+        if (!first_formats.empty()) {
+            joined_empty_format = first_formats.front();
+        } else if (joined_empty_format.empty() && !last_formats.empty()) {
+            const auto deleted_index = normalized.end.utf16_offset == 0
+                ? 0U
+                : std::min(normalized.end.utf16_offset - 1U,
+                           last_formats.size() - 1U);
+            joined_empty_format = last_formats[deleted_index];
+        } else if (joined_empty_format.empty()) {
+            joined_empty_format = last.paragraph_mark_character_format_;
+        }
+    }
+
     std::vector<EquationAtom> joined_equations;
     joined_equations.reserve(first.equations_.size() + last.equations_.size());
     for (const auto& equation : first.equations_) {
@@ -1396,6 +1559,11 @@ Result<void> Document::deleteRange(const Range& range) {
         }
     }
     first.setContent(std::move(joined), std::move(joined_formats));
+    if (first.text_.empty()) {
+        first.paragraph_mark_character_format_ =
+            empty_paragraph_format.value_or(
+                std::move(joined_empty_format));
+    }
     first.equations_ = std::move(joined_equations);
     first.images_ = std::move(joined_images);
 
@@ -1447,11 +1615,35 @@ Result<void> Document::replaceRange(const Range& range, const std::u16string& te
     }
 
     const auto insertion = normalized.value().start;
+    const bool deletes_content = !normalized.value().empty();
+    const auto original_mark = paragraphs_[
+        normalized.value().start_paragraph_index]
+                                   .paragraph_mark_character_format_;
     const auto deletion = deleteRange(range);
     if (!deletion) {
         return deletion.error();
     }
-    return insertText(insertion, text, format);
+    const auto insertion_index = paragraphIndex(insertion.paragraph_id);
+    if (!insertion_index) {
+        return paragraphMissing(insertion.paragraph_id);
+    }
+    auto& paragraph = paragraphs_[*insertion_index];
+    if (!text.empty()) {
+        // Deletion-to-empty promotion is only observable if the replacement
+        // remains empty. A normal replacement must not rewrite the paragraph
+        // mark as a hidden side effect. Restore it after insertion so a null
+        // operation format can still inherit the deleted text's format.
+        const auto insertion_result = insertText(insertion, text, format);
+        if (!insertion_result) {
+            return insertion_result.error();
+        }
+        paragraph.paragraph_mark_character_format_ = original_mark;
+        return {};
+    }
+    if (deletes_content && paragraph.text_.empty() && format) {
+        paragraph.paragraph_mark_character_format_ = *format;
+    }
+    return {};
 }
 
 Result<void> Document::applyCharacterFormat(const Range& range,
@@ -1465,7 +1657,7 @@ Result<void> Document::applyCharacterFormat(const Range& range,
         return delta_validation.error();
     }
     const auto normalized = normalized_result.value();
-    if (normalized.empty() || delta.empty()) {
+    if (delta.empty()) {
         return {};
     }
 
@@ -1482,6 +1674,30 @@ Result<void> Document::applyCharacterFormat(const Range& range,
             return result.error();
         }
     }
+    return {};
+}
+
+Result<void> Document::applyParagraphMarkCharacterFormat(
+    NodeId paragraph_id, const CharacterFormatDelta& delta) {
+    const auto index = paragraphIndex(paragraph_id);
+    if (!index) {
+        return paragraphMissing(paragraph_id);
+    }
+    const auto delta_validation = delta.validate();
+    if (!delta_validation) {
+        return delta_validation.error();
+    }
+    if (delta.empty()) {
+        return {};
+    }
+    auto candidate = paragraphs_[*index].paragraph_mark_character_format_;
+    delta.applyTo(candidate);
+    const auto validation = candidate.validate();
+    if (!validation) {
+        return validation.error();
+    }
+    paragraphs_[*index].paragraph_mark_character_format_ =
+        std::move(candidate);
     return {};
 }
 
@@ -1521,7 +1737,9 @@ Result<void> Document::applyParagraphFormat(const std::vector<NodeId>& paragraph
     return {};
 }
 
-Result<void> Document::splitParagraph(const Position& position, NodeId new_paragraph_id) {
+Result<void> Document::splitParagraph(
+    const Position& position, NodeId new_paragraph_id,
+    std::optional<CharacterFormat> new_paragraph_mark_format) {
     const auto position_validation = validatePosition(position);
     if (!position_validation) {
         return position_validation.error();
@@ -1532,10 +1750,19 @@ Result<void> Document::splitParagraph(const Position& position, NodeId new_parag
     if (nodeIdInUse(new_paragraph_id)) {
         return Error{ErrorCode::duplicate_node_id, "New paragraph NodeId already exists"};
     }
+    if (new_paragraph_mark_format) {
+        const auto mark_format_validation =
+            new_paragraph_mark_format->validate();
+        if (!mark_format_validation) {
+            return mark_format_validation.error();
+        }
+    }
 
     const auto index = paragraphIndex(position.paragraph_id).value();
     auto& original = paragraphs_[index];
     const auto original_format = original.format_;
+    const auto inherited_mark_format = new_paragraph_mark_format.value_or(
+        original.characterFormatAt(position.utf16_offset));
     const auto formats = original.denseFormats();
 
     auto right_text = original.text_.substr(position.utf16_offset);
@@ -1574,7 +1801,7 @@ Result<void> Document::splitParagraph(const Position& position, NodeId new_parag
     original.setContent(std::move(left_text), std::move(left_formats));
     original.equations_ = std::move(left_equations);
     original.images_ = std::move(left_images);
-    Paragraph right(new_paragraph_id, {});
+    Paragraph right(new_paragraph_id, {}, inherited_mark_format);
     right.format_ = original_format;
     right.setContent(std::move(right_text), std::move(right_formats));
     right.equations_ = std::move(right_equations);

@@ -25,20 +25,33 @@ Result<void> applyOne(Document& document, const Operation& operation) {
                 return document.insertImage(
                     typed.position, typed.encoded_payload, typed.image_format,
                     typed.accessible_name, typed.width_emu, typed.height_emu,
-                    typed.image_id, typed.character_format);
+                    typed.image_id, typed.character_format, typed.layout);
             } else if constexpr (std::is_same_v<Type, ResizeImage>) {
                 return document.resizeImage(
                     typed.image_id, typed.width_emu, typed.height_emu);
+            } else if constexpr (std::is_same_v<Type, SetImageLayout>) {
+                return document.setImageLayout(typed.image_id, typed.layout);
+            } else if constexpr (
+                std::is_same_v<Type, SetImageAccessibleName>) {
+                return document.setImageAccessibleName(
+                    typed.image_id, typed.accessible_name);
             } else if constexpr (std::is_same_v<Type, DeleteRange>) {
-                return document.deleteRange(typed.range);
+                return document.deleteRange(
+                    typed.range, typed.empty_paragraph_format);
             } else if constexpr (std::is_same_v<Type, ReplaceRange>) {
                 return document.replaceRange(typed.range, typed.text, typed.format);
             } else if constexpr (std::is_same_v<Type, SetCharacterFormat>) {
                 return document.applyCharacterFormat(typed.range, typed.delta);
+            } else if constexpr (
+                std::is_same_v<Type, SetParagraphMarkCharacterFormat>) {
+                return document.applyParagraphMarkCharacterFormat(
+                    typed.paragraph_id, typed.delta);
             } else if constexpr (std::is_same_v<Type, SetParagraphFormat>) {
                 return document.applyParagraphFormat(typed.paragraph_ids, typed.delta);
             } else if constexpr (std::is_same_v<Type, SplitParagraph>) {
-                return document.splitParagraph(typed.position, typed.new_paragraph_id);
+                return document.splitParagraph(
+                    typed.position, typed.new_paragraph_id,
+                    typed.new_paragraph_mark_format);
             } else if constexpr (std::is_same_v<Type, MergeWithNextParagraph>) {
                 return document.mergeWithNext(typed.paragraph_id);
             } else if constexpr (std::is_same_v<Type, InsertTable>) {

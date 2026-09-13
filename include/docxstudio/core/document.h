@@ -194,8 +194,32 @@ inline constexpr std::size_t kMaximumDocumentEncodedImageBytes =
     32U * 1024U * 1024U;
 inline constexpr std::size_t kMaximumImageAccessibleNameBytes = 4U * 1024U;
 inline constexpr std::int64_t kMaximumInlineImageDimensionEmu = 254000000;
+inline constexpr std::int64_t kMaximumImageWrapDistanceEmu = 254000000;
 
 enum class ImageFormat : std::uint8_t { png, jpeg };
+
+// Inline images participate in the text line. Square and top-and-bottom images
+// are anchored to their containing paragraph and affect surrounding text using
+// the corresponding wrap mode. Additional OOXML wrap modes can extend this
+// enum without changing the transport-neutral layout record.
+enum class ImagePlacement : std::uint8_t {
+    inline_with_text,
+    square,
+    top_and_bottom,
+};
+
+struct ImageLayout {
+    ImagePlacement placement{ImagePlacement::inline_with_text};
+    std::int64_t distance_top_emu{0};
+    std::int64_t distance_right_emu{0};
+    std::int64_t distance_bottom_emu{0};
+    std::int64_t distance_left_emu{0};
+    bool move_with_text{true};
+
+    [[nodiscard]] Result<void> validate() const;
+
+    auto operator<=>(const ImageLayout&) const = default;
+};
 
 [[nodiscard]] constexpr std::string_view imageContentType(
     ImageFormat format) noexcept {
@@ -237,6 +261,7 @@ struct ImageAtom {
     std::string accessible_name;
     std::int64_t width_emu{0};
     std::int64_t height_emu{0};
+    ImageLayout layout;
 
     auto operator<=>(const ImageAtom&) const = default;
 };
@@ -245,8 +270,9 @@ class Paragraph {
 public:
     Paragraph();
 
-    [[nodiscard]] static Result<Paragraph> create(std::u16string text,
-                                                   NodeId id = NodeId::generate());
+    [[nodiscard]] static Result<Paragraph> create(
+        std::u16string text, NodeId id = NodeId::generate(),
+        CharacterFormat paragraph_mark_character_format = {});
 
     [[nodiscard]] NodeId id() const noexcept { return id_; }
     [[nodiscard]] const std::u16string& text() const noexcept { return text_; }
@@ -263,12 +289,19 @@ public:
     [[nodiscard]] const ImageAtom* imageAt(
         std::size_t utf16_offset) const noexcept;
     [[nodiscard]] const ParagraphFormat& format() const noexcept { return format_; }
+    // Character properties carried by the paragraph mark. They provide the
+    // durable insertion format when the paragraph has no text.
+    [[nodiscard]] const CharacterFormat& paragraphMarkCharacterFormat()
+        const noexcept {
+        return paragraph_mark_character_format_;
+    }
     [[nodiscard]] CharacterFormat characterFormatAt(std::size_t utf16_offset) const;
 
     auto operator<=>(const Paragraph&) const = default;
 
 private:
-    Paragraph(NodeId id, std::u16string text);
+    Paragraph(NodeId id, std::u16string text,
+              CharacterFormat paragraph_mark_character_format = {});
 
     [[nodiscard]] std::vector<CharacterFormat> denseFormats() const;
     void setContent(std::u16string text, std::vector<CharacterFormat> formats);
@@ -290,6 +323,7 @@ private:
     std::vector<EquationAtom> equations_;
     std::vector<ImageAtom> images_;
     ParagraphFormat format_;
+    CharacterFormat paragraph_mark_character_format_;
 
     friend class Document;
 };
@@ -323,17 +357,29 @@ public:
         ImageFormat image_format, std::string accessible_name,
         std::int64_t width_emu, std::int64_t height_emu,
         NodeId image_id = NodeId::generate(),
-        const std::optional<CharacterFormat>& character_format = std::nullopt);
+        const std::optional<CharacterFormat>& character_format = std::nullopt,
+        ImageLayout layout = {});
     [[nodiscard]] Result<void> resizeImage(
         NodeId image_id, std::int64_t width_emu, std::int64_t height_emu);
-    [[nodiscard]] Result<void> deleteRange(const Range& range);
+    [[nodiscard]] Result<void> setImageLayout(NodeId image_id,
+                                              ImageLayout layout);
+    [[nodiscard]] Result<void> setImageAccessibleName(
+        NodeId image_id, std::string accessible_name);
+    [[nodiscard]] Result<void> deleteRange(
+        const Range& range,
+        const std::optional<CharacterFormat>& empty_paragraph_format =
+            std::nullopt);
     [[nodiscard]] Result<void> replaceRange(const Range& range, const std::u16string& text,
                                             const std::optional<CharacterFormat>& format = std::nullopt);
     [[nodiscard]] Result<void> applyCharacterFormat(const Range& range,
                                                     const CharacterFormatDelta& delta);
+    [[nodiscard]] Result<void> applyParagraphMarkCharacterFormat(
+        NodeId paragraph_id, const CharacterFormatDelta& delta);
     [[nodiscard]] Result<void> applyParagraphFormat(const std::vector<NodeId>& paragraph_ids,
                                                     const ParagraphFormatDelta& delta);
-    [[nodiscard]] Result<void> splitParagraph(const Position& position, NodeId new_paragraph_id);
+    [[nodiscard]] Result<void> splitParagraph(
+        const Position& position, NodeId new_paragraph_id,
+        std::optional<CharacterFormat> new_paragraph_mark_format = std::nullopt);
     [[nodiscard]] Result<void> mergeWithNext(NodeId paragraph_id);
     [[nodiscard]] Result<void> insertTable(std::optional<NodeId> before_block_id,
                                            Table table);

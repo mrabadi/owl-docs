@@ -11,6 +11,7 @@
 #include <QColor>
 #include <QContextMenuEvent>
 #include <QCheckBox>
+#include <QComboBox>
 #include <QDialog>
 #include <QDialogButtonBox>
 #include <QDoubleSpinBox>
@@ -20,6 +21,8 @@
 #include <QGlyphRun>
 #include <QInputMethodEvent>
 #include <QKeyEvent>
+#include <QLabel>
+#include <QLineEdit>
 #include <QMenu>
 #include <QMimeData>
 #include <QMouseEvent>
@@ -27,6 +30,7 @@
 #include <QPageSize>
 #include <QPainter>
 #include <QPdfWriter>
+#include <QPushButton>
 #include <QRegularExpression>
 #include <QRawFont>
 #include <QSaveFile>
@@ -49,6 +53,7 @@
 #include <numeric>
 #include <set>
 #include <span>
+#include <tuple>
 #include <unordered_map>
 
 namespace docxstudio::app {
@@ -58,15 +63,20 @@ constexpr double kScreenPointsScale = 96.0 / 72.0;
 constexpr double kPageGapPixels = 24.0;
 constexpr double kCanvasPaddingPixels = 28.0;
 constexpr double kEmuPerPoint = 12700.0;
-constexpr char kInlineImageClipboardMime[] =
+constexpr char kInlineImageClipboardLegacyMime[] =
     "application/x-owl-docs-inline-image-v1";
-constexpr char kInlineImageClipboardMagic[] = "OWLDIMG1";
-constexpr qsizetype kInlineImageClipboardHeaderBytes = 33;
+constexpr char kInlineImageClipboardMime[] =
+    "application/x-owl-docs-inline-image-v2";
+constexpr char kInlineImageClipboardLegacyMagic[] = "OWLDIMG1";
+constexpr char kInlineImageClipboardMagic[] = "OWLDIMG2";
+constexpr qsizetype kInlineImageClipboardLegacyHeaderBytes = 33;
+constexpr qsizetype kInlineImageClipboardHeaderBytes = 67;
 
 struct ClipboardInlineImage {
     core::ImageFormat format{core::ImageFormat::png};
     std::int64_t widthEmu{};
     std::int64_t heightEmu{};
+    core::ImageLayout layout;
     QString accessibleName;
     std::vector<std::uint8_t> encodedBytes;
 };
@@ -94,14 +104,16 @@ bool readLittleEndian(const QByteArray& input, qsizetype& cursor,
     return true;
 }
 
-QByteArray encodeClipboardInlineImage(const core::ImageAtom& image) {
+QByteArray encodeClipboardInlineImage(const core::ImageAtom& image,
+                                      bool legacy = false) {
     const auto bytes = image.encoded_payload.bytes();
     if (bytes.empty() || bytes.size() > core::kMaximumEncodedImageBytes ||
         image.accessible_name.size() >
             core::kMaximumImageAccessibleNameBytes ||
         image.width_emu <= 0 || image.height_emu <= 0 ||
         image.width_emu > core::kMaximumInlineImageDimensionEmu ||
-        image.height_emu > core::kMaximumInlineImageDimensionEmu) {
+        image.height_emu > core::kMaximumInlineImageDimensionEmu ||
+        !image.layout.validate()) {
         return {};
     }
     const QByteArray name(
@@ -109,12 +121,30 @@ QByteArray encodeClipboardInlineImage(const core::ImageAtom& image) {
         static_cast<qsizetype>(image.accessible_name.size()));
     const qsizetype payloadSize = static_cast<qsizetype>(bytes.size());
     QByteArray output;
-    output.reserve(kInlineImageClipboardHeaderBytes + name.size() +
+    output.reserve((legacy ? kInlineImageClipboardLegacyHeaderBytes
+                           : kInlineImageClipboardHeaderBytes) + name.size() +
                    payloadSize);
-    output.append(kInlineImageClipboardMagic, 8);
+    output.append(legacy ? kInlineImageClipboardLegacyMagic
+                         : kInlineImageClipboardMagic, 8);
     output.append(image.format == core::ImageFormat::png ? '\x01' : '\x02');
     appendLittleEndian(output, static_cast<std::uint64_t>(image.width_emu), 8);
     appendLittleEndian(output, static_cast<std::uint64_t>(image.height_emu), 8);
+    if (!legacy) {
+        output.append(static_cast<char>(image.layout.placement));
+        appendLittleEndian(
+            output, static_cast<std::uint64_t>(
+                        image.layout.distance_top_emu), 8);
+        appendLittleEndian(
+            output, static_cast<std::uint64_t>(
+                        image.layout.distance_right_emu), 8);
+        appendLittleEndian(
+            output, static_cast<std::uint64_t>(
+                        image.layout.distance_bottom_emu), 8);
+        appendLittleEndian(
+            output, static_cast<std::uint64_t>(
+                        image.layout.distance_left_emu), 8);
+        output.append(image.layout.move_with_text ? '\x01' : '\x00');
+    }
     appendLittleEndian(output, static_cast<std::uint64_t>(name.size()), 4);
     appendLittleEndian(output, static_cast<std::uint64_t>(payloadSize), 4);
     output.append(name);
@@ -124,8 +154,11 @@ QByteArray encodeClipboardInlineImage(const core::ImageAtom& image) {
 
 std::optional<ClipboardInlineImage> decodeClipboardInlineImage(
     const QByteArray& input) {
-    if (input.size() < kInlineImageClipboardHeaderBytes ||
-        input.first(8) != QByteArray(kInlineImageClipboardMagic, 8)) {
+    const bool legacy = input.size() >= kInlineImageClipboardLegacyHeaderBytes &&
+        input.first(8) == QByteArray(kInlineImageClipboardLegacyMagic, 8);
+    const bool current = input.size() >= kInlineImageClipboardHeaderBytes &&
+        input.first(8) == QByteArray(kInlineImageClipboardMagic, 8);
+    if (!legacy && !current) {
         return std::nullopt;
     }
     qsizetype cursor = 8;
@@ -137,8 +170,36 @@ std::optional<ClipboardInlineImage> decodeClipboardInlineImage(
     std::uint64_t nameLength = 0;
     std::uint64_t payloadLength = 0;
     if (!readLittleEndian(input, cursor, 8, width) ||
-        !readLittleEndian(input, cursor, 8, height) ||
-        !readLittleEndian(input, cursor, 4, nameLength) ||
+        !readLittleEndian(input, cursor, 8, height)) {
+        return std::nullopt;
+    }
+    core::ImageLayout layout;
+    if (current) {
+        if (cursor >= input.size()) return std::nullopt;
+        layout.placement = static_cast<core::ImagePlacement>(
+            static_cast<unsigned char>(input.at(cursor++)));
+        std::uint64_t top = 0;
+        std::uint64_t right = 0;
+        std::uint64_t bottom = 0;
+        std::uint64_t left = 0;
+        if (!readLittleEndian(input, cursor, 8, top) ||
+            !readLittleEndian(input, cursor, 8, right) ||
+            !readLittleEndian(input, cursor, 8, bottom) ||
+            !readLittleEndian(input, cursor, 8, left) ||
+            cursor >= input.size()) {
+            return std::nullopt;
+        }
+        layout.distance_top_emu = static_cast<std::int64_t>(top);
+        layout.distance_right_emu = static_cast<std::int64_t>(right);
+        layout.distance_bottom_emu = static_cast<std::int64_t>(bottom);
+        layout.distance_left_emu = static_cast<std::int64_t>(left);
+        const unsigned char move =
+            static_cast<unsigned char>(input.at(cursor++));
+        if (move > 1U) return std::nullopt;
+        layout.move_with_text = move == 1U;
+        if (!layout.validate()) return std::nullopt;
+    }
+    if (!readLittleEndian(input, cursor, 4, nameLength) ||
         !readLittleEndian(input, cursor, 4, payloadLength) ||
         width == 0 || height == 0 ||
         width > static_cast<std::uint64_t>(
@@ -156,9 +217,10 @@ std::optional<ClipboardInlineImage> decodeClipboardInlineImage(
         static_cast<std::uint64_t>(input.size() - cursor)) {
         return std::nullopt;
     }
+    const qsizetype nameOffset = cursor -
+        static_cast<qsizetype>(nameLength);
     const QByteArray nameBytes = input.mid(
-        kInlineImageClipboardHeaderBytes,
-        static_cast<qsizetype>(nameLength));
+        nameOffset, static_cast<qsizetype>(nameLength));
     const QString name = QString::fromUtf8(nameBytes);
     if (name.toUtf8() != nameBytes) return std::nullopt;
     const auto expected = formatByte == 1U
@@ -176,6 +238,7 @@ std::optional<ClipboardInlineImage> decodeClipboardInlineImage(
                                      : core::ImageFormat::jpeg;
     result.widthEmu = static_cast<std::int64_t>(width);
     result.heightEmu = static_cast<std::int64_t>(height);
+    result.layout = layout;
     result.accessibleName = name;
     result.encodedBytes.assign(payload.begin(), payload.end());
     return result;
@@ -593,6 +656,8 @@ bool operationsHaveNonTextChanges(const core::Document& base,
             }
             const auto& paragraph = working.paragraphs()[
                 normalized.value().start_paragraph_index];
+            const auto paragraphId = paragraph.id();
+            const auto markBefore = paragraph.paragraphMarkCharacterFormat();
             if (std::find(
                     paragraph.text().begin() + static_cast<std::ptrdiff_t>(
                         normalized.value().start.utf16_offset),
@@ -619,6 +684,11 @@ bool operationsHaveNonTextChanges(const core::Document& base,
                                       replacement->format)) {
                 return true;
             }
+            const auto* changedParagraph = working.findParagraph(paragraphId);
+            if (!changedParagraph ||
+                changedParagraph->paragraphMarkCharacterFormat() != markBefore) {
+                return true;
+            }
             continue;
         }
         if (const auto* deletion = std::get_if<core::DeleteRange>(&operation)) {
@@ -630,6 +700,8 @@ bool operationsHaveNonTextChanges(const core::Document& base,
             }
             const auto& paragraph = working.paragraphs()[
                 normalized.value().start_paragraph_index];
+            const auto paragraphId = paragraph.id();
+            const auto markBefore = paragraph.paragraphMarkCharacterFormat();
             if (std::find(
                     paragraph.text().begin() + static_cast<std::ptrdiff_t>(
                         normalized.value().start.utf16_offset),
@@ -640,7 +712,15 @@ bool operationsHaveNonTextChanges(const core::Document& base,
                     normalized.value().end.utf16_offset)) {
                 return true;
             }
-            if (!working.deleteRange(deletion->range)) return true;
+            if (!working.deleteRange(
+                    deletion->range, deletion->empty_paragraph_format)) {
+                return true;
+            }
+            const auto* changedParagraph = working.findParagraph(paragraphId);
+            if (!changedParagraph ||
+                changedParagraph->paragraphMarkCharacterFormat() != markBefore) {
+                return true;
+            }
             continue;
         }
         return true;
@@ -1065,15 +1145,13 @@ std::optional<core::CharacterFormat> insertionFormatFor(
     const core::Document& source,
     const core::NormalizedRange& replacement,
     const core::CharacterFormat& desired) {
-    if (desired.empty()) {
-        return std::nullopt;
-    }
-
     // A null operation format deliberately means "inherit at the insertion
     // point". Prefer it whenever it produces the same semantic formatting:
     // imported text can then remain a safe text-only OOXML patch instead of
     // being mislabeled as a formatting rewrite merely because its inherited
-    // run happens to be colored, bold, or otherwise directly formatted.
+    // run happens to be colored, bold, or otherwise directly formatted. An
+    // explicitly empty desired format is still meaningful when it clears the
+    // adjacent run's only property, so compare before deciding to inherit.
     return inheritedFormatAfterReplacement(source, replacement) == desired
         ? std::nullopt
         : std::optional<core::CharacterFormat>(desired);
@@ -1101,6 +1179,7 @@ struct ParagraphImageVisual {
     std::size_t layoutUtf16Offset{};
     QRectF rect;
     int pageIndex{};
+    core::ImageLayout layout;
 };
 
 struct DocumentCanvas::ParagraphVisual {
@@ -1189,6 +1268,9 @@ struct DocumentCanvas::Hit {
     std::optional<TableCursor> tableCursor;
     std::optional<core::NodeId> tableHandle;
     std::optional<core::NodeId> image;
+    std::optional<ImageResizeHandle> imageResizeHandle;
+    QPointF pagePoint;
+    int pageIndex{};
 };
 
 DocumentCanvas::DocumentCanvas(SpellChecker& spelling, QWidget* parent)
@@ -1256,6 +1338,7 @@ void DocumentCanvas::setDocument(core::Document document) {
     draggingTable_ = false;
     tableDropTargetValid_ = false;
     tableDropBefore_.reset();
+    imageResizeDrag_.reset();
     modified_ = false;
     nonTextModified_ = false;
     pageLayoutModified_ = false;
@@ -1659,6 +1742,21 @@ std::optional<core::NodeId> DocumentCanvas::selectedInlineImageId() const {
         : std::nullopt;
 }
 
+std::optional<core::ImageLayout> DocumentCanvas::selectedImageLayout() const {
+    const auto selected = selectedInlineImage();
+    return selected ? std::optional<core::ImageLayout>(selected->second.layout)
+                    : std::nullopt;
+}
+
+QString DocumentCanvas::selectedImageAccessibleName() const {
+    const auto selected = selectedInlineImage();
+    return selected
+        ? QString::fromUtf8(selected->second.accessible_name.data(),
+                            static_cast<qsizetype>(
+                                selected->second.accessible_name.size()))
+        : QString();
+}
+
 const QImage* DocumentCanvas::decodedInlineImage(
     const core::ImageAtom& image) const {
     const auto cached = decodedImages_.find(image.id);
@@ -1988,17 +2086,21 @@ void DocumentCanvas::rebuildLayout() const {
                 static_cast<double>(image.width_emu) / kEmuPerPoint;
             const double heightPoints =
                 static_cast<double>(image.height_emu) / kEmuPerPoint;
+            const bool anchored = image.layout.placement !=
+                core::ImagePlacement::inline_with_text;
             const double fitScale = std::min(
                 {1.0, baseWidth / widthPoints,
                  pageContentHeight / heightPoints});
             const double width = widthPoints * fitScale;
             const double height = heightPoints * fitScale;
             const auto layoutOffset = coreOffset;
-            layoutText[static_cast<qsizetype>(layoutOffset)] = QChar(0x00a0);
+            layoutText[static_cast<qsizetype>(layoutOffset)] = anchored
+                ? QChar(0x2060)
+                : QChar(0x00a0);
             visual->images.push_back(
                 {image.id, *decodedImage,
                  coreOffset, layoutOffset,
-                 QRectF(0.0, 0.0, width, height), 0});
+                 QRectF(0.0, 0.0, width, height), 0, image.layout});
         }
 
         QList<QTextLayout::FormatRange> ranges;
@@ -2012,6 +2114,10 @@ void DocumentCanvas::rebuildLayout() const {
             if (range.length > 0) ranges.push_back(range);
         }
         for (const auto& image : visual->images) {
+            if (image.layout.placement !=
+                core::ImagePlacement::inline_with_text) {
+                continue;
+            }
             const auto characterFormat = paragraph.characterFormatAt(
                 std::min(paragraph.text().size(),
                          image.coreUtf16Offset + 1U));
@@ -2164,6 +2270,139 @@ void DocumentCanvas::rebuildLayout() const {
         visual->layout->setTextOption(option);
 
         bool firstLine = true;
+
+        // Probe character positions without wrap exclusions. The canonical
+        // authored-DOCX subset writes moving pictures relative to character /
+        // paragraph with zero offsets, so the picture origin must use the
+        // U+FFFC character x and the paragraph y. Fixed pictures use page /
+        // page with zero offsets. Wrap distances enlarge only the text
+        // exclusion; they never translate or resize the picture itself.
+        std::unordered_map<core::NodeId, double, core::NodeIdHash>
+            movingAnchorXs;
+        if (std::any_of(
+                visual->images.begin(), visual->images.end(),
+                [](const ParagraphImageVisual& image) {
+                    return image.layout.placement !=
+                               core::ImagePlacement::inline_with_text &&
+                           image.layout.move_with_text;
+                })) {
+            QTextLayout probe(
+                finalLayoutText,
+                fontFrom(defaultFormat, defaultFontFamily_,
+                         defaultFontPointSize_));
+            probe.setFormats(ranges);
+            probe.setTextOption(option);
+            bool probeFirstLine = true;
+            probe.beginLayout();
+            while (true) {
+                QTextLine line = probe.createLine();
+                if (!line.isValid()) break;
+                const double extra = semanticList
+                    ? (probeFirstLine ? listBulletOffset : listTextOffset)
+                    : (probeFirstLine ? firstIndent : 0.0);
+                line.setLineWidth(std::max(18.0, baseWidth - extra));
+                line.setPosition(QPointF(
+                    marginLeftPoints_ + leftIndent + extra, 0.0));
+                const auto lineStart = static_cast<std::size_t>(
+                    line.textStart());
+                const auto lineEnd = lineStart +
+                    static_cast<std::size_t>(line.textLength());
+                for (const auto& image : visual->images) {
+                    if (image.layout.placement ==
+                            core::ImagePlacement::inline_with_text ||
+                        !image.layout.move_with_text ||
+                        image.layoutUtf16Offset < lineStart ||
+                        image.layoutUtf16Offset >= lineEnd) {
+                        continue;
+                    }
+                    movingAnchorXs.try_emplace(
+                        image.id,
+                        line.cursorToX(static_cast<int>(
+                            image.layoutUtf16Offset)));
+                }
+                probeFirstLine = false;
+            }
+            probe.endLayout();
+        }
+
+        // `allowOverlap="0"` is emitted for this subset. Resolve every
+        // supported anchor through one vertical cursor so mixed square and
+        // top/bottom pictures cannot occupy the same rectangle merely because
+        // their wrap kinds differ.
+        int nonOverlapPage = -1;
+        double nextAnchorY = 0.0;
+        for (auto& image : visual->images) {
+            if (image.layout.placement ==
+                core::ImagePlacement::inline_with_text) {
+                continue;
+            }
+            int anchorPage = page;
+            double anchorY = image.layout.move_with_text ? y : 0.0;
+            if (nonOverlapPage == anchorPage) {
+                anchorY = std::max(anchorY, nextAnchorY);
+            }
+            if (image.layout.move_with_text &&
+                anchorY + image.rect.height() > pageBottom &&
+                anchorY > marginTopPoints_) {
+                ++page;
+                y = marginTopPoints_;
+                anchorPage = page;
+                anchorY = y;
+                if (nonOverlapPage == anchorPage) {
+                    anchorY = std::max(anchorY, nextAnchorY);
+                }
+            }
+            image.pageIndex = anchorPage;
+            const auto movingX = movingAnchorXs.find(image.id);
+            const double anchorX = image.layout.move_with_text
+                ? (movingX != movingAnchorXs.end()
+                       ? movingX->second
+                       : marginLeftPoints_ + leftIndent)
+                : 0.0;
+            image.rect.moveTo(
+                anchorX, anchorY);
+            if (nonOverlapPage != anchorPage) {
+                nonOverlapPage = anchorPage;
+                nextAnchorY = image.rect.bottom();
+            } else {
+                nextAnchorY = std::max(nextAnchorY, image.rect.bottom());
+            }
+        }
+
+        const auto exclusionRect = [](const ParagraphImageVisual& image) {
+            const double top = static_cast<double>(
+                image.layout.distance_top_emu) / kEmuPerPoint;
+            const double right = static_cast<double>(
+                image.layout.distance_right_emu) / kEmuPerPoint;
+            const double bottom = static_cast<double>(
+                image.layout.distance_bottom_emu) / kEmuPerPoint;
+            const double left = static_cast<double>(
+                image.layout.distance_left_emu) / kEmuPerPoint;
+            return image.rect.adjusted(-left, -top, right, bottom);
+        };
+
+        const auto advancePastTopAndBottom = [&] {
+            while (true) {
+                double exclusionBottom = y;
+                for (const auto& image : visual->images) {
+                    if (image.layout.placement !=
+                            core::ImagePlacement::top_and_bottom ||
+                        image.pageIndex != page) {
+                        continue;
+                    }
+                    const QRectF exclusion = exclusionRect(image);
+                    if (exclusion.bottom() > y) {
+                        exclusionBottom = std::max(
+                            exclusionBottom, exclusion.bottom());
+                    }
+                }
+                y = exclusionBottom;
+                if (y < pageBottom || y <= marginTopPoints_) break;
+                ++page;
+                y = marginTopPoints_;
+            }
+        };
+
         if (!finalLayoutText.isEmpty()) {
             visual->layout->beginLayout();
             while (true) {
@@ -2174,60 +2413,130 @@ void DocumentCanvas::rebuildLayout() const {
                 const double extra = semanticList
                     ? (firstLine ? listBulletOffset : listTextOffset)
                     : (firstLine ? firstIndent : 0.0);
-                line.setLineWidth(std::max(18.0, baseWidth - extra));
-                const auto lineStart = static_cast<std::size_t>(line.textStart());
-                const auto lineEnd = lineStart +
-                    static_cast<std::size_t>(line.textLength());
-                qreal equationAscent = 0.0;
-                qreal equationDescent = 0.0;
-                for (const auto& equation : visual->equations) {
-                    if (equation.utf16Offset >= lineStart &&
-                        equation.utf16Offset < lineEnd) {
-                        equationAscent = std::max(
-                            equationAscent, equation.metrics.ascent);
-                        equationDescent = std::max(
-                            equationDescent, equation.metrics.descent);
+                advancePastTopAndBottom();
+                const auto squareWrapOffset = [&]() {
+                    double rightEdge = marginLeftPoints_ + leftIndent;
+                    double wrapBottom = y;
+                    for (const auto& image : visual->images) {
+                        if (image.layout.placement !=
+                                core::ImagePlacement::square ||
+                            image.pageIndex != page) {
+                            continue;
+                        }
+                        const QRectF exclusion = exclusionRect(image);
+                        if (y < exclusion.top() ||
+                            y >= exclusion.bottom()) continue;
+                        rightEdge = std::max(
+                            rightEdge, exclusion.right());
+                        wrapBottom = std::max(
+                            wrapBottom, exclusion.bottom());
                     }
-                }
-                qreal imageAscent = 0.0;
-                for (const auto& image : visual->images) {
-                    if (image.layoutUtf16Offset >= lineStart &&
-                        image.layoutUtf16Offset < lineEnd) {
-                        imageAscent = std::max<qreal>(
-                            imageAscent, image.rect.height());
+                    return std::pair{
+                        std::max(0.0, rightEdge -
+                                          (marginLeftPoints_ + leftIndent)),
+                        wrapBottom};
+                };
+                auto [wrapOffset, wrapBottom] = squareWrapOffset();
+                if (baseWidth - extra - wrapOffset < 18.0 &&
+                    wrapBottom > y) {
+                    y = wrapBottom;
+                    if (y >= pageBottom) {
+                        ++page;
+                        y = marginTopPoints_;
                     }
+                    advancePastTopAndBottom();
+                    std::tie(wrapOffset, wrapBottom) = squareWrapOffset();
                 }
-                const qreal contentAscent = std::max(
-                    equationAscent, imageAscent);
-                const double topPadding = std::max<double>(
-                    0.0, contentAscent - line.ascent());
-                const double naturalAdvance = std::max<double>(
-                    line.height(),
-                    std::max<qreal>(line.ascent(), contentAscent) +
-                        std::max<qreal>(line.descent(), equationDescent) +
-                        line.leading());
-                double advance = naturalAdvance;
-                if (paragraphFormat.line_spacing_emu) {
-                    const double requested = emuToPoints(paragraphFormat.line_spacing_emu);
-                    switch (paragraphFormat.line_spacing_rule.value_or(
-                        core::LineSpacingRule::automatic)) {
-                        case core::LineSpacingRule::exact:
-                            advance = requested; break;
-                        case core::LineSpacingRule::at_least:
-                            advance = std::max(naturalAdvance, requested); break;
-                        case core::LineSpacingRule::automatic:
-                            advance = std::max(1.0, naturalAdvance * requested / 12.0);
-                            break;
+                line.setLineWidth(
+                    std::max(18.0, baseWidth - extra - wrapOffset));
+                const auto measureLine = [&]() {
+                    const auto lineStart = static_cast<std::size_t>(
+                        line.textStart());
+                    const auto lineEnd = lineStart +
+                        static_cast<std::size_t>(line.textLength());
+                    qreal equationAscent = 0.0;
+                    qreal equationDescent = 0.0;
+                    for (const auto& equation : visual->equations) {
+                        if (equation.utf16Offset >= lineStart &&
+                            equation.utf16Offset < lineEnd) {
+                            equationAscent = std::max(
+                                equationAscent, equation.metrics.ascent);
+                            equationDescent = std::max(
+                                equationDescent, equation.metrics.descent);
+                        }
                     }
-                }
+                    qreal imageAscent = 0.0;
+                    for (const auto& image : visual->images) {
+                        if (image.layout.placement ==
+                                core::ImagePlacement::inline_with_text &&
+                            image.layoutUtf16Offset >= lineStart &&
+                            image.layoutUtf16Offset < lineEnd) {
+                            imageAscent = std::max<qreal>(
+                                imageAscent, image.rect.height());
+                        }
+                    }
+                    const qreal contentAscent = std::max(
+                        equationAscent, imageAscent);
+                    const double topPadding = std::max<double>(
+                        0.0, contentAscent - line.ascent());
+                    const double naturalAdvance = std::max<double>(
+                        line.height(),
+                        std::max<qreal>(line.ascent(), contentAscent) +
+                            std::max<qreal>(line.descent(), equationDescent) +
+                            line.leading());
+                    double advance = naturalAdvance;
+                    if (paragraphFormat.line_spacing_emu) {
+                        const double requested = emuToPoints(
+                            paragraphFormat.line_spacing_emu);
+                        switch (paragraphFormat.line_spacing_rule.value_or(
+                            core::LineSpacingRule::automatic)) {
+                            case core::LineSpacingRule::exact:
+                                advance = requested;
+                                break;
+                            case core::LineSpacingRule::at_least:
+                                advance = std::max(
+                                    naturalAdvance, requested);
+                                break;
+                            case core::LineSpacingRule::automatic:
+                                advance = std::max(
+                                    1.0,
+                                    naturalAdvance * requested / 12.0);
+                                break;
+                        }
+                    }
+                    return std::tuple{
+                        lineStart, lineEnd, topPadding, advance};
+                };
+                auto [lineStart, lineEnd, topPadding, advance] =
+                    measureLine();
                 if (y + advance > pageBottom && y > marginTopPoints_) {
                     ++page;
                     y = marginTopPoints_;
+                    advancePastTopAndBottom();
+                    std::tie(wrapOffset, wrapBottom) = squareWrapOffset();
+                    if (baseWidth - extra - wrapOffset < 18.0 &&
+                        wrapBottom > y) {
+                        y = wrapBottom;
+                        if (y >= pageBottom) {
+                            ++page;
+                            y = marginTopPoints_;
+                        }
+                        advancePastTopAndBottom();
+                        std::tie(wrapOffset, wrapBottom) =
+                            squareWrapOffset();
+                    }
+                    line.setLineWidth(
+                        std::max(18.0, baseWidth - extra - wrapOffset));
+                    std::tie(lineStart, lineEnd, topPadding, advance) =
+                        measureLine();
                 }
                 line.setPosition(QPointF(
-                    marginLeftPoints_ + leftIndent + extra, y + topPadding));
+                    marginLeftPoints_ + leftIndent + extra + wrapOffset,
+                    y + topPadding));
                 for (auto& image : visual->images) {
-                    if (image.layoutUtf16Offset < lineStart ||
+                    if (image.layout.placement !=
+                            core::ImagePlacement::inline_with_text ||
+                        image.layoutUtf16Offset < lineStart ||
                         image.layoutUtf16Offset >= lineEnd) {
                         continue;
                     }
@@ -2246,7 +2555,14 @@ void DocumentCanvas::rebuildLayout() const {
         if (visual->lines.empty() && visual->images.empty()) {
             y += 14.0;
         }
-        const double contentBottom = y;
+        double contentBottom = y;
+        for (const auto& image : visual->images) {
+            if (image.pageIndex != page) continue;
+            contentBottom = std::max(
+                contentBottom,
+                exclusionRect(image).bottom());
+        }
+        y = contentBottom;
         // No implicit paragraph gap: an unspecified format is true single
         // spacing. Imported or explicitly selected paragraph spacing remains
         // represented by space_after_emu above.
@@ -2257,15 +2573,18 @@ void DocumentCanvas::rebuildLayout() const {
             firstPage = visual->lines.front().pageIndex;
             top = visual->lines.front().line.y();
         }
-        if (!visual->images.empty() &&
-            visual->images.front().pageIndex <= firstPage) {
-            firstPage = visual->images.front().pageIndex;
-            top = std::min(top, visual->images.front().rect.top());
+        for (const auto& image : visual->images) {
+            if (image.pageIndex < firstPage) {
+                firstPage = image.pageIndex;
+                top = image.rect.top();
+            } else if (image.pageIndex == firstPage) {
+                top = std::min(top, image.rect.top());
+            }
         }
         int lastPage = page;
         if (!visual->lines.empty()) lastPage = visual->lines.back().pageIndex;
-        if (!visual->images.empty()) {
-            lastPage = std::max(lastPage, visual->images.back().pageIndex);
+        for (const auto& image : visual->images) {
+            lastPage = std::max(lastPage, image.pageIndex);
         }
         const double blockBottom = contentBottom;
         blockPlacements_.push_back({paragraph.id(), core::BodyBlockKind::paragraph,
@@ -2957,13 +3276,18 @@ void DocumentCanvas::renderPage(QPainter& painter, int pageIndexValue,
                 : std::vector<SpellingWord>{};
         for (const auto& image : paragraph.images) {
             if (image.pageIndex == pageIndexValue && !image.image.isNull()) {
-                painter.drawImage(image.rect, image.image);
+                const QRectF renderedRect = imageResizeDrag_ &&
+                        imageResizeDrag_->imageId == image.id &&
+                        imageResizeDrag_->pageIndex == pageIndexValue
+                    ? imageResizeDrag_->previewRect
+                    : image.rect;
+                painter.drawImage(renderedRect, image.image);
                 if (decorations && selectedImage &&
                     image.id == *selectedImage) {
                     painter.setBrush(Qt::NoBrush);
                     painter.setPen(QPen(
                         QColor(QStringLiteral("#2f80ed")), 1.2));
-                    painter.drawRect(image.rect);
+                    painter.drawRect(renderedRect);
                     constexpr double kHandleSize = 5.0;
                     painter.setBrush(QColor(QStringLiteral("#2f80ed")));
                     const auto drawHandle =
@@ -2973,10 +3297,14 @@ void DocumentCanvas::renderPage(QPainter& painter, int pageIndexValue,
                             center.y() - kHandleSize / 2.0,
                             kHandleSize, kHandleSize));
                     };
-                    drawHandle(image.rect.topLeft());
-                    drawHandle(image.rect.topRight());
-                    drawHandle(image.rect.bottomLeft());
-                    drawHandle(image.rect.bottomRight());
+                    // Picture Layout v1 stores dimensions but not a movable
+                    // image origin. Expose only handles whose preview can be
+                    // committed without the image jumping back on release.
+                    drawHandle(QPointF(renderedRect.right(),
+                                       renderedRect.center().y()));
+                    drawHandle(renderedRect.bottomRight());
+                    drawHandle(QPointF(renderedRect.center().x(),
+                                       renderedRect.bottom()));
                     painter.setBrush(Qt::NoBrush);
                 }
             }
@@ -3266,9 +3594,8 @@ void DocumentCanvas::replaceSelection(const QString& text, bool coalesceTyping) 
     const auto parts = normalizedText.split(QLatin1Char('\n'), Qt::KeepEmptyParts);
     const auto firstFormat = insertionFormatFor(
         snap.document, normalized, typingFormat_);
-    const auto followingFormat = typingFormat_.empty()
-        ? std::nullopt
-        : std::optional<core::CharacterFormat>(typingFormat_);
+    const auto followingFormat =
+        std::optional<core::CharacterFormat>(typingFormat_);
     bool clearResultingList = false;
     const auto* startParagraph = snap.document.findParagraph(
         normalized.start.paragraph_id);
@@ -3349,7 +3676,8 @@ void DocumentCanvas::replaceSelection(const QString& text, bool coalesceTyping) 
 
     for (int index = 1; index < parts.size(); ++index) {
         const auto newId = core::NodeId::generate();
-        operations.push_back(core::SplitParagraph{cursor, newId});
+        operations.push_back(core::SplitParagraph{
+            cursor, newId, followingFormat});
         cursor = {newId, 0};
         QString insertedPart = parts[index];
         if (continuedListMarker) {
@@ -3463,7 +3791,8 @@ bool DocumentCanvas::insertInlineImageWithGeometry(
     std::vector<std::uint8_t> encodedBytes,
     const QString& accessibleName,
     std::optional<std::int64_t> requestedWidthEmu,
-    std::optional<std::int64_t> requestedHeightEmu) {
+    std::optional<std::int64_t> requestedHeightEmu,
+    core::ImageLayout layout) {
     if (rejectLiveEditDuringPreview()) return false;
     if (selectedTable_ || tableCursor_ || tableCellSelection_) {
         emit operationFailed(tr(
@@ -3582,7 +3911,7 @@ bool DocumentCanvas::insertInlineImageWithGeometry(
                                               : core::ImageFormat::jpeg,
         encodedName.toStdString(), widthEmu, heightEmu, imageId,
         insertionFormatFor(snapshot.document, normalized.value(),
-                           typingFormat_)});
+                           typingFormat_), layout});
     core::Position after = insertion;
     ++after.utf16_offset;
     const core::Range imageSelection{insertion, after};
@@ -3671,6 +4000,39 @@ bool DocumentCanvas::resizeSelectedInlineImage(double widthPoints,
                  std::nullopt, std::nullopt, false, selection_);
 }
 
+bool DocumentCanvas::setSelectedImageLayout(
+    const core::ImageLayout& layout) {
+    if (rejectLiveEditDuringPreview()) return false;
+    const auto validation = layout.validate();
+    if (!validation) {
+        emit operationFailed(errorText(validation.error()));
+        return false;
+    }
+    const auto selected = selectedInlineImage();
+    if (!selected) return false;
+    if (selected->second.layout == layout) return true;
+    return apply({core::SetImageLayout{selected->second.id, layout}},
+                 std::nullopt, std::nullopt, false, selection_);
+}
+
+bool DocumentCanvas::setSelectedImageAccessibleName(
+    const QString& accessibleName) {
+    if (rejectLiveEditDuringPreview()) return false;
+    const QByteArray utf8 = accessibleName.toUtf8();
+    if (utf8.size() > static_cast<qsizetype>(
+                          core::kMaximumImageAccessibleNameBytes)) {
+        emit operationFailed(tr("Alt text is too long."));
+        return false;
+    }
+    const auto selected = selectedInlineImage();
+    if (!selected) return false;
+    const std::string value(utf8.constData(),
+                            static_cast<std::size_t>(utf8.size()));
+    if (selected->second.accessible_name == value) return true;
+    return apply({core::SetImageAccessibleName{selected->second.id, value}},
+                 std::nullopt, std::nullopt, false, selection_);
+}
+
 void DocumentCanvas::showSelectedImageSizeDialog() {
     const auto selected = selectedInlineImage();
     if (!selected) return;
@@ -3686,16 +4048,25 @@ void DocumentCanvas::showSelectedImageSizeDialog() {
     auto* form = new QFormLayout;
     auto* width = new QDoubleSpinBox(&dialog);
     width->setObjectName(QStringLiteral("pictureSize.width"));
-    width->setRange(0.01, 200.0);
-    width->setDecimals(2);
+    constexpr double kEmuPerInch = 72.0 * kEmuPerPoint;
+    constexpr double kMinimumPictureInches = 1.0 / 72.0;
+    const double maximumPictureInches =
+        static_cast<double>(core::kMaximumInlineImageDimensionEmu) /
+        kEmuPerInch;
+    // Six decimal inches resolve to less than half an EMU, so accepting an
+    // untouched value can never silently quantize valid stored geometry.
+    width->setDecimals(6);
+    width->setRange(kMinimumPictureInches, maximumPictureInches);
     width->setSuffix(tr(" in"));
     width->setValue(selectedWidthPoints / 72.0);
     auto* height = new QDoubleSpinBox(&dialog);
     height->setObjectName(QStringLiteral("pictureSize.height"));
-    height->setRange(0.01, 200.0);
-    height->setDecimals(2);
+    height->setDecimals(6);
+    height->setRange(kMinimumPictureInches, maximumPictureInches);
     height->setSuffix(tr(" in"));
     height->setValue(selectedHeightPoints / 72.0);
+    const double initialWidthValue = width->value();
+    const double initialHeightValue = height->value();
     auto* lockAspect = new QCheckBox(tr("Lock aspect ratio"), &dialog);
     lockAspect->setObjectName(QStringLiteral("pictureSize.lockAspect"));
     lockAspect->setChecked(true);
@@ -3730,9 +4101,213 @@ void DocumentCanvas::showSelectedImageSizeDialog() {
     width->setFocus();
     width->selectAll();
     if (dialog.exec() == QDialog::Accepted) {
+        const auto toEmu = [](double inches) {
+            return static_cast<std::int64_t>(
+                std::llround(inches * 72.0 * kEmuPerPoint));
+        };
+        const std::int64_t widthEmu = width->value() == initialWidthValue
+            ? selected->second.width_emu
+            : toEmu(width->value());
+        const std::int64_t heightEmu = height->value() == initialHeightValue
+            ? selected->second.height_emu
+            : toEmu(height->value());
         static_cast<void>(resizeSelectedInlineImage(
-            width->value() * 72.0, height->value() * 72.0));
+            static_cast<double>(widthEmu) / kEmuPerPoint,
+            static_cast<double>(heightEmu) / kEmuPerPoint));
     }
+}
+
+void DocumentCanvas::showSelectedImageAltTextDialog() {
+    const auto selected = selectedInlineImage();
+    if (!selected) return;
+
+    QDialog dialog(this);
+    dialog.setObjectName(QStringLiteral("pictureAltTextDialog"));
+    dialog.setWindowTitle(tr("Picture Alt Text"));
+    auto* outer = new QVBoxLayout(&dialog);
+    auto* explanation = new QLabel(
+        tr("Describe the picture for people who use a screen reader."),
+        &dialog);
+    explanation->setWordWrap(true);
+    outer->addWidget(explanation);
+    auto* edit = new QLineEdit(&dialog);
+    edit->setObjectName(QStringLiteral("pictureAltText.value"));
+    edit->setAccessibleName(tr("Picture description"));
+    // The model limit is measured in UTF-8 bytes, not UTF-16 code units.
+    // Keep one extra code unit as an overflow sentinel: an over-limit ASCII
+    // paste must remain visibly invalid instead of being silently truncated
+    // to an apparently valid 4096-byte value.
+    edit->setMaxLength(
+        static_cast<int>(core::kMaximumImageAccessibleNameBytes) + 1);
+    edit->setText(QString::fromUtf8(
+        selected->second.accessible_name.data(),
+        static_cast<qsizetype>(selected->second.accessible_name.size())));
+    edit->selectAll();
+    outer->addWidget(edit);
+    auto* byteCount = new QLabel(&dialog);
+    byteCount->setObjectName(QStringLiteral("pictureAltText.byteCount"));
+    byteCount->setAccessibleName(tr("Alt text length"));
+    outer->addWidget(byteCount);
+    auto* buttons = new QDialogButtonBox(
+        QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
+    buttons->setObjectName(QStringLiteral("pictureAltText.buttons"));
+    outer->addWidget(buttons);
+    connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+    const auto refreshByteCount = [edit, byteCount, buttons] {
+        const qsizetype encodedBytes = edit->text().toUtf8().size();
+        const qsizetype maximumBytes = static_cast<qsizetype>(
+            core::kMaximumImageAccessibleNameBytes);
+        const bool valid = encodedBytes <= maximumBytes;
+        byteCount->setText(valid
+            ? QObject::tr("%1 of %2 UTF-8 bytes")
+                  .arg(encodedBytes)
+                  .arg(maximumBytes)
+            : QObject::tr("Alt text is %1 bytes; the maximum is %2.")
+                  .arg(encodedBytes)
+                  .arg(maximumBytes));
+        byteCount->setStyleSheet(valid
+            ? QString()
+            : QStringLiteral("color: #c01c28;"));
+        if (auto* ok = buttons->button(QDialogButtonBox::Ok)) {
+            ok->setEnabled(valid);
+        }
+    };
+    connect(edit, &QLineEdit::textChanged, &dialog,
+            [refreshByteCount](const QString&) { refreshByteCount(); });
+    refreshByteCount();
+    edit->setFocus();
+    if (dialog.exec() == QDialog::Accepted) {
+        static_cast<void>(setSelectedImageAccessibleName(edit->text()));
+    }
+}
+
+void DocumentCanvas::showSelectedImageLayoutDialog() {
+    const auto selected = selectedInlineImage();
+    if (!selected) return;
+
+    QDialog dialog(this);
+    dialog.setObjectName(QStringLiteral("pictureLayoutDialog"));
+    dialog.setWindowTitle(tr("Picture Layout"));
+    auto* outer = new QVBoxLayout(&dialog);
+    auto* form = new QFormLayout;
+    auto* placement = new QComboBox(&dialog);
+    placement->setObjectName(QStringLiteral("pictureLayout.placement"));
+    placement->addItem(tr("In Line with Text"),
+                       static_cast<int>(
+                           core::ImagePlacement::inline_with_text));
+    placement->addItem(tr("Square"),
+                       static_cast<int>(core::ImagePlacement::square));
+    placement->addItem(tr("Top and Bottom"),
+                       static_cast<int>(
+                           core::ImagePlacement::top_and_bottom));
+    const int selectedPlacement = placement->findData(
+        static_cast<int>(selected->second.layout.placement));
+    placement->setCurrentIndex(std::max(0, selectedPlacement));
+    form->addRow(tr("Text wrapping:"), placement);
+
+    const auto makeDistance = [&dialog](const char* objectName,
+                                        std::int64_t emu) {
+        auto* value = new QDoubleSpinBox(&dialog);
+        value->setObjectName(QString::fromLatin1(objectName));
+        value->setDecimals(6);
+        value->setRange(
+            0.0,
+            static_cast<double>(core::kMaximumImageWrapDistanceEmu) /
+                (72.0 * kEmuPerPoint));
+        value->setSingleStep(0.05);
+        value->setSuffix(QObject::tr(" in"));
+        value->setValue(static_cast<double>(emu) / (72.0 * kEmuPerPoint));
+        return value;
+    };
+    auto* top = makeDistance("pictureLayout.distanceTop",
+                             selected->second.layout.distance_top_emu);
+    auto* right = makeDistance("pictureLayout.distanceRight",
+                               selected->second.layout.distance_right_emu);
+    auto* bottom = makeDistance("pictureLayout.distanceBottom",
+                                selected->second.layout.distance_bottom_emu);
+    auto* left = makeDistance("pictureLayout.distanceLeft",
+                              selected->second.layout.distance_left_emu);
+    const std::array<double, 4> initialDistanceValues{
+        top->value(), right->value(), bottom->value(), left->value()};
+    form->addRow(tr("Distance above:"), top);
+    form->addRow(tr("Distance right:"), right);
+    form->addRow(tr("Distance below:"), bottom);
+    form->addRow(tr("Distance left:"), left);
+    auto* moveWithText = new QCheckBox(tr("Move with text"), &dialog);
+    moveWithText->setObjectName(QStringLiteral("pictureLayout.moveWithText"));
+    moveWithText->setChecked(selected->second.layout.move_with_text);
+    form->addRow(QString(), moveWithText);
+    outer->addLayout(form);
+
+    bool anchoredMoveWithText = moveWithText->isChecked();
+    connect(moveWithText, &QCheckBox::toggled, &dialog,
+            [&anchoredMoveWithText, moveWithText](bool checked) {
+                if (moveWithText->isEnabled()) {
+                    anchoredMoveWithText = checked;
+                }
+            });
+    const auto refreshPlacementControls = [
+        placement, moveWithText, top, right, bottom, left,
+        &anchoredMoveWithText] {
+        const bool isInline = placement->currentData().toInt() ==
+            static_cast<int>(core::ImagePlacement::inline_with_text);
+        const QSignalBlocker moveBlocker(moveWithText);
+        moveWithText->setChecked(isInline ? true : anchoredMoveWithText);
+        moveWithText->setEnabled(!isInline);
+        // Inline distances are retained for round-trip compatibility but the
+        // current page engine does not apply them visually.
+        top->setEnabled(!isInline);
+        right->setEnabled(!isInline);
+        bottom->setEnabled(!isInline);
+        left->setEnabled(!isInline);
+    };
+    connect(placement, qOverload<int>(&QComboBox::currentIndexChanged),
+            &dialog, [refreshPlacementControls](int) {
+                refreshPlacementControls();
+            });
+    refreshPlacementControls();
+
+    auto* buttons = new QDialogButtonBox(
+        QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
+    buttons->setObjectName(QStringLiteral("pictureLayout.buttons"));
+    outer->addWidget(buttons);
+    connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+    placement->setFocus();
+    if (dialog.exec() != QDialog::Accepted) return;
+
+    core::ImageLayout layout;
+    layout.placement = static_cast<core::ImagePlacement>(
+        placement->currentData().toInt());
+    const auto toEmu = [](double inches) {
+        return static_cast<std::int64_t>(
+            std::llround(inches * 72.0 * kEmuPerPoint));
+    };
+    const auto retainedEmu = [&toEmu](QDoubleSpinBox* field,
+                                     double initialValue,
+                                     std::int64_t originalEmu) {
+        return field->value() == initialValue
+            ? originalEmu
+            : toEmu(field->value());
+    };
+    layout.distance_top_emu = retainedEmu(
+        top, initialDistanceValues[0],
+        selected->second.layout.distance_top_emu);
+    layout.distance_right_emu = retainedEmu(
+        right, initialDistanceValues[1],
+        selected->second.layout.distance_right_emu);
+    layout.distance_bottom_emu = retainedEmu(
+        bottom, initialDistanceValues[2],
+        selected->second.layout.distance_bottom_emu);
+    layout.distance_left_emu = retainedEmu(
+        left, initialDistanceValues[3],
+        selected->second.layout.distance_left_emu);
+    layout.move_with_text = layout.placement ==
+            core::ImagePlacement::inline_with_text
+        ? true
+        : moveWithText->isChecked();
+    static_cast<void>(setSelectedImageLayout(layout));
 }
 
 bool DocumentCanvas::insertTable(std::size_t rows, std::size_t columns,
@@ -3762,7 +4337,8 @@ bool DocumentCanvas::insertTable(std::size_t rows, std::size_t columns,
         operations.push_back(core::DeleteRange{selection_});
     }
     operations.push_back(core::SplitParagraph{
-        normalized.value().start, rightParagraphId});
+        normalized.value().start, rightParagraphId,
+        std::optional<core::CharacterFormat>(typingFormat_)});
     operations.push_back(core::InsertTable{
         rightParagraphId, std::move(table.value())});
     const core::Range bodyCursor{{rightParagraphId, 0}, {rightParagraphId, 0}};
@@ -4487,9 +5063,14 @@ void DocumentCanvas::togglePlainTextList(bool numbered) {
         changes.push_back({paragraph.id(), oldLength, newLength});
         const QString oldPrefix = text.first(static_cast<qsizetype>(oldLength));
         if (oldPrefix != replacement) {
+            const auto replacementFormat =
+                normalized.value().empty() && marker && marker->emptyItem
+                ? std::optional<core::CharacterFormat>(typingFormat_)
+                : std::optional<core::CharacterFormat>(
+                      paragraph.characterFormatAt(0));
             operations.push_back(core::ReplaceRange{
                 {{paragraph.id(), 0}, {paragraph.id(), oldLength}},
-                toUtf16(replacement), paragraph.characterFormatAt(0)});
+                toUtf16(replacement), replacementFormat});
         }
         operations.push_back(core::SetParagraphFormat{
             {paragraph.id()}, removeList
@@ -4541,7 +5122,9 @@ bool DocumentCanvas::continuePlainTextList() {
         const core::Position start{selection_.focus.paragraph_id, 0};
         const core::Position end{selection_.focus.paragraph_id,
                                  static_cast<std::size_t>(text.size())};
-        apply({core::DeleteRange{{start, end}},
+        apply({core::DeleteRange{
+                   {start, end},
+                   std::optional<core::CharacterFormat>(typingFormat_)},
                core::SetParagraphFormat{{start.paragraph_id},
                                         clearSemanticListDelta()}},
               start);
@@ -4592,12 +5175,12 @@ bool DocumentCanvas::continuePlainTextList() {
     if (!normalized.value().empty()) {
         operations.push_back(core::DeleteRange{adjustedRange});
     }
-    operations.push_back(core::SplitParagraph{splitPosition, newId});
+    operations.push_back(core::SplitParagraph{
+        splitPosition, newId,
+        std::optional<core::CharacterFormat>(typingFormat_)});
     operations.push_back(core::InsertText{
         {newId, 0}, toUtf16(nextPrefix),
-        typingFormat_.empty()
-            ? std::nullopt
-            : std::optional<core::CharacterFormat>(typingFormat_)});
+        std::optional<core::CharacterFormat>(typingFormat_)});
     if (!paragraph->format().list_id) {
         const auto delta = semanticListDelta(listId, level, listLayout);
         operations.push_back(core::SetParagraphFormat{
@@ -4902,7 +5485,9 @@ bool DocumentCanvas::handlePlainTextListBackspace() {
     const core::Position end{
         selection_.focus.paragraph_id,
         static_cast<std::size_t>(marker->prefixLength)};
-    apply({core::DeleteRange{{start, end}},
+    apply({core::DeleteRange{
+               {start, end},
+               std::optional<core::CharacterFormat>(typingFormat_)},
            core::SetParagraphFormat{{start.paragraph_id},
                                     clearSemanticListDelta()}},
           start);
@@ -4987,9 +5572,15 @@ void DocumentCanvas::copy() {
     resetVerticalNavigation();
     if (const auto selected = selectedInlineImage()) {
         const QByteArray native = encodeClipboardInlineImage(selected->second);
+        const QByteArray legacy = encodeClipboardInlineImage(
+            selected->second, true);
         if (native.isEmpty()) return;
         auto* mime = new QMimeData;
         mime->setData(QString::fromLatin1(kInlineImageClipboardMime), native);
+        if (!legacy.isEmpty()) {
+            mime->setData(
+                QString::fromLatin1(kInlineImageClipboardLegacyMime), legacy);
+        }
         const auto payload = selected->second.encoded_payload.bytes();
         const QByteArray encoded(
             reinterpret_cast<const char*>(payload.data()),
@@ -5047,9 +5638,15 @@ void DocumentCanvas::paste() {
     clearPendingSpellingWord();
     const QMimeData* mime = QApplication::clipboard()->mimeData();
     if (!tableCursor_ && !selectedTable_ && mime &&
-        mime->hasFormat(QString::fromLatin1(kInlineImageClipboardMime))) {
+        (mime->hasFormat(QString::fromLatin1(kInlineImageClipboardMime)) ||
+         mime->hasFormat(
+             QString::fromLatin1(kInlineImageClipboardLegacyMime)))) {
+        const QString nativeFormat = mime->hasFormat(
+            QString::fromLatin1(kInlineImageClipboardMime))
+            ? QString::fromLatin1(kInlineImageClipboardMime)
+            : QString::fromLatin1(kInlineImageClipboardLegacyMime);
         const auto image = decodeClipboardInlineImage(
-            mime->data(QString::fromLatin1(kInlineImageClipboardMime)));
+            mime->data(nativeFormat));
         if (!image) {
             emit operationFailed(tr(
                 "The Owl Docs picture on the clipboard is malformed or exceeds the safety limits."));
@@ -5057,7 +5654,7 @@ void DocumentCanvas::paste() {
         }
         static_cast<void>(insertInlineImageWithGeometry(
             image->encodedBytes, image->accessibleName,
-            image->widthEmu, image->heightEmu));
+            image->widthEmu, image->heightEmu, image->layout));
         return;
     }
     if (!tableCursor_ && !selectedTable_ && mime) {
@@ -5150,7 +5747,14 @@ void DocumentCanvas::deleteBackward(bool byWord) {
             }
         }
         core::Position start{paragraph.id(), static_cast<std::size_t>(previous)};
-        apply({core::DeleteRange{{start, selection_.focus}}}, start);
+        const bool emptiesParagraph = start.utf16_offset == 0 &&
+            selection_.focus.utf16_offset == paragraph.text().size();
+        apply({core::DeleteRange{
+                   {start, selection_.focus},
+                   emptiesParagraph
+                       ? std::optional<core::CharacterFormat>(typingFormat_)
+                       : std::nullopt}},
+              start);
     } else if (*index > 0) {
         const auto& previous = snap.document.paragraphs()[*index - 1];
         const core::Position cursor{previous.id(), previous.text().size()};
@@ -5193,7 +5797,14 @@ void DocumentCanvas::deleteForward(bool byWord) {
             }
         }
         const core::Position end{paragraph.id(), static_cast<std::size_t>(next)};
-        apply({core::DeleteRange{{selection_.focus, end}}}, selection_.focus);
+        const bool emptiesParagraph = selection_.focus.utf16_offset == 0 &&
+            end.utf16_offset == paragraph.text().size();
+        apply({core::DeleteRange{
+                   {selection_.focus, end},
+                   emptiesParagraph
+                       ? std::optional<core::CharacterFormat>(typingFormat_)
+                       : std::nullopt}},
+              selection_.focus);
     } else if (*index + 1 < snap.document.paragraphs().size()) {
         const auto& nextParagraph = snap.document.paragraphs()[*index + 1];
         std::vector<core::Operation> operations;
@@ -5395,6 +6006,13 @@ void DocumentCanvas::moveVertical(bool down, bool extend) {
 }
 
 void DocumentCanvas::keyPressEvent(QKeyEvent* event) {
+    if (imageResizeDrag_ && event->key() == Qt::Key_Escape) {
+        imageResizeDrag_.reset();
+        viewport()->setCursor(Qt::ArrowCursor);
+        viewport()->update();
+        event->accept();
+        return;
+    }
     if (previewId_) {
         const bool unmodifiedText =
             !(event->modifiers() & (Qt::ControlModifier | Qt::AltModifier |
@@ -5429,6 +6047,14 @@ void DocumentCanvas::keyPressEvent(QKeyEvent* event) {
     if (event->matches(QKeySequence::Bold)) { toggleBold(); return; }
     if (event->matches(QKeySequence::Italic)) { toggleItalic(); return; }
     if (event->matches(QKeySequence::Underline)) { toggleUnderline(); return; }
+    if (selectedInlineImageId() && event->key() == Qt::Key_F2) {
+        if (event->modifiers() & Qt::ShiftModifier) {
+            showSelectedImageAltTextDialog();
+        } else {
+            showSelectedImageSizeDialog();
+        }
+        return;
+    }
     const auto tableMoveShortcut =
         (event->modifiers() & (Qt::ShiftModifier | Qt::AltModifier |
                                Qt::ControlModifier | Qt::MetaModifier)) ==
@@ -5936,6 +6562,50 @@ DocumentCanvas::Hit DocumentCanvas::hitTest(const QPoint& viewportPoint) const {
                            verticalScrollBar()->value();
     const QPointF point((viewportPoint.x() - left) / scale,
                         (viewportPoint.y() - pageTop) / scale);
+    if (const auto selectedImage = selectedInlineImageId()) {
+        constexpr double kHandleHitPixels = 8.0;
+        const double radius = kHandleHitPixels / std::max(0.01, scale);
+        for (const auto& paragraph : visuals_) {
+            const auto found = std::find_if(
+                paragraph->images.begin(), paragraph->images.end(),
+                [selectedImage, page](const ParagraphImageVisual& image) {
+                    return image.id == *selectedImage &&
+                           image.pageIndex == page;
+                });
+            if (found == paragraph->images.end()) continue;
+            const QRectF rect = imageResizeDrag_ &&
+                    imageResizeDrag_->imageId == found->id &&
+                    imageResizeDrag_->pageIndex == page
+                ? imageResizeDrag_->previewRect
+                : found->rect;
+            const std::array<std::pair<ImageResizeHandle, QPointF>, 3>
+                handles{{
+                    // Prefer the corner when handles overlap on a very small
+                    // picture; it changes both dimensions and matches the
+                    // visible bottom-right affordance.
+                    {ImageResizeHandle::bottom_right, rect.bottomRight()},
+                    {ImageResizeHandle::right, QPointF(rect.right(),
+                                                       rect.center().y())},
+                    {ImageResizeHandle::bottom, QPointF(rect.center().x(),
+                                                        rect.bottom())},
+                }};
+            for (const auto& [handle, center] : handles) {
+                if (!QRectF(center.x() - radius, center.y() - radius,
+                            radius * 2.0, radius * 2.0)
+                         .contains(point)) {
+                    continue;
+                }
+                Hit hit;
+                hit.image = found->id;
+                hit.position = {paragraph->id, found->coreUtf16Offset};
+                hit.imageResizeHandle = handle;
+                hit.pagePoint = point;
+                hit.pageIndex = page;
+                return hit;
+            }
+            break;
+        }
+    }
     for (const auto& tableVisual : tableVisuals_) {
         if (tableVisual->handlePageIndex == page &&
             tableVisual->handleRect.adjusted(-2.0, -2.0, 2.0, 2.0)
@@ -5979,14 +6649,20 @@ DocumentCanvas::Hit DocumentCanvas::hitTest(const QPoint& viewportPoint) const {
             return hit;
         }
     }
-    for (const auto& paragraph : visuals_) {
-        for (const auto& image : paragraph->images) {
-            if (image.pageIndex == page &&
-                image.rect.adjusted(-2.0, -2.0, 2.0, 2.0)
+    // Pictures are painted in document order, so the last intersecting
+    // picture is visually on top and must receive the click first.
+    for (auto paragraph = visuals_.rbegin(); paragraph != visuals_.rend();
+         ++paragraph) {
+        for (auto image = (*paragraph)->images.rbegin();
+             image != (*paragraph)->images.rend(); ++image) {
+            if (image->pageIndex == page &&
+                image->rect.adjusted(-2.0, -2.0, 2.0, 2.0)
                     .contains(point)) {
                 Hit hit;
-                hit.image = image.id;
-                hit.position = {paragraph->id, image.coreUtf16Offset};
+                hit.image = image->id;
+                hit.position = {(*paragraph)->id, image->coreUtf16Offset};
+                hit.pagePoint = point;
+                hit.pageIndex = page;
                 return hit;
             }
         }
@@ -6040,6 +6716,31 @@ void DocumentCanvas::mousePressEvent(QMouseEvent* event) {
             tableDropBefore_.reset();
             selecting_ = false;
             viewport()->setCursor(Qt::SizeAllCursor);
+            event->accept();
+            return;
+        }
+        if (hit.image && hit.imageResizeHandle) {
+            static_cast<void>(selectInlineImage(*hit.image));
+            ensureLayout();
+            for (const auto& paragraph : visuals_) {
+                const auto found = std::find_if(
+                    paragraph->images.begin(), paragraph->images.end(),
+                    [&hit](const ParagraphImageVisual& image) {
+                        return image.id == *hit.image;
+                    });
+                if (found == paragraph->images.end()) continue;
+                const auto selected = selectedInlineImage();
+                if (!selected) break;
+                imageResizeDrag_ = ImageResizeDrag{
+                    found->id, *hit.imageResizeHandle, hit.pagePoint,
+                    found->rect, found->rect, found->pageIndex,
+                    static_cast<double>(selected->second.width_emu) /
+                        kEmuPerPoint,
+                    static_cast<double>(selected->second.height_emu) /
+                        kEmuPerPoint};
+                break;
+            }
+            selecting_ = false;
             event->accept();
             return;
         }
@@ -6218,6 +6919,63 @@ void DocumentCanvas::mouseMoveEvent(QMouseEvent* event) {
     if (previewId_) {
         return;
     }
+    if (imageResizeDrag_ && (event->buttons() & Qt::LeftButton)) {
+        const double scale = kScreenPointsScale * zoomPercent_ / 100.0;
+        const double pagePixelWidth = pageWidthPoints_ * scale;
+        const double documentWidth = std::max(
+            pagePixelWidth + 2 * kCanvasPaddingPixels,
+            static_cast<double>(viewport()->width()));
+        const double left = (documentWidth - pagePixelWidth) / 2.0 -
+                            horizontalScrollBar()->value();
+        const double pageTop = kCanvasPaddingPixels +
+            imageResizeDrag_->pageIndex *
+                (pageHeightPoints_ * scale + kPageGapPixels) -
+            verticalScrollBar()->value();
+        const QPointF current(
+            (event->position().x() - left) / scale,
+            (event->position().y() - pageTop) / scale);
+        const QPointF delta = current - imageResizeDrag_->startPoint;
+        const QRectF original = imageResizeDrag_->originalRect;
+        const auto handle = imageResizeDrag_->handle;
+        const bool changesWidth = handle == ImageResizeHandle::right ||
+                                  handle == ImageResizeHandle::bottom_right;
+        const bool changesHeight = handle == ImageResizeHandle::bottom ||
+                                   handle == ImageResizeHandle::bottom_right;
+        constexpr double kMinimumPicturePoints = 1.0;
+        constexpr double kMaximumPicturePoints = 20'000.0;
+        double width = original.width();
+        double height = original.height();
+        if (changesWidth) width += delta.x();
+        if (changesHeight) height += delta.y();
+        width = std::clamp(width, kMinimumPicturePoints,
+                           kMaximumPicturePoints);
+        height = std::clamp(height, kMinimumPicturePoints,
+                            kMaximumPicturePoints);
+
+        const bool corner = handle == ImageResizeHandle::bottom_right;
+        if (corner && !(event->modifiers() & Qt::ShiftModifier) &&
+            original.width() > 0.0 && original.height() > 0.0) {
+            const double aspect = original.width() / original.height();
+            const double widthChange = std::abs(
+                width / original.width() - 1.0);
+            const double heightChange = std::abs(
+                height / original.height() - 1.0);
+            if (widthChange >= heightChange) {
+                height = std::clamp(width / aspect,
+                                    kMinimumPicturePoints,
+                                    kMaximumPicturePoints);
+            } else {
+                width = std::clamp(height * aspect,
+                                   kMinimumPicturePoints,
+                                   kMaximumPicturePoints);
+            }
+        }
+        imageResizeDrag_->previewRect = QRectF(
+            original.topLeft(), QSizeF(width, height));
+        viewport()->update();
+        event->accept();
+        return;
+    }
     if (draggingTable_ && (event->buttons() & Qt::LeftButton)) {
         ensureLayout();
         const double scale = kScreenPointsScale * zoomPercent_ / 100.0;
@@ -6247,10 +7005,24 @@ void DocumentCanvas::mouseMoveEvent(QMouseEvent* event) {
         return;
     }
     const auto hover = hitTest(event->position().toPoint());
-    viewport()->setCursor(
-        hover.tableHandle ? Qt::SizeAllCursor
-                          : hover.image ? Qt::ArrowCursor
-                                        : Qt::IBeamCursor);
+    if (hover.imageResizeHandle) {
+        switch (*hover.imageResizeHandle) {
+            case ImageResizeHandle::bottom_right:
+                viewport()->setCursor(Qt::SizeFDiagCursor);
+                break;
+            case ImageResizeHandle::bottom:
+                viewport()->setCursor(Qt::SizeVerCursor);
+                break;
+            case ImageResizeHandle::right:
+                viewport()->setCursor(Qt::SizeHorCursor);
+                break;
+        }
+    } else {
+        viewport()->setCursor(
+            hover.tableHandle ? Qt::SizeAllCursor
+                              : hover.image ? Qt::ArrowCursor
+                                            : Qt::IBeamCursor);
+    }
     if (selecting_ && tableMouseSelectionAnchor_ &&
         (event->buttons() & Qt::LeftButton) && hover.tableCursor &&
         hover.tableCursor->tableId == tableMouseSelectionAnchor_->tableId) {
@@ -6293,6 +7065,27 @@ void DocumentCanvas::mouseReleaseEvent(QMouseEvent* event) {
     if (event->button() != Qt::LeftButton) return;
     selecting_ = false;
     tableMouseSelectionAnchor_.reset();
+    if (imageResizeDrag_) {
+        const auto drag = *imageResizeDrag_;
+        imageResizeDrag_.reset();
+        viewport()->setCursor(Qt::ArrowCursor);
+        const bool changed =
+            std::abs(drag.previewRect.width() - drag.originalRect.width()) >
+                0.01 ||
+            std::abs(drag.previewRect.height() - drag.originalRect.height()) >
+                0.01;
+        if (changed && drag.originalRect.width() > 0.0 &&
+            drag.originalRect.height() > 0.0) {
+            const double width = drag.originalWidthPoints *
+                drag.previewRect.width() / drag.originalRect.width();
+            const double height = drag.originalHeightPoints *
+                drag.previewRect.height() / drag.originalRect.height();
+            static_cast<void>(resizeSelectedInlineImage(width, height));
+        }
+        viewport()->update();
+        event->accept();
+        return;
+    }
     if (draggingTable_) {
         draggingTable_ = false;
         viewport()->setCursor(Qt::IBeamCursor);
@@ -6377,6 +7170,14 @@ void DocumentCanvas::contextMenuEvent(QContextMenuEvent* event) {
         size->setObjectName(QStringLiteral("context.pictureSize"));
         connect(size, &QAction::triggered, this,
                 &DocumentCanvas::showSelectedImageSizeDialog);
+        auto* altText = menu.addAction(tr("Alt Text…"));
+        altText->setObjectName(QStringLiteral("context.pictureAltText"));
+        connect(altText, &QAction::triggered, this,
+                &DocumentCanvas::showSelectedImageAltTextDialog);
+        auto* layout = menu.addAction(tr("Wrap and Layout…"));
+        layout->setObjectName(QStringLiteral("context.pictureLayout"));
+        connect(layout, &QAction::triggered, this,
+                &DocumentCanvas::showSelectedImageLayoutDialog);
         auto* remove = menu.addAction(tr("Delete Picture"));
         remove->setObjectName(QStringLiteral("context.deletePicture"));
         connect(remove, &QAction::triggered, this,
@@ -6473,6 +7274,7 @@ void DocumentCanvas::focusInEvent(QFocusEvent* event) {
 void DocumentCanvas::focusOutEvent(QFocusEvent* event) {
     endTypingGroup();
     clearPendingSpellingWord();
+    imageResizeDrag_.reset();
     QAbstractScrollArea::focusOutEvent(event); viewport()->update();
 }
 
@@ -6672,7 +7474,7 @@ void DocumentCanvas::applyCharacterFormatInternal(
                 tableSelectionAnchor_.value_or(focus), cell->text.size());
             const auto start = std::min(anchor, focus);
             const auto end = std::max(anchor, focus);
-            if (start == end) {
+            if (start == end && !cell->text.empty()) {
                 typingFormat_ = std::move(resultingTypingFormat);
                 emitCursorFormat();
                 return;
@@ -6704,8 +7506,23 @@ void DocumentCanvas::applyCharacterFormatInternal(
     auto resultingTypingFormat = typingFormat_;
     delta.applyTo(resultingTypingFormat);
     if (selection_.anchor == selection_.focus) {
-        typingFormat_ = std::move(resultingTypingFormat);
-        emitCursorFormat();
+        const auto snap = session_->snapshot();
+        const auto* paragraph = snap.document.findParagraph(
+            selection_.focus.paragraph_id);
+        if (paragraph && paragraph->text().empty()) {
+            // Empty lines have no character run to recover from after the
+            // user clicks elsewhere, so keep their insertion format in the
+            // semantic paragraph mark. A non-empty caret remains transient
+            // until text is actually entered, matching normal editor
+            // behavior and avoiding an invisible document mutation.
+            apply({core::SetParagraphMarkCharacterFormat{
+                       selection_.focus.paragraph_id, delta}},
+                  std::nullopt, std::move(resultingTypingFormat), false,
+                  selection_, coalesceWithPrevious);
+        } else {
+            typingFormat_ = std::move(resultingTypingFormat);
+            emitCursorFormat();
+        }
         return;
     }
     apply({core::SetCharacterFormat{selection_, delta}}, std::nullopt,
@@ -6867,7 +7684,9 @@ void DocumentCanvas::insertPageBreak() {
     if (!normalized.value().empty()) {
         operations.push_back(core::DeleteRange{selection_});
     }
-    operations.push_back(core::SplitParagraph{normalized.value().start, newId});
+    operations.push_back(core::SplitParagraph{
+        normalized.value().start, newId,
+        std::optional<core::CharacterFormat>(typingFormat_)});
     core::ParagraphFormatDelta delta;
     delta.page_break_before = core::PropertyDelta<bool>::set(true);
     operations.push_back(core::SetParagraphFormat{{newId}, delta});

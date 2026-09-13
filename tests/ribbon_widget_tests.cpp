@@ -80,6 +80,19 @@ int main(int argc, char** argv) {
     for (const auto& id : tableCommandIds) {
         commands.add(id, id, QKeySequence(), [] {});
     }
+    const QStringList pictureCommandIds{
+        QStringLiteral("picture.size"),
+        QStringLiteral("picture.altText"),
+        QStringLiteral("picture.layoutOptions"),
+        QStringLiteral("picture.wrapInline"),
+        QStringLiteral("picture.wrapSquare"),
+        QStringLiteral("picture.wrapTopBottom"),
+        QStringLiteral("picture.delete"),
+    };
+    for (const auto& id : pictureCommandIds) {
+        commands.add(id, id, QKeySequence(), [] {},
+                     id.startsWith(QStringLiteral("picture.wrap")));
+    }
 
     docxstudio::app::RibbonWidget ribbon(commands);
     auto* fontPicker = ribbon.findChild<QFontComboBox*>(
@@ -218,10 +231,13 @@ int main(int argc, char** argv) {
     check(tabs != nullptr, "ribbon has no tab widget");
     const int homeIndex = tabIndex(*tabs, QStringLiteral("Home"));
     const int tableIndex = tabIndex(*tabs, QStringLiteral("Table"));
-    check(homeIndex >= 0 && tableIndex >= 0,
-          "ribbon is missing Home or contextual Table tab");
+    const int pictureIndex = tabIndex(*tabs, QStringLiteral("Picture"));
+    check(homeIndex >= 0 && tableIndex >= 0 && pictureIndex >= 0,
+          "ribbon is missing a primary or contextual tab");
     check(!tabs->isTabVisible(tableIndex),
           "Table tab is visible without a selected table");
+    check(!tabs->isTabVisible(pictureIndex),
+          "Picture tab is visible without a selected picture");
     for (const auto& id : tableCommandIds) {
         auto* action = commands.action(id);
         auto* button = ribbon.findChild<QToolButton*>(
@@ -234,6 +250,35 @@ int main(int argc, char** argv) {
                   !button->toolTip().isEmpty(),
               "Table command is not an accessible icon action");
     }
+    for (const auto& id : pictureCommandIds) {
+        check(!commands.action(id)->isEnabled(),
+              "Picture command is enabled outside a picture context");
+    }
+
+    ribbon.setPictureContext(true,
+                             docxstudio::core::ImagePlacement::square);
+    check(tabs->isTabVisible(pictureIndex),
+          "Picture tab did not appear for a selected picture");
+    for (const auto& id : pictureCommandIds) {
+        check(commands.action(id)->isEnabled(),
+              "Picture command stayed disabled inside a picture context");
+    }
+    check(commands.action(QStringLiteral("picture.wrapSquare"))->isChecked() &&
+              !commands.action(QStringLiteral("picture.wrapInline"))->isChecked() &&
+              !commands.action(QStringLiteral("picture.wrapTopBottom"))->isChecked(),
+          "Picture ribbon did not mirror the selected wrap mode");
+    auto* pictureWrap = ribbon.findChild<QToolButton*>(
+        QStringLiteral("ribbonButton.picture.wrap"));
+    check(pictureWrap && pictureWrap->menu() &&
+              pictureWrap->menu()->actions().size() == 3 &&
+              !pictureWrap->icon().isNull() &&
+              !pictureWrap->accessibleName().isEmpty(),
+          "Picture ribbon has no accessible visual wrap menu");
+    tabs->setCurrentIndex(pictureIndex);
+    ribbon.setPictureContext(false);
+    check(!tabs->isTabVisible(pictureIndex) &&
+              tabs->currentIndex() == homeIndex,
+          "closing picture context did not return the ribbon to Home");
 
     ribbon.setTableContext(true);
     check(tabs->isTabVisible(tableIndex),

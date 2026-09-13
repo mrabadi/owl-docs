@@ -131,6 +131,31 @@ struct EquationPayload {
     auto operator<=>(const EquationPayload&) const = default;
 };
 
+inline constexpr std::int64_t kMaximumImageWrapDistanceEmu = 254000000;
+inline constexpr std::int64_t kMaximumImageDimensionEmu = 254000000;
+inline constexpr std::size_t kMaximumImageAccessibleNameBytes =
+    4U * 1024U;
+
+// This transport-neutral subset deliberately models only placements whose
+// positioning and wrapping can be regenerated without guessing. Other
+// DrawingML anchors remain opaque in the opened package.
+enum class ImagePlacement : std::uint8_t {
+    inline_with_text,
+    square,
+    top_and_bottom,
+};
+
+struct ImageLayout {
+    ImagePlacement placement{ImagePlacement::inline_with_text};
+    std::int64_t distance_top_emu{0};
+    std::int64_t distance_right_emu{0};
+    std::int64_t distance_bottom_emu{0};
+    std::int64_t distance_left_emu{0};
+    bool move_with_text{true};
+
+    auto operator<=>(const ImageLayout&) const = default;
+};
+
 // Value-like, immutable byte storage shared by every DrawingML reference to
 // one package member. Copying paragraphs or snapshots therefore cannot copy a
 // large media member once per reference.
@@ -198,6 +223,10 @@ struct InlineImagePayload {
     std::int64_t width_emu{0};
     std::int64_t height_emu{0};
     SharedImageBytes bytes;
+    // DrawingML docPr@descr. `name` remains the required DrawingML object
+    // identity/display name and is the fallback when descr is absent.
+    std::string accessible_name;
+    ImageLayout layout;
 
     [[nodiscard]] bool renderable() const noexcept {
         return width_emu > 0 && height_emu > 0 && !bytes.empty();
@@ -410,15 +439,24 @@ struct NewInlineImage {
     std::int64_t width_emu{0};
     std::int64_t height_emu{0};
     std::vector<std::uint8_t> bytes;
+    std::string accessible_name;
+    ImageLayout layout;
 
     auto operator<=>(const NewInlineImage&) const = default;
 };
 
 struct NewRun {
     NewRun() = default;
+    NewRun(std::string new_text, BasicRunFormat new_format)
+        : text(std::move(new_text)), format(std::move(new_format)) {}
     NewRun(std::string new_text, BasicRunFormat new_format,
-           std::optional<EquationPayload> new_equation = std::nullopt,
-           std::optional<NewInlineImage> new_inline_image = std::nullopt)
+           std::optional<EquationPayload> new_equation)
+        : text(std::move(new_text)),
+          format(std::move(new_format)),
+          equation(std::move(new_equation)) {}
+    NewRun(std::string new_text, BasicRunFormat new_format,
+           std::optional<EquationPayload> new_equation,
+           std::optional<NewInlineImage> new_inline_image)
         : text(std::move(new_text)),
           format(std::move(new_format)),
           equation(std::move(new_equation)),
@@ -476,8 +514,8 @@ struct NewParagraph {
     std::optional<bool> page_break_before;
     std::vector<std::uint32_t> left_tab_stops_twips;
     std::optional<NewNumbering> numbering;
-    // Written as w:pPr/w:rPr. Use this for an empty table cell's insertion
-    // format instead of relying on a zero-length w:r alone.
+    // Written as w:pPr/w:rPr. This is the durable insertion format of an
+    // empty body paragraph or table cell; a zero-length w:r is not equivalent.
     std::optional<BasicRunFormat> paragraph_mark_format;
 
     auto operator<=>(const NewParagraph&) const = default;

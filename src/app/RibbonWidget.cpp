@@ -241,6 +241,46 @@ QIcon paintedCommandIcon(const QString& id, const QWidget* widget,
         mountains.lineTo(16, 12);
         mountains.lineTo(20, 18);
         painter.drawPath(mountains);
+    } else if (id == QStringLiteral("picture.size")) {
+        painter.drawRect(QRectF(5, 5, 14, 14));
+        painter.drawLine(2, 2, 9, 2);
+        painter.drawLine(2, 2, 2, 9);
+        painter.drawLine(2, 2, 8, 8);
+        painter.drawLine(15, 22, 22, 22);
+        painter.drawLine(22, 15, 22, 22);
+        painter.drawLine(16, 16, 22, 22);
+    } else if (id == QStringLiteral("picture.altText")) {
+        painter.drawRoundedRect(QRectF(3, 5, 18, 14), 1, 1);
+        painter.drawEllipse(QPointF(16.5, 9), 1.8, 1.8);
+        painter.drawLine(5, 17, 10, 12);
+        painter.drawLine(10, 12, 14, 16);
+        QFont font = widget->font();
+        font.setPointSize(7);
+        font.setBold(true);
+        painter.setFont(font);
+        painter.drawText(QRect(1, 0, 14, 9), Qt::AlignLeft, QStringLiteral("ALT"));
+    } else if (id == QStringLiteral("picture.layoutOptions")) {
+        painter.drawRect(QRectF(7, 7, 10, 10));
+        painter.drawLine(2, 4, 22, 4);
+        painter.drawLine(2, 20, 22, 20);
+        painter.drawLine(2, 9, 5, 9);
+        painter.drawLine(19, 9, 22, 9);
+        painter.drawLine(2, 14, 5, 14);
+        painter.drawLine(19, 14, 22, 14);
+    } else if (id == QStringLiteral("picture.delete")) {
+        painter.drawRect(QRectF(5, 6, 14, 14));
+        painter.setPen(QPen(QColor(QStringLiteral("#c62828")), 2.0,
+                            Qt::SolidLine, Qt::RoundCap));
+        painter.drawLine(4, 4, 20, 20);
+        painter.drawLine(20, 4, 4, 20);
+    } else if (id.startsWith(QStringLiteral("picture.wrap"))) {
+        painter.drawRect(QRectF(8, 7, 8, 10));
+        painter.drawLine(2, 4, 22, 4);
+        painter.drawLine(2, 20, 22, 20);
+        painter.drawLine(2, 9, 6, 9);
+        painter.drawLine(18, 9, 22, 9);
+        painter.drawLine(2, 14, 6, 14);
+        painter.drawLine(18, 14, 22, 14);
     } else if (id == QStringLiteral("insert.equation")) {
         drawLetter(QStringLiteral("∑"), false, true, 15);
     } else if (id == QStringLiteral("insert.comment") ||
@@ -443,8 +483,10 @@ RibbonWidget::RibbonWidget(CommandRegistry& commands, QWidget* parent) : QWidget
     listTabIndex_ = tabs_->addTab(makeListTab(commands), tr("List"));
     tabs_->setTabVisible(listTabIndex_, false);
     tableTabIndex_ = tabs_->addTab(makeTableTab(commands), tr("Table"));
+    pictureTabIndex_ = tabs_->addTab(makePictureTab(commands), tr("Picture"));
     outer->addWidget(tabs_);
     setTableContext(false);
+    setPictureContext(false);
     setFontFamily(QStringLiteral("Carlito"));
     setFontPointSize(11.0);
     setTextColor(Qt::black);
@@ -773,6 +815,50 @@ QWidget* RibbonWidget::makeTableTab(CommandRegistry& commands) {
     return page;
 }
 
+QWidget* RibbonWidget::makePictureTab(CommandRegistry& commands) {
+    QHBoxLayout* layout{};
+    auto* page = makeTabPage(this, layout);
+    page->setObjectName(QStringLiteral("ribbon.pictureTab"));
+
+    addButtons(layout, commands, page,
+               {"picture.size", "picture.altText", "picture.layoutOptions"});
+    layout->addWidget(divider(page));
+
+    auto* wrap = new QToolButton(page);
+    wrap->setObjectName(QStringLiteral("ribbonButton.picture.wrap"));
+    wrap->setText(tr("Wrap Text"));
+    wrap->setIcon(paintedCommandIcon(QStringLiteral("picture.wrap"), page));
+    wrap->setIconSize(QSize(22, 22));
+    wrap->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+    wrap->setPopupMode(QToolButton::InstantPopup);
+    wrap->setAutoRaise(true);
+    wrap->setFocusPolicy(Qt::NoFocus);
+    wrap->setAccessibleName(tr("Wrap Text"));
+    wrap->setAccessibleDescription(
+        tr("Choose how text flows around the selected picture"));
+    wrap->setToolTip(wrap->accessibleDescription());
+    auto* wrapMenu = new QMenu(wrap);
+    wrapMenu->setObjectName(QStringLiteral("ribbonMenu.picture.wrap"));
+    pictureWrapInline_ = commands.action(QStringLiteral("picture.wrapInline"));
+    pictureWrapSquare_ = commands.action(QStringLiteral("picture.wrapSquare"));
+    pictureWrapTopBottom_ =
+        commands.action(QStringLiteral("picture.wrapTopBottom"));
+    for (auto* action : {pictureWrapInline_, pictureWrapSquare_,
+                         pictureWrapTopBottom_}) {
+        if (!action) continue;
+        if (action->icon().isNull()) {
+            action->setIcon(paintedCommandIcon(action->objectName(), page));
+        }
+        wrapMenu->addAction(action);
+    }
+    wrap->setMenu(wrapMenu);
+    layout->addWidget(wrap);
+    layout->addWidget(divider(page));
+    addButtons(layout, commands, page, {"picture.delete"});
+    layout->addStretch(1);
+    return page;
+}
+
 void RibbonWidget::setFontFamily(const QString& family) {
     const QSignalBlocker blocker(fontFamily_);
     fontFamily_->setCurrentFont(QFont(family));
@@ -831,6 +917,45 @@ void RibbonWidget::setTableContext(bool visible) {
         tabs_->setCurrentIndex(0);
     }
     tabs_->setTabVisible(tableTabIndex_, visible);
+}
+
+void RibbonWidget::setPictureContext(bool visible,
+                                     core::ImagePlacement placement) {
+    if (!tabs_ || pictureTabIndex_ < 0) return;
+    auto* page = tabs_->widget(pictureTabIndex_);
+    if (page) {
+        const auto buttons = page->findChildren<QToolButton*>();
+        for (auto* button : buttons) {
+            if (auto* action = button->defaultAction()) {
+                action->setEnabled(visible);
+            } else {
+                button->setEnabled(visible);
+            }
+        }
+    }
+    for (auto* action : {pictureWrapInline_, pictureWrapSquare_,
+                         pictureWrapTopBottom_}) {
+        if (action) action->setEnabled(visible);
+    }
+    if (pictureWrapInline_) {
+        const QSignalBlocker blocker(pictureWrapInline_);
+        pictureWrapInline_->setChecked(
+            placement == core::ImagePlacement::inline_with_text);
+    }
+    if (pictureWrapSquare_) {
+        const QSignalBlocker blocker(pictureWrapSquare_);
+        pictureWrapSquare_->setChecked(
+            placement == core::ImagePlacement::square);
+    }
+    if (pictureWrapTopBottom_) {
+        const QSignalBlocker blocker(pictureWrapTopBottom_);
+        pictureWrapTopBottom_->setChecked(
+            placement == core::ImagePlacement::top_and_bottom);
+    }
+    if (!visible && tabs_->currentIndex() == pictureTabIndex_) {
+        tabs_->setCurrentIndex(0);
+    }
+    tabs_->setTabVisible(pictureTabIndex_, visible);
 }
 
 }  // namespace docxstudio::app

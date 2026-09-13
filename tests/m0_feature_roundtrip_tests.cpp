@@ -243,6 +243,90 @@ void testNativeInlinePngAndJpeg(const TemporaryDirectory& temporary) {
           "unchanged image Save As changed package bytes");
 }
 
+void testNativePictureLayoutsAndAltText(
+    const TemporaryDirectory& temporary) {
+    const auto path = temporary.file("picture-layouts.docx");
+    const auto png = onePixelPng();
+
+    auto inline_image = image(
+        ooxml::RasterImageFormat::png, "Inline owl", 914400, 457200,
+        png);
+    inline_image.accessible_name = "Inline description";
+    inline_image.layout.distance_top_emu = 11;
+    inline_image.layout.distance_right_emu = 22;
+    inline_image.layout.distance_bottom_emu = 33;
+    inline_image.layout.distance_left_emu = 44;
+
+    auto square_image = image(
+        ooxml::RasterImageFormat::png, "Square owl", 800000, 600000,
+        png);
+    square_image.accessible_name = "Square & <owl>";
+    square_image.layout = {
+        ooxml::ImagePlacement::square, 101, 202, 303, 404, false};
+
+    auto top_bottom_image = image(
+        ooxml::RasterImageFormat::png, "Top-bottom owl", 700000,
+        500000, png);
+    top_bottom_image.accessible_name = "Top and bottom description";
+    top_bottom_image.layout = {
+        ooxml::ImagePlacement::top_and_bottom, 505, 606, 707, 808,
+        true};
+
+    ooxml::NewParagraph paragraph;
+    paragraph.runs.push_back(imageRun(std::move(inline_image)));
+    paragraph.runs.push_back(imageRun(std::move(square_image)));
+    paragraph.runs.push_back(imageRun(std::move(top_bottom_image)));
+    const auto save = ooxml::DocxDocument::writeNew(path, {paragraph});
+    check(save.saved,
+          save.error ? save.error->message
+                     : "picture-layout DOCX was not saved");
+
+    const std::string xml = readTextMember(path, "word/document.xml");
+    check(std::count(xml.begin(), xml.end(), '\0') == 0 &&
+              xml.find("<wp:inline distT=\"11\" distB=\"33\" distL=\"44\" distR=\"22\">") !=
+                  std::string::npos &&
+              xml.find("<wp:wrapSquare wrapText=\"bothSides\"/>") !=
+                  std::string::npos &&
+              xml.find("<wp:wrapTopAndBottom/>") != std::string::npos &&
+              xml.find("<wp:positionH relativeFrom=\"page\"><wp:posOffset>0</wp:posOffset></wp:positionH><wp:positionV relativeFrom=\"page\">") !=
+                  std::string::npos &&
+              xml.find("<wp:positionH relativeFrom=\"character\"><wp:posOffset>0</wp:posOffset></wp:positionH><wp:positionV relativeFrom=\"paragraph\">") !=
+                  std::string::npos &&
+              xml.find("descr=\"Square &amp; &lt;owl&gt;\"") !=
+                  std::string::npos,
+          "authored picture placement, distances, or alt text is incomplete");
+
+    ooxml::Error error;
+    auto reopened = ooxml::DocxDocument::open(path, &error);
+    check(reopened != nullptr, error.message);
+    check(reopened->paragraphs().size() == 1 &&
+              reopened->paragraphs()[0].runs.size() == 3,
+          "picture-layout run order changed after reopen");
+    const auto& imported_inline =
+        *reopened->paragraphs()[0].runs[0].fragments[0].inline_image;
+    const auto& imported_square =
+        *reopened->paragraphs()[0].runs[1].fragments[0].inline_image;
+    const auto& imported_top_bottom =
+        *reopened->paragraphs()[0].runs[2].fragments[0].inline_image;
+    check(imported_inline.accessible_name == "Inline description" &&
+              imported_inline.layout == ooxml::ImageLayout{
+                  ooxml::ImagePlacement::inline_with_text, 11, 22, 33,
+                  44, true} &&
+              imported_square.accessible_name == "Square & <owl>" &&
+              imported_square.layout == ooxml::ImageLayout{
+                  ooxml::ImagePlacement::square, 101, 202, 303, 404,
+                  false} &&
+              imported_top_bottom.accessible_name ==
+                  "Top and bottom description" &&
+              imported_top_bottom.layout == ooxml::ImageLayout{
+                  ooxml::ImagePlacement::top_and_bottom, 505, 606, 707,
+                  808, true},
+          "picture placement, distances, move-with-text, or alt text changed after reopen");
+    check(reopened->compatibility().classification ==
+              ooxml::CompatibilityClass::basic_body_text_patch,
+          "canonical picture anchors were classified as unsupported");
+}
+
 void expectRejectedImage(
     const TemporaryDirectory& temporary, std::string_view filename,
     ooxml::NewInlineImage payload) {
@@ -278,6 +362,50 @@ void testUnsafeAuthoredImagesAreRejected(
         temporary, "unsupported-kind.docx",
         image(static_cast<ooxml::RasterImageFormat>(99), "Owl", 100, 100,
               onePixelPng()));
+
+    auto negative_wrap = image(
+        ooxml::RasterImageFormat::png, "Owl", 100, 100,
+        onePixelPng());
+    negative_wrap.layout = {
+        ooxml::ImagePlacement::square, 0, 0, 0, -1, true};
+    expectRejectedImage(
+        temporary, "negative-wrap.docx", std::move(negative_wrap));
+    auto oversized_wrap = image(
+        ooxml::RasterImageFormat::png, "Owl", 100, 100,
+        onePixelPng());
+    oversized_wrap.layout = {
+        ooxml::ImagePlacement::top_and_bottom,
+        ooxml::kMaximumImageWrapDistanceEmu + 1, 0, 0, 0, true};
+    expectRejectedImage(
+        temporary, "oversized-wrap.docx", std::move(oversized_wrap));
+    auto fixed_inline = image(
+        ooxml::RasterImageFormat::png, "Owl", 100, 100,
+        onePixelPng());
+    fixed_inline.layout.move_with_text = false;
+    expectRejectedImage(
+        temporary, "fixed-inline.docx", std::move(fixed_inline));
+    auto unknown_placement = image(
+        ooxml::RasterImageFormat::png, "Owl", 100, 100,
+        onePixelPng());
+    unknown_placement.layout.placement =
+        static_cast<ooxml::ImagePlacement>(255);
+    expectRejectedImage(
+        temporary, "unknown-placement.docx",
+        std::move(unknown_placement));
+    auto oversized_anchor = image(
+        ooxml::RasterImageFormat::png, "Owl",
+        ooxml::kMaximumImageDimensionEmu + 1, 100, onePixelPng());
+    oversized_anchor.layout.placement = ooxml::ImagePlacement::square;
+    expectRejectedImage(
+        temporary, "oversized-anchor.docx",
+        std::move(oversized_anchor));
+    auto oversized_alt = image(
+        ooxml::RasterImageFormat::png, "Owl", 100, 100,
+        onePixelPng());
+    oversized_alt.accessible_name.assign(
+        ooxml::kMaximumImageAccessibleNameBytes + 1U, 'a');
+    expectRejectedImage(
+        temporary, "oversized-alt.docx", std::move(oversized_alt));
 
     auto truncated_png = onePixelPng();
     truncated_png.pop_back();
@@ -440,6 +568,7 @@ int main() {
     try {
         TemporaryDirectory temporary;
         testNativeInlinePngAndJpeg(temporary);
+        testNativePictureLayoutsAndAltText(temporary);
         testUnsafeAuthoredImagesAreRejected(temporary);
         testOrderedNativeSections(temporary);
         testUnsafeSectionShapesAreRejected(temporary);

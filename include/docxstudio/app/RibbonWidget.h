@@ -1,8 +1,11 @@
 #pragma once
 
+#include "docxstudio/core/document.h"
+
 #include <QColor>
 #include <QWidget>
 
+class QAction;
 class QComboBox;
 class QFontComboBox;
 class QLabel;
@@ -29,6 +32,10 @@ public:
     // The contextual Table tab is available only while a table or table cell
     // is selected. Hiding it also disables its command-palette actions.
     void setTableContext(bool visible);
+    // The contextual Picture tab is available only while one semantic image
+    // atom is selected. The active wrap choice is mirrored in its menu.
+    void setPictureContext(bool visible, core::ImagePlacement placement =
+                           core::ImagePlacement::inline_with_text);
 
 signals:
     void fontFamilyRequested(const QString& family);
@@ -52,6 +59,7 @@ private:
     QWidget* makeViewTab(CommandRegistry& commands);
     QWidget* makeListTab(CommandRegistry& commands);
     QWidget* makeTableTab(CommandRegistry& commands);
+    QWidget* makePictureTab(CommandRegistry& commands);
 
     QTabWidget* tabs_{};
     QFontComboBox* fontFamily_{};
@@ -62,6 +70,10 @@ private:
     QLabel* listLevel_{};
     int listTabIndex_{-1};
     int tableTabIndex_{-1};
+    int pictureTabIndex_{-1};
+    QAction* pictureWrapInline_{};
+    QAction* pictureWrapSquare_{};
+    QAction* pictureWrapTopBottom_{};
 };
 
 }  // namespace docxstudio::app

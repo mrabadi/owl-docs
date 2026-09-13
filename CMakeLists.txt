@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.22)
 
-project(OwlDocs VERSION 0.3.0 LANGUAGES CXX)
+project(OwlDocs VERSION 0.4.0 LANGUAGES CXX)
 
 include(GNUInstallDirs)
 include(CTest)
@@ -342,6 +342,13 @@ if(BUILD_TESTING)
         set_tests_properties(image_ui_tests PROPERTIES
             ENVIRONMENT "QT_QPA_PLATFORM=offscreen;XDG_DATA_HOME=/tmp/owl-docs-image-ui-tests")
 
+        add_executable(picture_dialog_tests tests/picture_dialog_tests.cpp)
+        target_link_libraries(picture_dialog_tests PRIVATE docxstudio_app)
+        docxstudio_warnings(picture_dialog_tests)
+        add_test(NAME picture_dialog_tests COMMAND picture_dialog_tests)
+        set_tests_properties(picture_dialog_tests PROPERTIES
+            ENVIRONMENT "QT_QPA_PLATFORM=offscreen;XDG_DATA_HOME=/tmp/owl-docs-picture-dialog-tests")
+
         add_executable(print_tests tests/print_tests.cpp)
         target_link_libraries(print_tests PRIVATE docxstudio_app)
         docxstudio_warnings(print_tests)
@@ -362,6 +369,13 @@ if(BUILD_TESTING)
         add_test(NAME editor_tool_bridge_tests COMMAND editor_tool_bridge_tests)
         set_tests_properties(editor_tool_bridge_tests PROPERTIES
             ENVIRONMENT "QT_QPA_PLATFORM=offscreen;XDG_DATA_HOME=/tmp/owl-docs-tests")
+
+        add_executable(codex_controller_tests tests/codex_controller_tests.cpp)
+        target_link_libraries(codex_controller_tests PRIVATE docxstudio_app)
+        docxstudio_warnings(codex_controller_tests)
+        add_test(NAME codex_controller_tests COMMAND codex_controller_tests)
+        set_tests_properties(codex_controller_tests PROPERTIES
+            ENVIRONMENT "QT_QPA_PLATFORM=offscreen;XDG_DATA_HOME=/tmp/owl-docs-codex-controller-tests")
 
         add_executable(app_import_tests tests/app_import_tests.cpp)
         target_link_libraries(app_import_tests PRIVATE docxstudio_app)
@@ -417,6 +431,23 @@ if(BUILD_TESTING AND OWL_DOCS_ICON_GENERATOR_PYTHON)
                 --check)
     set_tests_properties(icon_generation_tests PROPERTIES
         LABELS "branding;maintenance")
+endif()
+
+# When a Codex runtime and Python are present on the build host, verify the
+# exact experimental fields used by Owl Docs against app-server's generated
+# protocol schema. Builds remain possible on fully offline hosts without Codex.
+if(BUILD_TESTING)
+    find_program(OWL_DOCS_CODEX_SCHEMA_EXECUTABLE NAMES codex
+                 HINTS /usr/lib/chatgpt/resources)
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(OWL_DOCS_CODEX_SCHEMA_EXECUTABLE AND Python3_Interpreter_FOUND)
+        add_test(NAME codex_app_server_schema_compatibility
+            COMMAND "${Python3_EXECUTABLE}"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/tools/check_codex_app_server_schema.py"
+                    --codex "${OWL_DOCS_CODEX_SCHEMA_EXECUTABLE}")
+        set_tests_properties(codex_app_server_schema_compatibility PROPERTIES
+            LABELS "codex;compatibility" TIMEOUT 45)
+    endif()
 endif()
 
 set(CPACK_GENERATOR "DEB")

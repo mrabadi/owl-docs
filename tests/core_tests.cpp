@@ -212,6 +212,231 @@ void testSparseFormatting() {
     CHECK(paragraph_snapshot.document.paragraphs().front().format().space_after_emu == 152400);
 }
 
+void testParagraphMarkCharacterFormatting() {
+    const auto default_paragraph = Paragraph::create(u"");
+    CHECK(default_paragraph);
+    CHECK(default_paragraph.value().paragraphMarkCharacterFormat().empty());
+    CHECK(default_paragraph.value().characterFormatAt(0).empty());
+
+    CharacterFormat active_format;
+    active_format.font_family = "Carlito";
+    active_format.font_size_half_points = 28;
+    active_format.bold = true;
+    active_format.italic = true;
+    active_format.underline = UnderlineStyle::single;
+    active_format.foreground_argb = 0xff123456U;
+    active_format.highlight_argb = 0xffffff00U;
+    const auto restored_id = NodeId::generate();
+    const auto restored = Paragraph::create(u"", restored_id, active_format);
+    CHECK(restored);
+    CHECK(restored.value().paragraphMarkCharacterFormat() == active_format);
+    CHECK(restored.value().characterFormatAt(0) == active_format);
+    CHECK(Document::create({restored.value()}));
+
+    CharacterFormat invalid_format;
+    invalid_format.font_size_half_points = 0;
+    const auto invalid_restored = Paragraph::create(
+        u"", NodeId::generate(), invalid_format);
+    CHECK(!invalid_restored);
+    CHECK(invalid_restored.error().code == ErrorCode::invalid_formatting);
+    auto corrupted_paragraph = restored.value();
+    auto& corrupted_mark = const_cast<CharacterFormat&>(
+        corrupted_paragraph.paragraphMarkCharacterFormat());
+    corrupted_mark.font_family = "";
+    const auto corrupted_document = Document::create({corrupted_paragraph});
+    CHECK(!corrupted_document);
+    CHECK(corrupted_document.error().code == ErrorCode::invalid_formatting);
+
+    DocumentSession empty_session(documentWithText(u""));
+    auto snapshot = empty_session.snapshot();
+    const auto paragraph_id = snapshot.document.paragraphs().front().id();
+    CharacterFormatDelta activate;
+    activate.font_family = PropertyDelta<std::string>::set("Carlito");
+    activate.font_size_half_points =
+        PropertyDelta<std::int32_t>::set(28);
+    activate.bold = PropertyDelta<bool>::set(true);
+    activate.italic = PropertyDelta<bool>::set(true);
+    activate.underline =
+        PropertyDelta<UnderlineStyle>::set(UnderlineStyle::single);
+    activate.foreground_argb =
+        PropertyDelta<std::uint32_t>::set(0xff123456U);
+    activate.highlight_argb =
+        PropertyDelta<std::uint32_t>::set(0xffffff00U);
+    CHECK(empty_session.applyBatch(
+        snapshot.revision,
+        std::vector<Operation>{SetCharacterFormat{
+            {{paragraph_id, 0}, {paragraph_id, 0}}, activate}}));
+    auto formatted_empty = empty_session.snapshot();
+    CHECK(formatted_empty.document.paragraphs().front()
+              .paragraphMarkCharacterFormat() == active_format);
+    CHECK(formatted_empty.document.paragraphs().front()
+              .characterFormatAt(0) == active_format);
+
+    // The paragraph-mark change is durable session state and survives leaving
+    // the paragraph, snapshotting, and an undo/redo cycle.
+    CHECK(empty_session.undo(formatted_empty.revision));
+    CHECK(empty_session.snapshot().document.paragraphs().front()
+              .paragraphMarkCharacterFormat().empty());
+    CHECK(empty_session.redo(empty_session.snapshot().revision));
+    CHECK(empty_session.snapshot().document.paragraphs().front()
+              .paragraphMarkCharacterFormat() == active_format);
+
+    snapshot = empty_session.snapshot();
+    CHECK(empty_session.applyBatch(
+        snapshot.revision,
+        std::vector<Operation>{
+            InsertText{{paragraph_id, 0}, u"Typed", std::nullopt}}));
+    auto typed = empty_session.snapshot();
+    CHECK(typed.document.paragraphs().front().text() == u"Typed");
+    CHECK(typed.document.paragraphs().front().characterFormatAt(5) ==
+          active_format);
+    CHECK(typed.document.paragraphs().front()
+              .paragraphMarkCharacterFormat() == active_format);
+
+    CHECK(empty_session.applyBatch(
+        typed.revision,
+        std::vector<Operation>{DeleteRange{
+            {{paragraph_id, 0}, {paragraph_id, 5}}}}));
+    const auto emptied_again = empty_session.snapshot();
+    CHECK(emptied_again.document.paragraphs().front().text().empty());
+    CHECK(emptied_again.document.paragraphs().front()
+              .characterFormatAt(0) == active_format);
+
+    CharacterFormatDelta change_color;
+    change_color.foreground_argb =
+        PropertyDelta<std::uint32_t>::set(0xffabcdefU);
+    CHECK(empty_session.applyBatch(
+        emptied_again.revision,
+        std::vector<Operation>{SetParagraphMarkCharacterFormat{
+            paragraph_id, change_color}}));
+    const auto recolored = empty_session.snapshot();
+    auto expected_recolored = active_format;
+    expected_recolored.foreground_argb = 0xffabcdefU;
+    CHECK(recolored.document.paragraphs().front()
+              .paragraphMarkCharacterFormat() == expected_recolored);
+    CHECK(recolored.document.paragraphs().front().characterFormatAt(0) ==
+          expected_recolored);
+
+    CharacterFormatDelta invalid_delta;
+    invalid_delta.font_family = PropertyDelta<std::string>::set("");
+    const auto before_invalid = empty_session.snapshot();
+    CHECK(!empty_session.applyBatch(
+        before_invalid.revision,
+        std::vector<Operation>{
+            SetParagraphMarkCharacterFormat{paragraph_id, invalid_delta}}));
+    CHECK(empty_session.snapshot().revision == before_invalid.revision);
+    CHECK(empty_session.snapshot().document == before_invalid.document);
+
+    // A collapsed selection in a non-empty paragraph retains the historical
+    // no-op behavior; the explicit mark operation is available when callers
+    // intentionally need to change that paragraph's future empty format.
+    auto nonempty = documentWithText(u"plain");
+    const auto nonempty_id = nonempty.paragraphs().front().id();
+    CHECK(nonempty.applyCharacterFormat(
+        {{nonempty_id, 2}, {nonempty_id, 2}}, activate));
+    CHECK(nonempty.paragraphs().front().characterFormats().empty());
+    CHECK(nonempty.paragraphs().front()
+              .paragraphMarkCharacterFormat().empty());
+    CHECK(nonempty.applyParagraphMarkCharacterFormat(nonempty_id, activate));
+    CHECK(nonempty.paragraphs().front()
+              .paragraphMarkCharacterFormat() == active_format);
+
+    // A document can contain styled text whose paragraph mark is still
+    // sparse (for example after import). Deleting all content must promote
+    // the visible insertion format so returning to the empty paragraph does
+    // not fall back to document defaults.
+    auto deletion_to_empty = documentWithText(u"styled");
+    const auto deletion_id = deletion_to_empty.paragraphs().front().id();
+    CHECK(deletion_to_empty.applyCharacterFormat(
+        {{deletion_id, 0}, {deletion_id, 6}}, activate));
+    CHECK(deletion_to_empty.paragraphs().front()
+              .paragraphMarkCharacterFormat().empty());
+    CHECK(deletion_to_empty.deleteRange(
+        {{deletion_id, 0}, {deletion_id, 6}}));
+    CHECK(deletion_to_empty.paragraphs().front().text().empty());
+    CHECK(deletion_to_empty.paragraphs().front()
+              .paragraphMarkCharacterFormat() == active_format);
+
+    // A non-empty replacement is not a deletion-to-empty transition and must
+    // not rewrite an independently specified paragraph mark.
+    CharacterFormat original_mark;
+    original_mark.language = "en-US";
+    auto replacement = Paragraph::create(
+        u"styled", NodeId::generate(), original_mark);
+    CHECK(replacement);
+    auto replacement_document = Document::create({replacement.value()});
+    CHECK(replacement_document);
+    const auto replacement_id =
+        replacement_document.value().paragraphs().front().id();
+    CHECK(replacement_document.value().applyCharacterFormat(
+        {{replacement_id, 0}, {replacement_id, 6}}, activate));
+    CHECK(replacement_document.value().replaceRange(
+        {{replacement_id, 0}, {replacement_id, 6}}, u"new",
+        active_format));
+    CHECK(replacement_document.value().paragraphs().front().text() == u"new");
+    CHECK(replacement_document.value().paragraphs().front()
+              .paragraphMarkCharacterFormat() == original_mark);
+
+    // Enter at the end derives the new empty paragraph's mark from the active
+    // format immediately to the left, and unformatted insertion consumes it.
+    CharacterFormatDelta format_tail;
+    format_tail.bold = PropertyDelta<bool>::set(true);
+    format_tail.font_family = PropertyDelta<std::string>::set("Carlito");
+    format_tail.font_size_half_points =
+        PropertyDelta<std::int32_t>::set(24);
+    format_tail.foreground_argb =
+        PropertyDelta<std::uint32_t>::set(0xff654321U);
+    CHECK(nonempty.applyCharacterFormat(
+        {{nonempty_id, 4}, {nonempty_id, 5}}, format_tail));
+    const auto inherited_format =
+        nonempty.paragraphs().front().characterFormatAt(5);
+    const auto derived_paragraph_id = NodeId::generate();
+    CHECK(nonempty.splitParagraph(
+        {nonempty_id, 5}, derived_paragraph_id));
+    CHECK(nonempty.paragraphs()[1].text().empty());
+    CHECK(nonempty.paragraphs()[1].paragraphMarkCharacterFormat() ==
+          inherited_format);
+    CHECK(nonempty.paragraphs()[1].characterFormatAt(0) == inherited_format);
+    CHECK(nonempty.insertText(
+        {derived_paragraph_id, 0}, u"next"));
+    CHECK(nonempty.paragraphs()[1].characterFormatAt(4) == inherited_format);
+
+    // The caller can pass an exact active typing format when it differs from
+    // the adjacent run. The split operation remains one undoable transaction.
+    DocumentSession explicit_split(documentWithText(u"line"));
+    auto split_before = explicit_split.snapshot();
+    const auto split_source =
+        split_before.document.paragraphs().front().id();
+    const auto split_target = NodeId::generate();
+    CharacterFormat explicit_active;
+    explicit_active.font_family = "Liberation Serif";
+    explicit_active.font_size_half_points = 36;
+    explicit_active.italic = true;
+    explicit_active.foreground_argb = 0xff112233U;
+    CHECK(explicit_split.applyBatch(
+        split_before.revision,
+        std::vector<Operation>{SplitParagraph{
+            {split_source, 4}, split_target, explicit_active}}));
+    const auto split_after = explicit_split.snapshot();
+    CHECK(split_after.document.paragraphs()[1]
+              .paragraphMarkCharacterFormat() == explicit_active);
+    CHECK(split_after.document.paragraphs()[1].characterFormatAt(0) ==
+          explicit_active);
+    CHECK(explicit_split.undo(split_after.revision));
+    CHECK(explicit_split.snapshot().document == split_before.document);
+    CHECK(explicit_split.redo(explicit_split.snapshot().revision));
+    CHECK(explicit_split.snapshot().document == split_after.document);
+
+    invalid_format.font_size_half_points = 0;
+    const auto before_invalid_split = explicit_split.snapshot();
+    CHECK(!explicit_split.applyBatch(
+        before_invalid_split.revision,
+        std::vector<Operation>{SplitParagraph{
+            {split_target, 0}, NodeId::generate(), invalid_format}}));
+    CHECK(explicit_split.snapshot().revision == before_invalid_split.revision);
+    CHECK(explicit_split.snapshot().document == before_invalid_split.document);
+}
+
 void testSemanticListFormatting() {
     const ListLayout defaults;
     for (std::size_t level = 0; level < kListLevelCount; ++level) {
@@ -443,6 +668,7 @@ void testSemanticImageAtomEditing() {
     CHECK(kMaximumDocumentEncodedImageBytes == 32U * 1024U * 1024U);
     CHECK(kMaximumImageAccessibleNameBytes == 4U * 1024U);
     CHECK(kMaximumInlineImageDimensionEmu == 254000000);
+    CHECK(kMaximumImageWrapDistanceEmu == 254000000);
     CHECK(imageContentType(ImageFormat::png) == "image/png");
     CHECK(imageContentType(ImageFormat::jpeg) == "image/jpeg");
     CHECK(imageContentType(static_cast<ImageFormat>(255)).empty());
@@ -541,6 +767,7 @@ void testSemanticImageAtomEditing() {
         CHECK(image->accessible_name == "Revenue diagram");
         CHECK(image->width_emu == 914400);
         CHECK(image->height_emu == 457200);
+        CHECK(image->layout == ImageLayout{});
         CHECK(image->encoded_payload == payload);
         CHECK(image->encoded_payload.bytes().data() == payload.bytes().data());
     }
@@ -747,6 +974,152 @@ void testSemanticImageAtomEditing() {
         unordered_equation_paragraph.equations());
     std::swap(equation_metadata[0], equation_metadata[1]);
     CHECK(!Document::create({unordered_equation_paragraph}));
+}
+
+void testImageLayoutAndAccessibleNameOperations() {
+    const ImageLayout default_layout;
+    CHECK(default_layout.placement == ImagePlacement::inline_with_text);
+    CHECK(default_layout.distance_top_emu == 0);
+    CHECK(default_layout.distance_right_emu == 0);
+    CHECK(default_layout.distance_bottom_emu == 0);
+    CHECK(default_layout.distance_left_emu == 0);
+    CHECK(default_layout.move_with_text);
+    CHECK(default_layout.validate());
+
+    ImageLayout square_layout{
+        ImagePlacement::square,
+        12700,
+        25400,
+        38100,
+        kMaximumImageWrapDistanceEmu,
+        true,
+    };
+    CHECK(square_layout.validate());
+    ImageLayout top_bottom_layout{
+        ImagePlacement::top_and_bottom,
+        4000,
+        3000,
+        2000,
+        1000,
+        false,
+    };
+    CHECK(top_bottom_layout.validate());
+
+    auto document = documentWithText(u"ab");
+    const auto paragraph_id = document.paragraphs().front().id();
+    const auto image_id = NodeId::generate();
+    const EncodedImagePayload payload(tinyPngBytes());
+    CHECK(document.insertImage(
+        {paragraph_id, 1}, payload, ImageFormat::png, "Initial name",
+        914400, 457200, image_id, std::nullopt, square_layout));
+    CHECK(document.findImage(image_id)->layout == square_layout);
+
+    CHECK(document.setImageLayout(image_id, top_bottom_layout));
+    CHECK(document.findImage(image_id)->layout == top_bottom_layout);
+    const std::string unicode_name{"Revenue \xcf\x80lot"};
+    CHECK(document.setImageAccessibleName(image_id, unicode_name));
+    CHECK(document.findImage(image_id)->accessible_name == unicode_name);
+
+    const auto before_invalid_layout = document;
+    const auto check_invalid_layout = [&](ImageLayout invalid) {
+        const auto validation = invalid.validate();
+        CHECK(!validation);
+        CHECK(validation.error().code == ErrorCode::invalid_operation);
+        const auto result = document.setImageLayout(image_id, invalid);
+        CHECK(!result);
+        CHECK(result.error().code == ErrorCode::invalid_operation);
+        CHECK(document == before_invalid_layout);
+    };
+    auto invalid_layout = square_layout;
+    invalid_layout.placement = static_cast<ImagePlacement>(255);
+    check_invalid_layout(invalid_layout);
+    invalid_layout = square_layout;
+    invalid_layout.distance_top_emu = -1;
+    check_invalid_layout(invalid_layout);
+    invalid_layout = square_layout;
+    invalid_layout.distance_right_emu = kMaximumImageWrapDistanceEmu + 1;
+    check_invalid_layout(invalid_layout);
+    invalid_layout = square_layout;
+    invalid_layout.distance_bottom_emu = -1;
+    check_invalid_layout(invalid_layout);
+    invalid_layout = square_layout;
+    invalid_layout.distance_left_emu = kMaximumImageWrapDistanceEmu + 1;
+    check_invalid_layout(invalid_layout);
+    invalid_layout = default_layout;
+    invalid_layout.move_with_text = false;
+    check_invalid_layout(invalid_layout);
+
+    const auto missing_image = NodeId::generate();
+    const auto missing_layout = document.setImageLayout(
+        missing_image, square_layout);
+    CHECK(!missing_layout);
+    CHECK(missing_layout.error().code == ErrorCode::invalid_operation);
+    const auto invalid_id_layout = document.setImageLayout(
+        NodeId{}, square_layout);
+    CHECK(!invalid_id_layout);
+    CHECK(invalid_id_layout.error().code == ErrorCode::invalid_node_id);
+
+    const std::string maximum_name(kMaximumImageAccessibleNameBytes, 'a');
+    CHECK(document.setImageAccessibleName(image_id, maximum_name));
+    CHECK(document.findImage(image_id)->accessible_name == maximum_name);
+    const auto before_invalid_name = document;
+    const auto oversized_name = document.setImageAccessibleName(
+        image_id, std::string(kMaximumImageAccessibleNameBytes + 1U, 'a'));
+    CHECK(!oversized_name);
+    CHECK(oversized_name.error().code == ErrorCode::invalid_operation);
+    const std::string invalid_utf8{"\xc0\xaf", 2};
+    const auto malformed_name =
+        document.setImageAccessibleName(image_id, invalid_utf8);
+    CHECK(!malformed_name);
+    CHECK(malformed_name.error().code == ErrorCode::invalid_operation);
+    CHECK(document == before_invalid_name);
+    const auto missing_name = document.setImageAccessibleName(
+        missing_image, "Name");
+    CHECK(!missing_name);
+    CHECK(missing_name.error().code == ErrorCode::invalid_operation);
+    const auto invalid_id_name = document.setImageAccessibleName(
+        NodeId{}, "Name");
+    CHECK(!invalid_id_name);
+    CHECK(invalid_id_name.error().code == ErrorCode::invalid_node_id);
+
+    auto malformed_paragraph = document.paragraphs().front();
+    auto& malformed_images = const_cast<std::vector<ImageAtom>&>(
+        malformed_paragraph.images());
+    malformed_images.front().layout.distance_left_emu = -1;
+    const auto malformed_document = Document::create({malformed_paragraph});
+    CHECK(!malformed_document);
+    CHECK(malformed_document.error().code == ErrorCode::invalid_operation);
+
+    DocumentSession session(document);
+    auto snapshot = session.snapshot();
+    const ImageLayout session_layout{
+        ImagePlacement::square, 10, 20, 30, 40, false};
+    const std::vector<Operation> change_properties{
+        SetImageLayout{image_id, session_layout},
+        SetImageAccessibleName{image_id, "Session name"},
+    };
+    CHECK(session.applyBatch(snapshot.revision, change_properties));
+    const auto changed = session.snapshot();
+    CHECK(changed.document.findImage(image_id)->layout == session_layout);
+    CHECK(changed.document.findImage(image_id)->accessible_name ==
+          "Session name");
+    CHECK(session.undo(changed.revision));
+    CHECK(session.snapshot().document == snapshot.document);
+    CHECK(session.redo(session.snapshot().revision));
+    CHECK(session.snapshot().document == changed.document);
+
+    const auto before_atomic_rejection = session.snapshot();
+    invalid_layout = default_layout;
+    invalid_layout.move_with_text = false;
+    const std::vector<Operation> invalid_batch{
+        SetImageAccessibleName{image_id, "Must roll back"},
+        SetImageLayout{image_id, invalid_layout},
+    };
+    const auto rejected = session.applyBatch(
+        before_atomic_rejection.revision, invalid_batch);
+    CHECK(!rejected);
+    CHECK(session.snapshot().revision == before_atomic_rejection.revision);
+    CHECK(session.snapshot().document == before_atomic_rejection.document);
 }
 
 void testImageResourceLimitsAndSessionHistory() {
@@ -1568,6 +1941,34 @@ void testTableFormattingStructureAndStyles() {
               .foreground_argb ==
           std::optional<std::uint32_t>{0xff77216fU});
 
+    // Whole-cell deletion promotes the deleted text's formatting into the
+    // end-of-cell marker when no explicit active format is supplied.
+    CharacterFormat styled_cell_format;
+    styled_cell_format.font_family = "Carlito";
+    styled_cell_format.font_size_half_points = 31;
+    styled_cell_format.italic = true;
+    styled_cell_format.foreground_argb = 0xff3157a4U;
+    CHECK(apply(snapshot.revision, {
+        SetTableCellText{table_id, 1, 0, u"styled", styled_cell_format},
+    }));
+    snapshot = session.snapshot();
+    CHECK(snapshot.document.findTable(table_id)
+              ->cell(1, 0)
+              ->default_character_format.empty());
+    CHECK(apply(snapshot.revision, {
+        SetTableCellText{table_id, 1, 0, u""},
+    }));
+    snapshot = session.snapshot();
+    CHECK(snapshot.document.findTable(table_id)->cell(1, 0)->text.empty());
+    CHECK(snapshot.document.findTable(table_id)
+              ->cell(1, 0)
+              ->default_character_format == styled_cell_format);
+    CHECK(session.undo(snapshot.revision));
+    snapshot = session.snapshot();
+    CHECK(session.undo(snapshot.revision));
+    snapshot = session.snapshot();
+    CHECK(snapshot.document.findTable(table_id)->cell(1, 0)->text == u"lower");
+
     const std::vector<NodeId> row_ids{
         NodeId::generate(), NodeId::generate()};
     const std::vector<NodeId> column_ids{
@@ -1812,12 +2213,14 @@ int main() {
     testNodeIdsAndRevision();
     testUtf16BoundariesAndAtomicBatch();
     testSparseFormatting();
+    testParagraphMarkCharacterFormatting();
     testSemanticListFormatting();
     testParagraphStructureAndHistory();
     testUndoCoalescing();
     testPreviewIsolationAndAcceptance();
     testStaleAndIndependentPreviews();
     testSemanticImageAtomEditing();
+    testImageLayoutAndAccessibleNameOperations();
     testImageResourceLimitsAndSessionHistory();
     testBoundedSessionHistoryAndPreviews();
     testSemanticEquationAtomEditing();

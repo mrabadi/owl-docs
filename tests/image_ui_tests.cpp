@@ -12,6 +12,7 @@
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QImage>
+#include <QInputMethodQueryEvent>
 #include <QKeyEvent>
 #include <QMessageBox>
 #include <QMimeData>
@@ -21,6 +22,7 @@
 #include <QTemporaryDir>
 #include <QTimer>
 
+#include <array>
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
@@ -102,6 +104,47 @@ void clickViewport(DocumentCanvas& canvas, const QPoint& position) {
     QApplication::sendEvent(canvas.viewport(), &release);
 }
 
+QRect inputMethodCursorRect(DocumentCanvas& canvas) {
+    QInputMethodQueryEvent event(Qt::ImCursorRectangle);
+    QApplication::sendEvent(&canvas, &event);
+    return event.value(Qt::ImCursorRectangle).toRect();
+}
+
+void pressViewport(DocumentCanvas& canvas, const QPoint& position,
+                   Qt::KeyboardModifiers modifiers = Qt::NoModifier) {
+    const QPoint global = canvas.viewport()->mapToGlobal(position);
+    QMouseEvent press(QEvent::MouseButtonPress, QPointF(position),
+                      QPointF(position), QPointF(global), Qt::LeftButton,
+                      Qt::LeftButton, modifiers);
+    QApplication::sendEvent(canvas.viewport(), &press);
+}
+
+void moveViewport(DocumentCanvas& canvas, const QPoint& position,
+                  Qt::MouseButtons buttons = Qt::NoButton,
+                  Qt::KeyboardModifiers modifiers = Qt::NoModifier) {
+    const QPoint global = canvas.viewport()->mapToGlobal(position);
+    QMouseEvent move(QEvent::MouseMove, QPointF(position), QPointF(position),
+                     QPointF(global), Qt::NoButton, buttons, modifiers);
+    QApplication::sendEvent(canvas.viewport(), &move);
+}
+
+void releaseViewport(DocumentCanvas& canvas, const QPoint& position,
+                     Qt::KeyboardModifiers modifiers = Qt::NoModifier) {
+    const QPoint global = canvas.viewport()->mapToGlobal(position);
+    QMouseEvent release(QEvent::MouseButtonRelease, QPointF(position),
+                        QPointF(position), QPointF(global), Qt::LeftButton,
+                        Qt::NoButton, modifiers);
+    QApplication::sendEvent(canvas.viewport(), &release);
+}
+
+void dragViewport(DocumentCanvas& canvas, const QPoint& start,
+                  const QPoint& end,
+                  Qt::KeyboardModifiers modifiers = Qt::NoModifier) {
+    pressViewport(canvas, start, modifiers);
+    moveViewport(canvas, end, Qt::LeftButton, modifiers);
+    releaseViewport(canvas, end, modifiers);
+}
+
 QRect redBounds(const QImage& image) {
     QRect result;
     for (int y = 0; y < image.height(); ++y) {
@@ -116,6 +159,53 @@ QRect redBounds(const QImage& image) {
         }
     }
     return result;
+}
+
+QRect colorBounds(const QImage& image, const QColor& target,
+                  int tolerance = 20) {
+    QRect result;
+    for (int y = 0; y < image.height(); ++y) {
+        for (int x = 0; x < image.width(); ++x) {
+            const QColor color = image.pixelColor(x, y);
+            if (std::abs(color.red() - target.red()) > tolerance ||
+                std::abs(color.green() - target.green()) > tolerance ||
+                std::abs(color.blue() - target.blue()) > tolerance) {
+                continue;
+            }
+            result = result.isValid() ? result.united(QRect(x, y, 1, 1))
+                                      : QRect(x, y, 1, 1);
+        }
+    }
+    return result;
+}
+
+QImage rasterizeFirstPdfPage(const QString& pdfPath,
+                             const QString& outputRoot) {
+    const QString pdftoppm = QStandardPaths::findExecutable(
+        QStringLiteral("pdftoppm"),
+        {QStringLiteral("/usr/bin"), QStringLiteral("/bin")});
+    check(!pdftoppm.isEmpty(),
+          "pdftoppm is required for picture-layout PDF tests");
+    QProcess rasterizer;
+    rasterizer.start(
+        pdftoppm,
+        {QStringLiteral("-f"), QStringLiteral("1"),
+         QStringLiteral("-singlefile"), QStringLiteral("-png"),
+         QStringLiteral("-r"), QStringLiteral("96"), pdfPath,
+         outputRoot});
+    const bool started = rasterizer.waitForStarted(5000);
+    const bool finished = started && rasterizer.waitForFinished(15000);
+    if (!finished || rasterizer.exitStatus() != QProcess::NormalExit ||
+        rasterizer.exitCode() != 0) {
+        std::cerr << rasterizer.readAllStandardError().constData() << '\n';
+    }
+    check(finished && rasterizer.exitStatus() == QProcess::NormalExit &&
+              rasterizer.exitCode() == 0,
+          "pdftoppm could not rasterize picture-layout PDF");
+    const QImage rendered(outputRoot + QStringLiteral(".png"));
+    check(!rendered.isNull(),
+          "pdftoppm did not produce a picture-layout raster");
+    return rendered;
 }
 
 void testCanvasObjectLifecycle(docxstudio::app::SpellChecker& spelling) {
@@ -204,6 +294,8 @@ void testCanvasObjectLifecycle(docxstudio::app::SpellChecker& spelling) {
     const QImage rendered = canvas.viewport()->grab().toImage();
     const QRect red = redBounds(rendered);
     check(red.isValid(), "inline picture was not rendered on the page");
+    const int screenPageCount = canvas.pageCount();
+    const std::uint64_t screenLayoutGeneration = canvas.layoutGeneration();
 
     QTemporaryDir pdfOutput;
     check(pdfOutput.isValid(), "could not create picture PDF test directory");
@@ -213,6 +305,9 @@ void testCanvasObjectLifecycle(docxstudio::app::SpellChecker& spelling) {
     check(canvas.exportPdf(pdfPath, pdfError) &&
               QFileInfo(pdfPath).size() > 500,
           "shared page renderer did not export the inline picture PDF");
+    check(canvas.pageCount() == screenPageCount &&
+              canvas.layoutGeneration() == screenLayoutGeneration,
+          "PDF export repaginated or changed the screen layout result");
     const QString pdftoppm = QStandardPaths::findExecutable(
         QStringLiteral("pdftoppm"),
         {QStringLiteral("/usr/bin"), QStringLiteral("/bin")});
@@ -239,8 +334,12 @@ void testCanvasObjectLifecycle(docxstudio::app::SpellChecker& spelling) {
               rasterizer.exitCode() == 0,
           "pdftoppm could not rasterize the inline-picture PDF");
     const QImage renderedPdf(renderedPdfRoot + QStringLiteral(".png"));
-    check(!renderedPdf.isNull() && redBounds(renderedPdf).isValid(),
+    const QRect pdfRed = redBounds(renderedPdf);
+    check(!renderedPdf.isNull() && pdfRed.isValid(),
           "the exported PDF omitted or recolored the inline picture");
+    check(std::abs(pdfRed.width() - red.width()) <= 3 &&
+              std::abs(pdfRed.height() - red.height()) <= 3,
+          "screen and PDF used different laid-out picture bounds");
     const QString pdftotext = QStandardPaths::findExecutable(
         QStringLiteral("pdftotext"),
         {QStringLiteral("/usr/bin"), QStringLiteral("/bin")});
@@ -337,6 +436,616 @@ void testCanvasObjectLifecycle(docxstudio::app::SpellChecker& spelling) {
     check(decoded && decoded->document == recoverySource &&
               decoded->document.paragraphs().front().images().size() == 1,
           "recovery codec did not preserve inline-picture source and geometry");
+}
+
+void testPicturePropertiesAndClipboardVersions(
+    docxstudio::app::SpellChecker& spelling) {
+    DocumentCanvas source(spelling);
+    const auto png = encodedPng(Qt::red, 52, 31);
+    check(source.insertInlineImage(png, QStringLiteral("Original alt text")),
+          "could not insert picture-properties fixture");
+    const auto imageId = *source.selectedInlineImageId();
+    check(source.resizeSelectedInlineImage(123.0, 73.0),
+          "could not configure clipboard geometry fixture");
+
+    const docxstudio::core::ImageLayout squareLayout{
+        docxstudio::core::ImagePlacement::square,
+        1100, 2200, 3300, 4400, false};
+    auto beforeLayout = source.snapshot();
+    check(source.setSelectedImageLayout(squareLayout),
+          "could not set picture layout");
+    auto afterLayout = source.snapshot();
+    check(afterLayout.revision.value() == beforeLayout.revision.value() + 1 &&
+              imageAtoms(source).front().layout == squareLayout,
+          "one picture-layout action was not exactly one semantic revision");
+    source.undo();
+    check(imageAtoms(source).front().layout ==
+              docxstudio::core::ImageLayout{},
+          "Undo did not restore the previous picture layout");
+    source.redo();
+    check(imageAtoms(source).front().layout == squareLayout,
+          "Redo did not restore the picture layout");
+    const auto beforeNoOpLayout = source.snapshot();
+    check(source.setSelectedImageLayout(squareLayout) &&
+              source.snapshot().revision == beforeNoOpLayout.revision,
+          "reapplying an identical picture layout created a revision");
+
+    const QString revisedAltText = QStringLiteral("Quarterly owl diagram");
+    const auto beforeAltText = source.snapshot();
+    check(source.setSelectedImageAccessibleName(revisedAltText),
+          "could not set picture alt text");
+    const auto afterAltText = source.snapshot();
+    check(afterAltText.revision.value() ==
+                  beforeAltText.revision.value() + 1 &&
+              imageAtoms(source).front().accessible_name ==
+                  revisedAltText.toStdString(),
+          "one picture alt-text action was not exactly one semantic revision");
+    source.undo();
+    check(imageAtoms(source).front().accessible_name == "Original alt text" &&
+              imageAtoms(source).front().layout == squareLayout,
+          "Undo of alt text also changed picture layout or failed to restore the name");
+    source.redo();
+    check(imageAtoms(source).front().accessible_name ==
+              revisedAltText.toStdString(),
+          "Redo did not restore picture alt text");
+    const auto beforeNoOpAltText = source.snapshot();
+    check(source.setSelectedImageAccessibleName(revisedAltText) &&
+              source.snapshot().revision == beforeNoOpAltText.revision,
+          "reapplying identical picture alt text created a revision");
+
+    check(source.selectInlineImage(imageId),
+          "could not select picture for native clipboard test");
+    source.copy();
+    const QMimeData* copied = QApplication::clipboard()->mimeData();
+    check(copied && copied->hasFormat(QStringLiteral(
+                        "application/x-owl-docs-inline-image-v2")) &&
+              copied->hasFormat(QStringLiteral(
+                  "application/x-owl-docs-inline-image-v1")),
+          "picture copy did not publish both current and legacy native formats");
+    const QByteArray currentPayload = copied->data(QStringLiteral(
+        "application/x-owl-docs-inline-image-v2"));
+    const QByteArray legacyPayload = copied->data(QStringLiteral(
+        "application/x-owl-docs-inline-image-v1"));
+    check(currentPayload.startsWith(QByteArrayLiteral("OWLDIMG2")) &&
+              legacyPayload.startsWith(QByteArrayLiteral("OWLDIMG1")),
+          "native clipboard payloads used the wrong protocol magic");
+    const auto expected = imageAtoms(source).front();
+
+    auto* currentMime = new QMimeData;
+    currentMime->setData(
+        QStringLiteral("application/x-owl-docs-inline-image-v2"),
+        currentPayload);
+    QApplication::clipboard()->setMimeData(currentMime);
+    DocumentCanvas currentPaste(spelling);
+    const auto beforeCurrentPaste = currentPaste.snapshot();
+    currentPaste.paste();
+    const auto currentImages = imageAtoms(currentPaste);
+    check(currentPaste.snapshot().revision.value() ==
+                  beforeCurrentPaste.revision.value() + 1 &&
+              currentImages.size() == 1 &&
+              currentImages.front().encoded_payload ==
+                  expected.encoded_payload &&
+              currentImages.front().format == expected.format &&
+              currentImages.front().width_emu == expected.width_emu &&
+              currentImages.front().height_emu == expected.height_emu &&
+              currentImages.front().accessible_name ==
+                  expected.accessible_name &&
+              currentImages.front().layout == expected.layout,
+          "native v2 clipboard paste lost bytes, format, geometry, alt text, or layout");
+
+    auto* legacyMime = new QMimeData;
+    legacyMime->setData(
+        QStringLiteral("application/x-owl-docs-inline-image-v1"),
+        legacyPayload);
+    QApplication::clipboard()->setMimeData(legacyMime);
+    DocumentCanvas legacyPaste(spelling);
+    const auto beforeLegacyPaste = legacyPaste.snapshot();
+    legacyPaste.paste();
+    const auto legacyImages = imageAtoms(legacyPaste);
+    check(legacyPaste.snapshot().revision.value() ==
+                  beforeLegacyPaste.revision.value() + 1 &&
+              legacyImages.size() == 1 &&
+              legacyImages.front().encoded_payload ==
+                  expected.encoded_payload &&
+              legacyImages.front().format == expected.format &&
+              legacyImages.front().width_emu == expected.width_emu &&
+              legacyImages.front().height_emu == expected.height_emu &&
+              legacyImages.front().accessible_name ==
+                  expected.accessible_name &&
+              legacyImages.front().layout ==
+                  docxstudio::core::ImageLayout{},
+          "legacy v1 clipboard paste was rejected or did not use default layout semantics");
+}
+
+void testCanonicalAnchorOriginsAndSharedPdfGeometry(
+    docxstudio::app::SpellChecker& spelling) {
+    DocumentCanvas canvas(spelling);
+    canvas.resize(1000, 700);
+    canvas.show();
+    canvas.setFocus();
+    canvas.insertText(QStringLiteral("Prefix "));
+    const auto png = encodedPng(Qt::red, 64, 40);
+    check(canvas.insertInlineImage(png, QStringLiteral("origin fixture")),
+          "could not insert canonical-anchor fixture");
+    const auto imageId = *canvas.selectedInlineImageId();
+
+    docxstudio::core::ImageLayout moving{
+        docxstudio::core::ImagePlacement::square, 0, 0, 0, 0, true};
+    check(canvas.setSelectedImageLayout(moving),
+          "could not configure moving canonical anchor");
+    sendKey(canvas, Qt::Key_Right);
+    QApplication::processEvents();
+    const QRect movingScreen = colorBounds(
+        canvas.viewport()->grab().toImage(), Qt::red);
+    check(movingScreen.isValid(),
+          "moving canonical anchor did not render on the canvas");
+
+    // Wrap distances expand the text exclusion only. They are not wp:posOffset
+    // and therefore must not translate or rescale the picture rectangle.
+    constexpr std::int64_t kEighteenPointsEmu = 18 * 12700;
+    moving.distance_top_emu = kEighteenPointsEmu;
+    moving.distance_right_emu = kEighteenPointsEmu;
+    moving.distance_bottom_emu = kEighteenPointsEmu;
+    moving.distance_left_emu = kEighteenPointsEmu;
+    check(canvas.selectInlineImage(imageId) &&
+              canvas.setSelectedImageLayout(moving),
+          "could not configure canonical wrap distances");
+    sendKey(canvas, Qt::Key_Right);
+    QApplication::processEvents();
+    const QRect spacedScreen = colorBounds(
+        canvas.viewport()->grab().toImage(), Qt::red);
+    check(spacedScreen.isValid() &&
+              std::abs(spacedScreen.left() - movingScreen.left()) <= 1 &&
+              std::abs(spacedScreen.top() - movingScreen.top()) <= 1 &&
+              std::abs(spacedScreen.width() - movingScreen.width()) <= 1 &&
+              std::abs(spacedScreen.height() - movingScreen.height()) <= 1,
+          "wrap distances incorrectly changed the canvas picture rectangle");
+
+    QTemporaryDir output;
+    check(output.isValid(),
+          "could not create canonical-anchor PDF directory");
+    const QString movingPdfPath =
+        output.filePath(QStringLiteral("moving-anchor.pdf"));
+    QString error;
+    check(canvas.exportPdf(movingPdfPath, error),
+          "could not export moving-anchor PDF");
+    const QRect movingPdf = colorBounds(
+        rasterizeFirstPdfPage(
+            movingPdfPath,
+            output.filePath(QStringLiteral("moving-anchor-page"))),
+        Qt::red);
+    check(movingPdf.isValid(),
+          "moving anchor was absent from the shared PDF renderer");
+
+    auto fixed = moving;
+    fixed.move_with_text = false;
+    check(canvas.selectInlineImage(imageId) &&
+              canvas.setSelectedImageLayout(fixed),
+          "could not configure fixed canonical anchor");
+    sendKey(canvas, Qt::Key_Right);
+    QApplication::processEvents();
+    const QRect fixedScreen = colorBounds(
+        canvas.viewport()->grab().toImage(), Qt::red);
+    check(fixedScreen.isValid(),
+          "fixed canonical anchor did not render on the canvas");
+    const QString fixedPdfPath =
+        output.filePath(QStringLiteral("fixed-anchor.pdf"));
+    error.clear();
+    check(canvas.exportPdf(fixedPdfPath, error),
+          "could not export fixed-anchor PDF");
+    const QRect fixedPdf = colorBounds(
+        rasterizeFirstPdfPage(
+            fixedPdfPath,
+            output.filePath(QStringLiteral("fixed-anchor-page"))),
+        Qt::red);
+    check(fixedPdf.isValid() && fixedPdf.left() <= 1 && fixedPdf.top() <= 1,
+          "fixed page/page zero-offset anchor was not at the PDF page origin");
+
+    const QPoint screenDelta = movingScreen.topLeft() -
+                               fixedScreen.topLeft();
+    const QPoint pdfDelta = movingPdf.topLeft() - fixedPdf.topLeft();
+    check(screenDelta.x() > 90 && screenDelta.y() > 90 &&
+              std::abs(screenDelta.x() - pdfDelta.x()) <= 3 &&
+              std::abs(screenDelta.y() - pdfDelta.y()) <= 3 &&
+              std::abs(movingPdf.width() - fixedPdf.width()) <= 1 &&
+              std::abs(movingPdf.height() - fixedPdf.height()) <= 1,
+          "canvas/PDF disagreed on character/paragraph versus page/page anchor origins");
+    canvas.hide();
+}
+
+void testMixedAnchorNonOverlapAndTopmostHitTarget(
+    docxstudio::app::SpellChecker& spelling) {
+    DocumentCanvas mixed(spelling);
+    mixed.resize(900, 620);
+    mixed.show();
+    mixed.setFocus();
+    const auto redPng = encodedPng(Qt::red, 80, 48);
+    const auto greenPng = encodedPng(Qt::green, 80, 48);
+    check(mixed.insertInlineImage(redPng, QStringLiteral("square")),
+          "could not insert mixed square anchor");
+    const auto squareId = *mixed.selectedInlineImageId();
+    check(mixed.setSelectedImageLayout({
+              docxstudio::core::ImagePlacement::square,
+              0, 0, 0, 0, true}),
+          "could not configure mixed square anchor");
+    sendKey(mixed, Qt::Key_Right);
+    check(mixed.insertInlineImage(greenPng, QStringLiteral("top-bottom")),
+          "could not insert mixed top/bottom anchor");
+    check(mixed.setSelectedImageLayout({
+              docxstudio::core::ImagePlacement::top_and_bottom,
+              0, 0, 0, 0, true}),
+          "could not configure mixed top/bottom anchor");
+    sendKey(mixed, Qt::Key_Right);
+    QApplication::processEvents();
+    const QImage mixedRaster = mixed.viewport()->grab().toImage();
+    const QRect red = colorBounds(mixedRaster, Qt::red);
+    const QRect green = colorBounds(mixedRaster, Qt::green);
+    check(red.isValid() && green.isValid() &&
+              green.top() >= red.bottom() - 1 &&
+              !red.intersects(green),
+          "square followed by top/bottom anchors overlapped on the canvas");
+    check(mixed.selectInlineImage(squareId),
+          "mixed anchor selection was lost after layout");
+    mixed.hide();
+
+    // Fixed anchors in separate paragraphs intentionally share the canonical
+    // page/page zero origin. Rendering paints the later paragraph last, so a
+    // click in the overlap must select that visually topmost picture.
+    DocumentCanvas overlap(spelling);
+    overlap.resize(900, 620);
+    overlap.show();
+    overlap.setFocus();
+    const auto bluePng = encodedPng(Qt::blue, 80, 48);
+    check(overlap.insertInlineImage(redPng, QStringLiteral("back")),
+          "could not insert backmost fixed anchor");
+    check(overlap.setSelectedImageLayout({
+              docxstudio::core::ImagePlacement::square,
+              0, 0, 0, 0, false}),
+          "could not configure backmost fixed anchor");
+    sendKey(overlap, Qt::Key_Right);
+    sendKey(overlap, Qt::Key_Return);
+    check(overlap.insertInlineImage(bluePng, QStringLiteral("front")),
+          "could not insert topmost fixed anchor");
+    const auto frontId = *overlap.selectedInlineImageId();
+    check(overlap.setSelectedImageLayout({
+              docxstudio::core::ImagePlacement::square,
+              0, 0, 0, 0, false}),
+          "could not configure topmost fixed anchor");
+    sendKey(overlap, Qt::Key_Right);
+    QApplication::processEvents();
+    const QRect blue = colorBounds(
+        overlap.viewport()->grab().toImage(), Qt::blue);
+    check(blue.isValid(),
+          "could not locate topmost fixed anchor for hit testing");
+    clickViewport(overlap, blue.center());
+    check(overlap.selectedInlineImageId() == frontId,
+          "overlapping picture hit-test did not follow reverse paint order");
+    overlap.hide();
+}
+
+void testAnchoredMultipageFlowIsPageLocal(
+    docxstudio::app::SpellChecker& spelling) {
+    DocumentCanvas canvas(spelling);
+    canvas.resize(1000, 1000);
+    canvas.setPageSizePoints(320.0, 220.0);
+    canvas.setMarginsPoints(24.0, 24.0, 24.0, 24.0);
+    canvas.show();
+    canvas.setFocus();
+
+    // The fitted image occupies almost the full first-page content height. A
+    // hard-line sequence then crosses onto page two while its square exclusion
+    // is still active on page one.
+    const auto png = encodedPng(Qt::red, 120, 230);
+    check(canvas.insertInlineImage(png, QStringLiteral("page-one square")),
+          "could not insert multipage square fixture");
+    check(canvas.setSelectedImageLayout({
+              docxstudio::core::ImagePlacement::square,
+              0, 0, 0, 0, true}),
+          "could not configure multipage square fixture");
+    sendKey(canvas, Qt::Key_Right);
+
+    QString flow;
+    constexpr int kLineCount = 18;
+    for (int index = 0; index < kLineCount; ++index) {
+        if (index > 0) flow += QChar::LineSeparator;
+        flow += QStringLiteral("L%1").arg(index, 2, 10, QLatin1Char('0'));
+    }
+    flow += QStringLiteral("\nFOLLOW");
+    canvas.insertText(flow);
+    QApplication::processEvents();
+
+    std::vector<int> pages;
+    std::vector<int> cursorXs;
+    std::vector<int> cursorYs;
+    pages.reserve(kLineCount);
+    cursorXs.reserve(kLineCount);
+    cursorYs.reserve(kLineCount);
+    for (int index = 0; index < kLineCount; ++index) {
+        const QString marker = QStringLiteral("L%1").arg(
+            index, 2, 10, QLatin1Char('0'));
+        check(canvas.findNext(marker, true),
+              "could not locate a multipage hard-line marker");
+        const QRect cursor = inputMethodCursorRect(canvas);
+        pages.push_back(canvas.currentPageNumber());
+        cursorXs.push_back(cursor.x());
+        cursorYs.push_back(cursor.y());
+    }
+
+    std::optional<std::size_t> firstSecondPage;
+    for (std::size_t index = 0; index + 1U < pages.size(); ++index) {
+        if (pages[index] == 2 && pages[index + 1U] == 2) {
+            firstSecondPage = index;
+            break;
+        }
+    }
+    check(firstSecondPage.has_value(),
+          "multipage fixture did not leave adjacent markers on page two");
+    check(std::abs(cursorXs[*firstSecondPage] -
+                   cursorXs[*firstSecondPage + 1U]) <= 2,
+          "first page-two line retained the page-one square-wrap offset");
+
+    const int lastMarkerPage = pages.back();
+    const int lastMarkerY = cursorYs.back();
+    check(canvas.findNext(QStringLiteral("FOLLOW"), true),
+          "could not locate paragraph after multipage anchor fixture");
+    const QRect followingCursor = inputMethodCursorRect(canvas);
+    if (!(canvas.currentPageNumber() == lastMarkerPage &&
+          followingCursor.y() > lastMarkerY &&
+          followingCursor.y() - lastMarkerY < 50)) {
+        std::cerr << "multipage geometry: lastPage=" << lastMarkerPage
+                  << " followingPage=" << canvas.currentPageNumber()
+                  << " lastY=" << lastMarkerY
+                  << " followingY=" << followingCursor.y() << '\n';
+    }
+    check(canvas.currentPageNumber() == lastMarkerPage &&
+              followingCursor.y() > lastMarkerY &&
+              followingCursor.y() - lastMarkerY < 50,
+          "a prior-page picture bottom displaced the following paragraph on the current page");
+    canvas.hide();
+}
+
+void testResizeHandleDragIsOneUndo(
+    docxstudio::app::SpellChecker& spelling) {
+    enum class ResizeExpectation {
+        width_only,
+        height_only,
+        locked_corner,
+        free_corner,
+    };
+    const auto png = encodedPng(Qt::red, 80, 48);
+    const auto exerciseHandle =
+        [&spelling, &png](const auto& handlePoint, const QPoint& delta,
+                          Qt::CursorShape cursor,
+                          ResizeExpectation expectation,
+                          Qt::KeyboardModifiers modifiers = Qt::NoModifier) {
+            DocumentCanvas canvas(spelling);
+            canvas.resize(900, 520);
+            canvas.show();
+            canvas.setFocus();
+            check(canvas.insertInlineImage(
+                      png, QStringLiteral("resize handle fixture")),
+                  "could not insert resize-handle fixture");
+            const auto imageId = *canvas.selectedInlineImageId();
+            const auto original = imageAtoms(canvas).front();
+
+            // Capture the undecorated raster bounds, then reselect the image
+            // so the tested point is a real painted and hit-tested handle.
+            sendKey(canvas, Qt::Key_Right);
+            QApplication::processEvents();
+            const QRect imageBounds =
+                redBounds(canvas.viewport()->grab().toImage());
+            check(imageBounds.isValid(),
+                  "could not locate rendered resize-handle fixture");
+            check(canvas.selectInlineImage(imageId),
+                  "could not reselect resize-handle fixture");
+            QApplication::processEvents();
+
+            const QPoint start = handlePoint(imageBounds);
+            moveViewport(canvas, start);
+            check(canvas.viewport()->cursor().shape() == cursor,
+                  "exposed picture handle did not advertise its resize cursor");
+
+            int documentChangeSignals = 0;
+            QObject::connect(
+                &canvas, &DocumentCanvas::documentChanged,
+                [&documentChangeSignals](qulonglong) {
+                    ++documentChangeSignals;
+                });
+            const auto beforeDrag = canvas.snapshot();
+            dragViewport(canvas, start, start + delta, modifiers);
+            QApplication::processEvents();
+            const auto afterDrag = canvas.snapshot();
+            const auto resized = imageAtoms(canvas).front();
+            check(afterDrag.revision.value() ==
+                          beforeDrag.revision.value() + 1 &&
+                      documentChangeSignals == 1,
+                  "one handle drag was not exactly one semantic transaction");
+
+            switch (expectation) {
+                case ResizeExpectation::width_only:
+                    check(resized.width_emu > original.width_emu &&
+                              resized.height_emu == original.height_emu,
+                          "right handle changed more than picture width");
+                    break;
+                case ResizeExpectation::height_only:
+                    check(resized.width_emu == original.width_emu &&
+                              resized.height_emu > original.height_emu,
+                          "bottom handle changed more than picture height");
+                    break;
+                case ResizeExpectation::locked_corner:
+                case ResizeExpectation::free_corner: {
+                    check(resized.width_emu > original.width_emu &&
+                              resized.height_emu > original.height_emu,
+                          "bottom-right handle did not change both dimensions");
+                    const double originalRatio =
+                        static_cast<double>(original.width_emu) /
+                        static_cast<double>(original.height_emu);
+                    const double resizedRatio =
+                        static_cast<double>(resized.width_emu) /
+                        static_cast<double>(resized.height_emu);
+                    if (expectation == ResizeExpectation::locked_corner) {
+                        check(std::abs(originalRatio - resizedRatio) < 0.002,
+                              "bottom-right handle did not preserve aspect ratio by default");
+                    } else {
+                        check(std::abs(originalRatio - resizedRatio) > 0.05,
+                              "Shift did not allow a free-aspect corner resize");
+                    }
+                    break;
+                }
+            }
+
+            canvas.undo();
+            const auto undone = imageAtoms(canvas).front();
+            check(undone.width_emu == original.width_emu &&
+                      undone.height_emu == original.height_emu,
+                  "one Undo did not restore pre-drag picture geometry");
+            canvas.redo();
+            const auto redone = imageAtoms(canvas).front();
+            check(redone.width_emu == resized.width_emu &&
+                      redone.height_emu == resized.height_emu,
+                  "Redo did not restore handle-drag picture geometry");
+            canvas.hide();
+        };
+
+    exerciseHandle(
+        [](const QRect& bounds) {
+            return QPoint(bounds.right() + 1, bounds.center().y());
+        },
+        QPoint(32, 0), Qt::SizeHorCursor,
+        ResizeExpectation::width_only);
+    exerciseHandle(
+        [](const QRect& bounds) {
+            return QPoint(bounds.center().x(), bounds.bottom() + 1);
+        },
+        QPoint(0, 20), Qt::SizeVerCursor,
+        ResizeExpectation::height_only);
+    exerciseHandle(
+        [](const QRect& bounds) {
+            return bounds.bottomRight() + QPoint(1, 1);
+        },
+        QPoint(32, 19), Qt::SizeFDiagCursor,
+        ResizeExpectation::locked_corner);
+    exerciseHandle(
+        [](const QRect& bounds) {
+            return bounds.bottomRight() + QPoint(1, 1);
+        },
+        QPoint(36, 4), Qt::SizeFDiagCursor,
+        ResizeExpectation::free_corner, Qt::ShiftModifier);
+
+    DocumentCanvas cancellation(spelling);
+    cancellation.resize(900, 520);
+    cancellation.show();
+    cancellation.setFocus();
+    check(cancellation.insertInlineImage(
+              png, QStringLiteral("resize cancellation fixture")),
+          "could not insert resize-cancellation fixture");
+    const auto imageId = *cancellation.selectedInlineImageId();
+    const auto original = imageAtoms(cancellation).front();
+    sendKey(cancellation, Qt::Key_Right);
+    QApplication::processEvents();
+    const QRect imageBounds =
+        redBounds(cancellation.viewport()->grab().toImage());
+    check(imageBounds.isValid(),
+          "could not locate resize-cancellation fixture");
+    check(cancellation.selectInlineImage(imageId),
+          "could not reselect resize-cancellation fixture");
+    QApplication::processEvents();
+    const QRect selectedImageBounds =
+        redBounds(cancellation.viewport()->grab().toImage());
+    check(selectedImageBounds.isValid(),
+          "could not locate selected resize-cancellation fixture");
+
+    const auto isResizeCursor = [](Qt::CursorShape cursor) {
+        return cursor == Qt::SizeHorCursor ||
+               cursor == Qt::SizeVerCursor ||
+               cursor == Qt::SizeFDiagCursor ||
+               cursor == Qt::SizeBDiagCursor;
+    };
+    const std::array<QPoint, 5> removedHandlePoints{{
+        imageBounds.topLeft(),
+        QPoint(imageBounds.center().x(), imageBounds.top()),
+        QPoint(imageBounds.right() + 1, imageBounds.top()),
+        QPoint(imageBounds.left(), imageBounds.center().y()),
+        QPoint(imageBounds.left(), imageBounds.bottom() + 1),
+    }};
+    for (const QPoint& point : removedHandlePoints) {
+        moveViewport(cancellation, point);
+        check(!isResizeCursor(cancellation.viewport()->cursor().shape()),
+              "an uncommittable top/left picture handle remained hit-testable");
+    }
+
+    int documentChangeSignals = 0;
+    int operationFailureSignals = 0;
+    QObject::connect(
+        &cancellation, &DocumentCanvas::documentChanged,
+        [&documentChangeSignals](qulonglong) { ++documentChangeSignals; });
+    QObject::connect(
+        &cancellation, &DocumentCanvas::operationFailed,
+        [&operationFailureSignals](const QString&) {
+            ++operationFailureSignals;
+        });
+    const auto beforeUnsupportedDrag = cancellation.snapshot();
+    dragViewport(cancellation, imageBounds.topLeft(),
+                 imageBounds.topLeft() - QPoint(24, 16));
+    check(cancellation.snapshot().revision ==
+                  beforeUnsupportedDrag.revision &&
+              imageAtoms(cancellation).front().width_emu ==
+                  original.width_emu &&
+              imageAtoms(cancellation).front().height_emu ==
+                  original.height_emu,
+          "dragging a removed top/left hotspot changed picture geometry");
+
+    const QPoint bottomRight = imageBounds.bottomRight() + QPoint(1, 1);
+    const QPoint previewEnd = bottomRight + QPoint(40, 24);
+    const auto beforeCancel = cancellation.snapshot();
+    pressViewport(cancellation, bottomRight);
+    moveViewport(cancellation, previewEnd, Qt::LeftButton);
+    QApplication::processEvents();
+    const QRect previewBounds =
+        redBounds(cancellation.viewport()->grab().toImage());
+    check(previewBounds.isValid() &&
+              previewBounds.width() > imageBounds.width() &&
+              previewBounds.topLeft() == selectedImageBounds.topLeft() &&
+              cancellation.snapshot().revision == beforeCancel.revision &&
+              documentChangeSignals == 0,
+          "resize preview moved its fixed origin or mutated the document before release");
+    sendKey(cancellation, Qt::Key_Escape);
+    QApplication::processEvents();
+    const QRect cancelledBounds =
+        redBounds(cancellation.viewport()->grab().toImage());
+    releaseViewport(cancellation, previewEnd);
+    check(cancelledBounds.isValid() &&
+              cancelledBounds.width() < previewBounds.width() &&
+              cancellation.viewport()->cursor().shape() == Qt::ArrowCursor &&
+              cancellation.snapshot().revision == beforeCancel.revision &&
+              documentChangeSignals == 0 &&
+              imageAtoms(cancellation).front().width_emu ==
+                  original.width_emu &&
+              imageAtoms(cancellation).front().height_emu ==
+                  original.height_emu,
+          "Escape did not cancel resize preview without a transaction");
+
+    const auto beforeNoOp = cancellation.snapshot();
+    dragViewport(cancellation, bottomRight, bottomRight);
+    constexpr double kEmuPerPoint = 12700.0;
+    const double originalWidthPoints =
+        static_cast<double>(original.width_emu) / kEmuPerPoint;
+    const double originalHeightPoints =
+        static_cast<double>(original.height_emu) / kEmuPerPoint;
+    check(cancellation.resizeSelectedInlineImage(
+              originalWidthPoints, originalHeightPoints) &&
+              cancellation.snapshot().revision == beforeNoOp.revision &&
+              documentChangeSignals == 0,
+          "no-op handle/API resize created a semantic transaction");
+
+    const auto beforeFailure = cancellation.snapshot();
+    check(!cancellation.resizeSelectedInlineImage(
+              0.0, originalHeightPoints) &&
+              cancellation.snapshot().revision == beforeFailure.revision &&
+              documentChangeSignals == 0 &&
+              operationFailureSignals == 1,
+          "invalid picture resize did not fail without changing the document");
+    cancellation.hide();
 }
 
 void testClipboardValidation(docxstudio::app::SpellChecker& spelling) {
@@ -560,10 +1269,24 @@ void testDialogSaveAndReopen() {
               insertedFromFile.front().accessible_name.find(
                   temporary.path().toStdString()) == std::string::npos,
           "Picture command did not insert a real inline image");
+    const docxstudio::core::ImageLayout squareLayout{
+        docxstudio::core::ImagePlacement::square,
+        101, 202, 303, 404, false};
+    check(canvas->setSelectedImageLayout(squareLayout) &&
+              canvas->setSelectedImageAccessibleName(
+                  QStringLiteral("Quarterly owl diagram")),
+          "could not configure square wrapping and alt text before Save As");
 
     sendKey(*canvas, Qt::Key_Right);
     check(canvas->insertInlineImage(png, QStringLiteral("second.png")),
           "could not insert adjacent image before DOCX save");
+    const docxstudio::core::ImageLayout topBottomLayout{
+        docxstudio::core::ImagePlacement::top_and_bottom,
+        505, 606, 707, 808, true};
+    check(canvas->setSelectedImageLayout(topBottomLayout) &&
+              canvas->setSelectedImageAccessibleName(
+                  QStringLiteral("Supporting owl figure")),
+          "could not configure top/bottom wrapping and alt text before Save As");
     sendKey(*canvas, Qt::Key_Right);
     check(canvas->insertEquation(QStringLiteral("x^2")),
           "could not insert equation after adjacent images before DOCX save");
@@ -606,6 +1329,24 @@ void testDialogSaveAndReopen() {
                           fragment.inline_image->width_emu > 0 &&
                           fragment.inline_image->height_emu > 0,
                       "native DrawingML lost picture bytes or extents");
+                const auto& importedImage = *fragment.inline_image;
+                if (imageCount == 1) {
+                    check(importedImage.accessible_name ==
+                                  "Quarterly owl diagram" &&
+                              importedImage.layout ==
+                                  docxstudio::ooxml::ImageLayout{
+                                      docxstudio::ooxml::ImagePlacement::square,
+                                      101, 202, 303, 404, false},
+                          "native DrawingML lost square wrapping, distances, fixed placement, or alt text");
+                } else if (imageCount == 2) {
+                    check(importedImage.accessible_name ==
+                                  "Supporting owl figure" &&
+                              importedImage.layout ==
+                                  docxstudio::ooxml::ImageLayout{
+                                      docxstudio::ooxml::ImagePlacement::top_and_bottom,
+                                      505, 606, 707, 808, true},
+                          "native DrawingML lost top/bottom wrapping, distances, moving placement, or alt text");
+                }
             } else if (fragment.kind ==
                        docxstudio::ooxml::FragmentKind::text) {
                 ordered += fragment.text;
@@ -635,10 +1376,16 @@ void testDialogSaveAndReopen() {
         : std::vector<docxstudio::core::ImageAtom>{};
     check(reopenedCanvas && reopenedImages.size() == 2 &&
               reopenedImages.front().encoded_payload.size() == png.size() &&
+              reopenedImages[0].accessible_name ==
+                  "Quarterly owl diagram" &&
+              reopenedImages[0].layout == squareLayout &&
+              reopenedImages[1].accessible_name ==
+                  "Supporting owl figure" &&
+              reopenedImages[1].layout == topBottomLayout &&
               reopenedCanvas->snapshot().document.paragraphs().front()
                       .equations().size() == 1 &&
               !reopenedCanvas->isModified(),
-          "desktop reopen did not reconstruct mixed semantic inline objects");
+          "desktop reopen did not reconstruct mixed semantic objects, picture layout, or alt text");
 }
 
 }  // namespace
@@ -652,6 +1399,11 @@ int main(int argc, char** argv) {
     QApplication::setQuitOnLastWindowClosed(false);
     docxstudio::app::SpellChecker spelling;
     testCanvasObjectLifecycle(spelling);
+    testPicturePropertiesAndClipboardVersions(spelling);
+    testCanonicalAnchorOriginsAndSharedPdfGeometry(spelling);
+    testMixedAnchorNonOverlapAndTopmostHitTarget(spelling);
+    testAnchoredMultipageFlowIsPageLocal(spelling);
+    testResizeHandleDragIsOneUndo(spelling);
     testClipboardValidation(spelling);
     testMixedObjectOrdering(spelling);
     testImageBudgetEvictionKeepsCanvasHistoryUsable(spelling);

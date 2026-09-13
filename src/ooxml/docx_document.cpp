@@ -2225,7 +2225,8 @@ void assignNumberingMarkers(std::vector<Paragraph>& paragraphs,
 }
 
 std::optional<std::int64_t> parsePositiveInt64Attribute(
-    const pugi::xml_node& node, const char* attribute_name) {
+    const pugi::xml_node& node, const char* attribute_name,
+    std::int64_t maximum = kMaximumInlineExtentEmu) {
     const std::string_view encoded = node.attribute(attribute_name).value();
     if (encoded.empty()) return std::nullopt;
     std::int64_t value = 0;
@@ -2236,10 +2237,382 @@ std::optional<std::int64_t> parsePositiveInt64Attribute(
     // conversions from overflowing.
     if (parsed.ec != std::errc{} ||
         parsed.ptr != encoded.data() + encoded.size() || value <= 0 ||
-        value > kMaximumInlineExtentEmu) {
+        value > maximum) {
         return std::nullopt;
     }
     return value;
+}
+
+bool parseBoundedDistanceAttribute(
+    const pugi::xml_node& node, const char* attribute_name,
+    std::int64_t& value) {
+    const pugi::xml_attribute attribute = node.attribute(attribute_name);
+    if (!attribute) {
+        value = 0;
+        return true;
+    }
+    const std::string_view encoded = attribute.value();
+    std::uint64_t parsed_value = 0;
+    const auto parsed = std::from_chars(
+        encoded.data(), encoded.data() + encoded.size(), parsed_value, 10);
+    if (encoded.empty() || parsed.ec != std::errc{} ||
+        parsed.ptr != encoded.data() + encoded.size() ||
+        parsed_value > static_cast<std::uint64_t>(
+                           kMaximumImageWrapDistanceEmu)) {
+        return false;
+    }
+    value = static_cast<std::int64_t>(parsed_value);
+    return true;
+}
+
+bool parseBooleanAttribute(const pugi::xml_node& node, const char* name,
+                           bool& value) {
+    const pugi::xml_attribute attribute = node.attribute(name);
+    if (!attribute) return false;
+    const std::string_view encoded = attribute.value();
+    if (encoded == "1" || encoded == "true") {
+        value = true;
+        return true;
+    }
+    if (encoded == "0" || encoded == "false") {
+        value = false;
+        return true;
+    }
+    return false;
+}
+
+bool parseExactInteger(std::string_view encoded, std::int64_t expected) {
+    if (encoded.empty()) return false;
+    std::int64_t value = 0;
+    const auto parsed = std::from_chars(
+        encoded.data(), encoded.data() + encoded.size(), value, 10);
+    return parsed.ec == std::errc{} &&
+        parsed.ptr == encoded.data() + encoded.size() && value == expected;
+}
+
+bool namespaceDeclaration(const pugi::xml_attribute& attribute) {
+    const std::string_view name = attribute.name();
+    return name == "xmlns" || name.starts_with("xmlns:");
+}
+
+bool hasOnlyAttributes(
+    const pugi::xml_node& node,
+    std::initializer_list<std::string_view> accepted) {
+    for (const pugi::xml_attribute attribute : node.attributes()) {
+        if (namespaceDeclaration(attribute)) continue;
+        if (std::find(accepted.begin(), accepted.end(), attribute.name()) ==
+            accepted.end()) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool hasNoElementChildren(const pugi::xml_node& node) {
+    return std::none_of(
+        node.begin(), node.end(), [](const pugi::xml_node& child) {
+            return child.type() == pugi::node_element;
+        });
+}
+
+bool parseCanonicalPosition(
+    const pugi::xml_node& position, std::string& relative_from) {
+    if (!hasOnlyAttributes(position, {"relativeFrom"})) return false;
+    const pugi::xml_attribute relative = position.attribute("relativeFrom");
+    if (!relative || std::string_view(relative.value()).empty()) return false;
+    relative_from = relative.value();
+
+    pugi::xml_node offset;
+    for (const pugi::xml_node child : position.children()) {
+        if (ignorableNode(child)) continue;
+        if (!isNamespacedElement(
+                child, "posOffset", kWordprocessingDrawingNamespace) ||
+            offset) {
+            return false;
+        }
+        offset = child;
+    }
+    return offset && hasOnlyAttributes(offset, {}) &&
+        hasNoElementChildren(offset) &&
+        parseExactInteger(offset.text().get(), 0);
+}
+
+bool canonicalGraphicFrameProperties(
+    const pugi::xml_node& properties) {
+    if (!hasOnlyAttributes(properties, {})) return false;
+    pugi::xml_node locks;
+    for (const pugi::xml_node child : properties.children()) {
+        if (ignorableNode(child)) continue;
+        if (!isDrawingElement(child, "graphicFrameLocks") || locks) {
+            return false;
+        }
+        locks = child;
+    }
+    if (!locks || !hasOnlyAttributes(locks, {"noChangeAspect"}) ||
+        !hasNoElementChildren(locks)) {
+        return false;
+    }
+    bool no_change_aspect = false;
+    return parseBooleanAttribute(
+               locks, "noChangeAspect", no_change_aspect) &&
+        no_change_aspect;
+}
+
+bool canonicalAnchorPictureTree(
+    const pugi::xml_node& graphic, std::int64_t width,
+    std::int64_t height) {
+    std::size_t graphic_data_count = 0;
+    std::size_t blip_count = 0;
+    const auto visit = [&](const auto& self,
+                           const pugi::xml_node& node) -> bool {
+        for (const pugi::xml_node child : node.children()) {
+            if (ignorableNode(child)) continue;
+            if (child.type() != pugi::node_element) return false;
+            const std::string uri = namespaceUri(child);
+            const std::string_view local = localName(child.name());
+            if (uri == kDrawingMainNamespace ||
+                uri == kStrictDrawingMainNamespace) {
+                static constexpr std::array<std::string_view, 10>
+                    accepted_drawing_elements{
+                        "graphic", "graphicData", "blip", "stretch",
+                        "fillRect", "xfrm", "off", "ext", "prstGeom",
+                        "avLst"};
+                if (std::find(
+                        accepted_drawing_elements.begin(),
+                        accepted_drawing_elements.end(), local) ==
+                    accepted_drawing_elements.end()) {
+                    return false;
+                }
+                if (local == "graphicData") {
+                    ++graphic_data_count;
+                    if (!hasOnlyAttributes(child, {"uri"}) ||
+                        std::string_view(child.attribute("uri").value()) !=
+                            kDrawingPictureNamespace) {
+                        return false;
+                    }
+                } else if (local == "blip") {
+                    ++blip_count;
+                    const auto relationship = namespacedAttribute(
+                        child, "embed",
+                        {kOfficeRelationshipsNamespace,
+                         kStrictOfficeRelationshipsNamespace});
+                    if (!relationship || relationship->empty()) return false;
+                    for (const pugi::xml_attribute attribute :
+                         child.attributes()) {
+                        if (namespaceDeclaration(attribute)) continue;
+                        if (localName(attribute.name()) != "embed" ||
+                            !namespacedAttribute(
+                                child, "embed",
+                                {kOfficeRelationshipsNamespace,
+                                 kStrictOfficeRelationshipsNamespace})) {
+                            return false;
+                        }
+                    }
+                } else if (local == "off") {
+                    if (!hasOnlyAttributes(child, {"x", "y"}) ||
+                        !parseExactInteger(child.attribute("x").value(), 0) ||
+                        !parseExactInteger(child.attribute("y").value(), 0)) {
+                        return false;
+                    }
+                } else if (local == "ext") {
+                    if (!hasOnlyAttributes(child, {"cx", "cy"}) ||
+                        !parseExactInteger(
+                            child.attribute("cx").value(), width) ||
+                        !parseExactInteger(
+                            child.attribute("cy").value(), height)) {
+                        return false;
+                    }
+                } else if (local == "prstGeom") {
+                    if (!hasOnlyAttributes(child, {"prst"}) ||
+                        std::string_view(child.attribute("prst").value()) !=
+                            "rect") {
+                        return false;
+                    }
+                } else if (!hasOnlyAttributes(child, {})) {
+                    return false;
+                }
+            } else if (uri == kDrawingPictureNamespace) {
+                static constexpr std::array<std::string_view, 7>
+                    accepted_picture_elements{
+                        "pic", "nvPicPr", "cNvPr", "cNvPicPr",
+                        "blipFill", "spPr", "style"};
+                if (std::find(
+                        accepted_picture_elements.begin(),
+                        accepted_picture_elements.end(), local) ==
+                    accepted_picture_elements.end()) {
+                    return false;
+                }
+                if (local == "cNvPr") {
+                    if (!hasOnlyAttributes(child, {"id", "name"})) {
+                        return false;
+                    }
+                } else if (!hasOnlyAttributes(child, {})) {
+                    return false;
+                }
+            } else {
+                return false;
+            }
+            if (!self(self, child)) return false;
+        }
+        return true;
+    };
+    return visit(visit, graphic) && graphic_data_count == 1U &&
+        blip_count == 1U;
+}
+
+bool parseCanonicalAnchor(
+    const pugi::xml_node& anchor, ImageLayout& layout,
+    pugi::xml_node& extent, pugi::xml_node& doc_properties,
+    pugi::xml_node& graphic) {
+    static constexpr std::array<std::string_view, 10> anchor_attributes{
+        "distT", "distB", "distL", "distR", "simplePos",
+        "relativeHeight", "behindDoc", "locked", "layoutInCell",
+        "allowOverlap"};
+    if (!hasOnlyAttributes(
+            anchor,
+            {anchor_attributes[0], anchor_attributes[1],
+             anchor_attributes[2], anchor_attributes[3],
+             anchor_attributes[4], anchor_attributes[5],
+             anchor_attributes[6], anchor_attributes[7],
+             anchor_attributes[8], anchor_attributes[9]}) ||
+        !parseBoundedDistanceAttribute(
+            anchor, "distT", layout.distance_top_emu) ||
+        !parseBoundedDistanceAttribute(
+            anchor, "distR", layout.distance_right_emu) ||
+        !parseBoundedDistanceAttribute(
+            anchor, "distB", layout.distance_bottom_emu) ||
+        !parseBoundedDistanceAttribute(
+            anchor, "distL", layout.distance_left_emu)) {
+        return false;
+    }
+    bool simple_position = true;
+    bool behind_document = true;
+    bool locked = true;
+    bool layout_in_cell = false;
+    bool allow_overlap = true;
+    if (!parseBooleanAttribute(anchor, "simplePos", simple_position) ||
+        simple_position ||
+        !parseExactInteger(
+            anchor.attribute("relativeHeight").value(), 0) ||
+        !parseBooleanAttribute(anchor, "behindDoc", behind_document) ||
+        behind_document ||
+        !parseBooleanAttribute(anchor, "locked", locked) || locked ||
+        !parseBooleanAttribute(anchor, "layoutInCell", layout_in_cell) ||
+        !layout_in_cell ||
+        !parseBooleanAttribute(anchor, "allowOverlap", allow_overlap) ||
+        allow_overlap) {
+        return false;
+    }
+
+    pugi::xml_node simple_position_node;
+    pugi::xml_node horizontal_position;
+    pugi::xml_node vertical_position;
+    pugi::xml_node wrap;
+    pugi::xml_node frame_properties;
+    for (const pugi::xml_node child : anchor.children()) {
+        if (ignorableNode(child)) continue;
+        if (child.type() != pugi::node_element) return false;
+        if (isNamespacedElement(
+                child, "simplePos", kWordprocessingDrawingNamespace)) {
+            if (simple_position_node) return false;
+            simple_position_node = child;
+        } else if (isNamespacedElement(
+                       child, "positionH",
+                       kWordprocessingDrawingNamespace)) {
+            if (horizontal_position) return false;
+            horizontal_position = child;
+        } else if (isNamespacedElement(
+                       child, "positionV",
+                       kWordprocessingDrawingNamespace)) {
+            if (vertical_position) return false;
+            vertical_position = child;
+        } else if (isNamespacedElement(
+                       child, "extent", kWordprocessingDrawingNamespace)) {
+            if (extent) return false;
+            extent = child;
+        } else if (isNamespacedElement(
+                       child, "effectExtent",
+                       kWordprocessingDrawingNamespace)) {
+            if (!hasOnlyAttributes(child, {"l", "t", "r", "b"}) ||
+                !hasNoElementChildren(child) ||
+                !parseExactInteger(child.attribute("l").value(), 0) ||
+                !parseExactInteger(child.attribute("t").value(), 0) ||
+                !parseExactInteger(child.attribute("r").value(), 0) ||
+                !parseExactInteger(child.attribute("b").value(), 0)) {
+                return false;
+            }
+        } else if (isNamespacedElement(
+                       child, "wrapSquare",
+                       kWordprocessingDrawingNamespace)) {
+            if (wrap || !hasOnlyAttributes(child, {"wrapText"}) ||
+                std::string_view(child.attribute("wrapText").value()) !=
+                    "bothSides" ||
+                !hasNoElementChildren(child)) {
+                return false;
+            }
+            layout.placement = ImagePlacement::square;
+            wrap = child;
+        } else if (isNamespacedElement(
+                       child, "wrapTopAndBottom",
+                       kWordprocessingDrawingNamespace)) {
+            if (wrap || !hasOnlyAttributes(child, {}) ||
+                !hasNoElementChildren(child)) {
+                return false;
+            }
+            layout.placement = ImagePlacement::top_and_bottom;
+            wrap = child;
+        } else if (isNamespacedElement(
+                       child, "docPr", kWordprocessingDrawingNamespace)) {
+            if (doc_properties ||
+                !hasOnlyAttributes(child, {"id", "name", "descr"}) ||
+                !child.attribute("id") || !child.attribute("name") ||
+                !hasNoElementChildren(child)) {
+                return false;
+            }
+            doc_properties = child;
+        } else if (isNamespacedElement(
+                       child, "cNvGraphicFramePr",
+                       kWordprocessingDrawingNamespace)) {
+            if (frame_properties ||
+                !canonicalGraphicFrameProperties(child)) {
+                return false;
+            }
+            frame_properties = child;
+        } else if (isDrawingElement(child, "graphic")) {
+            if (graphic) return false;
+            graphic = child;
+        } else {
+            return false;
+        }
+    }
+    if (!simple_position_node || !horizontal_position ||
+        !vertical_position || !extent || !wrap || !doc_properties ||
+        !graphic ||
+        !hasOnlyAttributes(simple_position_node, {"x", "y"}) ||
+        !hasNoElementChildren(simple_position_node) ||
+        !parseExactInteger(
+            simple_position_node.attribute("x").value(), 0) ||
+        !parseExactInteger(
+            simple_position_node.attribute("y").value(), 0)) {
+        return false;
+    }
+    std::string horizontal_relative;
+    std::string vertical_relative;
+    if (!parseCanonicalPosition(
+            horizontal_position, horizontal_relative) ||
+        !parseCanonicalPosition(vertical_position, vertical_relative)) {
+        return false;
+    }
+    if (horizontal_relative == "character" &&
+        vertical_relative == "paragraph") {
+        layout.move_with_text = true;
+    } else if (horizontal_relative == "page" &&
+               vertical_relative == "page") {
+        layout.move_with_text = false;
+    } else {
+        return false;
+    }
+    return true;
 }
 
 void collectDescendantsNamed(
@@ -2256,34 +2629,77 @@ void collectDescendantsNamed(
 
 std::optional<InlineImagePayload> parseInlineImage(
     const pugi::xml_node& drawing) {
-    pugi::xml_node inline_node;
+    pugi::xml_node drawing_container;
+    bool anchored = false;
     for (const pugi::xml_node child : drawing.children()) {
         if (ignorableNode(child)) continue;
-        if (!isNamespacedElement(
-                child, "inline", kWordprocessingDrawingNamespace) ||
-            inline_node) {
+        const bool inline_picture = isNamespacedElement(
+            child, "inline", kWordprocessingDrawingNamespace);
+        const bool anchored_picture = isNamespacedElement(
+            child, "anchor", kWordprocessingDrawingNamespace);
+        if ((!inline_picture && !anchored_picture) || drawing_container) {
             return std::nullopt;
         }
-        inline_node = child;
+        drawing_container = child;
+        anchored = anchored_picture;
     }
-    if (!inline_node) return std::nullopt;
+    if (!drawing_container) return std::nullopt;
 
     pugi::xml_node extent;
-    for (const pugi::xml_node child : inline_node.children()) {
-        if (isNamespacedElement(
-                child, "extent", kWordprocessingDrawingNamespace)) {
-            if (extent) return std::nullopt;
-            extent = child;
+    pugi::xml_node doc_properties;
+    pugi::xml_node graphic;
+    ImageLayout layout;
+    if (anchored) {
+        if (!parseCanonicalAnchor(
+                drawing_container, layout, extent, doc_properties,
+                graphic)) {
+            return std::nullopt;
+        }
+    } else {
+        if (!parseBoundedDistanceAttribute(
+                drawing_container, "distT", layout.distance_top_emu) ||
+            !parseBoundedDistanceAttribute(
+                drawing_container, "distR", layout.distance_right_emu) ||
+            !parseBoundedDistanceAttribute(
+                drawing_container, "distB", layout.distance_bottom_emu) ||
+            !parseBoundedDistanceAttribute(
+                drawing_container, "distL", layout.distance_left_emu)) {
+            return std::nullopt;
+        }
+        for (const pugi::xml_node child : drawing_container.children()) {
+            if (isNamespacedElement(
+                    child, "extent", kWordprocessingDrawingNamespace)) {
+                if (extent) return std::nullopt;
+                extent = child;
+            } else if (isNamespacedElement(
+                           child, "docPr",
+                           kWordprocessingDrawingNamespace)) {
+                if (doc_properties) return std::nullopt;
+                doc_properties = child;
+            } else if (isDrawingElement(child, "graphic")) {
+                if (graphic) return std::nullopt;
+                graphic = child;
+            }
         }
     }
     if (!extent) return std::nullopt;
-    const auto width = parsePositiveInt64Attribute(extent, "cx");
-    const auto height = parsePositiveInt64Attribute(extent, "cy");
+    const std::int64_t maximum_extent = anchored
+        ? kMaximumImageDimensionEmu
+        : kMaximumInlineExtentEmu;
+    const auto width =
+        parsePositiveInt64Attribute(extent, "cx", maximum_extent);
+    const auto height =
+        parsePositiveInt64Attribute(extent, "cy", maximum_extent);
     if (!width || !height) return std::nullopt;
+
+    if (anchored &&
+        !canonicalAnchorPictureTree(graphic, *width, *height)) {
+        return std::nullopt;
+    }
 
     std::vector<pugi::xml_node> blips;
     collectDescendantsNamed(
-        inline_node, "blip", kDrawingMainNamespace, blips);
+        drawing_container, "blip", kDrawingMainNamespace, blips);
     if (blips.size() != 1) return std::nullopt;
     const auto relationship_id = namespacedAttribute(
         blips.front(), "embed",
@@ -2291,15 +2707,24 @@ std::optional<InlineImagePayload> parseInlineImage(
     if (!relationship_id || relationship_id->empty()) return std::nullopt;
 
     std::string name;
-    for (const pugi::xml_node child : inline_node.children()) {
-        if (isNamespacedElement(
-                child, "docPr", kWordprocessingDrawingNamespace)) {
-            name = child.attribute("name").value();
-            break;
-        }
+    std::string accessible_name;
+    if (doc_properties) {
+        name = doc_properties.attribute("name").value();
+        const pugi::xml_attribute description =
+            doc_properties.attribute("descr");
+        accessible_name = description ? description.value() : name;
     }
-    return InlineImagePayload{
-        *relationship_id, {}, {}, std::move(name), *width, *height, {}};
+    if (accessible_name.size() > kMaximumImageAccessibleNameBytes) {
+        return std::nullopt;
+    }
+    InlineImagePayload result;
+    result.relationship_id = *relationship_id;
+    result.name = std::move(name);
+    result.width_emu = *width;
+    result.height_emu = *height;
+    result.accessible_name = std::move(accessible_name);
+    result.layout = layout;
+    return result;
 }
 
 void collectRunTokens(
@@ -3034,23 +3459,6 @@ bool parseDocumentXml(
         paragraph.format_is_basic = direct_paragraph.format_is_basic &&
                                     inherited_format_is_basic &&
                                     numbering_is_basic;
-        if (paragraph.direct_body_child &&
-            paragraph.paragraph_mark_format.has_value()) {
-            // Table-cell paragraph marks have a semantic destination in the
-            // core cell's default insertion format. Body paragraphs do not
-            // yet expose an equivalent end-marker/default-format property,
-            // so keep this document out of the fully regeneratable subset.
-            basic_body = false;
-            appendIssueOnce(
-                report.issues,
-                seen_issues,
-                CompatibilityIssue{
-                    IssueSeverity::warning,
-                    IssueCode::unsupported_formatting,
-                    std::string(kDocumentPart),
-                    "Direct body paragraph-mark formatting is preserved but is not editable in the current semantic model",
-                    paragraph_index});
-        }
         if (!paragraph.format_is_basic) {
             basic_body = false;
             appendIssueOnce(
@@ -4639,19 +5047,52 @@ struct AuthoredImagePart {
     std::string content_type;
 };
 
+bool validImageLayout(const ImageLayout& layout) {
+    switch (layout.placement) {
+        case ImagePlacement::inline_with_text:
+        case ImagePlacement::square:
+        case ImagePlacement::top_and_bottom:
+            break;
+        default:
+            return false;
+    }
+    const auto valid_distance = [](std::int64_t distance) {
+        return distance >= 0 &&
+            distance <= kMaximumImageWrapDistanceEmu;
+    };
+    return valid_distance(layout.distance_top_emu) &&
+        valid_distance(layout.distance_right_emu) &&
+        valid_distance(layout.distance_bottom_emu) &&
+        valid_distance(layout.distance_left_emu) &&
+        (layout.placement != ImagePlacement::inline_with_text ||
+         layout.move_with_text);
+}
+
 bool validateNewInlineImage(
     const NewInlineImage& image, std::size_t paragraph_index,
     LossReport& loss, Error* error) {
-    IssueCode issue_code = IssueCode::invalid_utf8;
-    std::string detail;
+    IssueCode name_issue_code = IssueCode::invalid_utf8;
+    std::string name_detail;
     const bool valid_name = !image.name.empty() && image.name.size() <= 255U &&
-        isValidUtf8XmlText(image.name, issue_code, detail) &&
+        isValidUtf8XmlText(image.name, name_issue_code, name_detail) &&
         image.name != "." && image.name != ".." &&
         image.name.find('/') == std::string::npos &&
         image.name.find('\\') == std::string::npos;
+    IssueCode accessible_name_issue_code = IssueCode::invalid_utf8;
+    std::string accessible_name_detail;
+    const bool valid_accessible_name =
+        image.accessible_name.size() <=
+            kMaximumImageAccessibleNameBytes &&
+        isValidUtf8XmlText(
+            image.accessible_name, accessible_name_issue_code,
+            accessible_name_detail);
+    const std::int64_t maximum_extent =
+        image.layout.placement == ImagePlacement::inline_with_text
+        ? kMaximumInlineExtentEmu
+        : kMaximumImageDimensionEmu;
     const bool valid_extent = image.width_emu > 0 && image.height_emu > 0 &&
-        image.width_emu <= kMaximumInlineExtentEmu &&
-        image.height_emu <= kMaximumInlineExtentEmu;
+        image.width_emu <= maximum_extent &&
+        image.height_emu <= maximum_extent;
     const bool valid_size = !image.bytes.empty() &&
         image.bytes.size() <= NewInlineImage::maximum_encoded_bytes;
     const bool supported_format =
@@ -4664,27 +5105,42 @@ bool validateNewInlineImage(
         ? raster::inspect(image.bytes, image.format, raster_limits)
         : raster::Inspection{};
     const bool valid_encoding = supported_format && raster_inspection.ok();
-    if (valid_name && valid_extent && valid_size && valid_encoding) return true;
+    const bool valid_layout = validImageLayout(image.layout);
+    if (valid_name && valid_accessible_name && valid_extent && valid_size &&
+        valid_encoding && valid_layout) {
+        return true;
+    }
 
     std::string message;
+    IssueCode issue_code = IssueCode::structural_rewrite_required;
     if (!valid_name) {
-        message = detail.empty()
+        message = name_detail.empty()
             ? "Inline image name must be safe metadata, not a path"
-            : detail;
+            : name_detail;
+        if (!name_detail.empty()) issue_code = name_issue_code;
+    } else if (!valid_accessible_name) {
+        message = accessible_name_detail.empty()
+            ? "Image alt text exceeds the 4 KiB metadata limit"
+            : accessible_name_detail;
+        if (!accessible_name_detail.empty()) {
+            issue_code = accessible_name_issue_code;
+        }
     } else if (!valid_extent) {
         message = "Inline image display dimensions are outside the supported range";
     } else if (!valid_size) {
         message = "Inline image encoded bytes are empty or exceed 64 MiB";
     } else if (!supported_format) {
         message = "Inline image format is unsupported";
-    } else {
+    } else if (!valid_encoding) {
         message = image.format == RasterImageFormat::png
             ? "Inline image bytes do not match a supported bounded PNG"
             : "Inline image bytes do not match a supported bounded JPEG";
+    } else {
+        message =
+            "Image placement or wrap distance is outside the supported subset";
     }
     loss.issues.push_back(blockingIssue(
-        detail.empty() ? IssueCode::structural_rewrite_required : issue_code,
-        message, paragraph_index));
+        issue_code, message, paragraph_index));
     setError(error, ErrorCode::unsafe_edit, message);
     return false;
 }
@@ -5109,15 +5565,48 @@ void appendInlineImageDrawing(
     const AuthoredImagePart& part, std::size_t image_number) {
     const auto& image = *part.image;
     const std::string name = escapeXmlAttribute(image.name);
+    const std::string accessible_name = escapeXmlAttribute(
+        image.accessible_name.empty() ? image.name
+                                      : image.accessible_name);
     output << "<w:r>";
     appendBasicRunProperties(output, run.format);
-    output
-        << "<w:drawing><wp:inline distT=\"0\" distB=\"0\" distL=\"0\" distR=\"0\">"
-           "<wp:extent cx=\""
-        << image.width_emu << "\" cy=\"" << image.height_emu
-        << "\"/><wp:effectExtent l=\"0\" t=\"0\" r=\"0\" b=\"0\"/>"
-           "<wp:docPr id=\""
+    output << "<w:drawing>";
+    if (image.layout.placement == ImagePlacement::inline_with_text) {
+        output << "<wp:inline distT=\"" << image.layout.distance_top_emu
+               << "\" distB=\"" << image.layout.distance_bottom_emu
+               << "\" distL=\"" << image.layout.distance_left_emu
+               << "\" distR=\"" << image.layout.distance_right_emu
+               << "\">";
+    } else {
+        const std::string_view horizontal_relative =
+            image.layout.move_with_text ? "character" : "page";
+        const std::string_view vertical_relative =
+            image.layout.move_with_text ? "paragraph" : "page";
+        output << "<wp:anchor distT=\"" << image.layout.distance_top_emu
+               << "\" distB=\"" << image.layout.distance_bottom_emu
+               << "\" distL=\"" << image.layout.distance_left_emu
+               << "\" distR=\"" << image.layout.distance_right_emu
+               << "\" simplePos=\"0\" relativeHeight=\"0\" behindDoc=\"0\""
+                  " locked=\"0\" layoutInCell=\"1\" allowOverlap=\"0\">"
+                  "<wp:simplePos x=\"0\" y=\"0\"/><wp:positionH relativeFrom=\""
+               << horizontal_relative
+               << "\"><wp:posOffset>0</wp:posOffset></wp:positionH>"
+                  "<wp:positionV relativeFrom=\""
+               << vertical_relative
+               << "\"><wp:posOffset>0</wp:posOffset></wp:positionV>";
+    }
+    output << "<wp:extent cx=\"" << image.width_emu << "\" cy=\""
+           << image.height_emu
+           << "\"/><wp:effectExtent l=\"0\" t=\"0\" r=\"0\" b=\"0\"/>";
+    if (image.layout.placement == ImagePlacement::square) {
+        output << "<wp:wrapSquare wrapText=\"bothSides\"/>";
+    } else if (image.layout.placement ==
+               ImagePlacement::top_and_bottom) {
+        output << "<wp:wrapTopAndBottom/>";
+    }
+    output << "<wp:docPr id=\""
         << image_number << "\" name=\"" << name
+        << "\" descr=\"" << accessible_name
         << "\"/><wp:cNvGraphicFramePr><a:graphicFrameLocks noChangeAspect=\"1\"/>"
            "</wp:cNvGraphicFramePr><a:graphic><a:graphicData uri=\""
         << kDrawingPictureNamespace
@@ -5130,7 +5619,10 @@ void appendInlineImageDrawing(
         << image.width_emu << "\" cy=\"" << image.height_emu
         << "\"/></a:xfrm><a:prstGeom prst=\"rect\"><a:avLst/>"
            "</a:prstGeom></pic:spPr></pic:pic></a:graphicData></a:graphic>"
-           "</wp:inline></w:drawing></w:r>";
+        << (image.layout.placement == ImagePlacement::inline_with_text
+                ? "</wp:inline>"
+                : "</wp:anchor>")
+        << "</w:drawing></w:r>";
 }
 
 bool buildNewDocumentXml(

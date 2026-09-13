@@ -211,6 +211,47 @@ std::string alignmentName(const core::ParagraphFormat& format) {
     return "left";
 }
 
+codex::Json characterStyleFor(const core::CharacterFormat& source) {
+    codex::Json style = codex::Json::object();
+    if (source.font_family) style["fontFamily"] = *source.font_family;
+    if (source.font_size_half_points) {
+        style["fontSizePoints"] = *source.font_size_half_points / 2.0;
+    }
+    if (source.bold) style["bold"] = *source.bold;
+    if (source.italic) style["italic"] = *source.italic;
+    if (source.underline) {
+        style["underline"] =
+            *source.underline != core::UnderlineStyle::none;
+    }
+    if (source.strike) style["strike"] = *source.strike;
+    const auto colorName = [](std::uint32_t argb) {
+        return toUtf8(QStringLiteral("#%1")
+                          .arg(argb & 0x00ffffffU, 6, 16,
+                               QLatin1Char('0'))
+                          .toUpper());
+    };
+    if (source.foreground_argb) {
+        style["foregroundColor"] = colorName(*source.foreground_argb);
+    }
+    if (source.highlight_argb) {
+        style["highlightColor"] = colorName(*source.highlight_argb);
+    }
+    if (source.baseline) {
+        switch (*source.baseline) {
+            case core::BaselinePosition::normal:
+                style["verticalAlign"] = "baseline";
+                break;
+            case core::BaselinePosition::superscript:
+                style["verticalAlign"] = "superscript";
+                break;
+            case core::BaselinePosition::subscript:
+                style["verticalAlign"] = "subscript";
+                break;
+        }
+    }
+    return style;
+}
+
 codex::Json formattingFor(
     const std::vector<core::FormatRun>& characterFormats,
     const core::ParagraphFormat& paragraphFormat,
@@ -222,38 +263,7 @@ codex::Json formattingFor(
         const std::size_t start = std::max(run.start, returnedTextStart);
         const std::size_t end = std::min(run.end, returnedTextEnd);
         if (start >= end) continue;
-        codex::Json format = codex::Json::object();
-        if (run.format.font_family) format["fontFamily"] = *run.format.font_family;
-        if (run.format.font_size_half_points)
-            format["fontSizePoints"] = *run.format.font_size_half_points / 2.0;
-        if (run.format.bold) format["bold"] = *run.format.bold;
-        if (run.format.italic) format["italic"] = *run.format.italic;
-        if (run.format.underline)
-            format["underline"] = *run.format.underline != core::UnderlineStyle::none;
-        if (run.format.strike) format["strike"] = *run.format.strike;
-        const auto colorName = [](std::uint32_t argb) {
-            return toUtf8(QStringLiteral("#%1")
-                              .arg(argb & 0x00ffffffU, 6, 16,
-                                   QLatin1Char('0'))
-                              .toUpper());
-        };
-        if (run.format.foreground_argb)
-            format["foregroundColor"] = colorName(*run.format.foreground_argb);
-        if (run.format.highlight_argb)
-            format["highlightColor"] = colorName(*run.format.highlight_argb);
-        if (run.format.baseline) {
-            switch (*run.format.baseline) {
-                case core::BaselinePosition::normal:
-                    format["verticalAlign"] = "baseline";
-                    break;
-                case core::BaselinePosition::superscript:
-                    format["verticalAlign"] = "superscript";
-                    break;
-                case core::BaselinePosition::subscript:
-                    format["verticalAlign"] = "subscript";
-                    break;
-            }
-        }
+        auto format = characterStyleFor(run.format);
         runs.push_back({{"start", start - returnedTextStart},
                         {"end", end - returnedTextStart},
                         {"style", std::move(format)}});
@@ -265,15 +275,27 @@ codex::Json formattingFor(
 codex::Json formattingFor(const core::Paragraph& paragraph,
                           std::size_t returnedTextStart,
                           std::size_t returnedTextLength) {
-    return formattingFor(paragraph.characterFormats(), paragraph.format(),
-                         returnedTextStart, returnedTextLength);
+    auto result = formattingFor(
+        paragraph.characterFormats(), paragraph.format(), returnedTextStart,
+        returnedTextLength);
+    if (!paragraph.paragraphMarkCharacterFormat().empty()) {
+        result["paragraphMarkStyle"] = characterStyleFor(
+            paragraph.paragraphMarkCharacterFormat());
+    }
+    return result;
 }
 
 codex::Json formattingFor(const core::TableCell& cell,
                           std::size_t returnedTextStart,
                           std::size_t returnedTextLength) {
-    return formattingFor(cell.character_formats, cell.paragraph_format,
-                         returnedTextStart, returnedTextLength);
+    auto result = formattingFor(
+        cell.character_formats, cell.paragraph_format, returnedTextStart,
+        returnedTextLength);
+    if (!cell.default_character_format.empty()) {
+        result["paragraphMarkStyle"] = characterStyleFor(
+            cell.default_character_format);
+    }
+    return result;
 }
 
 codex::Json equationsFor(const core::Paragraph& paragraph,
@@ -305,6 +327,17 @@ codex::Json imagesFor(const core::Paragraph& paragraph,
             image.utf16_offset >= returnedTextEnd) {
             continue;
         }
+        const auto placement = [&image] {
+            switch (image.layout.placement) {
+                case core::ImagePlacement::inline_with_text:
+                    return "inline";
+                case core::ImagePlacement::square:
+                    return "square";
+                case core::ImagePlacement::top_and_bottom:
+                    return "topBottom";
+            }
+            return "inline";
+        }();
         images.push_back(
             {{"id", image.id.toString()},
              {"utf16Offset", image.utf16_offset - returnedTextStart},
@@ -312,6 +345,13 @@ codex::Json imagesFor(const core::Paragraph& paragraph,
              {"mimeType", core::imageContentType(image.format)},
              {"widthEmu", image.width_emu},
              {"heightEmu", image.height_emu},
+             {"layout",
+              {{"placement", placement},
+               {"distanceTopEmu", image.layout.distance_top_emu},
+               {"distanceRightEmu", image.layout.distance_right_emu},
+               {"distanceBottomEmu", image.layout.distance_bottom_emu},
+               {"distanceLeftEmu", image.layout.distance_left_emu},
+               {"moveWithText", image.layout.move_with_text}}},
              {"encodedBytes", image.encoded_payload.size()}});
     }
     return images;
@@ -908,7 +948,8 @@ bool appendWorkingOperation(core::Document& working,
                     typed.position, typed.canonical_latex, typed.display,
                     typed.equation_id, typed.format);
             } else if constexpr (std::is_same_v<Type, core::DeleteRange>) {
-                return working.deleteRange(typed.range);
+                return working.deleteRange(
+                    typed.range, typed.empty_paragraph_format);
             } else if constexpr (std::is_same_v<Type, core::ReplaceRange>) {
                 return working.replaceRange(typed.range, typed.text, typed.format);
             } else if constexpr (std::is_same_v<Type, core::SetCharacterFormat>) {

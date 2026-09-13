@@ -33,6 +33,19 @@ struct InsertImage {
     std::int64_t height_emu{0};
     NodeId image_id{NodeId::generate()};
     std::optional<CharacterFormat> character_format;
+    ImageLayout layout{};
+
+    InsertImage(
+        Position target_position, EncodedImagePayload payload,
+        ImageFormat format, std::string name, std::int64_t width,
+        std::int64_t height, NodeId id = NodeId::generate(),
+        std::optional<CharacterFormat> character_formatting = std::nullopt,
+        ImageLayout image_layout = {})
+        : position(target_position), encoded_payload(std::move(payload)),
+          image_format(format), accessible_name(std::move(name)),
+          width_emu(width), height_emu(height), image_id(id),
+          character_format(std::move(character_formatting)),
+          layout(image_layout) {}
 };
 
 struct ResizeImage {
@@ -41,8 +54,27 @@ struct ResizeImage {
     std::int64_t height_emu{0};
 };
 
+struct SetImageLayout {
+    NodeId image_id;
+    ImageLayout layout;
+};
+
+struct SetImageAccessibleName {
+    NodeId image_id;
+    std::string accessible_name;
+};
+
 struct DeleteRange {
     Range range;
+    // When deletion leaves its surviving paragraph empty, callers may supply
+    // the active insertion format that cannot be inferred from deleted text.
+    std::optional<CharacterFormat> empty_paragraph_format;
+
+    DeleteRange(
+        Range deleted_range,
+        std::optional<CharacterFormat> resulting_empty_format = std::nullopt)
+        : range(deleted_range),
+          empty_paragraph_format(std::move(resulting_empty_format)) {}
 };
 
 struct ReplaceRange {
@@ -56,6 +88,11 @@ struct SetCharacterFormat {
     CharacterFormatDelta delta;
 };
 
+struct SetParagraphMarkCharacterFormat {
+    NodeId paragraph_id;
+    CharacterFormatDelta delta;
+};
+
 struct SetParagraphFormat {
     std::vector<NodeId> paragraph_ids;
     ParagraphFormatDelta delta;
@@ -66,6 +103,15 @@ struct SplitParagraph {
     // Callers may retain this ID and refer to the new paragraph in a later
     // operation in the same sequential batch.
     NodeId new_paragraph_id{NodeId::generate()};
+    // When present, this is the caller's active typing format at the split.
+    // Otherwise the core derives the new mark from the caret context.
+    std::optional<CharacterFormat> new_paragraph_mark_format;
+
+    SplitParagraph(
+        Position split_position, NodeId new_id = NodeId::generate(),
+        std::optional<CharacterFormat> mark_format = std::nullopt)
+        : position(split_position), new_paragraph_id(new_id),
+          new_paragraph_mark_format(std::move(mark_format)) {}
 };
 
 struct MergeWithNextParagraph {
@@ -160,8 +206,11 @@ struct DeleteTable {
 };
 
 using Operation = std::variant<InsertText, InsertEquation, InsertImage,
-                               ResizeImage, DeleteRange, ReplaceRange,
-                               SetCharacterFormat, SetParagraphFormat,
+                               ResizeImage, SetImageLayout,
+                               SetImageAccessibleName, DeleteRange, ReplaceRange,
+                               SetCharacterFormat,
+                               SetParagraphMarkCharacterFormat,
+                               SetParagraphFormat,
                                SplitParagraph, MergeWithNextParagraph,
                                InsertTable, SetTableCellText,
                                SetTableCellCharacterFormat,

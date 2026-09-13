@@ -298,6 +298,105 @@ std::optional<core::ImageFormat> parseImageFormat(std::string_view value) {
     return std::nullopt;
 }
 
+const char* imagePlacementName(core::ImagePlacement placement) noexcept {
+    switch (placement) {
+        case core::ImagePlacement::inline_with_text:
+            return "inline";
+        case core::ImagePlacement::square:
+            return "square";
+        case core::ImagePlacement::top_and_bottom:
+            return "top-and-bottom";
+    }
+    return "unknown";
+}
+
+std::optional<core::ImagePlacement> parseImagePlacement(
+    std::string_view value) {
+    if (value == "inline") return core::ImagePlacement::inline_with_text;
+    if (value == "square") return core::ImagePlacement::square;
+    if (value == "top-and-bottom") {
+        return core::ImagePlacement::top_and_bottom;
+    }
+    return std::nullopt;
+}
+
+Json encodeImageLayout(const core::ImageLayout& layout) {
+    return {{"placement", imagePlacementName(layout.placement)},
+            {"distance_top_emu", layout.distance_top_emu},
+            {"distance_right_emu", layout.distance_right_emu},
+            {"distance_bottom_emu", layout.distance_bottom_emu},
+            {"distance_left_emu", layout.distance_left_emu},
+            {"move_with_text", layout.move_with_text}};
+}
+
+bool readImageDistance(const Json& input, const char* key,
+                       std::int64_t& value, std::string& error) {
+    const auto found = input.find(key);
+    if (found == input.end()) return true;
+    if (found->is_number_unsigned()) {
+        const auto encoded = found->get<std::uint64_t>();
+        if (encoded > static_cast<std::uint64_t>(
+                          std::numeric_limits<std::int64_t>::max())) {
+            error = std::string("Recovery image-layout field '") + key +
+                "' is out of range";
+            return false;
+        }
+        value = static_cast<std::int64_t>(encoded);
+        return true;
+    }
+    if (found->is_number_integer()) {
+        value = found->get<std::int64_t>();
+        return true;
+    }
+    error = std::string("Recovery image-layout field '") + key +
+        "' is not an integer";
+    return false;
+}
+
+bool decodeImageLayout(const Json& input, core::ImageLayout& layout,
+                       std::string& error) {
+    if (!input.is_object()) {
+        error = "Recovery image layout is not an object";
+        return false;
+    }
+    if (const auto found = input.find("placement"); found != input.end()) {
+        if (!found->is_string()) {
+            error = "Recovery image placement is not a string";
+            return false;
+        }
+        const auto parsed = parseImagePlacement(found->get<std::string>());
+        if (!parsed) {
+            error = "Recovery image placement is unknown";
+            return false;
+        }
+        layout.placement = *parsed;
+    }
+    if (!readImageDistance(
+            input, "distance_top_emu", layout.distance_top_emu, error) ||
+        !readImageDistance(
+            input, "distance_right_emu", layout.distance_right_emu, error) ||
+        !readImageDistance(
+            input, "distance_bottom_emu", layout.distance_bottom_emu, error) ||
+        !readImageDistance(
+            input, "distance_left_emu", layout.distance_left_emu, error)) {
+        return false;
+    }
+    if (const auto found = input.find("move_with_text");
+        found != input.end()) {
+        if (!found->is_boolean()) {
+            error = "Recovery image move-with-text value is not Boolean";
+            return false;
+        }
+        layout.move_with_text = found->get<bool>();
+    }
+    const auto validation = layout.validate();
+    if (!validation) {
+        error = validation.error().message;
+        return false;
+    }
+    return true;
+}
+
 raster::Format rasterFormat(core::ImageFormat format) noexcept {
     if (format == core::ImageFormat::png) return raster::Format::png;
     if (format == core::ImageFormat::jpeg) return raster::Format::jpeg;
@@ -762,6 +861,12 @@ std::optional<std::string> RecoveryCodec::encode(const RecoveryDocument& recover
     std::size_t totalImageBytes = 0;
     std::unordered_set<core::NodeId, core::NodeIdHash> imageIds;
     for (const auto& paragraph : recovery.document.paragraphs()) {
+        const auto markFormatValidation =
+            paragraph.paragraphMarkCharacterFormat().validate();
+        if (!markFormatValidation) {
+            error = markFormatValidation.error().message;
+            return std::nullopt;
+        }
         if (paragraph.text().size() > kMaximumCodeUnits - totalCodeUnits) {
             error = "Recovery document text exceeds the size limit";
             return std::nullopt;
@@ -804,6 +909,7 @@ std::optional<std::string> RecoveryCodec::encode(const RecoveryDocument& recover
                 image.height_emu > core::kMaximumInlineImageDimensionEmu ||
                 image.encoded_payload.size() >
                     core::kMaximumDocumentEncodedImageBytes - totalImageBytes ||
+                !image.layout.validate() ||
                 !validEncodedImage(image.encoded_payload, image.format)) {
                 error =
                     "Recovery inline-picture metadata or payload is invalid";
@@ -862,6 +968,7 @@ std::optional<std::string> RecoveryCodec::encode(const RecoveryDocument& recover
                  {"width_emu", image.width_emu},
                  {"height_emu", image.height_emu},
                  {"accessible_name", image.accessible_name},
+                 {"layout", encodeImageLayout(image.layout)},
                  {"format", imageFormatName(image.format)},
                  {"encoded_base64", base64Encode(image.encoded_payload.bytes())}});
         }
@@ -869,6 +976,9 @@ std::optional<std::string> RecoveryCodec::encode(const RecoveryDocument& recover
             {{"id", paragraph.id().toString()},
              {"text_utf16", encodeUtf16(paragraph.text())},
              {"format", encodeParagraphFormat(paragraph.format())},
+             {"paragraph_mark_character_format",
+              encodeCharacterFormat(
+                  paragraph.paragraphMarkCharacterFormat())},
              {"runs", std::move(runs)},
              {"equations", std::move(equations)},
              {"images", std::move(images)}});
@@ -986,6 +1096,7 @@ std::optional<RecoveryDocument> RecoveryCodec::decode(std::string_view payload,
             std::string accessible_name;
             std::int64_t width_emu{};
             std::int64_t height_emu{};
+            core::ImageLayout layout;
             std::size_t source_order{};
         };
         std::vector<core::Paragraph> paragraphs;
@@ -1070,7 +1181,7 @@ std::optional<RecoveryDocument> RecoveryCodec::decode(std::string_view payload,
                      static_cast<std::size_t>(offset64),
                      std::move(encodedPayload), *format,
                      std::move(accessibleName), *width, *height,
-                     sourceOrder});
+                     {}, sourceOrder});
                 legacyImagesByParagraph[*paragraphId].push_back(imageIndex);
             }
             totalImages = images.size();
@@ -1173,6 +1284,14 @@ std::optional<RecoveryDocument> RecoveryCodec::decode(std::string_view payload,
                         encodedImage.at("format").get<std::string>());
                     const auto encodedBase64 =
                         encodedImage.at("encoded_base64").get<std::string>();
+                    core::ImageLayout layout;
+                    if (version >= 7) {
+                        const auto encodedLayout = encodedImage.find("layout");
+                        if (encodedLayout != encodedImage.end() &&
+                            !decodeImageLayout(*encodedLayout, layout, error)) {
+                            return std::nullopt;
+                        }
+                    }
                     const std::size_t remainingDocumentBytes =
                         core::kMaximumDocumentEncodedImageBytes -
                         totalImageBytes;
@@ -1211,7 +1330,7 @@ std::optional<RecoveryDocument> RecoveryCodec::decode(std::string_view payload,
                          static_cast<std::size_t>(offset64),
                          std::move(encodedPayload), *format,
                          std::move(accessibleName), widthEmu, heightEmu,
-                         sourceOrder});
+                         layout, sourceOrder});
                 }
                 std::sort(
                     paragraphImages.begin(), paragraphImages.end(),
@@ -1263,7 +1382,20 @@ std::optional<RecoveryDocument> RecoveryCodec::decode(std::string_view payload,
                          [](char16_t value) {
                              return value != core::kInlineObjectReplacementCharacter;
                          });
-            auto paragraph = core::Paragraph::create(std::move(plainText), *id);
+            core::CharacterFormat paragraphMarkCharacterFormat;
+            if (version >= 8) {
+                const auto encodedMarkFormat = encodedParagraph.find(
+                    "paragraph_mark_character_format");
+                if (encodedMarkFormat != encodedParagraph.end() &&
+                    !decodeCharacterFormat(
+                        *encodedMarkFormat, paragraphMarkCharacterFormat,
+                        error)) {
+                    return std::nullopt;
+                }
+            }
+            auto paragraph = core::Paragraph::create(
+                std::move(plainText), *id,
+                std::move(paragraphMarkCharacterFormat));
             if (!paragraph) {
                 error = paragraph.error().message;
                 return std::nullopt;
@@ -1355,7 +1487,8 @@ std::optional<RecoveryDocument> RecoveryCodec::decode(std::string_view payload,
                         {image.paragraph_id, image.offset},
                         std::move(image.encoded_payload), image.format,
                         std::move(image.accessible_name), image.width_emu,
-                        image.height_emu, image.image_id);
+                        image.height_emu, image.image_id, std::nullopt,
+                        image.layout);
                 }();
                 if (!inserted) {
                     error = inserted.error().message;

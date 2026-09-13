@@ -12,7 +12,13 @@
 
 namespace docxstudio::app {
 
-CodexController::CodexController(QObject* parent) : QObject(parent) {}
+CodexController::CodexController(QObject* parent,
+                                 ProcessFactory processFactory)
+    : QObject(parent), processFactory_(std::move(processFactory)) {
+    if (!processFactory_) {
+        processFactory_ = [] { return std::make_unique<QtProcess>(); };
+    }
+}
 CodexController::~CodexController() { shutdown(); }
 
 void CodexController::setEditorToolHandler(EditorToolHandler handler) {
@@ -45,7 +51,13 @@ void CodexController::enable() {
         return;
     }
 
-    auto process = std::make_unique<QtProcess>();
+    auto process = processFactory_();
+    if (!process) {
+        enabling_ = false;
+        emit errorOccurred(tr("Could not create the Codex process adapter."));
+        emit statusChanged(false, tr("Codex is unavailable"));
+        return;
+    }
     transport_ = std::make_shared<codex::StdioJsonlTransport>(std::move(process));
     client_ = std::make_unique<codex::Client>(transport_);
     client_->setProtocolErrorHandler([this](std::string_view message) {
@@ -79,7 +91,10 @@ void CodexController::enable() {
 
     codex::InitializeOptions options;
     options.client = {"owl_docs", "Owl Docs", DOCXSTUDIO_VERSION};
-    options.experimentalApi = false;
+    // App-hosted dynamic tools and their item/tool/call request flow are part
+    // of app-server's experimental protocol surface. Opt in explicitly so a
+    // supported runtime accepts the editor.v1 catalog registered below.
+    options.experimentalApi = true;
     client_->initialize(options, [this](codex::Result<codex::InitializeResult> result) {
         if (!result) {
             enabling_ = false;

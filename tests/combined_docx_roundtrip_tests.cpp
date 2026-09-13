@@ -101,6 +101,126 @@ DocumentCanvas* listCanvas(docxstudio::app::MainWindow& window,
     return nullptr;
 }
 
+void testEmptyBodyParagraphFormattingSurvivesSaveAndReopen() {
+    namespace core = docxstudio::core;
+    namespace ooxml = docxstudio::ooxml;
+
+    docxstudio::app::MainWindow authored;
+    authored.resize(1000, 760);
+    authored.show();
+    QApplication::processEvents();
+    auto* canvas = authored.findChild<DocumentCanvas*>();
+    check(canvas != nullptr,
+          "could not reach the empty-paragraph save canvas");
+    const QColor requestedColor(QStringLiteral("#284b63"));
+    constexpr std::int32_t kRequestedHalfPoints = 31;
+    canvas->setForeground(requestedColor);
+    canvas->setFontPointSize(15.5);
+    canvas->toggleItalic();
+
+    auto snapshot = canvas->snapshot();
+    check(snapshot.document.paragraphs().size() == 1 &&
+              snapshot.document.paragraphs()[0].text().empty() &&
+              snapshot.document.paragraphs()[0]
+                      .paragraphMarkCharacterFormat()
+                      .foreground_argb ==
+                  static_cast<std::uint32_t>(requestedColor.rgba()) &&
+              snapshot.document.paragraphs()[0]
+                      .paragraphMarkCharacterFormat()
+                      .font_size_half_points == kRequestedHalfPoints &&
+              snapshot.document.paragraphs()[0]
+                      .paragraphMarkCharacterFormat()
+                      .italic == true,
+          "formatting an empty body paragraph did not update its paragraph mark");
+
+    QTemporaryDir output;
+    check(output.isValid(),
+          "could not create empty-paragraph DOCX test directory");
+    const QString path = output.filePath(
+        QStringLiteral("empty-paragraph-format.docx"));
+    auto* saveAs = authored.findChild<QAction*>(QStringLiteral("file.saveAs"));
+    check(saveAs != nullptr,
+          "could not reach Save As for the empty paragraph");
+    bool selectedDestination = false;
+    QTimer::singleShot(0, &authored, [&] {
+        auto* dialog = authored.findChild<QFileDialog*>();
+        check(dialog != nullptr,
+              "empty-paragraph Save As did not open a file dialog");
+        dialog->selectFile(path);
+        selectedDestination = true;
+        check(QMetaObject::invokeMethod(dialog, "accept", Qt::DirectConnection),
+              "could not accept the empty-paragraph Save As destination");
+    });
+    saveAs->trigger();
+    check(selectedDestination && QFileInfo::exists(path) &&
+              !canvas->isModified(),
+          "formatted empty paragraph was not saved as a clean DOCX baseline");
+
+    const QByteArray xml = zipMember(path, "word/document.xml");
+    check(xml.contains("<w:p><w:pPr><w:rPr>") &&
+              xml.contains("<w:color w:val=\"284B63\"/>") &&
+              xml.contains("<w:sz w:val=\"31\"/>") &&
+              xml.contains("<w:i/>"),
+          "native Save As did not serialize the empty paragraph insertion format");
+
+    ooxml::Error error;
+    auto package = ooxml::DocxDocument::open(
+        std::filesystem::path(QFile::encodeName(path).constData()), &error);
+    check(package != nullptr && package->paragraphs().size() == 1 &&
+              package->paragraphs()[0].paragraph_mark_format.has_value() &&
+              package->paragraphs()[0].paragraph_mark_format
+                      ->foreground_rgb == 0x284b63U &&
+              package->paragraphs()[0].paragraph_mark_format
+                      ->font_size_half_points == kRequestedHalfPoints &&
+              package->paragraphs()[0].paragraph_mark_format->italic == true &&
+              package->compatibility().classification ==
+                  ooxml::CompatibilityClass::basic_body_text_patch,
+          "saved paragraph-mark formatting did not reopen through OOXML");
+
+    docxstudio::app::MainWindow reopened;
+    check(reopened.openPath(path),
+          "Owl Docs could not reopen its formatted empty paragraph");
+    DocumentCanvas* reopenedCanvas = nullptr;
+    for (auto* candidate : reopened.findChildren<DocumentCanvas*>()) {
+        const auto candidateSnapshot = candidate->snapshot();
+        if (candidateSnapshot.document.paragraphs().size() == 1 &&
+            candidateSnapshot.document.paragraphs()[0]
+                    .paragraphMarkCharacterFormat()
+                    .foreground_argb ==
+                static_cast<std::uint32_t>(requestedColor.rgba())) {
+            reopenedCanvas = candidate;
+            break;
+        }
+    }
+    check(reopenedCanvas != nullptr,
+          "semantic DOCX import lost the empty paragraph insertion format");
+    snapshot = reopenedCanvas->snapshot();
+    check(snapshot.document.paragraphs().size() == 1 &&
+              snapshot.document.paragraphs()[0]
+                      .paragraphMarkCharacterFormat()
+                      .foreground_argb ==
+                  static_cast<std::uint32_t>(requestedColor.rgba()) &&
+              snapshot.document.paragraphs()[0]
+                      .paragraphMarkCharacterFormat()
+                      .font_size_half_points == kRequestedHalfPoints &&
+              snapshot.document.paragraphs()[0]
+                      .paragraphMarkCharacterFormat()
+                      .italic == true &&
+              !reopenedCanvas->isModified(),
+          "semantic DOCX import lost the empty paragraph insertion format");
+
+    reopenedCanvas->insertText(QStringLiteral("Owl"));
+    snapshot = reopenedCanvas->snapshot();
+    const auto& typedParagraph = snapshot.document.paragraphs()[0];
+    check(fromUtf16(typedParagraph.text()) == QStringLiteral("Owl") &&
+              typedParagraph.characterFormatAt(1).foreground_argb ==
+                  static_cast<std::uint32_t>(requestedColor.rgba()) &&
+              typedParagraph.characterFormatAt(1).font_size_half_points ==
+                  kRequestedHalfPoints &&
+              typedParagraph.characterFormatAt(1).italic == true,
+          "typing after DOCX reopen did not consume the paragraph-mark format");
+}
+
 void testCombinedNativeReopenKeepsSemanticOrder() {
     namespace math = docxstudio::math;
     namespace ooxml = docxstudio::ooxml;
@@ -385,14 +505,14 @@ void testEditedTableFormattingSurvivesSaveAndReopen() {
                                  35;
                   }),
               "raw DOCX cell character formatting changed");
-        if (index == 3) {
-            check(paragraph.paragraph_mark_format.has_value() &&
-                      paragraph.paragraph_mark_format->foreground_rgb ==
-                          0x336699U &&
-                      paragraph.paragraph_mark_format
-                              ->font_size_half_points == 35,
-                  "raw DOCX empty cell lost paragraph-mark insertion formatting");
-        }
+        check(paragraph.paragraph_mark_format.has_value() &&
+                  paragraph.paragraph_mark_format->foreground_rgb ==
+                      0x336699U &&
+                  paragraph.paragraph_mark_format
+                          ->font_size_half_points == 35,
+              index == 3
+                  ? "raw DOCX empty cell lost paragraph-mark insertion formatting"
+                  : "raw DOCX non-empty cell lost paragraph-mark insertion formatting");
     }
 
     docxstudio::app::MainWindow reopened;
@@ -417,9 +537,13 @@ void testEditedTableFormattingSurvivesSaveAndReopen() {
                   character.foreground_argb ==
                       static_cast<std::uint32_t>(requestedColor.rgba()) &&
                   character.font_size_half_points == kRequestedHalfPoints &&
+                  cell.default_character_format.foreground_argb ==
+                      static_cast<std::uint32_t>(requestedColor.rgba()) &&
+                  cell.default_character_format.font_size_half_points ==
+                      kRequestedHalfPoints &&
                   cell.paragraph_format.alignment ==
                       core::ParagraphAlignment::right,
-              "MainWindow reopen lost table content or cell formatting");
+              "MainWindow reopen lost table content, character formatting, or paragraph-mark insertion formatting");
     }
     check(reopenedTable.cell(0, 0) &&
               reopenedTable.cell(0, 0)->characterFormatAt(1).bold == false,
@@ -760,6 +884,7 @@ void testNumberedLevelStylesSurviveSaveAndReopen() {
 int main(int argc, char** argv) {
     QApplication application(argc, argv);
     QApplication::setQuitOnLastWindowClosed(false);
+    testEmptyBodyParagraphFormattingSurvivesSaveAndReopen();
     testCombinedNativeReopenKeepsSemanticOrder();
     testTableOnlyImportUsesTrailingEditSurface();
     testEditedTableFormattingSurvivesSaveAndReopen();
