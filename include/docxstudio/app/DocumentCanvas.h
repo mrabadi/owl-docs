@@ -25,6 +25,7 @@ class QPdfWriter;
 class QPrinter;
 class QTextLayout;
 class QTimer;
+class QWheelEvent;
 
 namespace docxstudio::app {
 
@@ -87,6 +88,9 @@ class DocumentCanvas final : public QAbstractScrollArea {
     Q_OBJECT
 
 public:
+    static constexpr int kMinimumZoomPercent = 25;
+    static constexpr int kMaximumZoomPercent = 400;
+
     explicit DocumentCanvas(SpellChecker& spelling, QWidget* parent = nullptr);
     DocumentCanvas(SpellChecker& spelling, core::DocumentSessionLimits limits,
                    QWidget* parent = nullptr);
@@ -134,6 +138,7 @@ public:
     void cut();
     void copy();
     void paste();
+    void pasteTextOnly();
     void selectAll();
     void insertText(const QString& text);
     // Inserts a bounded PNG/JPEG as an inline picture at the current body
@@ -238,11 +243,13 @@ signals:
     void cursorListContextChanged(bool active, int oneBasedLevel);
     void listPropertiesRequested();
     void pageStatusChanged(int currentPage, int pageCount, int wordCount);
+    void zoomChanged(int percent);
     void operationFailed(const QString& message);
 
 protected:
     void paintEvent(QPaintEvent* event) override;
     void resizeEvent(QResizeEvent* event) override;
+    void wheelEvent(QWheelEvent* event) override;
     void keyPressEvent(QKeyEvent* event) override;
     void inputMethodEvent(QInputMethodEvent* event) override;
     QVariant inputMethodQuery(Qt::InputMethodQuery query) const override;
@@ -425,6 +432,8 @@ private:
     bool pageLayoutModified_{false};
     bool selecting_{false};
     int zoomPercent_{100};
+    int zoomWheelAngleRemainder_{0};
+    int zoomWheelPixelRemainder_{0};
     double pageWidthPoints_{612.0};
     double pageHeightPoints_{792.0};
     double marginTopPoints_{72.0};

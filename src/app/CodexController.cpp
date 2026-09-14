@@ -106,6 +106,67 @@ void CodexController::enable() {
 }
 
 void CodexController::afterInitialize() {
+    loadDocumentModeConfiguration();
+}
+
+void CodexController::loadDocumentModeConfiguration() {
+    client_->sendRequest(
+        "config/read", {{"includeLayers", false}},
+        [this](codex::Result<codex::Json> result) {
+            if (!result) {
+                enabling_ = false;
+                emit errorOccurred(
+                    tr("Could not isolate the Owl Docs Codex session from "
+                       "external MCP servers: %1")
+                        .arg(resultError(*result.error)));
+                emit statusChanged(false, tr("Codex is unavailable"));
+                return;
+            }
+
+            documentModeConfig_ = codex::Json::object();
+            if (!result.value->is_object()) {
+                enabling_ = false;
+                emit errorOccurred(
+                    tr("Codex returned an invalid configuration response; "
+                       "Owl Docs did not start an unrestricted chat session."));
+                emit statusChanged(false, tr("Codex is unavailable"));
+                return;
+            }
+            const auto config = result.value->find("config");
+            if (config == result.value->end() || !config->is_object()) {
+                enabling_ = false;
+                emit errorOccurred(
+                    tr("Codex returned an invalid configuration response; "
+                       "Owl Docs did not start an unrestricted chat session."));
+                emit statusChanged(false, tr("Codex is unavailable"));
+                return;
+            }
+            auto servers = config->find("mcp_servers");
+            if (servers == config->end()) {
+                // Older app-server builds exposed this field in camel case.
+                // Accept it for discovery while always sending the documented
+                // snake-case configuration keys.
+                servers = config->find("mcpServers");
+            }
+            if (servers == config->end() || !servers->is_object()) {
+                enabling_ = false;
+                emit errorOccurred(
+                    tr("Codex did not return a recognized MCP configuration; "
+                       "Owl Docs did not start an unrestricted chat session."));
+                emit statusChanged(false, tr("Codex is unavailable"));
+                return;
+            }
+            auto disabled = codex::Json::object();
+            for (const auto& [name, ignored] : servers->items()) {
+                static_cast<void>(ignored);
+                disabled[name] = {{"enabled", false}};
+            }
+            documentModeConfig_["mcp_servers"] = std::move(disabled);
+            readAccount();
+        });
+}
+
+void CodexController::readAccount() {
     client_->readAccount(false, [this](codex::Result<codex::AccountState> result) {
         if (!result) {
             enabling_ = false;
@@ -272,6 +333,7 @@ void CodexController::resumeThreadAndTurn(const QString& documentKey,
         "Do not run commands or inspect the filesystem. Use editor_v1_search to locate text, "
         "editor_v1_read for bounded paragraph or typed table-cell context, and leave all writes "
         "in editor_v1_preview until the user accepts them.";
+    options.config = documentModeConfig_;
     if (!tier.isEmpty()) options.serviceTier = tier.toStdString();
     client_->resumeThread(
         options,
@@ -309,6 +371,7 @@ void CodexController::startThreadAndTurn(const QString& documentKey,
     for (const auto& definition : codex::editorV1ToolDefinitions()) {
         options.dynamicTools.push_back(definition.toDynamicToolSpec());
     }
+    options.config = documentModeConfig_;
     client_->startThread(options, [this, documentKey, prompt, model, effort, tier](codex::Result<codex::ThreadState> result) {
         if (!result) {
             failTurn(resultError(*result.error));

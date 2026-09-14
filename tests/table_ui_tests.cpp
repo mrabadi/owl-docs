@@ -1467,6 +1467,82 @@ void testTableContextSelectionAndClipboard(
     canvas.hide();
 }
 
+void testPasteTextOnlyInTableCells(
+    docxstudio::app::SpellChecker& spelling) {
+    DocumentCanvas canvas(spelling);
+    const auto tableId = insertAndPopulateTable(
+        canvas, 2, 2, false,
+        {QStringLiteral("One"), QStringLiteral("Two"),
+         QStringLiteral("Three"), QStringLiteral("Four")});
+
+    check(canvas.activateTableCell(tableId, 0, 0, 0),
+          "could not activate a cell for plain-text replacement");
+    for (int index = 0; index < 3; ++index) {
+        sendKey(canvas, Qt::Key_Right, Qt::ShiftModifier);
+    }
+    const QColor requestedColor(QStringLiteral("#3157a4"));
+    canvas.setForeground(requestedColor);
+    QApplication::clipboard()->setText(QStringLiteral("Cell"));
+    const auto beforeSelectionPaste = canvas.snapshot();
+    sendKey(canvas, Qt::Key_V,
+            Qt::ControlModifier | Qt::ShiftModifier);
+    auto pasted = canvas.snapshot();
+    const auto* table = pasted.document.findTable(tableId);
+    check(pasted.revision.value() ==
+              beforeSelectionPaste.revision.value() + 1 &&
+              table && fromUtf16(table->cell(0, 0)->text) ==
+                           QStringLiteral("Cell") &&
+              table->cell(0, 0)->characterFormatAt(2).foreground_argb ==
+                  static_cast<std::uint32_t>(requestedColor.rgba()),
+          "plain-text paste did not replace a table-cell text selection with its current format");
+    canvas.undo();
+    pasted = canvas.snapshot();
+    table = pasted.document.findTable(tableId);
+    check(table && fromUtf16(table->cell(0, 0)->text) ==
+                       QStringLiteral("One"),
+          "one Undo did not restore a table-cell text selection paste");
+
+    check(canvas.activateTableCell(tableId, 0, 1, 2),
+          "could not place a table-cell caret for plain-text paste");
+    QApplication::clipboard()->setText(QStringLiteral("X\nY"));
+    const auto beforeCaretPaste = canvas.snapshot();
+    canvas.pasteTextOnly();
+    pasted = canvas.snapshot();
+    table = pasted.document.findTable(tableId);
+    check(pasted.revision.value() == beforeCaretPaste.revision.value() + 1 &&
+              table && fromUtf16(table->cell(0, 1)->text) ==
+                           QStringLiteral("TwX\u2028Yo"),
+          "plain-text paste at a table-cell caret lost its line break or insertion point");
+    canvas.undo();
+    pasted = canvas.snapshot();
+    table = pasted.document.findTable(tableId);
+    check(table && fromUtf16(table->cell(0, 1)->text) ==
+                       QStringLiteral("Two"),
+          "one Undo did not restore a table-cell caret paste");
+
+    check(canvas.selectTableCells(tableId, 0, 0, 0, 1),
+          "could not prepare a rectangular cell paste selection");
+    QApplication::clipboard()->setText(
+        QStringLiteral("only\tplain\ntext"));
+    const auto beforeRangePaste = canvas.snapshot();
+    canvas.pasteTextOnly();
+    pasted = canvas.snapshot();
+    table = pasted.document.findTable(tableId);
+    check(pasted.revision.value() == beforeRangePaste.revision.value() + 1 &&
+              table && table->rowCount() == 2 && table->columnCount() == 2 &&
+              fromUtf16(table->cell(0, 0)->text) ==
+                  QStringLiteral("only\tplain\u2028text") &&
+              table->cell(0, 1)->text.empty(),
+          "plain-text paste interpreted tabs/newlines as a table or failed to replace the selected cell range");
+    canvas.undo();
+    pasted = canvas.snapshot();
+    table = pasted.document.findTable(tableId);
+    check(table && fromUtf16(table->cell(0, 0)->text) ==
+                       QStringLiteral("One") &&
+              fromUtf16(table->cell(0, 1)->text) == QStringLiteral("Two"),
+          "one Undo did not restore an entire rectangular cell paste");
+}
+
 void testTableCellSpellcheckCommitTiming(
     docxstudio::app::SpellChecker& spelling) {
     check(spelling.available(),
@@ -1655,7 +1731,14 @@ void testSingleDialogAndNativeSave() {
     auto* canvas = window.findChild<DocumentCanvas*>();
     auto* insertAction = window.findChild<QAction*>(
         QStringLiteral("insert.table"));
-    check(canvas && insertAction, "could not reach the table insertion command");
+    auto* pasteTextOnlyAction = window.findChild<QAction*>(
+        QStringLiteral("edit.pasteTextOnly"));
+    check(canvas && insertAction && pasteTextOnlyAction &&
+              pasteTextOnlyAction->text() ==
+                  QStringLiteral("Paste as Text Only") &&
+              pasteTextOnlyAction->shortcut() ==
+                  QKeySequence(QStringLiteral("Ctrl+Shift+V")),
+          "could not reach the Paste as Text Only command and shortcut");
 
     bool inspectedDialog = false;
     QTimer::singleShot(0, &window, [&] {
@@ -1737,6 +1820,7 @@ int main(int argc, char** argv) {
     testTabAtLastCellAppendsOneUndoableRow(spelling);
     testDoubleClickSelectsTableCellWord(spelling);
     testTableContextSelectionAndClipboard(spelling);
+    testPasteTextOnlyInTableCells(spelling);
     testTableCellSpellcheckCommitTiming(spelling);
     testTableCellSpellingContextReplacement(spelling);
     testSingleDialogAndNativeSave();

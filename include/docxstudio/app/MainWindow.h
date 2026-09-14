@@ -19,6 +19,8 @@ class QColorDialog;
 class QColor;
 class QTabWidget;
 class QTimer;
+class QSlider;
+class QToolButton;
 
 namespace docxstudio::core { class Document; }
 namespace docxstudio::ooxml { class DocxDocument; }
@@ -53,6 +55,8 @@ private:
     void clearHighlight();
     void showLiveColorPicker(bool highlight);
     void restoreCanvasFocus(DocumentCanvas* canvas);
+    void setActiveZoomPercent(int percent);
+    void synchronizeZoomControls(DocumentCanvas* canvas);
     DocumentCanvas* createDocumentTab(core::Document document,
                                       std::unique_ptr<TabState> state,
                                       const QString& title);
@@ -105,6 +109,10 @@ private:
     CodexController* codex_{};
     QLabel* pageStatus_{};
     QLabel* saveStatus_{};
+    QLabel* zoomStatus_{};
+    QSlider* zoomSlider_{};
+    QToolButton* zoomOut_{};
+    QToolButton* zoomIn_{};
     QMenu* recentMenu_{};
     QTimer* recoveryDebounce_{};
     QTimer* recoveryPeriodic_{};

@@ -9,6 +9,7 @@ class QAction;
 class QComboBox;
 class QFontComboBox;
 class QLabel;
+class QSpinBox;
 class QTabWidget;
 class QToolButton;
 
@@ -66,7 +67,7 @@ private:
     QComboBox* fontSize_{};
     QToolButton* textColor_{};
     QToolButton* highlightColor_{};
-    QComboBox* zoom_{};
+    QSpinBox* zoom_{};
     QLabel* listLevel_{};
     int listTabIndex_{-1};
     int tableTabIndex_{-1};

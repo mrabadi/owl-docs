@@ -20,6 +20,7 @@
 #include <QToolButton>
 #include <QVBoxLayout>
 #include <QSignalBlocker>
+#include <QSpinBox>
 
 #include <algorithm>
 #include <utility>
@@ -686,19 +687,18 @@ QWidget* RibbonWidget::makeViewTab(CommandRegistry& commands) {
     auto* page = makeTabPage(this, layout);
     addButtons(layout, commands, page, {"view.navigation", "view.ruler", "view.pageWidth"});
     layout->addWidget(new QLabel(tr("Zoom:"), page));
-    zoom_ = new QComboBox(page);
+    zoom_ = new QSpinBox(page);
     zoom_->setObjectName(QStringLiteral("ribbon.zoom"));
     zoom_->setAccessibleName(tr("Zoom"));
-    zoom_->addItems({"50%", "75%", "100%", "125%", "150%", "200%"});
-    zoom_->setCurrentText("100%");
-    connect(zoom_, &QComboBox::textActivated, this, [this](QString value) {
-        value.remove(QLatin1Char('%'));
-        bool ok = false;
-        const int percent = value.toInt(&ok);
-        if (ok) {
-            emit zoomRequested(percent);
-        }
-    });
+    zoom_->setAccessibleDescription(
+        tr("Set document zoom from 25 to 400 percent"));
+    zoom_->setRange(25, 400);
+    zoom_->setSingleStep(10);
+    zoom_->setSuffix(QStringLiteral("%"));
+    zoom_->setKeyboardTracking(false);
+    zoom_->setValue(100);
+    connect(zoom_, qOverload<int>(&QSpinBox::valueChanged), this,
+            &RibbonWidget::zoomRequested);
     layout->addWidget(zoom_);
     layout->addStretch(1);
     return page;
@@ -884,7 +884,7 @@ void RibbonWidget::setHighlightColor(const QColor& color) {
 
 void RibbonWidget::setZoomPercent(int percent) {
     const QSignalBlocker blocker(zoom_);
-    zoom_->setCurrentText(QString::number(percent) + QLatin1Char('%'));
+    zoom_->setValue(percent);
 }
 
 void RibbonWidget::setListContext(bool visible, int level) {

@@ -55,6 +55,35 @@ constexpr std::string_view kStrictOfficeRelationshipsNamespace =
     "http://purl.oclc.org/ooxml/officeDocument/relationships";
 constexpr std::string_view kDocumentRelationshipsPart =
     "word/_rels/document.xml.rels";
+constexpr std::string_view kNewContentTypes =
+    "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+    "<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">"
+    "<Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>"
+    "<Default Extension=\"xml\" ContentType=\"application/xml\"/>"
+    "<Override PartName=\"/word/document.xml\" "
+    "ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml\"/>"
+    "<Override PartName=\"/word/styles.xml\" "
+    "ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml\"/>"
+    "<Override PartName=\"/word/settings.xml\" "
+    "ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.settings+xml\"/>"
+    "</Types>";
+constexpr std::string_view kNewRootRelationships =
+    "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+    "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">"
+    "<Relationship Id=\"rId1\" "
+    "Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" "
+    "Target=\"word/document.xml\"/>"
+    "</Relationships>";
+constexpr std::string_view kNewDocumentRelationships =
+    "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+    "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">"
+    "<Relationship Id=\"rId1\" "
+    "Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles\" "
+    "Target=\"styles.xml\"/>"
+    "<Relationship Id=\"rId2\" "
+    "Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/settings\" "
+    "Target=\"settings.xml\"/>"
+    "</Relationships>";
 constexpr std::int64_t kMaximumInlineExtentEmu = 3'600'000'000LL;
 // ECMA-376/ISO 29500 numbering levels are zero-based ilvl 0 through 8.
 constexpr std::uint8_t kMaximumNativeNumberingLevel = 8;
@@ -178,7 +207,11 @@ struct ParsedPackage {
     std::vector<ImportedSection> sections;
     std::vector<SpanLocation> spans;
     CompatibilityReport compatibility;
+    std::optional<DocumentDefaults> canonical_simple_regeneration_defaults;
 };
+
+std::string buildNewStylesXml(const DocumentDefaults& defaults);
+std::string buildNewSettingsXml(const DocumentDefaults& defaults);
 
 void setError(Error* error, ErrorCode code, std::string message) {
     if (error != nullptr) {
@@ -4051,6 +4084,562 @@ void resolveInlineImages(ParsedPackage& parsed, const OpenOptions& options) {
     zip_discard(archive);
 }
 
+bool isCanonicalWriterWordElement(
+    const pugi::xml_node& node, std::string_view expected_local_name) {
+    return node.type() == pugi::node_element &&
+           prefixName(node.name()) == "w" &&
+           localName(node.name()) == expected_local_name &&
+           namespaceUri(node) == kWordNamespace;
+}
+
+bool hasNoAttributes(const pugi::xml_node& node) {
+    return node.attributes().begin() == node.attributes().end();
+}
+
+bool hasOnlyCanonicalWriterWordAttributes(
+    const pugi::xml_node& node,
+    std::initializer_list<std::string_view> allowed_names) {
+    for (const pugi::xml_attribute attribute : node.attributes()) {
+        const std::string_view qualified_name = attribute.name();
+        if (prefixName(qualified_name) != "w" ||
+            namespaceUriForName(node, qualified_name) != kWordNamespace ||
+            std::find(
+                allowed_names.begin(), allowed_names.end(),
+                localName(qualified_name)) == allowed_names.end()) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool canonicalWriterEmptyLeaf(
+    const pugi::xml_node& node, std::string_view expected_local_name,
+    std::initializer_list<std::string_view> allowed_attributes) {
+    return isCanonicalWriterWordElement(node, expected_local_name) &&
+           hasOnlyCanonicalWriterWordAttributes(node, allowed_attributes) &&
+           !node.first_child();
+}
+
+bool canonicalWriterOnOffProperty(
+    const pugi::xml_node& node, std::string_view expected_local_name) {
+    if (!canonicalWriterEmptyLeaf(node, expected_local_name, {"val"})) {
+        return false;
+    }
+    const auto value = wordAttribute(node, "val");
+    // The current writer uses an absent value for true and the canonical
+    // decimal zero spelling for false. Broader ST_OnOff spellings are valid
+    // OOXML, but accepting them here would no longer identify writer-owned
+    // canonical markup.
+    return !value || *value == "0";
+}
+
+bool canonicalWriterRgb(std::string_view value) {
+    return value.size() == 6U &&
+           std::all_of(value.begin(), value.end(), [](unsigned char digit) {
+               return (digit >= '0' && digit <= '9') ||
+                      (digit >= 'A' && digit <= 'F');
+           });
+}
+
+bool canonicalWriterRunProperties(const pugi::xml_node& properties) {
+    if (!isCanonicalWriterWordElement(properties, "rPr") ||
+        !hasNoAttributes(properties)) {
+        return false;
+    }
+
+    int previous_order = -1;
+    bool saw_property = false;
+    std::optional<std::string> size;
+    std::optional<std::string> complex_script_size;
+    for (const pugi::xml_node property : properties.children()) {
+        if (property.type() != pugi::node_element) return false;
+
+        int order = -1;
+        bool recognized = false;
+        if (isCanonicalWriterWordElement(property, "rFonts")) {
+            order = 0;
+            recognized = canonicalWriterEmptyLeaf(
+                property, "rFonts", {"ascii", "hAnsi"});
+            const auto ascii = wordAttribute(property, "ascii");
+            const auto high_ansi = wordAttribute(property, "hAnsi");
+            recognized = recognized && ascii && high_ansi &&
+                         !ascii->empty() && ascii == high_ansi;
+        } else if (isCanonicalWriterWordElement(property, "b")) {
+            order = 1;
+            recognized = canonicalWriterOnOffProperty(property, "b");
+        } else if (isCanonicalWriterWordElement(property, "i")) {
+            order = 2;
+            recognized = canonicalWriterOnOffProperty(property, "i");
+        } else if (isCanonicalWriterWordElement(property, "strike")) {
+            order = 3;
+            recognized = canonicalWriterOnOffProperty(property, "strike");
+        } else if (isCanonicalWriterWordElement(property, "color")) {
+            order = 4;
+            recognized = canonicalWriterEmptyLeaf(property, "color", {"val"});
+            const auto value = wordAttribute(property, "val");
+            recognized = recognized && value && canonicalWriterRgb(*value);
+        } else if (isCanonicalWriterWordElement(property, "sz")) {
+            order = 5;
+            recognized = canonicalWriterEmptyLeaf(property, "sz", {"val"});
+            size = wordAttribute(property, "val");
+            recognized = recognized && size.has_value();
+        } else if (isCanonicalWriterWordElement(property, "szCs")) {
+            order = 6;
+            recognized = canonicalWriterEmptyLeaf(property, "szCs", {"val"});
+            complex_script_size = wordAttribute(property, "val");
+            recognized = recognized && complex_script_size.has_value();
+        } else if (isCanonicalWriterWordElement(property, "u")) {
+            order = 7;
+            recognized = canonicalWriterEmptyLeaf(property, "u", {"val"});
+            const auto value = wordAttribute(property, "val");
+            recognized = recognized && value &&
+                         (*value == "single" || *value == "none");
+        } else if (isCanonicalWriterWordElement(property, "shd")) {
+            order = 8;
+            recognized = canonicalWriterEmptyLeaf(
+                property, "shd", {"val", "color", "fill"});
+            const auto value = wordAttribute(property, "val");
+            const auto color = wordAttribute(property, "color");
+            const auto fill = wordAttribute(property, "fill");
+            recognized = recognized && value && *value == "clear" &&
+                         color && *color == "auto" && fill &&
+                         canonicalWriterRgb(*fill);
+        } else if (isCanonicalWriterWordElement(property, "vertAlign")) {
+            order = 9;
+            recognized = canonicalWriterEmptyLeaf(
+                property, "vertAlign", {"val"});
+            const auto value = wordAttribute(property, "val");
+            recognized = recognized && value &&
+                         (*value == "baseline" ||
+                          *value == "superscript" ||
+                          *value == "subscript");
+        }
+        if (!recognized || order <= previous_order) return false;
+        previous_order = order;
+        saw_property = true;
+    }
+    // appendBasicRunProperties always emits w:sz and w:szCs together with
+    // the same value. Keeping that invariant here prevents a regeneration
+    // from silently changing complex-script sizing.
+    if (size.has_value() != complex_script_size.has_value() ||
+        (size && size != complex_script_size)) {
+        return false;
+    }
+    return saw_property;
+}
+
+bool canonicalWriterTextElement(const pugi::xml_node& text_node) {
+    if (!isCanonicalWriterWordElement(text_node, "t")) return false;
+
+    bool preserve_space = false;
+    for (const pugi::xml_attribute attribute : text_node.attributes()) {
+        if (preserve_space ||
+            std::string_view(attribute.name()) != "xml:space" ||
+            std::string_view(attribute.value()) != "preserve") {
+            return false;
+        }
+        preserve_space = true;
+    }
+
+    std::string text;
+    for (const pugi::xml_node child : text_node.children()) {
+        if (child.type() != pugi::node_pcdata) return false;
+        text += child.value();
+    }
+    if (text.find_first_of("\t\r\n") != std::string::npos ||
+        text.find("\xe2\x80\xa8") != std::string::npos) {
+        return false;
+    }
+    const bool needs_preserve = !text.empty() &&
+                                (text.front() == ' ' || text.back() == ' ');
+    return preserve_space == needs_preserve;
+}
+
+bool canonicalWriterRun(const pugi::xml_node& run) {
+    if (!isCanonicalWriterWordElement(run, "r") ||
+        !hasNoAttributes(run)) {
+        return false;
+    }
+
+    bool saw_properties = false;
+    bool saw_content = false;
+    bool previous_was_text = false;
+    for (const pugi::xml_node child : run.children()) {
+        if (child.type() != pugi::node_element) return false;
+        if (isCanonicalWriterWordElement(child, "rPr")) {
+            if (saw_properties || saw_content ||
+                !canonicalWriterRunProperties(child)) {
+                return false;
+            }
+            saw_properties = true;
+            previous_was_text = false;
+            continue;
+        }
+        if (isCanonicalWriterWordElement(child, "t")) {
+            // appendWordRunContents never creates adjacent w:t nodes inside
+            // one run; it joins those characters into one text segment.
+            if (previous_was_text || !canonicalWriterTextElement(child)) {
+                return false;
+            }
+            previous_was_text = true;
+        } else if (isCanonicalWriterWordElement(child, "tab")) {
+            if (!canonicalWriterEmptyLeaf(child, "tab", {})) return false;
+            previous_was_text = false;
+        } else if (isCanonicalWriterWordElement(child, "br")) {
+            if (!canonicalWriterEmptyLeaf(child, "br", {})) return false;
+            previous_was_text = false;
+        } else {
+            // In particular, w:cr is imported as a soft line break but is not
+            // emitted by the current writer, so it is not canonical-owned.
+            return false;
+        }
+        saw_content = true;
+    }
+    return saw_content;
+}
+
+bool canonicalWriterParagraphProperties(const pugi::xml_node& properties) {
+    if (!isCanonicalWriterWordElement(properties, "pPr") ||
+        !hasNoAttributes(properties)) {
+        return false;
+    }
+
+    int previous_order = -1;
+    bool saw_property = false;
+    for (const pugi::xml_node property : properties.children()) {
+        if (property.type() != pugi::node_element) return false;
+
+        int order = -1;
+        bool recognized = false;
+        if (isCanonicalWriterWordElement(property, "keepNext")) {
+            order = 0;
+            recognized = canonicalWriterOnOffProperty(property, "keepNext");
+        } else if (isCanonicalWriterWordElement(property, "keepLines")) {
+            order = 1;
+            recognized = canonicalWriterOnOffProperty(property, "keepLines");
+        } else if (isCanonicalWriterWordElement(property, "pageBreakBefore")) {
+            order = 2;
+            recognized = canonicalWriterOnOffProperty(
+                property, "pageBreakBefore");
+        } else if (isCanonicalWriterWordElement(property, "tabs")) {
+            order = 3;
+            recognized = hasNoAttributes(property);
+            bool saw_tab = false;
+            std::uint32_t previous_position = 0;
+            for (const pugi::xml_node tab : property.children()) {
+                if (tab.type() != pugi::node_element ||
+                    !canonicalWriterEmptyLeaf(tab, "tab", {"val", "pos"})) {
+                    recognized = false;
+                    break;
+                }
+                const auto value = wordAttribute(tab, "val");
+                bool parsed = true;
+                const auto position = parseUnsignedIntegerAttribute(
+                    tab, "pos", parsed);
+                if (!value || *value != "left" || !parsed || !position ||
+                    *position == 0 || *position > 31'680U ||
+                    *position <= previous_position) {
+                    recognized = false;
+                    break;
+                }
+                previous_position = *position;
+                saw_tab = true;
+            }
+            recognized = recognized && saw_tab;
+        } else if (isCanonicalWriterWordElement(property, "spacing")) {
+            order = 4;
+            recognized = canonicalWriterEmptyLeaf(
+                property, "spacing",
+                {"before", "after", "line", "lineRule"});
+            const auto before = wordAttribute(property, "before");
+            const auto after = wordAttribute(property, "after");
+            const auto line = wordAttribute(property, "line");
+            const auto rule = wordAttribute(property, "lineRule");
+            recognized = recognized && (before || after || line) &&
+                         (!rule ||
+                          (*rule == "auto" || *rule == "atLeast" ||
+                           *rule == "exact")) &&
+                         (!rule || line);
+        } else if (isCanonicalWriterWordElement(property, "ind")) {
+            order = 5;
+            recognized = canonicalWriterEmptyLeaf(
+                property, "ind",
+                {"left", "right", "firstLine", "hanging"});
+            const auto left = wordAttribute(property, "left");
+            const auto right = wordAttribute(property, "right");
+            const auto first_line = wordAttribute(property, "firstLine");
+            const auto hanging = wordAttribute(property, "hanging");
+            recognized = recognized &&
+                         (left || right || first_line || hanging) &&
+                         !(first_line && hanging);
+        } else if (isCanonicalWriterWordElement(property, "jc")) {
+            order = 6;
+            recognized = canonicalWriterEmptyLeaf(property, "jc", {"val"});
+            const auto value = wordAttribute(property, "val");
+            recognized = recognized && value &&
+                         (*value == "left" || *value == "center" ||
+                          *value == "right" || *value == "both");
+        } else if (isCanonicalWriterWordElement(property, "rPr")) {
+            order = 7;
+            recognized = canonicalWriterRunProperties(property);
+        }
+        if (!recognized || order <= previous_order) return false;
+        previous_order = order;
+        saw_property = true;
+    }
+    return saw_property;
+}
+
+bool canonicalWriterParagraph(const pugi::xml_node& paragraph) {
+    if (!isCanonicalWriterWordElement(paragraph, "p") ||
+        !hasNoAttributes(paragraph)) {
+        return false;
+    }
+
+    bool saw_properties = false;
+    bool saw_run = false;
+    for (const pugi::xml_node child : paragraph.children()) {
+        if (child.type() != pugi::node_element) return false;
+        if (isCanonicalWriterWordElement(child, "pPr")) {
+            if (saw_properties || saw_run ||
+                !canonicalWriterParagraphProperties(child)) {
+                return false;
+            }
+            saw_properties = true;
+        } else if (isCanonicalWriterWordElement(child, "r")) {
+            if (!canonicalWriterRun(child)) return false;
+            saw_run = true;
+        } else {
+            return false;
+        }
+    }
+    return true;
+}
+
+std::optional<std::uint32_t> canonicalDefaultTabStop(
+    std::string_view settings_xml) {
+    pugi::xml_document document;
+    if (!document.load_buffer(
+            settings_xml.data(), settings_xml.size(), pugi::parse_default,
+            pugi::encoding_auto)) {
+        return std::nullopt;
+    }
+    const pugi::xml_node root = document.document_element();
+    if (!isWordElement(root, "settings")) return std::nullopt;
+
+    pugi::xml_node tab_stop;
+    for (const pugi::xml_node child : root.children()) {
+        if (ignorableNode(child)) continue;
+        if (!isWordElement(child, "defaultTabStop") || tab_stop) {
+            return std::nullopt;
+        }
+        tab_stop = child;
+    }
+    if (!tab_stop || !hasOnlyIgnorableChildren(tab_stop) ||
+        !hasOnlyWordAttributes(tab_stop, {"val"})) {
+        return std::nullopt;
+    }
+    bool recognized = true;
+    const auto value = parseUnsignedIntegerAttribute(
+        tab_stop, "val", recognized);
+    if (!recognized || !value || *value == 0 || *value > 31'680U) {
+        return std::nullopt;
+    }
+    return value;
+}
+
+bool canonicalSimpleDocumentEnvelope(
+    std::string_view document_xml, const ParsedPackage& parsed) {
+    const std::string prefix =
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+        "<w:document xmlns:w=\"" + std::string(kWordNamespace) +
+        "\" xmlns:m=\"" + std::string(kOfficeMathNamespace) +
+        "\" xmlns:r=\"" + std::string(kOfficeRelationshipsNamespace) +
+        "\" xmlns:wp=\"" + std::string(kWordprocessingDrawingNamespace) +
+        "\" xmlns:a=\"" + std::string(kDrawingMainNamespace) +
+        "\" xmlns:pic=\"" + std::string(kDrawingPictureNamespace) +
+        "\"><w:body>";
+    constexpr std::string_view suffix = "</w:body></w:document>";
+    if (!document_xml.starts_with(prefix) ||
+        !document_xml.ends_with(suffix)) {
+        return false;
+    }
+
+    pugi::xml_document document;
+    if (!document.load_buffer(
+            document_xml.data(), document_xml.size(), pugi::parse_full,
+            pugi::encoding_auto)) {
+        return false;
+    }
+    const pugi::xml_node root = document.document_element();
+    if (!isWordElement(root, "document")) return false;
+
+    pugi::xml_node body;
+    for (const pugi::xml_node child : root.children()) {
+        if (!isCanonicalWriterWordElement(child, "body") || body) {
+            return false;
+        }
+        body = child;
+    }
+    if (!body) return false;
+
+    std::size_t paragraph_count = 0;
+    pugi::xml_node section;
+    for (const pugi::xml_node child : body.children()) {
+        if (isCanonicalWriterWordElement(child, "p") && !section &&
+            canonicalWriterParagraph(child)) {
+            ++paragraph_count;
+            continue;
+        }
+        if (isCanonicalWriterWordElement(child, "sectPr") && !section &&
+            hasNoAttributes(child)) {
+            section = child;
+            continue;
+        }
+        return false;
+    }
+    if (!section || paragraph_count != parsed.body_blocks.size() ||
+        parsed.sections.size() != 1U || !parsed.page_settings ||
+        parsed.sections.front().first_body_block_index != 0U ||
+        parsed.sections.front().body_block_count != paragraph_count) {
+        return false;
+    }
+    if (!std::all_of(
+            parsed.body_blocks.begin(), parsed.body_blocks.end(),
+            [](const ImportedBodyBlock& block) {
+                return std::holds_alternative<ImportedParagraphBlock>(block);
+            })) {
+        return false;
+    }
+
+    pugi::xml_node page_size;
+    pugi::xml_node page_margins;
+    for (const pugi::xml_node child : section.children()) {
+        if (isCanonicalWriterWordElement(child, "pgSz") && !page_size &&
+            !page_margins) {
+            page_size = child;
+        } else if (isCanonicalWriterWordElement(child, "pgMar") &&
+                   page_size && !page_margins) {
+            page_margins = child;
+        } else {
+            return false;
+        }
+    }
+    if (!page_size || !page_margins ||
+        page_size.first_child() || page_margins.first_child() ||
+        !hasOnlyCanonicalWriterWordAttributes(
+            page_size, {"w", "h", "orient"}) ||
+        !hasOnlyCanonicalWriterWordAttributes(
+            page_margins,
+            {"top", "right", "bottom", "left", "header", "footer",
+             "gutter"}) ||
+        !wordAttribute(page_size, "w") ||
+        !wordAttribute(page_size, "h") ||
+        !wordAttribute(page_margins, "top") ||
+        !wordAttribute(page_margins, "right") ||
+        !wordAttribute(page_margins, "bottom") ||
+        !wordAttribute(page_margins, "left") ||
+        wordAttribute(page_margins, "header") !=
+            std::optional<std::string>{"720"} ||
+        wordAttribute(page_margins, "footer") !=
+            std::optional<std::string>{"720"} ||
+        wordAttribute(page_margins, "gutter") !=
+            std::optional<std::string>{"0"}) {
+        return false;
+    }
+    const auto parsed_page = parsePageSettingsFromSection(section);
+    if (!parsed_page || *parsed_page != *parsed.page_settings ||
+        parsed.sections.front().page != *parsed.page_settings ||
+        parsed.sections.front().break_kind != SectionBreakKind::next_page) {
+        return false;
+    }
+    const auto orientation = wordAttribute(page_size, "orient");
+    const bool landscape = parsed_page->width_twips > parsed_page->height_twips;
+    if ((landscape && orientation !=
+                          std::optional<std::string>{"landscape"}) ||
+        (!landscape && orientation.has_value())) {
+        return false;
+    }
+
+    if (parsed.paragraphs.size() != paragraph_count) return false;
+    for (const auto& paragraph : parsed.paragraphs) {
+        if (!paragraph.direct_body_child || paragraph.has_unsupported_content ||
+            !paragraph.format_is_basic || paragraph.style_id ||
+            paragraph.numbering || paragraph.numbering_id ||
+            paragraph.numbering_level) {
+            return false;
+        }
+        for (const auto& run : paragraph.runs) {
+            if (run.has_unsupported_content || !run.format_is_basic ||
+                run.style_id) {
+                return false;
+            }
+            if (std::any_of(
+                    run.fragments.begin(), run.fragments.end(),
+                    [](const RunFragment& fragment) {
+                        return fragment.kind == FragmentKind::equation ||
+                               fragment.kind == FragmentKind::inline_image ||
+                               fragment.kind == FragmentKind::page_break;
+                    })) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+std::optional<DocumentDefaults> canonicalSimpleRegenerationDefaults(
+    const ParsedPackage& parsed, std::string_view content_types_xml,
+    std::string_view root_relationships_xml,
+    std::string_view document_relationships_xml,
+    std::string_view styles_xml, std::string_view settings_xml,
+    const ImportContext& context) {
+    static constexpr std::array<std::string_view, 6> expected_members{
+        kContentTypesPart,
+        kRootRelationshipsPart,
+        kDocumentPart,
+        kDocumentRelationshipsPart,
+        "word/styles.xml",
+        "word/settings.xml",
+    };
+    if (parsed.entries.size() != expected_members.size() ||
+        parsed.compatibility.classification !=
+            CompatibilityClass::basic_body_text_patch ||
+        !parsed.compatibility.issues.empty() ||
+        content_types_xml != kNewContentTypes ||
+        root_relationships_xml != kNewRootRelationships ||
+        document_relationships_xml != kNewDocumentRelationships) {
+        return std::nullopt;
+    }
+    for (const auto name : expected_members) {
+        if (std::none_of(
+                parsed.entries.begin(), parsed.entries.end(),
+                [name](const EntryRecord& entry) {
+                    return entry.member.name == name;
+                })) {
+            return std::nullopt;
+        }
+    }
+
+    const auto tab_stop = canonicalDefaultTabStop(settings_xml);
+    if (!tab_stop || !context.default_run_format.font_family ||
+        !context.default_run_format.font_size_half_points) {
+        return std::nullopt;
+    }
+    DocumentDefaults defaults;
+    defaults.font_family = *context.default_run_format.font_family;
+    defaults.font_size_half_points =
+        *context.default_run_format.font_size_half_points;
+    defaults.default_tab_stop_twips = *tab_stop;
+    if (styles_xml != buildNewStylesXml(defaults) ||
+        settings_xml != buildNewSettingsXml(defaults)) {
+        return std::nullopt;
+    }
+    return canonicalSimpleDocumentEnvelope(parsed.document_xml, parsed)
+        ? std::optional<DocumentDefaults>{std::move(defaults)}
+        : std::nullopt;
+}
+
 bool inspectPackage(
     std::vector<std::uint8_t> bytes,
     std::uint32_t source_mode,
@@ -4083,6 +4672,7 @@ bool inspectPackage(
     std::optional<std::size_t> root_relationships_index;
     std::optional<std::size_t> document_relationships_index;
     std::optional<std::size_t> styles_index;
+    std::optional<std::size_t> settings_index;
     std::optional<std::size_t> numbering_index;
     std::optional<std::size_t> theme_index;
     bool has_encrypted_member = false;
@@ -4162,6 +4752,8 @@ bool inspectPackage(
             document_relationships_index = static_cast<std::size_t>(index);
         } else if (name == "word/styles.xml") {
             styles_index = static_cast<std::size_t>(index);
+        } else if (name == "word/settings.xml") {
+            settings_index = static_cast<std::size_t>(index);
         } else if (name == "word/numbering.xml") {
             numbering_index = static_cast<std::size_t>(index);
         } else if (name == "word/theme/theme1.xml") {
@@ -4255,6 +4847,7 @@ bool inspectPackage(
         theme_index = related;
     }
     std::string styles_xml;
+    std::string settings_xml;
     std::string numbering_xml;
     std::string theme_xml;
     const auto read_optional = [&](const std::optional<std::size_t>& index,
@@ -4264,6 +4857,7 @@ bool inspectPackage(
             options.max_document_xml_bytes, destination, error);
     };
     if (!read_optional(styles_index, styles_xml) ||
+        !read_optional(settings_index, settings_xml) ||
         !read_optional(numbering_index, numbering_xml) ||
         !read_optional(theme_index, theme_xml)) {
         zip_discard(archive);
@@ -4329,6 +4923,11 @@ bool inspectPackage(
     resolveInlineImages(parsed, options);
     parsed.sections = parseBodySections(parsed.document_xml);
     parsed.page_settings = parseBodyPageSettings(parsed.document_xml);
+    parsed.canonical_simple_regeneration_defaults =
+        canonicalSimpleRegenerationDefaults(
+            parsed, content_types_xml, relationships_xml,
+            document_relationships_xml, styles_xml, settings_xml,
+            import_context);
 
     const bool global_blocker = std::any_of(
         parsed.compatibility.issues.begin(),
@@ -6471,38 +7070,6 @@ bool buildNewNumberingXml(
     return true;
 }
 
-constexpr std::string_view kNewContentTypes =
-    "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
-    "<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">"
-    "<Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>"
-    "<Default Extension=\"xml\" ContentType=\"application/xml\"/>"
-    "<Override PartName=\"/word/document.xml\" "
-    "ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml\"/>"
-    "<Override PartName=\"/word/styles.xml\" "
-    "ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml\"/>"
-    "<Override PartName=\"/word/settings.xml\" "
-    "ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.settings+xml\"/>"
-    "</Types>";
-
-constexpr std::string_view kNewRootRelationships =
-    "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
-    "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">"
-    "<Relationship Id=\"rId1\" "
-    "Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" "
-    "Target=\"word/document.xml\"/>"
-    "</Relationships>";
-
-constexpr std::string_view kNewDocumentRelationships =
-    "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
-    "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">"
-    "<Relationship Id=\"rId1\" "
-    "Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles\" "
-    "Target=\"styles.xml\"/>"
-    "<Relationship Id=\"rId2\" "
-    "Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/settings\" "
-    "Target=\"settings.xml\"/>"
-    "</Relationships>";
-
 std::string newContentTypes(
     bool has_numbering, const std::vector<AuthoredImagePart>& images) {
     std::string result(kNewContentTypes);
@@ -6727,6 +7294,14 @@ const std::vector<ImportedSection>& DocxDocument::sections() const noexcept {
 
 const CompatibilityReport& DocxDocument::compatibility() const noexcept {
     return impl_->package.compatibility;
+}
+
+bool DocxDocument::isCanonicalRegeneratableSimplePackage(
+    const DocumentDefaults& regeneration_defaults) const noexcept {
+    const auto& serialized_defaults =
+        impl_->package.canonical_simple_regeneration_defaults;
+    return serialized_defaults &&
+           *serialized_defaults == regeneration_defaults;
 }
 
 bool DocxDocument::dirty() const noexcept {

@@ -58,6 +58,9 @@ struct ThreadResumeOptions {
     std::optional<std::string> serviceTier;
     std::optional<std::string> developerInstructions;
     bool excludeTurns{true};
+    // Forward-compatible app-server configuration overrides. Keep these in
+    // step with the restrictions used when the thread was first created.
+    Json config;
 };
 
 struct UserInput {

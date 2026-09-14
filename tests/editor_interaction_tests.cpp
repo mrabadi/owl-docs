@@ -3,18 +3,23 @@
 #include "docxstudio/app/RibbonWidget.h"
 #include "docxstudio/app/SpellChecker.h"
 
+#include <QAction>
 #include <QApplication>
 #include <QClipboard>
 #include <QColor>
 #include <QComboBox>
+#include <QContextMenuEvent>
 #include <QEventLoop>
 #include <QImage>
 #include <QInputMethodEvent>
 #include <QKeyEvent>
+#include <QMenu>
+#include <QMimeData>
 #include <QMouseEvent>
 #include <QPixmap>
 #include <QStringList>
 #include <QTimer>
+#include <QWheelEvent>
 #include <QWidget>
 
 #include <algorithm>
@@ -157,6 +162,18 @@ void sendTextKey(DocumentCanvas& canvas, Qt::Key key, const QString& text,
                  Qt::KeyboardModifiers modifiers = Qt::NoModifier) {
     QKeyEvent event(QEvent::KeyPress, key, modifiers, text);
     QApplication::sendEvent(&canvas, &event);
+}
+
+void sendWheel(DocumentCanvas& canvas, int verticalDelta,
+               Qt::KeyboardModifiers modifiers = Qt::NoModifier,
+               int pixelDelta = 0) {
+    const QPoint position = canvas.viewport()->rect().center();
+    const QPoint globalPosition = canvas.viewport()->mapToGlobal(position);
+    QWheelEvent event(
+        QPointF(position), QPointF(globalPosition), QPoint(0, pixelDelta),
+        QPoint(0, verticalDelta), Qt::NoButton, modifiers,
+        Qt::NoScrollPhase, false);
+    QApplication::sendEvent(canvas.viewport(), &event);
 }
 
 void sendMouseEvent(DocumentCanvas& canvas, QEvent::Type type,
@@ -1067,6 +1084,121 @@ void testBaselineToggle(docxstudio::app::SpellChecker& spelling) {
           "second superscript toggle did not return to baseline");
 }
 
+void testZoomIsViewOnlyAndWheelDriven(
+    docxstudio::app::SpellChecker& spelling) {
+    DocumentCanvas canvas(spelling);
+    canvas.resize(900, 500);
+    canvas.setDocument(documentWithText(QStringLiteral("zoom me")));
+    canvas.markSaved();
+    canvas.show();
+    canvas.setFocus();
+    QApplication::processEvents();
+
+    const auto original = canvas.snapshot();
+    const auto originalSelection = canvas.selection();
+    const auto originalLayoutGeneration = canvas.layoutGeneration();
+    int signalCount = 0;
+    int lastSignaledZoom = -1;
+    QObject::connect(&canvas, &DocumentCanvas::zoomChanged, &canvas,
+                     [&](int percent) {
+                         ++signalCount;
+                         lastSignaledZoom = percent;
+                     });
+
+    canvas.setZoomPercent(100);
+    check(signalCount == 0,
+          "setting the current zoom emitted a redundant zoom signal");
+    canvas.setZoomPercent(999);
+    check(canvas.zoomPercent() == DocumentCanvas::kMaximumZoomPercent &&
+              lastSignaledZoom == DocumentCanvas::kMaximumZoomPercent,
+          "zoom did not clamp and report its 400 percent maximum");
+    canvas.setZoomPercent(-999);
+    check(canvas.zoomPercent() == DocumentCanvas::kMinimumZoomPercent &&
+              lastSignaledZoom == DocumentCanvas::kMinimumZoomPercent,
+          "zoom did not clamp and report its 25 percent minimum");
+    check(signalCount == 2,
+          "zoom bounds emitted an unexpected number of change signals");
+
+    auto afterZoom = canvas.snapshot();
+    check(afterZoom.revision == original.revision &&
+              paragraphTexts(afterZoom) == paragraphTexts(original) &&
+              canvas.selection() == originalSelection &&
+              !canvas.isModified(),
+          "changing zoom mutated or dirtied the document");
+    check(canvas.layoutGeneration() == originalLayoutGeneration,
+          "changing zoom unnecessarily repaginated the document");
+
+    canvas.setZoomPercent(100);
+    sendWheel(canvas, 120, Qt::ControlModifier);
+    check(canvas.zoomPercent() == 110,
+          "Ctrl+wheel-up did not zoom in by one step");
+    sendWheel(canvas, -120, Qt::ControlModifier);
+    check(canvas.zoomPercent() == 100,
+          "Ctrl+wheel-down did not zoom out by one step");
+    sendWheel(canvas, 60, Qt::ControlModifier);
+    check(canvas.zoomPercent() == 100,
+          "a partial high-resolution wheel delta zoomed too early");
+    sendWheel(canvas, 60, Qt::ControlModifier);
+    check(canvas.zoomPercent() == 110,
+          "high-resolution wheel deltas did not accumulate to one step");
+    sendWheel(canvas, -240, Qt::ControlModifier);
+    check(canvas.zoomPercent() == 90,
+          "a multi-notch wheel delta did not apply every zoom step");
+    sendWheel(canvas, 0, Qt::ControlModifier, 20);
+    check(canvas.zoomPercent() == 90,
+          "a partial touchpad pixel delta zoomed too early");
+    sendWheel(canvas, 0, Qt::ControlModifier, 20);
+    check(canvas.zoomPercent() == 100,
+          "touchpad pixel deltas did not accumulate smoothly");
+    sendWheel(canvas, 120);
+    check(canvas.zoomPercent() == 100,
+          "plain wheel scrolling unexpectedly changed zoom");
+
+    // Keyboard formatting shortcuts deliberately remain available. Zoom is
+    // mouse-wheel-only here, so Ctrl+=/Ctrl++ and Ctrl+- cannot steal the
+    // existing subscript/superscript command bindings owned by MainWindow.
+    sendKey(canvas, Qt::Key_Equal, Qt::ControlModifier);
+    sendKey(canvas, Qt::Key_Plus,
+            Qt::ControlModifier | Qt::ShiftModifier);
+    sendKey(canvas, Qt::Key_Minus, Qt::ControlModifier);
+    check(canvas.zoomPercent() == 100,
+          "a formatting-compatible keyboard sequence changed zoom");
+
+    for (int index = 0; index < 60; ++index) {
+        sendWheel(canvas, 120, Qt::ControlModifier);
+    }
+    check(canvas.zoomPercent() == DocumentCanvas::kMaximumZoomPercent,
+          "repeated Ctrl+wheel-up did not stop at 400 percent");
+    const int signalsAtMaximum = signalCount;
+    sendWheel(canvas, 120, Qt::ControlModifier);
+    check(signalCount == signalsAtMaximum,
+          "wheel input past 400 percent emitted a false zoom change");
+    for (int index = 0; index < 60; ++index) {
+        sendWheel(canvas, -120, Qt::ControlModifier);
+    }
+    check(canvas.zoomPercent() == DocumentCanvas::kMinimumZoomPercent,
+          "repeated Ctrl+wheel-down did not stop at 25 percent");
+
+    canvas.setZoomPercent(100);
+    QString summary;
+    QString error;
+    check(canvas.createReplacementPreview(QStringLiteral("preview"), summary,
+                                          error),
+          "could not create the zoom preview fixture");
+    const auto liveBeforePreviewZoom = canvas.snapshot();
+    sendWheel(canvas, 120, Qt::ControlModifier);
+    check(canvas.zoomPercent() == 110 && canvas.hasPreview(),
+          "Ctrl+wheel zoom was blocked by an active Codex preview");
+    const auto liveAfterPreviewZoom = canvas.snapshot();
+    check(liveAfterPreviewZoom.revision == liveBeforePreviewZoom.revision &&
+              paragraphTexts(liveAfterPreviewZoom) ==
+                  paragraphTexts(liveBeforePreviewZoom) &&
+              !canvas.isModified(),
+          "zooming an active preview mutated the live document");
+    canvas.discardPreview();
+    canvas.hide();
+}
+
 void testFontSizeCommit(docxstudio::app::SpellChecker& spelling) {
     docxstudio::app::CommandRegistry commands;
     docxstudio::app::RibbonWidget ribbon(commands);
@@ -1940,6 +2072,94 @@ void testClipboard(docxstudio::app::SpellChecker& spelling) {
           "paste shortcut did not restore clipboard text");
 }
 
+void testPasteTextOnly(docxstudio::app::SpellChecker& spelling) {
+    const QColor requestedColor(QStringLiteral("#365f91"));
+    DocumentCanvas canvas(spelling);
+    canvas.setDocument(documentWithColor(
+        QStringLiteral("replace"), 0, 7,
+        static_cast<std::uint32_t>(requestedColor.rgba())));
+    canvas.selectAll();
+
+    auto* richClipboard = new QMimeData;
+    richClipboard->setText(QStringLiteral("plain\ntext"));
+    richClipboard->setHtml(QStringLiteral(
+        "<table><tr><td><b>rich object</b></td></tr></table>"));
+    richClipboard->setData(
+        QStringLiteral("application/x-owl-docs-inline-image-v2"),
+        QByteArrayLiteral("not a valid Owl Docs picture"));
+    QApplication::clipboard()->setMimeData(richClipboard);
+
+    const auto beforePaste = canvas.snapshot();
+    int failures = 0;
+    QObject::connect(&canvas, &DocumentCanvas::operationFailed,
+                     &canvas, [&failures](const QString&) { ++failures; });
+    sendKey(canvas, Qt::Key_V,
+            Qt::ControlModifier | Qt::ShiftModifier);
+    const auto pasted = canvas.snapshot();
+    check(pasted.revision.value() == beforePaste.revision.value() + 1,
+          "Paste as Text Only was not one document transaction");
+    check(paragraphTexts(pasted) ==
+              QStringList{QStringLiteral("plain"), QStringLiteral("text")},
+          "Ctrl+Shift+V did not insert only the clipboard plain text");
+    check(pasted.document.tables().empty() &&
+              pasted.document.paragraphs().front().images().empty() &&
+              failures == 0,
+          "Paste as Text Only interpreted rich/native clipboard content");
+    check(pasted.document.paragraphs().front()
+                  .characterFormatAt(1).foreground_argb ==
+              static_cast<std::uint32_t>(requestedColor.rgba()) &&
+              pasted.document.paragraphs().back()
+                  .characterFormatAt(1).foreground_argb ==
+              static_cast<std::uint32_t>(requestedColor.rgba()),
+          "plain-text paste did not use the current insertion formatting");
+    canvas.undo();
+    check(paragraphTexts(canvas.snapshot()) ==
+              QStringList{QStringLiteral("replace")},
+          "one Undo did not restore a multi-line plain-text paste");
+
+    auto* nonTextClipboard = new QMimeData;
+    nonTextClipboard->setHtml(QStringLiteral("<b>HTML only</b>"));
+    nonTextClipboard->setData(QStringLiteral("image/png"),
+                              QByteArrayLiteral("not a PNG"));
+    QApplication::clipboard()->setMimeData(nonTextClipboard);
+    const auto beforeRejectedPaste = canvas.snapshot();
+    canvas.pasteTextOnly();
+    check(canvas.snapshot().revision == beforeRejectedPaste.revision &&
+              paragraphTexts(canvas.snapshot()) ==
+                  paragraphTexts(beforeRejectedPaste),
+          "a clipboard without text/plain mutated the document");
+
+    DocumentCanvas contextCanvas(spelling);
+    contextCanvas.resize(800, 500);
+    contextCanvas.show();
+    contextCanvas.setFocus();
+    QApplication::processEvents();
+    QApplication::clipboard()->setText(QStringLiteral("from context menu"));
+    bool foundContextAction = false;
+    QTimer::singleShot(0, &contextCanvas, [&] {
+        auto* menu = qobject_cast<QMenu*>(QApplication::activePopupWidget());
+        check(menu != nullptr,
+              "document right-click did not open a context menu");
+        auto* action = menu->findChild<QAction*>(
+            QStringLiteral("context.pasteTextOnly"));
+        check(action && action->isEnabled() &&
+                  action->text() == QStringLiteral("Paste as Text Only"),
+              "document context menu has no enabled plain-text paste action");
+        foundContextAction = true;
+        action->trigger();
+        menu->close();
+    });
+    const QPoint contextPoint = inputMethodCursorRect(contextCanvas).center();
+    QContextMenuEvent contextEvent(
+        QContextMenuEvent::Mouse, contextPoint,
+        contextCanvas.viewport()->mapToGlobal(contextPoint));
+    QApplication::sendEvent(contextCanvas.viewport(), &contextEvent);
+    check(foundContextAction &&
+              onlyText(contextCanvas) == QStringLiteral("from context menu"),
+          "Paste as Text Only context action did not insert clipboard text");
+    contextCanvas.hide();
+}
+
 void testInputMethodCommit(docxstudio::app::SpellChecker& spelling) {
     DocumentCanvas canvas(spelling);
     commitInputMethodText(canvas, QString::fromUtf8("\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e"));
@@ -2479,6 +2699,7 @@ int main(int argc, char** argv) {
     testCollapsedBoldToggle(spelling);
     testEmptyParagraphTypingFormatSurvivesNavigation(spelling);
     testBaselineToggle(spelling);
+    testZoomIsViewOnlyAndWheelDriven(spelling);
     testFontSizeCommit(spelling);
     testBreakKeys(spelling);
     testSemanticListProperties(spelling);
@@ -2488,6 +2709,7 @@ int main(int argc, char** argv) {
     testTabEditingSemantics(spelling);
     testGraphemeBackspace(spelling);
     testClipboard(spelling);
+    testPasteTextOnly(spelling);
     testInputMethodCommit(spelling);
     testFindAndReplace(spelling);
     testReverseSelectionFormatting(spelling);

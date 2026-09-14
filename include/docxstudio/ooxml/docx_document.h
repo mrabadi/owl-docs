@@ -702,6 +702,15 @@ public:
     [[nodiscard]] const std::optional<PageSettings>& bodyPageSettings() const noexcept;
     [[nodiscard]] const std::vector<ImportedSection>& sections() const noexcept;
     [[nodiscard]] const CompatibilityReport& compatibility() const noexcept;
+    // True only for the deliberately narrow, text-only package shape emitted
+    // by this writer when every package part and document structure is covered
+    // by the current semantic regeneration path. This is stricter than
+    // basic_body_text_patch: an extra/custom part, relationship, setting,
+    // style, section property, table, drawing, equation, or numbering part
+    // makes the answer false so callers never infer rewrite safety merely from
+    // a simple-looking body.
+    [[nodiscard]] bool isCanonicalRegeneratableSimplePackage(
+        const DocumentDefaults& regeneration_defaults) const noexcept;
     [[nodiscard]] bool dirty() const noexcept;
 
     // Replaces only the character data inside one mapped w:t element. Markup,

@@ -593,6 +593,9 @@ RequestId Client::resumeThread(const ThreadResumeOptions& options,
     if (options.developerInstructions) {
         params["developerInstructions"] = *options.developerInstructions;
     }
+    if (options.config.is_object() && !options.config.empty()) {
+        params["config"] = options.config;
+    }
     return sendRequest(
         "thread/resume", std::move(params),
         [callback = std::move(callback)](Result<Json> raw) mutable {

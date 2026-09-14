@@ -20,6 +20,9 @@
 namespace {
 
 using docxstudio::ooxml::BasicParagraphAlignment;
+using docxstudio::ooxml::BasicBaseline;
+using docxstudio::ooxml::BasicLineSpacingRule;
+using docxstudio::ooxml::BasicRunFormat;
 using docxstudio::ooxml::BasicTableStyle;
 using docxstudio::ooxml::CompatibilityClass;
 using docxstudio::ooxml::DocxDocument;
@@ -146,6 +149,40 @@ void appendMembers(
         addMember(archive, name, contents);
     }
     check(zip_close(archive) == 0, "zip_close failed while extending fixture");
+}
+
+void replaceMember(
+    const std::filesystem::path& path, const std::string& name,
+    const std::string& contents) {
+    int error = 0;
+    zip_t* archive = zip_open(path.c_str(), 0, &error);
+    check(archive != nullptr, "zip_open failed while replacing fixture member");
+    void* owned_contents = nullptr;
+    if (!contents.empty()) {
+        owned_contents = std::malloc(contents.size());
+        check(owned_contents != nullptr,
+              "malloc failed for replacement ZIP fixture");
+        std::memcpy(owned_contents, contents.data(), contents.size());
+    }
+    zip_source_t* source = zip_source_buffer(
+        archive, owned_contents,
+        static_cast<zip_uint64_t>(contents.size()), 1);
+    if (source == nullptr) std::free(owned_contents);
+    check(source != nullptr, "zip_source_buffer failed for replacement member");
+    const zip_int64_t index = zip_file_add(
+        archive, name.c_str(), source,
+        ZIP_FL_OVERWRITE | ZIP_FL_ENC_UTF_8);
+    if (index < 0) {
+        zip_source_free(source);
+        zip_discard(archive);
+        throw std::runtime_error("zip_file_add replacement failed");
+    }
+    check(zip_set_file_compression(
+              archive, static_cast<zip_uint64_t>(index), ZIP_CM_DEFLATE,
+              6) == 0,
+          "zip_set_file_compression failed for replacement member");
+    check(zip_close(archive) == 0,
+          "zip_close failed while replacing fixture member");
 }
 
 std::string readMember(const std::filesystem::path& path, const char* name) {
@@ -2052,6 +2089,162 @@ void testXmlComplexityLimits(const TemporaryDirectory& temporary) {
           "node-count rejection did not identify the exceeded limit");
 }
 
+void testCanonicalSimplePackageRegenerationEligibility(
+    const TemporaryDirectory& temporary) {
+    BasicRunFormat run_format;
+    run_format.font_family = "Liberation Serif";
+    run_format.font_size_half_points = 25;
+    run_format.bold = true;
+    run_format.italic = false;
+    run_format.underline = true;
+    run_format.strike = false;
+    run_format.foreground_rgb = 0x00336699U;
+    run_format.highlight_rgb = 0x00ffee88U;
+    run_format.baseline = BasicBaseline::superscript;
+    NewParagraph paragraph;
+    paragraph.runs.push_back(
+        {"A simple\tOwl Docs document\nwith a second line", run_format});
+    paragraph.alignment = BasicParagraphAlignment::justified;
+    paragraph.left_indent_twips = 360;
+    paragraph.right_indent_twips = 180;
+    paragraph.first_line_indent_twips = -120;
+    paragraph.space_before_twips = 60;
+    paragraph.space_after_twips = 120;
+    paragraph.line_spacing = 280;
+    paragraph.line_spacing_rule = BasicLineSpacingRule::exact;
+    paragraph.keep_with_next = true;
+    paragraph.keep_lines = false;
+    paragraph.page_break_before = false;
+    paragraph.left_tab_stops_twips = {360, 720};
+    BasicRunFormat paragraph_mark_format;
+    paragraph_mark_format.bold = false;
+    paragraph.paragraph_mark_format = paragraph_mark_format;
+    DocumentDefaults defaults;
+    defaults.font_family = "Liberation Serif";
+    defaults.font_size_half_points = 25;
+    defaults.default_tab_stop_twips = 333;
+
+    const auto canonical_path = temporary.file("canonical-simple.docx");
+    const auto canonical_save = DocxDocument::writeNew(
+        canonical_path, {paragraph}, {}, defaults);
+    check(canonical_save.saved,
+          canonical_save.error
+              ? canonical_save.error->message
+              : "canonical simple package was not created");
+    Error error;
+    auto canonical = DocxDocument::open(canonical_path, &error);
+    check(canonical != nullptr, error.message);
+    check(canonical->compatibility().classification ==
+                  CompatibilityClass::basic_body_text_patch &&
+              canonical->compatibility().issues.empty() &&
+              canonical->isCanonicalRegeneratableSimplePackage(defaults),
+          "current-writer text-only package was not recognized as fully regeneratable");
+    auto mismatched_defaults = defaults;
+    mismatched_defaults.font_size_half_points += 1;
+    check(!canonical->isCanonicalRegeneratableSimplePackage(
+              mismatched_defaults),
+          "canonical package accepted regeneration with different document defaults");
+
+    const auto expect_document_variant_rejected =
+        [&](const char* file_name, std::string_view needle,
+            std::string_view replacement, const char* failure) {
+            const auto variant_path = temporary.file(file_name);
+            check(std::filesystem::copy_file(canonical_path, variant_path),
+                  "could not copy canonical body-grammar fixture");
+            std::string document_xml = readMember(
+                variant_path, "word/document.xml");
+            const auto position = document_xml.find(needle);
+            check(position != std::string::npos,
+                  "canonical body-grammar fixture marker is missing");
+            document_xml.replace(position, needle.size(), replacement);
+            replaceMember(variant_path, "word/document.xml", document_xml);
+            auto variant = DocxDocument::open(variant_path, &error);
+            check(variant != nullptr, error.message);
+            check(!variant->isCanonicalRegeneratableSimplePackage(defaults),
+                  failure);
+        };
+
+    expect_document_variant_rejected(
+        "canonical-run-complex-script-font.docx",
+        "<w:rFonts w:ascii=\"Liberation Serif\" "
+        "w:hAnsi=\"Liberation Serif\"/>",
+        "<w:rFonts w:ascii=\"Liberation Serif\" "
+        "w:hAnsi=\"Liberation Serif\" w:cs=\"Noto Sans Arabic\"/>",
+        "an unpreserved complex-script run font was declared regeneratable");
+    expect_document_variant_rejected(
+        "canonical-break-clear.docx", "<w:br/>",
+        "<w:br w:clear=\"all\"/>",
+        "an attributed line break was declared regeneratable");
+    expect_document_variant_rejected(
+        "canonical-tab-attribute.docx", "<w:tab/>",
+        "<w:tab w:future=\"1\"/>",
+        "a tab with an unknown attribute was declared regeneratable");
+    expect_document_variant_rejected(
+        "canonical-carriage-return.docx", "<w:br/>", "<w:cr/>",
+        "a non-writer carriage-return element was declared regeneratable");
+    expect_document_variant_rejected(
+        "canonical-text-attribute.docx", "<w:t>",
+        "<w:t w:future=\"1\">",
+        "a text node with an unknown attribute was declared regeneratable");
+    expect_document_variant_rejected(
+        "canonical-run-namespace.docx", "<w:r>",
+        "<w:r xmlns:future=\"urn:owl-docs:future\" "
+        "future:opaque=\"1\">",
+        "a run with an unknown namespace attribute was declared regeneratable");
+
+    const auto custom_path = temporary.file("canonical-plus-custom.docx");
+    check(std::filesystem::copy_file(canonical_path, custom_path),
+          "could not copy canonical custom-part fixture");
+    appendMembers(custom_path,
+                  {{"customXml/item1.bin",
+                    std::string("opaque\0payload", 14)}});
+    auto custom = DocxDocument::open(custom_path, &error);
+    check(custom != nullptr, error.message);
+    check(custom->compatibility().classification ==
+                  CompatibilityClass::basic_body_text_patch &&
+              custom->compatibility().issues.empty() &&
+              !custom->isCanonicalRegeneratableSimplePackage(defaults),
+          "an opaque custom package member was incorrectly declared regeneratable");
+
+    const auto external_path = temporary.file("canonical-plus-external.docx");
+    check(std::filesystem::copy_file(canonical_path, external_path),
+          "could not copy canonical external-relationship fixture");
+    std::string external_relationships = readMember(
+        external_path, "word/_rels/document.xml.rels");
+    const auto relationship_end = external_relationships.find(
+        "</Relationships>");
+    check(relationship_end != std::string::npos,
+          "canonical relationships closing element is missing");
+    external_relationships.insert(
+        relationship_end,
+        "<Relationship Id=\"rIdExternal\" "
+        "Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink\" "
+        "Target=\"https://example.invalid/\" TargetMode=\"External\"/>");
+    replaceMember(external_path, "word/_rels/document.xml.rels",
+                  external_relationships);
+    auto external = DocxDocument::open(external_path, &error);
+    check(external != nullptr, error.message);
+    check(!external->isCanonicalRegeneratableSimplePackage(defaults),
+          "an external relationship was incorrectly declared regeneratable");
+
+    const auto section_path = temporary.file("canonical-plus-columns.docx");
+    check(std::filesystem::copy_file(canonical_path, section_path),
+          "could not copy canonical section-property fixture");
+    std::string section_xml = readMember(section_path, "word/document.xml");
+    const auto section_end = section_xml.find("</w:sectPr>");
+    check(section_end != std::string::npos,
+          "canonical final section closing element is missing");
+    section_xml.insert(section_end, "<w:cols w:num=\"2\"/>");
+    replaceMember(section_path, "word/document.xml", section_xml);
+    auto section = DocxDocument::open(section_path, &error);
+    check(section != nullptr, error.message);
+    check(section->compatibility().classification ==
+                  CompatibilityClass::basic_body_text_patch &&
+              section->compatibility().issues.empty() &&
+              !section->isCanonicalRegeneratableSimplePackage(defaults),
+          "an unsupported final-section column setting was incorrectly declared regeneratable");
+}
+
 void testTextPatchPreservesOpaqueMembers(const TemporaryDirectory& temporary) {
     const auto source = temporary.file("complex.docx");
     const auto output = temporary.file("complex-edited.docx");
@@ -2184,6 +2377,7 @@ int main() {
         testTextPatchPreservesOpaqueMembers(temporary);
         testUnsupportedFormattingIsReported(temporary);
         testXmlComplexityLimits(temporary);
+        testCanonicalSimplePackageRegenerationEligibility(temporary);
         testUnsafeEditsAreRefused(temporary);
         testExcludedWordMainTypesAreRejected(temporary);
         std::cout << "OOXML tests passed\n";

@@ -37,6 +37,7 @@
 #include <QFontMetricsF>
 #include <QInputDialog>
 #include <QIcon>
+#include <QHBoxLayout>
 #include <QKeySequence>
 #include <QLabel>
 #include <QLineEdit>
@@ -49,6 +50,8 @@
 #include <QPushButton>
 #include <QRegularExpression>
 #include <QSettings>
+#include <QSignalBlocker>
+#include <QSlider>
 #include <QStandardPaths>
 #include <QStatusBar>
 #include <QSpinBox>
@@ -56,6 +59,7 @@
 #include <QTabWidget>
 #include <QTimer>
 #include <QToolBar>
+#include <QToolButton>
 #include <QVBoxLayout>
 #include <QtPrintSupport/QPrinter>
 
@@ -1516,21 +1520,28 @@ ooxml::PageSettings toOoxmlPageSettings(const DocumentCanvas& canvas) {
 }
 
 ooxml::DocumentDefaults toOoxmlDocumentDefaults(
-    const DocumentCanvas& canvas) {
+    const QString& fontFamily, double fontPointSize, int tabWidthSpaces) {
     ooxml::DocumentDefaults defaults;
-    defaults.font_family = canvas.defaultFontFamily().toStdString();
+    defaults.font_family = fontFamily.toStdString();
     defaults.font_size_half_points = static_cast<std::int32_t>(
-        std::lround(canvas.defaultFontPointSize() * 2.0));
+        std::lround(fontPointSize * 2.0));
 
-    QFont font(canvas.defaultFontFamily());
-    font.setPointSizeF(canvas.defaultFontPointSize());
+    QFont font(fontFamily);
+    font.setPointSizeF(fontPointSize);
     const qreal tabWidthPoints =
         QFontMetricsF(font).horizontalAdvance(QLatin1Char(' ')) *
-        static_cast<qreal>(canvas.tabWidthSpaces());
+        static_cast<qreal>(tabWidthSpaces);
     defaults.default_tab_stop_twips = static_cast<std::uint32_t>(
         std::clamp<std::int64_t>(std::llround(tabWidthPoints * 20.0),
                                  1, 31'680));
     return defaults;
+}
+
+ooxml::DocumentDefaults toOoxmlDocumentDefaults(
+    const DocumentCanvas& canvas) {
+    return toOoxmlDocumentDefaults(
+        canvas.defaultFontFamily(), canvas.defaultFontPointSize(),
+        canvas.tabWidthSpaces());
 }
 
 ooxml::BasicNumberFormat ooxmlNumberFormatForLevel(std::size_t level) {
@@ -2192,6 +2203,12 @@ struct MainWindow::TabState {
     QStringList sourceTextPrefixes;
     ImportedTableStyleSources importedTableStyleSources;
     bool regeneratable{true};
+    // When an existing package is eligible for full regeneration, retain the
+    // document defaults that were actually serialized into that package.
+    // Application preference changes update canvas insertion defaults, but
+    // must not silently rewrite an already-open document's Normal style or
+    // default tab stop on the next formatting/structural save.
+    std::optional<ooxml::DocumentDefaults> regenerationDefaults;
     bool recovered{false};
 };
 
@@ -2326,6 +2343,72 @@ MainWindow::MainWindow(QWidget* parent)
     statusBar()->addPermanentWidget(saveStatus_);
     statusBar()->addPermanentWidget(pageStatus_);
 
+    auto* zoomControls = new QWidget(this);
+    zoomControls->setObjectName(QStringLiteral("status.zoomControls"));
+    auto* zoomLayout = new QHBoxLayout(zoomControls);
+    zoomLayout->setContentsMargins(6, 0, 0, 0);
+    zoomLayout->setSpacing(4);
+
+    zoomOut_ = new QToolButton(zoomControls);
+    zoomOut_->setObjectName(QStringLiteral("status.zoomOut"));
+    zoomOut_->setAutoRaise(true);
+    zoomOut_->setFocusPolicy(Qt::NoFocus);
+    zoomOut_->setAccessibleName(tr("Zoom out"));
+    zoomOut_->setToolTip(tr("Zoom out"));
+    zoomOut_->setIcon(QIcon::fromTheme(QStringLiteral("zoom-out")));
+    if (zoomOut_->icon().isNull()) zoomOut_->setText(QStringLiteral("−"));
+
+    zoomSlider_ = new QSlider(Qt::Horizontal, zoomControls);
+    zoomSlider_->setObjectName(QStringLiteral("status.zoomSlider"));
+    zoomSlider_->setAccessibleName(tr("Document zoom"));
+    zoomSlider_->setAccessibleDescription(
+        tr("Zoom from 25 to 400 percent; hold Control and scroll over the document"));
+    zoomSlider_->setToolTip(zoomSlider_->accessibleDescription());
+    zoomSlider_->setRange(DocumentCanvas::kMinimumZoomPercent,
+                          DocumentCanvas::kMaximumZoomPercent);
+    zoomSlider_->setSingleStep(5);
+    zoomSlider_->setPageStep(10);
+    zoomSlider_->setTracking(false);
+    zoomSlider_->setFixedWidth(140);
+    zoomSlider_->setValue(100);
+
+    zoomIn_ = new QToolButton(zoomControls);
+    zoomIn_->setObjectName(QStringLiteral("status.zoomIn"));
+    zoomIn_->setAutoRaise(true);
+    zoomIn_->setFocusPolicy(Qt::NoFocus);
+    zoomIn_->setAccessibleName(tr("Zoom in"));
+    zoomIn_->setToolTip(tr("Zoom in"));
+    zoomIn_->setIcon(QIcon::fromTheme(QStringLiteral("zoom-in")));
+    if (zoomIn_->icon().isNull()) zoomIn_->setText(QStringLiteral("+"));
+
+    zoomStatus_ = new QLabel(QStringLiteral("100%"), zoomControls);
+    zoomStatus_->setObjectName(QStringLiteral("status.zoomPercent"));
+    zoomStatus_->setAccessibleName(tr("Current document zoom"));
+    zoomStatus_->setMinimumWidth(44);
+    zoomStatus_->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+
+    zoomLayout->addWidget(zoomOut_);
+    zoomLayout->addWidget(zoomSlider_);
+    zoomLayout->addWidget(zoomIn_);
+    zoomLayout->addWidget(zoomStatus_);
+    statusBar()->addPermanentWidget(zoomControls);
+
+    connect(zoomOut_, &QToolButton::clicked, this, [this] {
+        if (auto* canvas = activeCanvas()) {
+            setActiveZoomPercent(canvas->zoomPercent() - 10);
+        }
+    });
+    connect(zoomIn_, &QToolButton::clicked, this, [this] {
+        if (auto* canvas = activeCanvas()) {
+            setActiveZoomPercent(canvas->zoomPercent() + 10);
+        }
+    });
+    connect(zoomSlider_, &QSlider::sliderMoved, this, [this](int percent) {
+        zoomStatus_->setText(tr("%1%").arg(percent));
+    });
+    connect(zoomSlider_, &QSlider::valueChanged, this,
+            [this](int percent) { setActiveZoomPercent(percent); });
+
     const auto stateDir = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
     QDir().mkpath(stateDir);
     QFile::setPermissions(
@@ -2364,6 +2447,7 @@ MainWindow::MainWindow(QWidget* parent)
         updateWindowTitle();
         loadChatForActiveDocument();
         if (auto* canvas = activeCanvas()) {
+            synchronizeZoomControls(canvas);
             ribbon_->setFontFamily(canvas->currentFontFamily());
             ribbon_->setFontPointSize(canvas->currentFontPointSize());
             ribbon_->setTextColor(canvas->currentTextColor());
@@ -2374,6 +2458,7 @@ MainWindow::MainWindow(QWidget* parent)
                 pictureLayout.value_or(core::ImageLayout{}).placement);
             canvas->refreshCursorFormat();
         } else {
+            synchronizeZoomControls(nullptr);
             ribbon_->setListContext(false, 1);
             ribbon_->setTableContext(false);
             ribbon_->setPictureContext(false);
@@ -2413,6 +2498,11 @@ void MainWindow::registerCommands() {
     add("edit.cut", tr("Cut"), QKeySequence::Cut, [this] { if (activeCanvas()) activeCanvas()->cut(); });
     add("edit.copy", tr("Copy"), QKeySequence::Copy, [this] { if (activeCanvas()) activeCanvas()->copy(); });
     add("edit.paste", tr("Paste"), QKeySequence::Paste, [this] { if (activeCanvas()) activeCanvas()->paste(); });
+    add("edit.pasteTextOnly", tr("Paste as Text Only"),
+        QKeySequence(QStringLiteral("Ctrl+Shift+V")),
+        [this] {
+            if (activeCanvas()) activeCanvas()->pasteTextOnly();
+        });
     add("edit.find", tr("Find and Replace…"), QKeySequence::Find, [this] { showFindReplace(); });
     add("edit.commandPalette", tr("Command Palette…"), QKeySequence(QStringLiteral("Ctrl+Shift+P")),
         [this] { showCommandPalette(); });
@@ -2601,6 +2691,7 @@ void MainWindow::registerCommands() {
     // document while the user is editing a ribbon or dialog text field.
     for (const auto* id : {
              "edit.undo", "edit.redo", "edit.cut", "edit.copy", "edit.paste",
+             "edit.pasteTextOnly",
              "format.bold", "format.italic", "format.underline",
              "format.superscript", "format.subscript",
              "paragraph.alignLeft", "paragraph.alignCenter",
@@ -2637,6 +2728,7 @@ void MainWindow::registerCommands() {
     // is delivered to the old ribbon control instead of the document.
     for (const auto* id : {
              "edit.undo", "edit.redo", "edit.cut", "edit.copy", "edit.paste",
+             "edit.pasteTextOnly",
              "format.bold", "format.italic", "format.underline", "format.strike",
              "format.superscript", "format.subscript",
              "paragraph.bullets", "paragraph.numbering",
@@ -2684,7 +2776,9 @@ void MainWindow::buildMenus() {
     file->addSeparator();
     file->addAction(tr("Quit"), qApp, &QApplication::closeAllWindows, QKeySequence::Quit);
     auto* edit = menuBar()->addMenu(tr("&Edit"));
-    for (const auto* id : {"edit.undo", "edit.redo", "edit.cut", "edit.copy", "edit.paste", "edit.find", "edit.commandPalette"})
+    for (const auto* id : {"edit.undo", "edit.redo", "edit.cut", "edit.copy",
+                           "edit.paste", "edit.pasteTextOnly", "edit.find",
+                           "edit.commandPalette"})
         edit->addAction(commands_.action(QString::fromLatin1(id)));
     auto* insert = menuBar()->addMenu(tr("&Insert"));
     for (const auto* id : {"insert.table", "insert.image", "insert.equation", "insert.pageBreak"})
@@ -2754,7 +2848,7 @@ void MainWindow::connectRibbon() {
     connect(ribbon_, &RibbonWidget::zoomRequested, this, [this](int zoom) {
         auto* canvas = activeCanvas();
         if (!canvas) return;
-        canvas->setZoomPercent(zoom);
+        setActiveZoomPercent(zoom);
         restoreCanvasFocus(canvas);
     });
     connect(ribbon_, &RibbonWidget::listPropertiesRequested,
@@ -2772,6 +2866,38 @@ void MainWindow::restoreCanvasFocus(DocumentCanvas* canvas) {
     if (!canvas) return;
     canvas->setFocus();
     QTimer::singleShot(0, canvas, [canvas] { canvas->setFocus(); });
+}
+
+void MainWindow::setActiveZoomPercent(int percent) {
+    auto* canvas = activeCanvas();
+    if (!canvas) return;
+    canvas->setZoomPercent(percent);
+    // setZoomPercent deliberately emits only for a real change. Always sync
+    // so an attempted move beyond either bound snaps every control back.
+    synchronizeZoomControls(canvas);
+}
+
+void MainWindow::synchronizeZoomControls(DocumentCanvas* canvas) {
+    const bool available = canvas != nullptr;
+    const int percent = available ? canvas->zoomPercent() : 100;
+    if (zoomSlider_) {
+        const QSignalBlocker blocker(zoomSlider_);
+        zoomSlider_->setValue(percent);
+        zoomSlider_->setEnabled(available);
+    }
+    if (zoomStatus_) {
+        zoomStatus_->setText(tr("%1%").arg(percent));
+        zoomStatus_->setEnabled(available);
+    }
+    if (zoomOut_) {
+        zoomOut_->setEnabled(
+            available && percent > DocumentCanvas::kMinimumZoomPercent);
+    }
+    if (zoomIn_) {
+        zoomIn_->setEnabled(
+            available && percent < DocumentCanvas::kMaximumZoomPercent);
+    }
+    if (ribbon_) ribbon_->setZoomPercent(percent);
 }
 
 void MainWindow::applyTextColor(const QColor& color) {
@@ -2927,6 +3053,10 @@ DocumentCanvas* MainWindow::createDocumentTab(core::Document document,
     connect(canvas, &DocumentCanvas::pageStatusChanged, this, [this](int page, int count, int words) {
         pageStatus_->setText(tr("Page %1 of %2   %3 words").arg(page).arg(count).arg(words));
     });
+    connect(canvas, &DocumentCanvas::zoomChanged, this,
+            [this, canvas](int) {
+        if (canvas == activeCanvas()) synchronizeZoomControls(canvas);
+    });
     connect(canvas, &DocumentCanvas::operationFailed, this, [this](const QString& message) {
         QMessageBox::warning(this, tr("Edit could not be applied"), message);
     });
@@ -2939,6 +3069,7 @@ DocumentCanvas* MainWindow::createDocumentTab(core::Document document,
     ribbon_->setPictureContext(
         pictureLayout.has_value(),
         pictureLayout.value_or(core::ImageLayout{}).placement);
+    synchronizeZoomControls(canvas);
     canvas->refreshCursorFormat();
     canvas->setFocus();
     updateWindowTitle();
@@ -3039,7 +3170,16 @@ bool MainWindow::openPath(const QString& path) {
         }
     }
     state->package = std::move(package);
-    state->regeneratable = false;
+    const auto importedDefaults = toOoxmlDocumentDefaults(
+        editorPreferences_.defaultFontFamily(),
+        editorPreferences_.defaultFontPointSize(),
+        editorPreferences_.tabWidthSpaces());
+    state->regeneratable =
+        state->package->isCanonicalRegeneratableSimplePackage(
+            importedDefaults);
+    if (state->regeneratable) {
+        state->regenerationDefaults = importedDefaults;
+    }
     const auto page = state->package->bodyPageSettings();
     auto importedImages = std::move(semantic.value().images);
     auto importedTables = std::move(semantic.value().tables);
@@ -3112,7 +3252,12 @@ bool MainWindow::saveCanvas(DocumentCanvas* canvas, bool saveAs) {
     // An unchanged Save As must retain the original package byte-for-byte,
     // including for documents first created by this application. Regeneration
     // is reserved for an unsaved document or an actual semantic/layout edit.
+    const auto currentDefaults = toOoxmlDocumentDefaults(*canvas);
+    const bool regenerationDefaultsStillMatch =
+        !state->regenerationDefaults ||
+        *state->regenerationDefaults == currentDefaults;
     bool regenerate = state->regeneratable &&
+                      regenerationDefaultsStillMatch &&
                       (canvas->isModified() || !state->package);
     bool simplificationConfirmed = false;
     const auto confirmSimplification = [&]() {
@@ -3248,12 +3393,13 @@ bool MainWindow::saveCanvas(DocumentCanvas* canvas, bool saveAs) {
         }
         const auto result = ooxml::DocxDocument::writeNew(
             nativePath(target), output, toOoxmlPageSettings(*canvas),
-            toOoxmlDocumentDefaults(*canvas));
+            currentDefaults);
         if (!result) { QMessageBox::critical(this, tr("Save failed"), saveError(result.error)); return false; }
         ooxml::Error reopenError;
         state->package = ooxml::DocxDocument::open(nativePath(target), &reopenError);
         if (!state->package) { QMessageBox::critical(this, tr("Save validation failed"), fromUtf8(reopenError.message)); return false; }
         state->regeneratable = true;
+        state->regenerationDefaults = currentDefaults;
         state->sourceParagraphIndices.clear();
         state->sourceTextPrefixes.clear();
     }

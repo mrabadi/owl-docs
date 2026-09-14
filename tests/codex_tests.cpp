@@ -405,12 +405,12 @@ void testErrorsExitAndRedaction() {
     harness.process->emitStdout("{not-json}\n");
     CHECK(!diagnostics.empty());
     CHECK(diagnostics.back().find("malformed JSONL") != std::string::npos);
+    const std::size_t protocolDiagnosticCount = diagnostics.size();
     harness.process->emitStderr(
-        "Authorization: Bearer stderr-secret-token\n");
-    CHECK(diagnostics.back().find("stderr-secret-token") ==
-          std::string::npos);
-    CHECK(diagnostics.back().find("[REDACTED]") != std::string::npos);
+        "app-server diagnostic: optional MCP transport unavailable\n");
+    CHECK(diagnostics.size() == protocolDiagnosticCount);
     harness.process->emitStdout("{\"id\":999,\"result\":{}}\n");
+    CHECK(diagnostics.size() == protocolDiagnosticCount + 1);
     CHECK(diagnostics.back().find("unknown request id") != std::string::npos);
 
     bool exitFailureReceived = false;
@@ -456,7 +456,12 @@ void testErrorsExitAndRedaction() {
 
 void testDynamicToolRegistrationAndThreadResume() {
     ClientHarness harness;
+    const Json restrictedConfig =
+        {{"mcp_servers",
+          {{"local_http", {{"enabled", false}}},
+           {"writer_helper", {{"enabled", false}}}}}};
     ThreadStartOptions start;
+    start.config = restrictedConfig;
     for (const auto& definition : docxstudio::codex::editorV1ToolDefinitions()) {
         start.dynamicTools.push_back(definition.toDynamicToolSpec());
     }
@@ -470,6 +475,7 @@ void testDynamicToolRegistrationAndThreadResume() {
     CHECK(startRequest.at("params").at("dynamicTools").size() == 4);
     CHECK(startRequest.at("params").at("dynamicTools").at(0).at("name") ==
           docxstudio::codex::kEditorReadTool);
+    CHECK(startRequest.at("params").at("config") == restrictedConfig);
     harness.process->emitStdout(
         Json({{"id", startId},
               {"result", {{"thread", {{"id", "thread-persisted"}}}}}})
@@ -481,6 +487,7 @@ void testDynamicToolRegistrationAndThreadResume() {
     resume.workingDirectory = "/empty/document-sandbox";
     resume.approvalPolicy = "never";
     resume.sandbox = "read-only";
+    resume.config = restrictedConfig;
     bool resumed = false;
     const RequestId resumeId = harness.client->resumeThread(resume, [&](auto result) {
         CHECK(result.ok());
@@ -492,6 +499,7 @@ void testDynamicToolRegistrationAndThreadResume() {
     CHECK(resumeRequest.at("params").at("threadId") == "thread-persisted");
     CHECK(resumeRequest.at("params").at("excludeTurns") == true);
     CHECK(resumeRequest.at("params").at("sandbox") == "read-only");
+    CHECK(resumeRequest.at("params").at("config") == restrictedConfig);
     CHECK(!resumeRequest.at("params").contains("dynamicTools"));
     harness.process->emitStdout(
         Json({{"id", resumeId},

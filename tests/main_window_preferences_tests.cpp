@@ -11,11 +11,15 @@
 #include <QDoubleSpinBox>
 #include <QFont>
 #include <QFontComboBox>
+#include <QLabel>
 #include <QPushButton>
 #include <QSettings>
+#include <QSlider>
 #include <QSpinBox>
+#include <QTabWidget>
 #include <QTemporaryDir>
 #include <QTimer>
+#include <QToolButton>
 
 #include <cmath>
 #include <cstdlib>
@@ -61,6 +65,48 @@ void testOptionsDialogAndPropagation(QString& selectedFamily) {
     check(options && newDocument && canvases.size() == 1,
           "File Options or the initial document is missing");
     checkCanvasDefaults(*canvases.front(), QStringLiteral("Carlito"), 11.0, 4);
+
+    auto* zoomSlider = window.findChild<QSlider*>(
+        QStringLiteral("status.zoomSlider"));
+    auto* zoomLabel = window.findChild<QLabel*>(
+        QStringLiteral("status.zoomPercent"));
+    auto* zoomOut = window.findChild<QToolButton*>(
+        QStringLiteral("status.zoomOut"));
+    auto* zoomIn = window.findChild<QToolButton*>(
+        QStringLiteral("status.zoomIn"));
+    auto* ribbonZoom = window.findChild<QSpinBox*>(
+        QStringLiteral("ribbon.zoom"));
+    check(zoomSlider && zoomLabel && zoomOut && zoomIn && ribbonZoom,
+          "window is missing synchronized zoom controls");
+    check(zoomSlider->minimum() == DocumentCanvas::kMinimumZoomPercent &&
+              zoomSlider->maximum() == DocumentCanvas::kMaximumZoomPercent &&
+              zoomSlider->value() == 100 && zoomLabel->text() == QStringLiteral("100%"),
+          "status zoom control has the wrong initial range or value");
+    check(ribbonZoom->minimum() == DocumentCanvas::kMinimumZoomPercent &&
+              ribbonZoom->maximum() == DocumentCanvas::kMaximumZoomPercent &&
+              ribbonZoom->value() == 100,
+          "ribbon zoom control disagrees with the document zoom range");
+    check(!zoomSlider->accessibleName().isEmpty() &&
+              !zoomOut->accessibleName().isEmpty() &&
+              !zoomIn->accessibleName().isEmpty(),
+          "zoom controls are missing accessible names");
+
+    const auto initialRevision = canvases.front()->snapshot().revision;
+    zoomSlider->setValue(DocumentCanvas::kMaximumZoomPercent);
+    QApplication::processEvents();
+    check(canvases.front()->zoomPercent() ==
+              DocumentCanvas::kMaximumZoomPercent &&
+              zoomLabel->text() == QStringLiteral("400%") &&
+              ribbonZoom->value() == DocumentCanvas::kMaximumZoomPercent &&
+              !zoomIn->isEnabled(),
+          "400 percent status zoom did not synchronize the active document");
+    check(canvases.front()->snapshot().revision == initialRevision &&
+              !canvases.front()->isModified(),
+          "view zoom changed document content or dirty state");
+    zoomOut->click();
+    check(canvases.front()->zoomPercent() == 390 && zoomIn->isEnabled(),
+          "status zoom-out button did not move by one step");
+    zoomSlider->setValue(100);
 
     bool cancelled = false;
     QTimer::singleShot(0, &window, [&] {
@@ -130,6 +176,9 @@ void testOptionsDialogAndPropagation(QString& selectedFamily) {
     check(!canvases.front()->isModified(),
           "changing application defaults dirtied the document");
 
+    // Zoom is view state owned by each document tab. A new document starts at
+    // 100%, and returning to the first tab restores its prior zoom controls.
+    canvases.front()->setZoomPercent(175);
     newDocument->trigger();
     canvases = window.findChildren<DocumentCanvas*>();
     check(canvases.size() == 2,
@@ -137,6 +186,26 @@ void testOptionsDialogAndPropagation(QString& selectedFamily) {
     for (const auto* canvas : canvases) {
         checkCanvasDefaults(*canvas, selectedFamily, 13.5, 7);
     }
+    DocumentCanvas* active = nullptr;
+    QTabWidget* documentTabs = nullptr;
+    for (auto* candidate : window.findChildren<QTabWidget*>()) {
+        if (auto* canvas = qobject_cast<DocumentCanvas*>(candidate->currentWidget())) {
+            active = canvas;
+            documentTabs = candidate;
+            break;
+        }
+    }
+    check(active && documentTabs && active != canvases.front() &&
+              active->zoomPercent() == 100 && zoomSlider->value() == 100,
+          "new document did not receive independent default zoom state");
+    zoomSlider->setValue(400);
+    check(active->zoomPercent() == 400,
+          "status slider did not update the second document");
+    documentTabs->setCurrentWidget(canvases.front());
+    QApplication::processEvents();
+    check(zoomSlider->value() == 175 && zoomLabel->text() == QStringLiteral("175%") &&
+              ribbonZoom->value() == 175,
+          "switching tabs did not restore the document-specific zoom controls");
 }
 
 void testPreferencesReload(const QString& selectedFamily) {

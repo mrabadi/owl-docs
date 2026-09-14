@@ -6,6 +6,7 @@
 #include <QApplication>
 #include <QBuffer>
 #include <QFile>
+#include <QFileDialog>
 #include <QImage>
 #include <QInputMethodQueryEvent>
 #include <QKeyEvent>
@@ -183,12 +184,167 @@ void createNativeStyleAndNumberingFixture(const QString& path) {
          {"word/_rels/document.xml.rels", relationships}});
 }
 
+docxstudio::app::DocumentCanvas* canvasWithText(
+    docxstudio::app::MainWindow& window, const QString& text) {
+    for (auto* canvas :
+         window.findChildren<docxstudio::app::DocumentCanvas*>()) {
+        if (textOf(*canvas) == text) return canvas;
+    }
+    return nullptr;
+}
+
+void testCanonicalSimpleSaveGuard(QTemporaryDir& temporary) {
+    const QString path = temporary.filePath(
+        QStringLiteral("owl-canonical-simple.docx"));
+    {
+        docxstudio::app::MainWindow authored;
+        auto* canvas = authored.findChild<docxstudio::app::DocumentCanvas*>();
+        auto* saveAs = authored.findChild<QAction*>(
+            QStringLiteral("file.saveAs"));
+        check(canvas && saveAs,
+              "could not reach canonical simple-document Save As");
+        canvas->insertText(QStringLiteral("Canonical simple document"));
+        bool selectedDestination = false;
+        QTimer::singleShot(0, &authored, [&] {
+            auto* dialog = authored.findChild<QFileDialog*>();
+            check(dialog != nullptr,
+                  "canonical simple Save As did not open a file dialog");
+            dialog->selectFile(path);
+            selectedDestination = true;
+            check(QMetaObject::invokeMethod(
+                      dialog, "accept", Qt::DirectConnection),
+                  "could not accept canonical simple Save As destination");
+        });
+        saveAs->trigger();
+        check(selectedDestination && QFileInfo::exists(path) &&
+                  !canvas->isModified(),
+              "could not establish a canonical simple DOCX baseline");
+    }
+
+    {
+        docxstudio::app::MainWindow reopened;
+        check(reopened.openPath(path),
+              "could not reopen canonical simple DOCX");
+        auto* canvas = canvasWithText(
+            reopened, QStringLiteral("Canonical simple document"));
+        auto* save = reopened.findChild<QAction*>(
+            QStringLiteral("file.save"));
+        check(canvas && save,
+              "could not reach reopened canonical simple document");
+        canvas->selectAll();
+        canvas->toggleBold();
+        check(canvas->isModified() && canvas->hasNonTextChanges(),
+              "canonical simple formatting edit was not classified correctly");
+
+        bool unexpectedWarning = false;
+        QTimer monitor;
+        monitor.setInterval(1);
+        QObject::connect(&monitor, &QTimer::timeout, &reopened, [&] {
+            for (auto* widget : QApplication::topLevelWidgets()) {
+                auto* box = qobject_cast<QMessageBox*>(widget);
+                if (!box || !box->isVisible()) continue;
+                unexpectedWarning = true;
+                box->accept();
+            }
+        });
+        monitor.start();
+        save->trigger();
+        monitor.stop();
+        check(!unexpectedWarning && !canvas->isModified(),
+              "reopened canonical simple DOCX incorrectly required a simplified Save As");
+
+        docxstudio::ooxml::Error error;
+        auto saved = docxstudio::ooxml::DocxDocument::open(
+            std::filesystem::path(QFile::encodeName(path).constData()),
+            &error);
+        check(saved && !saved->paragraphs().empty() &&
+                  !saved->paragraphs().front().runs.empty() &&
+                  saved->paragraphs().front().runs.front().format.bold == true,
+              "normal Save did not persist canonical simple formatting");
+
+        const QByteArray beforeDefaultsChange = readFile(path);
+        canvas->setEditorDefaults(
+            canvas->defaultFontFamily(),
+            canvas->defaultFontPointSize() + 1.0,
+            canvas->tabWidthSpaces());
+        canvas->selectAll();
+        canvas->toggleItalic();
+        check(canvas->isModified() && canvas->hasNonTextChanges(),
+              "defaults-mismatch formatting edit was not classified correctly");
+
+        bool defaultsMismatchWarning = false;
+        QTimer defaultsMonitor;
+        defaultsMonitor.setInterval(1);
+        QObject::connect(
+            &defaultsMonitor, &QTimer::timeout, &reopened, [&] {
+                for (auto* widget : QApplication::topLevelWidgets()) {
+                    auto* box = qobject_cast<QMessageBox*>(widget);
+                    if (!box || !box->isVisible()) continue;
+                    defaultsMismatchWarning = box->text().contains(
+                        QStringLiteral(
+                            "preserves but cannot safely rewrite"));
+                    box->accept();
+                }
+            });
+        defaultsMonitor.start();
+        save->trigger();
+        defaultsMonitor.stop();
+        check(defaultsMismatchWarning && canvas->isModified() &&
+                  readFile(path) == beforeDefaultsChange,
+              "changed editor defaults silently rewrote a reopened document");
+    }
+
+    const QString opaquePath = temporary.filePath(
+        QStringLiteral("owl-canonical-simple-opaque.docx"));
+    check(QFile::copy(path, opaquePath),
+          "could not copy opaque save-guard fixture");
+    const std::string opaquePayload("opaque\0must-remain", 18);
+    replacePackageMembers(
+        opaquePath, {{"customXml/item1.bin", opaquePayload}});
+    const QByteArray opaqueBefore = readFile(opaquePath);
+    {
+        docxstudio::app::MainWindow imported;
+        check(imported.openPath(opaquePath),
+              "could not open opaque simple-body DOCX");
+        auto* canvas = canvasWithText(
+            imported, QStringLiteral("Canonical simple document"));
+        auto* save = imported.findChild<QAction*>(QStringLiteral("file.save"));
+        check(canvas && save,
+              "could not reach opaque simple-body save command");
+        canvas->selectAll();
+        canvas->toggleItalic();
+
+        bool preservationWarning = false;
+        QString warningText;
+        QTimer monitor;
+        monitor.setInterval(1);
+        QObject::connect(&monitor, &QTimer::timeout, &imported, [&] {
+            for (auto* widget : QApplication::topLevelWidgets()) {
+                auto* box = qobject_cast<QMessageBox*>(widget);
+                if (!box || !box->isVisible()) continue;
+                preservationWarning = true;
+                warningText = box->text();
+                box->accept();
+            }
+        });
+        monitor.start();
+        save->trigger();
+        monitor.stop();
+        check(preservationWarning &&
+                  warningText.contains(
+                      QStringLiteral("preserves but cannot safely rewrite")) &&
+                  canvas->isModified() && readFile(opaquePath) == opaqueBefore,
+              "opaque imported content bypassed the structural/formatting Save As guard");
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     QApplication application(argc, argv);
     QTemporaryDir temporary;
     check(temporary.isValid(), "temporary directory failed");
+    testCanonicalSimpleSaveGuard(temporary);
     const QString path = temporary.filePath(QStringLiteral("styled.docx"));
 
     docxstudio::ooxml::BasicRunFormat format;

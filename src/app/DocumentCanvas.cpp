@@ -43,6 +43,7 @@
 #include <QTextOption>
 #include <QTimer>
 #include <QVBoxLayout>
+#include <QWheelEvent>
 #include <QtPrintSupport/QPrinter>
 
 #include <algorithm>
@@ -71,6 +72,15 @@ constexpr char kInlineImageClipboardLegacyMagic[] = "OWLDIMG1";
 constexpr char kInlineImageClipboardMagic[] = "OWLDIMG2";
 constexpr qsizetype kInlineImageClipboardLegacyHeaderBytes = 33;
 constexpr qsizetype kInlineImageClipboardHeaderBytes = 67;
+
+bool isPasteTextOnlyShortcut(const QKeyEvent& event) {
+    constexpr auto relevantModifiers =
+        Qt::ControlModifier | Qt::ShiftModifier | Qt::AltModifier |
+        Qt::MetaModifier;
+    return event.key() == Qt::Key_V &&
+           (event.modifiers() & relevantModifiers) ==
+               (Qt::ControlModifier | Qt::ShiftModifier);
+}
 
 struct ClipboardInlineImage {
     core::ImageFormat format{core::ImageFormat::png};
@@ -1516,11 +1526,18 @@ QString DocumentCanvas::outlineText(std::size_t maxCharacters) const {
 }
 
 void DocumentCanvas::setZoomPercent(int percent) {
-    endTypingGroup();
-    resetVerticalNavigation();
-    zoomPercent_ = std::clamp(percent, 25, 500);
-    invalidateLayout();
+    const int bounded = std::clamp(
+        percent, kMinimumZoomPercent, kMaximumZoomPercent);
+    if (zoomPercent_ == bounded) {
+        return;
+    }
+    zoomPercent_ = bounded;
+    // Pagination and line layout use points, not screen pixels. A view-only
+    // zoom must therefore leave the document revision, editing state, and
+    // cached pagination untouched; only the scrollable pixel extent changes.
+    updateScrollBars();
     viewport()->update();
+    emit zoomChanged(zoomPercent_);
 }
 
 int DocumentCanvas::pageCount() const {
@@ -3487,6 +3504,48 @@ void DocumentCanvas::renderPage(QPainter& painter, int pageIndexValue,
 void DocumentCanvas::resizeEvent(QResizeEvent* event) {
     QAbstractScrollArea::resizeEvent(event);
     updateScrollBars();
+}
+
+void DocumentCanvas::wheelEvent(QWheelEvent* event) {
+    if (event->modifiers().testFlag(Qt::ControlModifier)) {
+        constexpr int kAngleUnitsPerStep = 120;
+        constexpr int kPixelsPerStep = 40;
+        constexpr int kZoomStepPercent = 10;
+        int steps = 0;
+        if (event->angleDelta().y() != 0) {
+            zoomWheelPixelRemainder_ = 0;
+            zoomWheelAngleRemainder_ += event->angleDelta().y();
+            steps = zoomWheelAngleRemainder_ / kAngleUnitsPerStep;
+            zoomWheelAngleRemainder_ %= kAngleUnitsPerStep;
+        } else if (event->pixelDelta().y() != 0) {
+            zoomWheelAngleRemainder_ = 0;
+            zoomWheelPixelRemainder_ += event->pixelDelta().y();
+            steps = zoomWheelPixelRemainder_ / kPixelsPerStep;
+            zoomWheelPixelRemainder_ %= kPixelsPerStep;
+        }
+        if (steps != 0) {
+            setZoomPercent(zoomPercent_ + steps * kZoomStepPercent);
+        }
+        const bool pushingPastMaximum =
+            zoomPercent_ == kMaximumZoomPercent &&
+            (event->angleDelta().y() > 0 || event->pixelDelta().y() > 0);
+        const bool pushingPastMinimum =
+            zoomPercent_ == kMinimumZoomPercent &&
+            (event->angleDelta().y() < 0 || event->pixelDelta().y() < 0);
+        if (pushingPastMaximum || pushingPastMinimum ||
+            event->phase() == Qt::ScrollEnd) {
+            zoomWheelAngleRemainder_ = 0;
+            zoomWheelPixelRemainder_ = 0;
+        }
+        // Ctrl+wheel belongs exclusively to document zoom. Consume even a
+        // zero-delta phase event or an event at a zoom bound so it never
+        // scrolls the document underneath the pointer.
+        event->accept();
+        return;
+    }
+    zoomWheelAngleRemainder_ = 0;
+    zoomWheelPixelRemainder_ = 0;
+    QAbstractScrollArea::wheelEvent(event);
 }
 
 bool DocumentCanvas::apply(std::vector<core::Operation> operations,
@@ -5689,6 +5748,77 @@ void DocumentCanvas::paste() {
     }
 }
 
+void DocumentCanvas::pasteTextOnly() {
+    if (rejectLiveEditDuringPreview()) {
+        return;
+    }
+
+    // Read the clipboard exactly once before changing selection or document
+    // state. In particular, do not fall back to image alt text, HTML, or a
+    // native Owl Docs object when text/plain is unavailable.
+    const QMimeData* mime = QApplication::clipboard()->mimeData();
+    if (!mime || !mime->hasText()) {
+        return;
+    }
+    const QString text = mime->text();
+    if (text.isEmpty()) {
+        return;
+    }
+
+    endTypingGroup();
+    resetVerticalNavigation();
+    clearPendingSpellingWord();
+    if (tableCursor_) {
+        static_cast<void>(replaceTableCellText(text, false));
+        return;
+    }
+    if (selectedTable_ && tableCellSelection_) {
+        const auto snap = session_->snapshot();
+        const auto* table = snap.document.findTable(*selectedTable_);
+        if (!table) return;
+        const auto cells = selectedTableCells(*table);
+        if (cells.empty()) return;
+
+        QString normalized = text;
+        normalized.replace(QStringLiteral("\r\n"),
+                           QString(QChar::LineSeparator));
+        normalized.replace(QLatin1Char('\r'), QChar::LineSeparator);
+        normalized.replace(QLatin1Char('\n'), QChar::LineSeparator);
+
+        // A rectangular cell range is one selection. Replace that selection
+        // with the plain text in its top-left cell and clear the remaining
+        // selected cells. The entire replacement is one core batch, hence one
+        // normal Undo transaction. Tabs/newlines remain text and are never
+        // interpreted as a pasted table.
+        std::vector<core::Operation> operations;
+        operations.reserve(cells.size());
+        bool first = true;
+        for (const auto& [row, column] : cells) {
+            operations.emplace_back(core::SetTableCellText{
+                table->id(), row, column,
+                first ? toUtf16(normalized) : std::u16string{},
+                first
+                    ? std::optional<core::CharacterFormat>(typingFormat_)
+                    : std::nullopt});
+            first = false;
+        }
+        const auto [row, column] = cells.front();
+        const TableCursor cursor{
+            table->id(), row, column,
+            static_cast<std::size_t>(normalized.size())};
+        static_cast<void>(apply(
+            std::move(operations), std::nullopt, std::nullopt, false,
+            std::nullopt, false, true, cursor, table->id()));
+        return;
+    }
+    if (selectedTable_) {
+        emit operationFailed(tr(
+            "Press Enter or F2 before pasting into the selected table."));
+        return;
+    }
+    replaceSelection(text);
+}
+
 void DocumentCanvas::selectAll() {
     if (previewId_) {
         return;
@@ -6020,6 +6150,7 @@ void DocumentCanvas::keyPressEvent(QKeyEvent* event) {
         const bool wouldMutate =
             event->matches(QKeySequence::Cut) ||
             event->matches(QKeySequence::Paste) ||
+            isPasteTextOnlyShortcut(*event) ||
             event->key() == Qt::Key_Backspace ||
             event->key() == Qt::Key_Delete ||
             event->key() == Qt::Key_Return ||
@@ -6041,6 +6172,7 @@ void DocumentCanvas::keyPressEvent(QKeyEvent* event) {
     // otherwise the canvas performs the same command exactly once.
     if (event->matches(QKeySequence::Undo)) { undo(); return; }
     if (event->matches(QKeySequence::Redo)) { redo(); return; }
+    if (isPasteTextOnlyShortcut(*event)) { pasteTextOnly(); return; }
     // Character-format shortcuts are valid in body text, an active table
     // cell, and an explicit cell range. Route them before the table-specific
     // key handling so table editing never swallows the standard shortcuts.
@@ -7265,6 +7397,14 @@ void DocumentCanvas::contextMenuEvent(QContextMenuEvent* event) {
     auto* pasteAction = menu.addAction(tr("Paste"), this,
                                        &DocumentCanvas::paste);
     pasteAction->setObjectName(QStringLiteral("context.paste"));
+    auto* pasteTextOnlyAction = menu.addAction(
+        tr("Paste as Text Only"), this, &DocumentCanvas::pasteTextOnly);
+    pasteTextOnlyAction->setObjectName(
+        QStringLiteral("context.pasteTextOnly"));
+    const QMimeData* clipboardMime = QApplication::clipboard()->mimeData();
+    pasteTextOnlyAction->setEnabled(
+        clipboardMime && clipboardMime->hasText() &&
+        !clipboardMime->text().isEmpty());
     menu.exec(event->globalPos());
 }
 

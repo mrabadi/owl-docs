@@ -158,10 +158,14 @@ void StdioJsonlTransport::consumeStandardOutput(const std::string_view bytes) {
 }
 
 void StdioJsonlTransport::consumeStandardError(const std::string_view bytes) {
-    if (bytes.empty()) {
-        return;
-    }
-    reportError("Codex app-server stderr: " + redactForLog(bytes));
+    // app-server writes its tracing/log stream to stderr. Individual lines
+    // can describe a recoverable optional integration failure (for example,
+    // an unrelated user-configured MCP server being offline) while the JSONL
+    // protocol remains healthy. Promoting that stream to a transport failure
+    // produces false user-facing chat errors. Real protocol failures still
+    // arrive through stdout validation, request errors, write failures, and
+    // the process-exit callback.
+    static_cast<void>(bytes);
 }
 
 void StdioJsonlTransport::processExited(const int exitCode) {

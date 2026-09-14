@@ -120,22 +120,40 @@ void testExperimentalHandshakePrecedesDynamicTools() {
                      {"platformFamily", "unix"},
                      {"platformOs", "linux"}}}});
     check(process->writes.size() == 3,
-          "controller did not complete initialize then request account state");
+          "controller did not complete initialize then inspect effective config");
     check(writtenMessage(*process, 1).value("method", std::string()) ==
               "initialized",
           "initialized notification did not follow initialize");
-    const Json accountRead = writtenMessage(*process, 2);
+    const Json configRead = writtenMessage(*process, 2);
+    check(configRead.value("method", std::string()) == "config/read",
+          "config/read did not follow the initialize handshake");
+    check(configRead.at("params").value("includeLayers", true) == false,
+          "config/read unnecessarily requested raw config layers");
+
+    process->emitStdout(
+        {{"id", configRead.at("id")},
+         {"result",
+          {{"config",
+            {{"mcp_servers",
+              {{"local_http", {{"enabled", true},
+                                {"url", "http://127.0.0.1:65535/mcp"}}},
+               {"writer_helper", {{"enabled", true},
+                                   {"command", "synthetic-helper"}}}}}}},
+           {"origins", Json::object()}}}});
+    check(process->writes.size() == 4,
+          "controller did not request account state after config isolation");
+    const Json accountRead = writtenMessage(*process, 3);
     check(accountRead.value("method", std::string()) == "account/read",
-          "account/read did not follow the initialize handshake");
+          "account/read did not follow restricted config discovery");
 
     process->emitStdout(
         {{"id", accountRead.at("id")},
          {"result", {{"requiresOpenaiAuth", true},
                      {"account", {{"type", "chatgpt"},
                                   {"planType", "plus"}}}}}});
-    check(process->writes.size() == 4,
+    check(process->writes.size() == 5,
           "controller did not discover models after managed account auth");
-    const Json modelList = writtenMessage(*process, 3);
+    const Json modelList = writtenMessage(*process, 4);
     check(modelList.value("method", std::string()) == "model/list",
           "model/list did not follow account/read");
 
@@ -170,9 +188,9 @@ void testExperimentalHandshakePrecedesDynamicTools() {
                            QStringLiteral("document:test"),
                            QStringLiteral("Selected text"),
                            QStringLiteral("Outline"));
-    check(process->writes.size() == 5,
+    check(process->writes.size() == 6,
           "controller did not start a thread for the first document turn");
-    const Json threadStart = writtenMessage(*process, 4);
+    const Json threadStart = writtenMessage(*process, 5);
     check(threadStart.value("method", std::string()) == "thread/start",
           "first document turn did not start a thread");
     check(threadStart.at("params").value("sandbox", std::string()) ==
@@ -182,6 +200,22 @@ void testExperimentalHandshakePrecedesDynamicTools() {
           "document thread did not retain its restricted legacy policy");
     check(threadStart.at("params").contains("dynamicTools"),
           "thread/start omitted the editor.v1 dynamic tools");
+    check(threadStart.at("params").contains("config"),
+          "thread/start omitted the restricted Codex config");
+    if (threadStart.at("params").contains("config")) {
+        const Json& restricted = threadStart.at("params").at("config");
+        check(restricted.contains("mcp_servers"),
+              "restricted thread config omitted inherited MCP servers");
+        if (restricted.contains("mcp_servers")) {
+            const Json& servers = restricted.at("mcp_servers");
+            check(servers.size() == 2,
+                  "restricted thread config did not cover every inherited MCP server");
+            check(servers.at("local_http") == Json({{"enabled", false}}),
+                  "HTTP MCP server was not disabled without copying its URL");
+            check(servers.at("writer_helper") == Json({{"enabled", false}}),
+                  "stdio MCP server was not disabled without copying its command");
+        }
+    }
     if (threadStart.at("params").contains("dynamicTools")) {
         const Json& tools = threadStart.at("params").at("dynamicTools");
         check(tools.is_array() &&
@@ -196,6 +230,118 @@ void testExperimentalHandshakePrecedesDynamicTools() {
     check(initialize.at("id").get<std::int64_t>() <
               threadStart.at("id").get<std::int64_t>(),
           "dynamic tools were registered before experimental capability negotiation");
+
+    process->emitStdout(
+        {{"id", threadStart.at("id")},
+         {"result", {{"thread", {{"id", "thread-new"}}}}}});
+    check(process->writes.size() == 7,
+          "controller did not start a turn after creating the thread");
+    const Json firstTurn = writtenMessage(*process, 6);
+    check(firstTurn.value("method", std::string()) == "turn/start",
+          "controller sent the wrong request after thread creation");
+    process->emitStdout(
+        {{"id", firstTurn.at("id")},
+         {"result", {{"turn", {{"id", "turn-new"},
+                                  {"status", "inProgress"},
+                                  {"items", Json::array()}}}}}});
+    process->emitStdout(
+        {{"method", "turn/completed"},
+         {"params", {{"threadId", "thread-new"},
+                     {"turn", {{"id", "turn-new"},
+                                {"status", "completed"}}}}}});
+
+    controller.restoreDocumentThread(QStringLiteral("document:resume"),
+                                     QStringLiteral("thread-saved"));
+    controller.sendMessage(QStringLiteral("Continue editing"),
+                           QStringLiteral("gpt-test"),
+                           QStringLiteral("medium"),
+                           QStringLiteral("default"),
+                           QStringLiteral("document:resume"),
+                           QStringLiteral("More text"),
+                           QStringLiteral("More outline"));
+    check(process->writes.size() == 8,
+          "controller did not resume the saved document thread");
+    const Json threadResume = writtenMessage(*process, 7);
+    check(threadResume.value("method", std::string()) == "thread/resume",
+          "saved document did not use thread/resume");
+    check(threadResume.at("params").at("config") ==
+              threadStart.at("params").at("config"),
+          "thread/resume did not reapply inherited MCP isolation");
+    controller.shutdown();
+}
+
+void testMalformedConfigFailsClosed() {
+    FakeProcess* process = nullptr;
+    docxstudio::app::CodexController controller(
+        nullptr, [&process] {
+            auto result = std::make_unique<FakeProcess>();
+            process = result.get();
+            return result;
+        });
+
+    QString error;
+    QObject::connect(
+        &controller, &docxstudio::app::CodexController::errorOccurred,
+        [&error](const QString& value) { error = value; });
+
+    controller.enable();
+    check(process != nullptr, "controller did not create its process adapter");
+    if (!process) return;
+    const Json initialize = writtenMessage(*process, 0);
+    process->emitStdout(
+        {{"id", initialize.at("id")},
+         {"result", {{"userAgent", "codex-controller-test"},
+                     {"platformFamily", "unix"},
+                     {"platformOs", "linux"}}}});
+    check(process->writes.size() == 3,
+          "controller did not request effective config after initialize");
+    const Json configRead = writtenMessage(*process, 2);
+    check(configRead.value("method", std::string()) == "config/read",
+          "controller did not issue config/read before authentication");
+
+    process->emitStdout(
+        {{"id", configRead.at("id")},
+         {"result", {{"config", "malformed"},
+                     {"origins", Json::object()}}}});
+    check(!error.isEmpty(),
+          "malformed effective config did not produce a user-visible setup error");
+    check(process->writes.size() == 3,
+          "controller continued authentication after unsafe config discovery failed");
+    controller.shutdown();
+}
+
+void testMissingMcpConfigFailsClosed() {
+    FakeProcess* process = nullptr;
+    docxstudio::app::CodexController controller(
+        nullptr, [&process] {
+            auto result = std::make_unique<FakeProcess>();
+            process = result.get();
+            return result;
+        });
+
+    QString error;
+    QObject::connect(
+        &controller, &docxstudio::app::CodexController::errorOccurred,
+        [&error](const QString& value) { error = value; });
+
+    controller.enable();
+    check(process != nullptr, "controller did not create its process adapter");
+    if (!process) return;
+    const Json initialize = writtenMessage(*process, 0);
+    process->emitStdout(
+        {{"id", initialize.at("id")},
+         {"result", {{"userAgent", "codex-controller-test"},
+                     {"platformFamily", "unix"},
+                     {"platformOs", "linux"}}}});
+    const Json configRead = writtenMessage(*process, 2);
+    process->emitStdout(
+        {{"id", configRead.at("id")},
+         {"result", {{"config", Json::object()},
+                     {"origins", Json::object()}}}});
+    check(!error.isEmpty(),
+          "missing MCP configuration did not fail closed");
+    check(process->writes.size() == 3,
+          "controller authenticated after MCP configuration was absent");
     controller.shutdown();
 }
 
@@ -204,6 +350,8 @@ void testExperimentalHandshakePrecedesDynamicTools() {
 int main(int argc, char** argv) {
     QCoreApplication application(argc, argv);
     testExperimentalHandshakePrecedesDynamicTools();
+    testMalformedConfigFailsClosed();
+    testMissingMcpConfigFailsClosed();
     if (failures != 0) {
         std::cerr << failures << " Codex controller test(s) failed\n";
         return 1;

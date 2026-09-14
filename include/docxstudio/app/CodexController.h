@@ -64,6 +64,8 @@ signals:
 
 private:
     void afterInitialize();
+    void loadDocumentModeConfiguration();
+    void readAccount();
     void beginLogin();
     void loadCatalog();
     void loadCatalogPage(std::optional<std::string> cursor);
@@ -96,6 +98,7 @@ private:
     EditorToolHandler editorToolHandler_;
     std::unordered_map<std::string, std::string> threadIds_;
     std::unordered_set<std::string> threadsNeedingResume_;
+    codex::Json documentModeConfig_;
     QString turnDocumentKey_;
     QString turnThreadId_;
     QString loginId_;
