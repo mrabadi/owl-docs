@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.22)
 
-project(OwlDocs VERSION 0.4.2 LANGUAGES CXX)
+project(OwlDocs VERSION 0.4.3 LANGUAGES CXX)
 
 include(GNUInstallDirs)
 include(CTest)
@@ -327,6 +327,14 @@ if(BUILD_TESTING)
         add_test(NAME navigation_workflow_tests COMMAND navigation_workflow_tests)
         set_tests_properties(navigation_workflow_tests PROPERTIES
             ENVIRONMENT "QT_QPA_PLATFORM=offscreen;XDG_DATA_HOME=/tmp/owl-docs-navigation-workflow-tests")
+
+        add_executable(file_workflow_tests
+            tests/file_workflow_tests.cpp)
+        target_link_libraries(file_workflow_tests PRIVATE docxstudio_app)
+        docxstudio_warnings(file_workflow_tests)
+        add_test(NAME file_workflow_tests COMMAND file_workflow_tests)
+        set_tests_properties(file_workflow_tests PROPERTIES
+            ENVIRONMENT "QT_QPA_PLATFORM=offscreen;XDG_DATA_HOME=/tmp/owl-docs-file-workflow-tests")
 
         add_executable(list_properties_ui_tests
             tests/list_properties_ui_tests.cpp)

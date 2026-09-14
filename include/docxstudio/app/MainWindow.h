@@ -8,6 +8,7 @@
 
 #include <QMainWindow>
 #include <QPointer>
+#include <QStringList>
 
 #include <memory>
 #include <unordered_map>
@@ -17,6 +18,8 @@ class QLockFile;
 class QMenu;
 class QColorDialog;
 class QColor;
+class QDragEnterEvent;
+class QDropEvent;
 class QTabWidget;
 class QTimer;
 class QSlider;
@@ -41,9 +44,12 @@ public:
     ~MainWindow() override;
 
     bool openPath(const QString& path);
+    int openPaths(const QStringList& paths);
 
 protected:
     void closeEvent(QCloseEvent* event) override;
+    void dragEnterEvent(QDragEnterEvent* event) override;
+    void dropEvent(QDropEvent* event) override;
 
 private:
     struct TabState;
@@ -64,7 +70,7 @@ private:
     DocumentCanvas* activeCanvas() const;
     TabState* activeState() const;
     TabState* stateFor(DocumentCanvas* canvas) const;
-    void newDocument();
+    void newDocument(bool replaceOnSuccessfulOpen = false);
     void openDocument();
     bool saveDocument(bool saveAs);
     bool saveCanvas(DocumentCanvas* canvas, bool saveAs);
@@ -90,7 +96,11 @@ private:
     void updateWindowTitle();
     void updateTabTitle(DocumentCanvas* canvas);
     void addRecentFile(const QString& path);
+    void removeRecentFile(const QString& path);
+    void removeMissingRecentFiles();
     void rebuildRecentMenu();
+    DocumentCanvas* canvasForPath(const QString& path) const;
+    DocumentCanvas* replaceableUntitledCanvas() const;
     QString documentKey() const;
     QString documentKeyFor(DocumentCanvas* canvas) const;
     DocumentCanvas* canvasForDocumentKey(const QString& key) const;

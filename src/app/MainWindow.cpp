@@ -29,6 +29,8 @@
 #include <QDialogButtonBox>
 #include <QDir>
 #include <QDoubleSpinBox>
+#include <QDragEnterEvent>
+#include <QDropEvent>
 #include <QFile>
 #include <QFileDialog>
 #include <QFileInfo>
@@ -46,6 +48,7 @@
 #include <QLockFile>
 #include <QMenuBar>
 #include <QMessageBox>
+#include <QMimeData>
 #include <QPrintDialog>
 #include <QPrintPreviewDialog>
 #include <QPushButton>
@@ -61,6 +64,7 @@
 #include <QTimer>
 #include <QToolBar>
 #include <QToolButton>
+#include <QUrl>
 #include <QVBoxLayout>
 #include <QtPrintSupport/QPrinter>
 
@@ -99,6 +103,56 @@ bool sameFileDestination(const QString& first, const QString& second) {
         if (!error && equivalent) return true;
     }
     return firstPath == secondPath;
+}
+
+QString normalizedAbsolutePath(const QString& path) {
+    return QDir::cleanPath(QFileInfo(path).absoluteFilePath());
+}
+
+bool isExistingRegularFile(const QString& path) {
+    const QFileInfo info(path);
+    return info.exists() && info.isFile();
+}
+
+bool isOpenableDocxPath(const QString& path) {
+    const QFileInfo info(path);
+    return isExistingRegularFile(path) &&
+           info.suffix().compare(QStringLiteral("docx"),
+                                 Qt::CaseInsensitive) == 0;
+}
+
+struct DroppedDocumentPaths {
+    QStringList paths;
+    int rejected{};
+};
+
+DroppedDocumentPaths droppedDocumentPaths(const QMimeData* mimeData) {
+    DroppedDocumentPaths selection;
+    if (!mimeData || !mimeData->hasUrls()) return selection;
+
+    for (const auto& url : mimeData->urls()) {
+        if (!url.isLocalFile() || !url.host().isEmpty()) {
+            ++selection.rejected;
+            continue;
+        }
+        const QString path = normalizedAbsolutePath(url.toLocalFile());
+        if (!isOpenableDocxPath(path)) {
+            ++selection.rejected;
+            continue;
+        }
+        const bool alreadySelected = std::any_of(
+            selection.paths.cbegin(), selection.paths.cend(),
+            [&path](const QString& existing) {
+                return sameFileDestination(existing, path);
+            });
+        if (!alreadySelected) selection.paths.push_back(path);
+    }
+    return selection;
+}
+
+QString escapedMenuLabel(QString label) {
+    label.replace(QLatin1Char('&'), QStringLiteral("&&"));
+    return label;
 }
 
 std::filesystem::path parserWorkerPath() {
@@ -2218,6 +2272,7 @@ struct MainWindow::TabState {
     bool navigationReplaceMode{false};
     std::vector<DocumentSearchHit> navigationHits;
     bool recovered{false};
+    bool replaceOnSuccessfulOpen{false};
 };
 
 MainWindow::MainWindow(QWidget* parent)
@@ -2226,6 +2281,7 @@ MainWindow::MainWindow(QWidget* parent)
     setWindowIcon(owlDocsApplicationIcon());
     resize(1280, 860);
     setMinimumSize(820, 600);
+    setAcceptDrops(true);
     {
         const QSettings settings;
         editorPreferences_ = EditorPreferences::load(settings);
@@ -2239,6 +2295,7 @@ MainWindow::MainWindow(QWidget* parent)
     layout->setSpacing(0);
     ribbon_ = new RibbonWidget(commands_, central);
     tabs_ = new QTabWidget(central);
+    tabs_->setObjectName(QStringLiteral("documentTabs"));
     tabs_->setDocumentMode(true);
     tabs_->setTabsClosable(true);
     tabs_->setMovable(true);
@@ -2571,7 +2628,7 @@ MainWindow::MainWindow(QWidget* parent)
             ribbon_->setPictureContext(false);
         }
     });
-    newDocument();
+    newDocument(true);
     if (recoveryOwner_)
         QTimer::singleShot(0, this, &MainWindow::restoreRecoveryJournals);
 }
@@ -2888,6 +2945,10 @@ void MainWindow::buildMenus() {
     file->addAction(commands_.action("file.new"));
     file->addAction(commands_.action("file.open"));
     recentMenu_ = file->addMenu(tr("Open Recent"));
+    recentMenu_->setObjectName(QStringLiteral("file.openRecent"));
+    recentMenu_->setToolTipsVisible(true);
+    connect(recentMenu_, &QMenu::aboutToShow, this,
+            &MainWindow::rebuildRecentMenu);
     rebuildRecentMenu();
     file->addSeparator();
     file->addAction(commands_.action("file.save"));
@@ -3233,19 +3294,29 @@ MainWindow::TabState* MainWindow::stateFor(DocumentCanvas* canvas) const {
 }
 MainWindow::TabState* MainWindow::activeState() const { return stateFor(activeCanvas()); }
 
-void MainWindow::newDocument() {
+void MainWindow::newDocument(bool replaceOnSuccessfulOpen) {
     auto state = std::make_unique<TabState>();
     state->baselineTexts = {QString()}; state->regeneratable = true;
+    state->replaceOnSuccessfulOpen = replaceOnSuccessfulOpen;
     createDocumentTab(documentFromText({QString()}), std::move(state), tr("Untitled"));
 }
 
 void MainWindow::openDocument() {
-    const auto path = QFileDialog::getOpenFileName(this, tr("Open DOCX"), {}, tr("Word documents (*.docx)"));
-    if (!path.isEmpty()) openPath(path);
+    const auto paths = QFileDialog::getOpenFileNames(
+        this, tr("Open DOCX"), {}, tr("Word documents (*.docx)"));
+    openPaths(paths);
 }
 
 bool MainWindow::openPath(const QString& path) {
-    QFile source(path);
+    const QString absolutePath = normalizedAbsolutePath(path);
+    if (auto* existing = canvasForPath(absolutePath)) {
+        tabs_->setCurrentWidget(existing);
+        if (const auto* state = stateFor(existing)) addRecentFile(state->path);
+        statusBar()->showMessage(tr("Document is already open"), 3000);
+        return true;
+    }
+
+    QFile source(absolutePath);
     if (!source.open(QIODevice::ReadOnly)) {
         QMessageBox::critical(
             this, tr("Could not open document"),
@@ -3253,6 +3324,22 @@ bool MainWindow::openPath(const QString& path) {
                 .arg(source.errorString()));
         return false;
     }
+    const QString descriptorPath =
+        QStringLiteral("/proc/self/fd/%1").arg(source.handle());
+    QString documentPath = QFileInfo(descriptorPath).symLinkTarget();
+    if (!isExistingRegularFile(documentPath)) {
+        documentPath = QFileInfo(absolutePath).canonicalFilePath();
+    }
+    if (!isExistingRegularFile(documentPath)) documentPath = absolutePath;
+    documentPath = normalizedAbsolutePath(documentPath);
+    if (auto* existing = canvasForPath(documentPath)) {
+        tabs_->setCurrentWidget(existing);
+        if (const auto* state = stateFor(existing)) addRecentFile(state->path);
+        statusBar()->showMessage(tr("Document is already open"), 3000);
+        return true;
+    }
+
+    auto* replaceableUntitled = replaceableUntitledCanvas();
     QString fingerprintError;
     auto diskFingerprint = fingerprintOpenFile(source, fingerprintError);
     if (!diskFingerprint) {
@@ -3287,8 +3374,6 @@ bool MainWindow::openPath(const QString& path) {
     // preservation-model import. The GUI parser surface is still a known
     // hardening gap, but it cannot be handed different bytes by a pathname
     // race.
-    const QString descriptorPath =
-        QStringLiteral("/proc/self/fd/%1").arg(source.handle());
     auto package = ooxml::DocxDocument::open(nativePath(descriptorPath), &error);
     if (!package) {
         QMessageBox::critical(this, tr("Could not open document"), fromUtf8(error.message)); return false;
@@ -3305,7 +3390,7 @@ bool MainWindow::openPath(const QString& path) {
     const QStringList paragraphs = currentTexts(
         {core::Revision{}, semantic.value().document});
     auto state = std::make_unique<TabState>();
-    state->path = QFileInfo(path).absoluteFilePath();
+    state->path = documentPath;
     state->diskFingerprint = std::move(diskFingerprint);
     state->baselineTexts = paragraphs;
     state->sourceParagraphIndices =
@@ -3337,7 +3422,7 @@ bool MainWindow::openPath(const QString& path) {
     auto* canvas = createDocumentTab(
                                      std::move(semantic.value().document),
                                      std::move(state),
-                                     QFileInfo(path).fileName());
+                                     QFileInfo(documentPath).fileName());
     canvas->setImportedPresentation(
         std::move(importedImages), std::move(importedTables));
     if (page) {
@@ -3346,8 +3431,40 @@ bool MainWindow::openPath(const QString& path) {
             page->margin_top_twips / 20.0, page->margin_right_twips / 20.0,
             page->margin_bottom_twips / 20.0, page->margin_left_twips / 20.0);
     }
-    addRecentFile(path);
+    if (replaceableUntitled) {
+        const int placeholderIndex = tabs_->indexOf(replaceableUntitled);
+        const auto placeholderState = states_.find(replaceableUntitled);
+        if (placeholderIndex >= 0 && placeholderState != states_.end() &&
+            placeholderState->second->replaceOnSuccessfulOpen &&
+            !replaceableUntitled->isModified()) {
+            tabs_->removeTab(placeholderIndex);
+            states_.erase(placeholderState);
+            delete replaceableUntitled;
+        }
+    }
+    addRecentFile(documentPath);
     return true;
+}
+
+int MainWindow::openPaths(const QStringList& paths) {
+    int opened = 0;
+    int skipped = 0;
+    for (const auto& path : paths) {
+        if (path.isEmpty() || !isOpenableDocxPath(path)) {
+            ++skipped;
+            continue;
+        }
+        if (openPath(path)) ++opened;
+    }
+    if (skipped > 0) {
+        statusBar()->showMessage(
+            skipped == 1
+                ? tr("Skipped 1 unavailable or unsupported document")
+                : tr("Skipped %1 unavailable or unsupported documents")
+                      .arg(skipped),
+            5000);
+    }
+    return opened;
 }
 
 bool MainWindow::saveDocument(bool saveAs) { return activeCanvas() && saveCanvas(activeCanvas(), saveAs); }
@@ -3604,7 +3721,7 @@ void MainWindow::closeTab(int index) {
     }
     deleteRecoveryFor(canvas);
     tabs_->removeTab(index); states_.erase(canvas); delete canvas;
-    if (tabs_->count() == 0) newDocument();
+    if (tabs_->count() == 0) newDocument(true);
 }
 
 void MainWindow::exportPdf() {
@@ -4151,20 +4268,210 @@ void MainWindow::updateWindowTitle() {
 }
 
 void MainWindow::addRecentFile(const QString& path) {
-    QSettings settings; auto recent = settings.value(QStringLiteral("recentFiles")).toStringList();
-    recent.removeAll(QFileInfo(path).absoluteFilePath()); recent.push_front(QFileInfo(path).absoluteFilePath());
+    const QString normalized = normalizedAbsolutePath(path);
+    QSettings settings;
+    auto recent = settings.value(QStringLiteral("recentFiles")).toStringList();
+    recent.erase(std::remove_if(recent.begin(), recent.end(),
+                                [&normalized](const QString& existing) {
+                                    return sameFileDestination(existing,
+                                                               normalized);
+                                }),
+                 recent.end());
+    recent.push_front(normalized);
     while (recent.size() > 10) recent.removeLast();
     settings.setValue(QStringLiteral("recentFiles"), recent);
-    rebuildRecentMenu();
+    settings.sync();
+    QTimer::singleShot(0, this, &MainWindow::rebuildRecentMenu);
+}
+
+void MainWindow::removeRecentFile(const QString& path) {
+    QSettings settings;
+    auto recent = settings.value(QStringLiteral("recentFiles")).toStringList();
+    recent.erase(std::remove_if(recent.begin(), recent.end(),
+                                [&path](const QString& existing) {
+                                    return sameFileDestination(existing, path);
+                                }),
+                 recent.end());
+    settings.setValue(QStringLiteral("recentFiles"), recent);
+    settings.sync();
+    QTimer::singleShot(0, this, &MainWindow::rebuildRecentMenu);
+}
+
+void MainWindow::removeMissingRecentFiles() {
+    QSettings settings;
+    auto recent = settings.value(QStringLiteral("recentFiles")).toStringList();
+    const auto previousSize = recent.size();
+    recent.erase(std::remove_if(recent.begin(), recent.end(),
+                                [](const QString& path) {
+                                    return !isExistingRegularFile(path);
+                                }),
+                 recent.end());
+    settings.setValue(QStringLiteral("recentFiles"), recent);
+    settings.sync();
+    QTimer::singleShot(0, this, &MainWindow::rebuildRecentMenu);
+    const qsizetype removed = previousSize - recent.size();
+    statusBar()->showMessage(
+        removed == 1 ? tr("Removed 1 unavailable recent document")
+                     : tr("Removed %1 unavailable recent documents")
+                           .arg(removed),
+        4000);
 }
 
 void MainWindow::rebuildRecentMenu() {
     if (!recentMenu_) return;
     recentMenu_->clear();
     QSettings settings;
-    const auto recent = settings.value(QStringLiteral("recentFiles")).toStringList();
-    for (const auto& path : recent) recentMenu_->addAction(QFileInfo(path).fileName(), this, [this, path] { openPath(path); });
-    if (recent.isEmpty()) recentMenu_->addAction(tr("No recent documents"))->setEnabled(false);
+    const auto stored = settings.value(QStringLiteral("recentFiles")).toStringList();
+    QStringList recent;
+    for (const auto& storedPath : stored) {
+        if (storedPath.isEmpty()) continue;
+        const QString path = normalizedAbsolutePath(storedPath);
+        const bool duplicate = std::any_of(
+            recent.cbegin(), recent.cend(), [&path](const QString& existing) {
+                return sameFileDestination(existing, path);
+            });
+        if (!duplicate) recent.push_back(path);
+        if (recent.size() == 10) break;
+    }
+    if (recent != stored) {
+        settings.setValue(QStringLiteral("recentFiles"), recent);
+        settings.sync();
+    }
+
+    if (recent.isEmpty()) {
+        auto* empty = recentMenu_->addAction(tr("No recent documents"));
+        empty->setObjectName(QStringLiteral("recent.empty"));
+        empty->setEnabled(false);
+        return;
+    }
+
+    std::map<QString, int> basenameCounts;
+    for (const auto& path : recent) {
+        ++basenameCounts[QFileInfo(path).fileName().toCaseFolded()];
+    }
+    bool hasUnavailable = false;
+    for (qsizetype index = 0; index < recent.size(); ++index) {
+        const QString path = recent[index];
+        const QFileInfo info(path);
+        QString visible = info.fileName();
+        if (basenameCounts[visible.toCaseFolded()] > 1) {
+            visible += tr(" — %1").arg(
+                QDir::toNativeSeparators(info.absolutePath()));
+        }
+        const QString ordinal = index < 9
+                                    ? QStringLiteral("&%1").arg(index + 1)
+                                    : QStringLiteral("%1").arg(index + 1);
+        auto* action = recentMenu_->addAction(
+            QStringLiteral("%1 %2")
+                .arg(ordinal, escapedMenuLabel(visible)));
+        action->setObjectName(
+            QStringLiteral("recent.open.%1").arg(index + 1));
+        action->setData(path);
+        action->setToolTip(QDir::toNativeSeparators(path));
+        connect(action, &QAction::triggered, this, [this, path] {
+            if (!isExistingRegularFile(path)) {
+                removeRecentFile(path);
+                statusBar()->showMessage(
+                    tr("Removed unavailable recent document: %1")
+                        .arg(QDir::toNativeSeparators(path)),
+                    5000);
+                return;
+            }
+            openPath(path);
+        });
+        hasUnavailable = hasUnavailable || !isExistingRegularFile(path);
+    }
+
+    recentMenu_->addSeparator();
+    auto* removeMissing = recentMenu_->addAction(
+        tr("Remove Missing Documents"), this,
+        &MainWindow::removeMissingRecentFiles);
+    removeMissing->setObjectName(QStringLiteral("recent.removeMissing"));
+    removeMissing->setEnabled(hasUnavailable);
+
+    auto* clear = recentMenu_->addAction(tr("Clear Recent Documents"));
+    clear->setObjectName(QStringLiteral("recent.clear"));
+    connect(clear, &QAction::triggered, this, [this] {
+        QSettings recentSettings;
+        recentSettings.remove(QStringLiteral("recentFiles"));
+        recentSettings.sync();
+        QTimer::singleShot(0, this, &MainWindow::rebuildRecentMenu);
+        statusBar()->showMessage(tr("Recent documents cleared"), 3000);
+    });
+}
+
+DocumentCanvas* MainWindow::canvasForPath(const QString& path) const {
+    for (const auto& [canvas, state] : states_) {
+        if (state && !state->path.isEmpty() &&
+            sameFileDestination(state->path, path)) {
+            return canvas;
+        }
+    }
+    return nullptr;
+}
+
+DocumentCanvas* MainWindow::replaceableUntitledCanvas() const {
+    for (const auto& [canvas, state] : states_) {
+        if (!state || !state->replaceOnSuccessfulOpen || state->recovered ||
+            state->package || !state->path.isEmpty() || canvas->isModified() ||
+            canvas->hasPreview()) {
+            continue;
+        }
+        const auto snapshot = canvas->snapshot();
+        const auto& paragraphs = snapshot.document.paragraphs();
+        if (paragraphs.size() == 1 && paragraphs.front().text().empty() &&
+            paragraphs.front().equations().empty() &&
+            paragraphs.front().images().empty() &&
+            snapshot.document.tables().empty()) {
+            return canvas;
+        }
+    }
+    return nullptr;
+}
+
+void MainWindow::dragEnterEvent(QDragEnterEvent* event) {
+    if ((event->possibleActions() & Qt::CopyAction) &&
+        !droppedDocumentPaths(event->mimeData()).paths.isEmpty()) {
+        event->setDropAction(Qt::CopyAction);
+        event->accept();
+        return;
+    }
+    event->ignore();
+}
+
+void MainWindow::dropEvent(QDropEvent* event) {
+    const auto selection = droppedDocumentPaths(event->mimeData());
+    if (!(event->possibleActions() & Qt::CopyAction) ||
+        selection.paths.isEmpty()) {
+        event->ignore();
+        return;
+    }
+    const int opened = openPaths(selection.paths);
+    if (opened == 0) {
+        event->ignore();
+        statusBar()->showMessage(tr("No documents were opened"), 5000);
+        return;
+    }
+    event->setDropAction(Qt::CopyAction);
+    event->accept();
+    const int skipped = selection.rejected +
+                        static_cast<int>(selection.paths.size()) - opened;
+    if (skipped > 0) {
+        const QString openedSummary =
+            opened == 1 ? tr("Opened 1 document")
+                        : tr("Opened %1 documents").arg(opened);
+        const QString skippedSummary =
+            skipped == 1 ? tr("skipped 1 unsupported item")
+                         : tr("skipped %1 unsupported items").arg(skipped);
+        statusBar()->showMessage(
+            tr("%1; %2").arg(openedSummary, skippedSummary),
+            5000);
+    } else {
+        statusBar()->showMessage(
+            opened == 1 ? tr("Opened 1 document")
+                        : tr("Opened %1 documents").arg(opened),
+            3500);
+    }
 }
 
 QString MainWindow::documentKey() const {

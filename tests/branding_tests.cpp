@@ -117,7 +117,7 @@ int main(int argc, char** argv) {
     check(desktop.contains(QStringLiteral("Name=Owl Docs\n")),
           "desktop file has the wrong product name");
     check(desktop.contains(QStringLiteral("TryExec=owl-docs\n")) &&
-              desktop.contains(QStringLiteral("Exec=owl-docs %f\n")) &&
+              desktop.contains(QStringLiteral("Exec=owl-docs %F\n")) &&
               desktop.contains(QStringLiteral("Icon=owl-docs\n")) &&
               desktop.contains(QStringLiteral("StartupWMClass=owl-docs\n")),
           "desktop executable or icon identity is inconsistent");
