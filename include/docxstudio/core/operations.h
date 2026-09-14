@@ -142,6 +142,19 @@ struct SetTableCellText {
           inserted_format(std::move(format)) {}
 };
 
+// Replaces one UTF-16 range without rebuilding the rest of the cell. This is
+// the table-cell analogue of ReplaceRange and preserves unrelated sparse run
+// formatting when several search matches are replaced in one atomic batch.
+struct ReplaceTableCellRange {
+    NodeId table_id;
+    std::size_t row{0};
+    std::size_t column{0};
+    std::size_t start{0};
+    std::size_t end{0};
+    std::u16string text;
+    std::optional<CharacterFormat> format;
+};
+
 struct SetTableCellCharacterFormat {
     NodeId table_id;
     std::size_t row{0};
@@ -213,6 +226,7 @@ using Operation = std::variant<InsertText, InsertEquation, InsertImage,
                                SetParagraphFormat,
                                SplitParagraph, MergeWithNextParagraph,
                                InsertTable, SetTableCellText,
+                               ReplaceTableCellRange,
                                SetTableCellCharacterFormat,
                                SetTableCellParagraphFormat, AppendTableRow,
                                InsertTableRow, DeleteTableRows,

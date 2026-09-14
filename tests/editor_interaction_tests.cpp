@@ -2214,6 +2214,255 @@ void testFindAndReplace(docxstudio::app::SpellChecker& spelling) {
           "redo did not restore the transformed replace-all caret");
 }
 
+void testSemanticSearchAcrossBodyAndTables(
+    docxstudio::app::SpellChecker& spelling) {
+    auto first = docxstudio::core::Paragraph::create(
+        u"needle first Cat concatenate cat CAT");
+    auto second = docxstudio::core::Paragraph::create(u"needle final");
+    check(first && second, "could not create search fixture paragraphs");
+    const auto firstId = first.value().id();
+    const auto secondId = second.value().id();
+    auto created = docxstudio::core::Document::create(
+        {first.value(), second.value()});
+    check(static_cast<bool>(created),
+          "could not create search fixture document");
+    auto tableResult = docxstudio::core::Table::create(2, 2, false);
+    check(static_cast<bool>(tableResult),
+          "could not create search fixture table");
+    const auto tableId = tableResult.value().id();
+    const auto cell00Id = tableResult.value().cell(0, 0)->id;
+    const auto cell10Id = tableResult.value().cell(1, 0)->id;
+    const auto cell11Id = tableResult.value().cell(1, 1)->id;
+    check(static_cast<bool>(created.value().insertTable(
+              secondId, tableResult.value())),
+          "could not insert search fixture table");
+    check(static_cast<bool>(created.value().setTableCellText(
+              tableId, 0, 0, u"red needle green")),
+          "could not populate first searchable table cell");
+    check(static_cast<bool>(created.value().setTableCellText(
+              tableId, 0, 1, u"no match")),
+          "could not populate nonmatching table cell");
+    check(static_cast<bool>(created.value().setTableCellText(
+              tableId, 1, 0, u"needle lower")),
+          "could not populate second searchable table cell");
+    check(static_cast<bool>(created.value().setTableCellText(
+              tableId, 1, 1, u"last needle")),
+          "could not populate third searchable table cell");
+
+    const auto applyCellColor = [&](std::size_t start, std::size_t end,
+                                    std::uint32_t argb) {
+        docxstudio::core::CharacterFormatDelta delta;
+        delta.foreground_argb =
+            docxstudio::core::PropertyDelta<std::uint32_t>::set(argb);
+        check(static_cast<bool>(
+                  created.value().applyTableCellCharacterFormat(
+                      tableId, 0, 0, start, end, delta)),
+              "could not format search fixture table cell");
+    };
+    constexpr std::uint32_t red = 0xffa02020U;
+    constexpr std::uint32_t blue = 0xff2050a0U;
+    constexpr std::uint32_t green = 0xff208040U;
+    applyCellColor(0, 4, red);
+    applyCellColor(4, 10, blue);
+    applyCellColor(10, 16, green);
+
+    DocumentCanvas canvas(spelling);
+    canvas.setDocument(std::move(created.value()));
+
+    const auto hits = canvas.searchHits(QStringLiteral("needle"));
+    check(hits.size() == 5,
+          "semantic search returned the wrong body/table hit count");
+    const auto matches = canvas.searchMatches(QStringLiteral("needle"));
+    check(matches.size() == hits.size() && matches[1].hit == hits[1] &&
+              matches[1].containerText == QStringLiteral("red needle green") &&
+              matches[0].containerOrdinal == 1 &&
+              matches[0].searchUnitOrdinal == 0 &&
+              matches[1].containerOrdinal == 1 &&
+              matches[1].searchUnitOrdinal == 1 &&
+              matches[2].searchUnitOrdinal == 3 &&
+              matches[4].containerOrdinal == 2 &&
+              matches[4].searchUnitOrdinal == 5,
+          "batched search did not return hit text from one result snapshot");
+    const auto* firstParagraph =
+        std::get_if<docxstudio::app::BodyParagraphSearchHit>(
+            &hits[0].target);
+    const auto* firstCell =
+        std::get_if<docxstudio::app::TableCellSearchHit>(
+            &hits[1].target);
+    const auto* secondCell =
+        std::get_if<docxstudio::app::TableCellSearchHit>(
+            &hits[2].target);
+    const auto* thirdCell =
+        std::get_if<docxstudio::app::TableCellSearchHit>(
+            &hits[3].target);
+    const auto* lastParagraph =
+        std::get_if<docxstudio::app::BodyParagraphSearchHit>(
+            &hits[4].target);
+    check(firstParagraph && firstParagraph->paragraphId == firstId &&
+              firstCell && firstCell->tableId == tableId &&
+              firstCell->cellId == cell00Id && firstCell->row == 0 &&
+              firstCell->column == 0 &&
+              secondCell && secondCell->cellId == cell10Id &&
+              secondCell->row == 1 && secondCell->column == 0 &&
+              thirdCell && thirdCell->cellId == cell11Id &&
+              thirdCell->row == 1 && thirdCell->column == 1 &&
+              lastParagraph && lastParagraph->paragraphId == secondId,
+          "semantic search did not follow body-block and row-major cell order");
+    check(canvas.searchHitContainerText(hits[1]) ==
+              std::optional<QString>{QStringLiteral("red needle green")},
+          "search hit presentation did not resolve its table-cell text");
+
+    using docxstudio::app::DocumentSearchOptions;
+    check(canvas.searchHits(QStringLiteral("Cat"),
+                            DocumentSearchOptions{false, true}).size() == 3,
+          "case-insensitive whole-word search returned the wrong hits");
+    check(canvas.searchHits(QStringLiteral("Cat"),
+                            DocumentSearchOptions{true, true}).size() == 1,
+          "case-sensitive whole-word search returned the wrong hits");
+    check(canvas.searchHits(QStringLiteral("Cat"),
+                            DocumentSearchOptions{false, false}).size() == 4,
+          "non-whole-word search omitted a substring hit");
+
+    check(canvas.activateSearchHit(hits[1]) &&
+              canvas.currentSearchHit() ==
+                  std::optional<docxstudio::app::DocumentSearchHit>{hits[1]} &&
+              canvas.selectedText() == QStringLiteral("needle"),
+          "activating a table-cell hit did not select that exact match");
+    const auto next = canvas.findNextHit(QStringLiteral("needle"));
+    check(next && *next == hits[2],
+          "find-next did not advance from one table cell to the next");
+    const auto previous = canvas.findPreviousHit(QStringLiteral("needle"));
+    check(previous && *previous == hits[1],
+          "find-previous did not return to the preceding table cell");
+    const auto precedingBody = canvas.findPreviousHit(
+        QStringLiteral("needle"));
+    check(precedingBody && *precedingBody == hits.front(),
+          "find-previous did not continue in document order");
+    const auto wrappedPrevious = canvas.findPreviousHit(
+        QStringLiteral("needle"));
+    check(wrappedPrevious && *wrappedPrevious == hits.back(),
+          "find-previous did not wrap from the first hit to the last");
+    check(canvas.activateSearchHit(hits.back()),
+          "could not activate the final body search hit");
+    const auto wrapped = canvas.findNextHit(QStringLiteral("needle"));
+    check(wrapped && *wrapped == hits.front(),
+          "find-next did not wrap from the final hit to the first");
+
+    check(canvas.activateSearchHit(hits[1]) &&
+              canvas.replaceCurrent(QStringLiteral("needle"),
+                                    QStringLiteral("term")),
+          "replace-current could not replace a semantic table-cell hit");
+    check(canvas.snapshot().document.findTable(tableId)->cell(0, 0)->text ==
+              u"red term green",
+          "replace-current produced the wrong table-cell text");
+    canvas.undo();
+    const auto baseline = canvas.snapshot();
+    check(baseline.document.findTable(tableId)->cell(0, 0)->text ==
+              u"red needle green",
+          "one undo did not restore a table-cell replacement");
+
+    check(canvas.replaceAllMatches(QStringLiteral("needle"),
+                                   QStringLiteral("OWL")) == 5,
+          "replace-all returned the wrong cross-container count");
+    const auto replaced = canvas.snapshot();
+    check(replaced.document.findParagraph(firstId)->text() ==
+              u"OWL first Cat concatenate cat CAT" &&
+              replaced.document.findParagraph(secondId)->text() ==
+              u"OWL final" &&
+              replaced.document.findTable(tableId)->cell(0, 0)->text ==
+              u"red OWL green" &&
+              replaced.document.findTable(tableId)->cell(1, 0)->text ==
+              u"OWL lower" &&
+              replaced.document.findTable(tableId)->cell(1, 1)->text ==
+              u"last OWL",
+          "replace-all produced incorrect body/table text");
+    const auto* formattedCell =
+        replaced.document.findTable(tableId)->cell(0, 0);
+    check(formattedCell->characterFormatAt(1).foreground_argb == red &&
+              formattedCell->characterFormatAt(5).foreground_argb == blue &&
+              formattedCell->characterFormatAt(9).foreground_argb == green,
+          "table-cell replacement damaged match or surrounding run formatting");
+    canvas.undo();
+    check(canvas.snapshot().document == baseline.document,
+          "one undo did not restore the complete cross-container replace-all");
+    canvas.undo();
+    check(canvas.snapshot().document == baseline.document,
+          "replace-all created more than one undo transaction");
+
+    DocumentCanvas staleCanvas(spelling);
+    staleCanvas.setDocument(documentWithText(QStringLiteral("needle")));
+    const auto staleHit = staleCanvas.searchHits(
+        QStringLiteral("needle")).front();
+    staleCanvas.insertText(QStringLiteral("x"));
+    const auto afterMutation = staleCanvas.snapshot();
+    check(!staleCanvas.searchHitContainerText(staleHit) &&
+              !staleCanvas.activateSearchHit(staleHit) &&
+              !staleCanvas.replaceSearchHit(staleHit,
+                                            QStringLiteral("stale")) &&
+              staleCanvas.snapshot().document == afterMutation.document,
+          "a stale search hit was resolved, activated, or replaced");
+}
+
+void testSearchNavigationDuringPreview(
+    docxstudio::app::SpellChecker& spelling) {
+    DocumentCanvas canvas(spelling);
+    canvas.setDocument(documentWithText(QStringLiteral("live needle")));
+    canvas.insertText(QStringLiteral("x"));
+    const auto live = canvas.snapshot();
+    const auto liveParagraph = live.document.paragraphs().front().id();
+    const auto previewParagraph = docxstudio::core::NodeId::generate();
+    QString summary;
+    QString error;
+    check(canvas.createOperationsPreview(
+              live.revision,
+              {docxstudio::core::SplitParagraph{
+                   {liveParagraph, 5}, previewParagraph},
+               docxstudio::core::InsertText{
+                   {previewParagraph, 0}, u"preview needle", std::nullopt}},
+              QStringLiteral("Preview-only search paragraph"), summary,
+              error),
+          "could not create preview-only search fixture");
+
+    const auto previewHits = canvas.searchHits(QStringLiteral("preview"));
+    check(previewHits.size() == 1 && previewHits.front().previewId &&
+              previewHits.front().revision == live.revision &&
+              std::get_if<docxstudio::app::BodyParagraphSearchHit>(
+                  &previewHits.front().target)->paragraphId ==
+                  previewParagraph &&
+              canvas.searchHitContainerText(previewHits.front()) ==
+                  std::optional<QString>{
+                      QStringLiteral("preview needle needle")},
+          "search did not read the displayed preview branch");
+    check(canvas.activateSearchHit(previewHits.front()) &&
+              canvas.currentSearchHit() ==
+                  std::optional<docxstudio::app::DocumentSearchHit>{
+                      previewHits.front()},
+          "preview search hit could not be activated read-only");
+    const auto next = canvas.findNextHit(QStringLiteral("needle"));
+    check(next.has_value(),
+          "find-next was incorrectly disabled during a preview");
+
+    int failures = 0;
+    QObject::connect(&canvas, &DocumentCanvas::operationFailed,
+                     [&failures](const QString&) { ++failures; });
+    check(!canvas.replaceSearchHit(previewHits.front(),
+                                  QStringLiteral("blocked")) &&
+              canvas.replaceAllMatches(QStringLiteral("needle"),
+                                       QStringLiteral("blocked")) == 0 &&
+              failures == 2 &&
+              canvas.snapshot().document == live.document,
+          "preview lock did not reject search writes atomically");
+
+    canvas.discardPreview();
+    check(!canvas.hasPreview() &&
+              canvas.selection().anchor == canvas.selection().focus &&
+              canvas.selection().focus.paragraph_id == liveParagraph &&
+              canvas.selection().focus.utf16_offset == 0 &&
+              !canvas.searchHitContainerText(previewHits.front()) &&
+              !canvas.activateSearchHit(previewHits.front()),
+          "discarding a preview did not restore a safe live selection");
+}
+
 void testReverseSelectionFormatting(docxstudio::app::SpellChecker& spelling) {
     const QColor blue(QStringLiteral("#336699"));
     DocumentCanvas canvas(spelling);
@@ -2712,6 +2961,8 @@ int main(int argc, char** argv) {
     testPasteTextOnly(spelling);
     testInputMethodCommit(spelling);
     testFindAndReplace(spelling);
+    testSemanticSearchAcrossBodyAndTables(spelling);
+    testSearchNavigationDuringPreview(spelling);
     testReverseSelectionFormatting(spelling);
     testDirtyAndLayoutHistory(spelling);
     testPreviewCursorAndFormatting(spelling);

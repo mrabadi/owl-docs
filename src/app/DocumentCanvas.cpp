@@ -50,11 +50,13 @@
 #include <array>
 #include <cmath>
 #include <limits>
+#include <iterator>
 #include <map>
 #include <numeric>
 #include <set>
 #include <span>
 #include <tuple>
+#include <type_traits>
 #include <unordered_map>
 
 namespace docxstudio::app {
@@ -259,6 +261,135 @@ QString fromUtf16(const std::u16string& text) {
 }
 
 std::u16string toUtf16(const QString& text) { return text.toStdU16String(); }
+
+struct SearchMatchRange {
+    std::size_t start{};
+    std::size_t end{};
+};
+
+bool boundaryAt(QTextBoundaryFinder& finder, qsizetype position) {
+    finder.setPosition(position);
+    return finder.isAtBoundary();
+}
+
+bool wholeWordMatch(QTextBoundaryFinder& finder, qsizetype start,
+                    qsizetype end) {
+    finder.setPosition(start);
+    if (!(finder.boundaryReasons() & QTextBoundaryFinder::StartOfItem)) {
+        return false;
+    }
+    finder.setPosition(end);
+    return finder.boundaryReasons() & QTextBoundaryFinder::EndOfItem;
+}
+
+std::vector<SearchMatchRange> searchMatchRanges(
+    const QString& text, const QString& needle,
+    const DocumentSearchOptions& options) {
+    std::vector<SearchMatchRange> matches;
+    if (needle.isEmpty() || needle.size() > text.size()) return matches;
+    const Qt::CaseSensitivity sensitivity = options.caseSensitive
+        ? Qt::CaseSensitive
+        : Qt::CaseInsensitive;
+    QTextBoundaryFinder graphemes(QTextBoundaryFinder::Grapheme, text);
+    QTextBoundaryFinder words(QTextBoundaryFinder::Word, text);
+    qsizetype offset = 0;
+    while (offset <= text.size() - needle.size()) {
+        const qsizetype start = text.indexOf(needle, offset, sensitivity);
+        if (start < 0) break;
+        const qsizetype end = start + needle.size();
+        offset = std::max(start + 1, end);
+        if (!boundaryAt(graphemes, start) ||
+            !boundaryAt(graphemes, end)) {
+            continue;
+        }
+        if (options.wholeWord && !wholeWordMatch(words, start, end)) {
+            continue;
+        }
+        matches.push_back({static_cast<std::size_t>(start),
+                           static_cast<std::size_t>(end)});
+    }
+    return matches;
+}
+
+std::size_t searchHitStart(const DocumentSearchHit& hit) {
+    return std::visit(
+        [](const auto& target) { return target.startUtf16; }, hit.target);
+}
+
+std::size_t searchHitEnd(const DocumentSearchHit& hit) {
+    return std::visit(
+        [](const auto& target) { return target.endUtf16; }, hit.target);
+}
+
+bool sameSearchUnit(
+    const std::variant<BodyParagraphSearchHit, TableCellSearchHit>& left,
+    const std::variant<BodyParagraphSearchHit, TableCellSearchHit>& right) {
+    if (left.index() != right.index()) return false;
+    if (const auto* leftParagraph =
+            std::get_if<BodyParagraphSearchHit>(&left)) {
+        const auto& rightParagraph = std::get<BodyParagraphSearchHit>(right);
+        return leftParagraph->paragraphId == rightParagraph.paragraphId;
+    }
+    const auto& leftCell = std::get<TableCellSearchHit>(left);
+    const auto& rightCell = std::get<TableCellSearchHit>(right);
+    return leftCell.tableId == rightCell.tableId &&
+           leftCell.cellId == rightCell.cellId &&
+           leftCell.row == rightCell.row &&
+           leftCell.column == rightCell.column;
+}
+
+std::optional<std::size_t> searchUnitOrdinal(
+    const core::Document& document,
+    const std::variant<BodyParagraphSearchHit, TableCellSearchHit>& target) {
+    std::size_t ordinal = 0;
+    for (const auto& block : document.bodyBlocks()) {
+        if (block.kind == core::BodyBlockKind::paragraph) {
+            if (const auto* paragraph =
+                    std::get_if<BodyParagraphSearchHit>(&target);
+                paragraph && paragraph->paragraphId == block.id) {
+                return ordinal;
+            }
+            ++ordinal;
+            continue;
+        }
+        const auto* table = document.findTable(block.id);
+        if (!table) continue;
+        for (std::size_t row = 0; row < table->rowCount(); ++row) {
+            for (std::size_t column = 0; column < table->columnCount();
+                 ++column) {
+                const auto* cell = table->cell(row, column);
+                if (const auto* requested =
+                        std::get_if<TableCellSearchHit>(&target);
+                    requested && cell && requested->tableId == table->id() &&
+                    requested->cellId == cell->id && requested->row == row &&
+                    requested->column == column) {
+                    return ordinal;
+                }
+                ++ordinal;
+            }
+        }
+    }
+    return std::nullopt;
+}
+
+std::size_t mapSearchOffset(
+    std::size_t originalOffset,
+    const std::vector<SearchMatchRange>& matches,
+    std::size_t replacementLength) {
+    std::int64_t shift = 0;
+    for (const auto& match : matches) {
+        if (originalOffset < match.start) break;
+        const auto mappedStart = static_cast<std::int64_t>(match.start) + shift;
+        if (originalOffset <= match.end) {
+            return static_cast<std::size_t>(
+                mappedStart + static_cast<std::int64_t>(replacementLength));
+        }
+        shift += static_cast<std::int64_t>(replacementLength) -
+                 static_cast<std::int64_t>(match.end - match.start);
+    }
+    return static_cast<std::size_t>(
+        static_cast<std::int64_t>(originalOffset) + shift);
+}
 
 struct SpellingWord {
     std::size_t start{};
@@ -3089,6 +3220,16 @@ void DocumentCanvas::rebuildLayout() const {
     updateScrollBars();
 }
 
+core::DocumentSnapshot DocumentCanvas::visibleDocumentSnapshot() const {
+    if (previewId_) {
+        const auto preview = session_->previewSnapshot(*previewId_);
+        if (preview) {
+            return {preview.value().revision, preview.value().document};
+        }
+    }
+    return session_->snapshot();
+}
+
 void DocumentCanvas::updateScrollBars() const {
     const double scale = kScreenPointsScale * zoomPercent_ / 100.0;
     const int contentHeight = static_cast<int>(std::ceil(
@@ -3137,7 +3278,7 @@ void DocumentCanvas::paintEvent(QPaintEvent*) {
 
 void DocumentCanvas::renderPage(QPainter& painter, int pageIndexValue,
                                 const QPointF& origin, double scale, bool decorations) const {
-    const auto snap = session_->snapshot();
+    const auto snap = visibleDocumentSnapshot();
     const auto normalized = snap.document.normalizeRange(selection_);
     const auto selectedImage = selectedInlineImageId();
     painter.save();
@@ -7913,124 +8054,569 @@ void DocumentCanvas::toggleOrientation() {
     recordLayoutChange(before);
 }
 
-bool DocumentCanvas::findNext(const QString& needle, bool caseSensitive) {
-    if (previewId_) {
-        return false;
-    }
-    endTypingGroup();
-    resetVerticalNavigation();
-    clearPendingSpellingWord();
-    if (needle.isEmpty()) return false;
-    const auto snap = session_->snapshot();
-    const Qt::CaseSensitivity sensitivity = caseSensitive ? Qt::CaseSensitive : Qt::CaseInsensitive;
-    auto startIndex = snap.document.paragraphIndex(selection_.focus.paragraph_id).value_or(0);
-    // Visit the starting paragraph twice: first from the caret to its end,
-    // then (after every other paragraph) from its beginning back to the caret.
-    // This makes Find Next genuinely wrap even in a one-paragraph document.
-    for (std::size_t pass = 0; pass <= snap.document.paragraphs().size(); ++pass) {
-        const std::size_t index = (startIndex + pass) % snap.document.paragraphs().size();
-        const auto& paragraph = snap.document.paragraphs()[index];
-        const QString text = fromUtf16(paragraph.text());
-        const qsizetype offset = pass == 0
-            ? static_cast<qsizetype>(selection_.focus.utf16_offset)
-            : 0;
-        const qsizetype limit = pass == snap.document.paragraphs().size()
-            ? static_cast<qsizetype>(selection_.focus.utf16_offset)
-            : text.size();
-        const qsizetype found = text.indexOf(needle, offset, sensitivity);
-        if (found >= 0 && found + needle.size() <= limit) {
-            selection_ = {{paragraph.id(), static_cast<std::size_t>(found)},
-                          {paragraph.id(), static_cast<std::size_t>(found + needle.size())}};
-            typingFormat_ = selectedCharacterFormat();
-            revealCursor();
-            viewport()->update();
-            emit selectionChanged();
-            emitCursorFormat();
-            return true;
+std::vector<DocumentSearchMatch> DocumentCanvas::searchMatches(
+    const QString& needle, DocumentSearchOptions options) const {
+    std::vector<DocumentSearchMatch> matches;
+    if (needle.isEmpty()) return matches;
+    const auto snap = visibleDocumentSnapshot();
+    std::size_t paragraphOrdinal = 0;
+    std::size_t tableOrdinal = 0;
+    std::size_t unitOrdinal = 0;
+    for (const auto& block : snap.document.bodyBlocks()) {
+        if (block.kind == core::BodyBlockKind::paragraph) {
+            ++paragraphOrdinal;
+            const auto* paragraph = snap.document.findParagraph(block.id);
+            if (!paragraph) continue;
+            const QString containerText = fromUtf16(paragraph->text());
+            for (const auto& range : searchMatchRanges(
+                     containerText, needle, options)) {
+                matches.push_back(DocumentSearchMatch{
+                    DocumentSearchHit{
+                        snap.revision,
+                        previewId_,
+                        BodyParagraphSearchHit{
+                            paragraph->id(), range.start, range.end}},
+                    containerText,
+                    paragraphOrdinal,
+                    unitOrdinal});
+            }
+            ++unitOrdinal;
+            continue;
+        }
+
+        ++tableOrdinal;
+        const auto* table = snap.document.findTable(block.id);
+        if (!table) continue;
+        for (std::size_t row = 0; row < table->rowCount(); ++row) {
+            for (std::size_t column = 0; column < table->columnCount();
+                 ++column) {
+                const auto* cell = table->cell(row, column);
+                if (!cell) continue;
+                const QString containerText = fromUtf16(cell->text);
+                for (const auto& range : searchMatchRanges(
+                         containerText, needle, options)) {
+                    matches.push_back(DocumentSearchMatch{
+                        DocumentSearchHit{
+                            snap.revision,
+                            previewId_,
+                            TableCellSearchHit{
+                                table->id(), cell->id, row, column,
+                                range.start, range.end}},
+                        containerText,
+                        tableOrdinal,
+                        unitOrdinal});
+                }
+                ++unitOrdinal;
+            }
         }
     }
-    return false;
+    return matches;
 }
 
-int DocumentCanvas::replaceAll(const QString& needle, const QString& replacement, bool caseSensitive) {
+std::vector<DocumentSearchHit> DocumentCanvas::searchHits(
+    const QString& needle, DocumentSearchOptions options) const {
+    auto matches = searchMatches(needle, options);
+    std::vector<DocumentSearchHit> hits;
+    hits.reserve(matches.size());
+    for (auto& match : matches) {
+        hits.push_back(std::move(match.hit));
+    }
+    return hits;
+}
+
+std::optional<QString> DocumentCanvas::searchHitContainerText(
+    const DocumentSearchHit& hit) const {
+    const auto snap = visibleDocumentSnapshot();
+    if (hit.revision != snap.revision || hit.previewId != previewId_) {
+        return std::nullopt;
+    }
+    return std::visit(
+        [&snap](const auto& target) -> std::optional<QString> {
+            using Target = std::decay_t<decltype(target)>;
+            if constexpr (std::is_same_v<Target,
+                                         BodyParagraphSearchHit>) {
+                const auto* paragraph = snap.document.findParagraph(
+                    target.paragraphId);
+                if (!paragraph || target.startUtf16 >= target.endUtf16 ||
+                    target.endUtf16 > paragraph->text().size() ||
+                    !core::isUtf16Boundary(paragraph->text(),
+                                           target.startUtf16) ||
+                    !core::isUtf16Boundary(paragraph->text(),
+                                           target.endUtf16)) {
+                    return std::nullopt;
+                }
+                return fromUtf16(paragraph->text());
+            } else {
+                const auto* table = snap.document.findTable(target.tableId);
+                const auto* cell = table
+                    ? table->cell(target.row, target.column)
+                    : nullptr;
+                if (!cell || cell->id != target.cellId ||
+                    target.startUtf16 >= target.endUtf16 ||
+                    target.endUtf16 > cell->text.size() ||
+                    !core::isUtf16Boundary(cell->text,
+                                           target.startUtf16) ||
+                    !core::isUtf16Boundary(cell->text,
+                                           target.endUtf16)) {
+                    return std::nullopt;
+                }
+                return fromUtf16(cell->text);
+            }
+        }, hit.target);
+}
+
+std::optional<DocumentSearchHit> DocumentCanvas::currentSearchHit() const {
+    const auto snap = visibleDocumentSnapshot();
+    if (selectedTable_ && tableCursor_ && tableSelectionAnchor_) {
+        const auto* table = snap.document.findTable(tableCursor_->tableId);
+        const auto* cell = table
+            ? table->cell(tableCursor_->row, tableCursor_->column)
+            : nullptr;
+        if (!cell) return std::nullopt;
+        const auto anchor = std::min(*tableSelectionAnchor_, cell->text.size());
+        const auto focus = std::min(tableCursor_->utf16Offset,
+                                    cell->text.size());
+        if (anchor == focus) return std::nullopt;
+        return DocumentSearchHit{
+            snap.revision,
+            previewId_,
+            TableCellSearchHit{
+                table->id(), cell->id, tableCursor_->row,
+                tableCursor_->column, std::min(anchor, focus),
+                std::max(anchor, focus)}};
+    }
+    if (selectedTable_) return std::nullopt;
+    const auto normalized = snap.document.normalizeRange(selection_);
+    if (!normalized || normalized.value().empty() ||
+        normalized.value().start.paragraph_id !=
+            normalized.value().end.paragraph_id) {
+        return std::nullopt;
+    }
+    return DocumentSearchHit{
+        snap.revision,
+        previewId_,
+        BodyParagraphSearchHit{
+            normalized.value().start.paragraph_id,
+            normalized.value().start.utf16_offset,
+            normalized.value().end.utf16_offset}};
+}
+
+bool DocumentCanvas::activateSearchHit(const DocumentSearchHit& hit) {
+    const auto snap = visibleDocumentSnapshot();
+    if (hit.revision != snap.revision || hit.previewId != previewId_) {
+        emit operationFailed(tr("The search result is stale. Search again."));
+        return false;
+    }
+    if (!searchHitContainerText(hit)) {
+        emit operationFailed(tr("The search result is no longer valid."));
+        return false;
+    }
+
     endTypingGroup();
     resetVerticalNavigation();
     clearPendingSpellingWord();
-    if (needle.isEmpty()) return 0;
+    if (const auto* paragraph =
+            std::get_if<BodyParagraphSearchHit>(&hit.target)) {
+        selection_ = {
+            {paragraph->paragraphId, paragraph->startUtf16},
+            {paragraph->paragraphId, paragraph->endUtf16}};
+        tableCursor_.reset();
+        tableSelectionAnchor_.reset();
+        tableCellSelection_.reset();
+        tableMouseSelectionAnchor_.reset();
+        selectedTable_.reset();
+    } else {
+        const auto& cell = std::get<TableCellSearchHit>(hit.target);
+        tableCursor_ = TableCursor{
+            cell.tableId, cell.row, cell.column, cell.endUtf16};
+        tableSelectionAnchor_ = cell.startUtf16;
+        tableCellSelection_.reset();
+        tableMouseSelectionAnchor_.reset();
+        selectedTable_ = cell.tableId;
+    }
+    // A preview is read-only and may have shifted ranges relative to the live
+    // document. Preserve the live insertion format until that branch is
+    // accepted or discarded instead of resolving it against mismatched text.
+    if (!previewId_) {
+        typingFormat_ = selectedCharacterFormat();
+    }
+    emit selectionChanged();
+    if (!previewId_) {
+        emitCursorFormat();
+    }
+    updateStatus();
+    viewport()->update();
+    revealCursor();
+    updateMicroFocus();
+    return true;
+}
+
+std::optional<DocumentSearchHit> DocumentCanvas::findNextHit(
+    const QString& needle, DocumentSearchOptions options) {
+    if (needle.isEmpty()) return std::nullopt;
+    const auto matches = searchMatches(needle, options);
+    if (matches.empty()) return std::nullopt;
+
+    if (const auto active = currentSearchHit()) {
+        const auto found = std::find_if(
+            matches.begin(), matches.end(), [&active](const auto& match) {
+                return match.hit == *active;
+            });
+        if (found != matches.end()) {
+            const auto next = std::next(found) == matches.end()
+                ? matches.begin()
+                : std::next(found);
+            if (activateSearchHit(next->hit)) return next->hit;
+            return std::nullopt;
+        }
+    }
+
+    const auto snap = visibleDocumentSnapshot();
+    std::optional<std::variant<BodyParagraphSearchHit, TableCellSearchHit>>
+        currentTarget;
+    std::size_t currentOffset = 0;
+    if (tableCursor_) {
+        const auto* table = snap.document.findTable(tableCursor_->tableId);
+        const auto* cell = table
+            ? table->cell(tableCursor_->row, tableCursor_->column)
+            : nullptr;
+        if (cell) {
+            currentOffset = std::min(tableCursor_->utf16Offset,
+                                     cell->text.size());
+            currentTarget = TableCellSearchHit{
+                table->id(), cell->id, tableCursor_->row,
+                tableCursor_->column, currentOffset, currentOffset};
+        }
+    } else if (tableCellSelection_ && selectedTable_) {
+        const auto* table = snap.document.findTable(*selectedTable_);
+        const auto* cell = table
+            ? table->cell(tableCellSelection_->focusRow,
+                          tableCellSelection_->focusColumn)
+            : nullptr;
+        if (cell) {
+            currentOffset = cell->text.size();
+            currentTarget = TableCellSearchHit{
+                table->id(), cell->id, tableCellSelection_->focusRow,
+                tableCellSelection_->focusColumn, currentOffset,
+                currentOffset};
+        }
+    } else if (selectedTable_) {
+        const auto* table = snap.document.findTable(*selectedTable_);
+        if (table && table->rowCount() > 0 && table->columnCount() > 0) {
+            const auto row = table->rowCount() - 1;
+            const auto column = table->columnCount() - 1;
+            const auto* cell = table->cell(row, column);
+            if (cell) {
+                currentOffset = cell->text.size();
+                currentTarget = TableCellSearchHit{
+                    table->id(), cell->id, row, column, currentOffset,
+                    currentOffset};
+            }
+        }
+    } else {
+        currentOffset = selection_.focus.utf16_offset;
+        currentTarget = BodyParagraphSearchHit{
+            selection_.focus.paragraph_id, currentOffset, currentOffset};
+    }
+
+    if (currentTarget) {
+        const auto currentOrdinal = searchUnitOrdinal(
+            snap.document, *currentTarget);
+        if (currentOrdinal) {
+            for (const auto& match : matches) {
+                if (match.searchUnitOrdinal > *currentOrdinal ||
+                    (match.searchUnitOrdinal == *currentOrdinal &&
+                     searchHitStart(match.hit) >= currentOffset)) {
+                    if (activateSearchHit(match.hit)) return match.hit;
+                    return std::nullopt;
+                }
+            }
+        }
+    }
+    if (activateSearchHit(matches.front().hit)) return matches.front().hit;
+    return std::nullopt;
+}
+
+std::optional<DocumentSearchHit> DocumentCanvas::findPreviousHit(
+    const QString& needle, DocumentSearchOptions options) {
+    if (needle.isEmpty()) return std::nullopt;
+    const auto matches = searchMatches(needle, options);
+    if (matches.empty()) return std::nullopt;
+
+    if (const auto active = currentSearchHit()) {
+        const auto found = std::find_if(
+            matches.begin(), matches.end(), [&active](const auto& match) {
+                return match.hit == *active;
+            });
+        if (found != matches.end()) {
+            const auto previous = found == matches.begin()
+                ? std::prev(matches.end())
+                : std::prev(found);
+            if (activateSearchHit(previous->hit)) return previous->hit;
+            return std::nullopt;
+        }
+    }
+
+    const auto snap = visibleDocumentSnapshot();
+    std::optional<std::variant<BodyParagraphSearchHit, TableCellSearchHit>>
+        currentTarget;
+    std::size_t currentOffset = 0;
+    if (tableCursor_) {
+        const auto* table = snap.document.findTable(tableCursor_->tableId);
+        const auto* cell = table
+            ? table->cell(tableCursor_->row, tableCursor_->column)
+            : nullptr;
+        if (cell) {
+            currentOffset = std::min(tableCursor_->utf16Offset,
+                                     cell->text.size());
+            currentTarget = TableCellSearchHit{
+                table->id(), cell->id, tableCursor_->row,
+                tableCursor_->column, currentOffset, currentOffset};
+        }
+    } else if (tableCellSelection_ && selectedTable_) {
+        const auto* table = snap.document.findTable(*selectedTable_);
+        const auto* cell = table
+            ? table->cell(tableCellSelection_->focusRow,
+                          tableCellSelection_->focusColumn)
+            : nullptr;
+        if (cell) {
+            currentTarget = TableCellSearchHit{
+                table->id(), cell->id, tableCellSelection_->focusRow,
+                tableCellSelection_->focusColumn, 0, 0};
+        }
+    } else if (selectedTable_) {
+        const auto* table = snap.document.findTable(*selectedTable_);
+        if (table && table->rowCount() > 0 && table->columnCount() > 0) {
+            const auto* cell = table->cell(0, 0);
+            if (cell) {
+                currentTarget = TableCellSearchHit{
+                    table->id(), cell->id, 0, 0, 0, 0};
+            }
+        }
+    } else {
+        currentOffset = selection_.focus.utf16_offset;
+        currentTarget = BodyParagraphSearchHit{
+            selection_.focus.paragraph_id, currentOffset, currentOffset};
+    }
+
+    if (currentTarget) {
+        const auto currentOrdinal = searchUnitOrdinal(
+            snap.document, *currentTarget);
+        if (currentOrdinal) {
+            for (auto iterator = matches.rbegin(); iterator != matches.rend();
+                 ++iterator) {
+                if (iterator->searchUnitOrdinal < *currentOrdinal ||
+                    (iterator->searchUnitOrdinal == *currentOrdinal &&
+                     searchHitEnd(iterator->hit) <= currentOffset)) {
+                    if (activateSearchHit(iterator->hit)) {
+                        return iterator->hit;
+                    }
+                    return std::nullopt;
+                }
+            }
+        }
+    }
+    if (activateSearchHit(matches.back().hit)) return matches.back().hit;
+    return std::nullopt;
+}
+
+bool DocumentCanvas::replaceSearchHit(const DocumentSearchHit& hit,
+                                      const QString& replacement) {
+    if (rejectLiveEditDuringPreview()) return false;
     const auto snap = session_->snapshot();
-    const Qt::CaseSensitivity sensitivity = caseSensitive ? Qt::CaseSensitive : Qt::CaseInsensitive;
-    std::vector<core::Operation> operations;
-    struct ReplacementTransform {
-        core::NodeId paragraph;
-        std::size_t start;
-        std::size_t end;
-        std::size_t replacementLength;
-    };
-    std::vector<ReplacementTransform> transforms;
-    int count = 0;
-    for (const auto& paragraph : snap.document.paragraphs()) {
-        const QString text = fromUtf16(paragraph.text());
-        QList<qsizetype> positions;
-        qsizetype position = 0;
-        while ((position = text.indexOf(needle, position, sensitivity)) >= 0) {
-            positions.push_front(position);
-            position += needle.size();
-            ++count;
+    if (hit.revision != snap.revision || hit.previewId.has_value()) {
+        emit operationFailed(tr("The search result is stale. Search again."));
+        return false;
+    }
+    const auto replacementText = toUtf16(replacement);
+    if (const auto* paragraph =
+            std::get_if<BodyParagraphSearchHit>(&hit.target)) {
+        const auto* source = snap.document.findParagraph(
+            paragraph->paragraphId);
+        if (!source || paragraph->startUtf16 >= paragraph->endUtf16 ||
+            paragraph->endUtf16 > source->text().size()) {
+            emit operationFailed(tr("The search result is no longer valid."));
+            return false;
         }
-        for (const qsizetype found : positions) {
-            // characterFormatAt() describes insertion affinity (the character
-            // to the left). Ask one position past the match start to inspect
-            // the first character actually being replaced, including at a
-            // format-run boundary.
-            const auto sourceFormat = paragraph.characterFormatAt(
-                static_cast<std::size_t>(found) + 1);
-            operations.push_back(core::ReplaceRange{
-                {{paragraph.id(), static_cast<std::size_t>(found)},
-                 {paragraph.id(), static_cast<std::size_t>(found + needle.size())}},
-                toUtf16(replacement),
-                sourceFormat.empty()
+        const auto format = source->characterFormatAt(
+            paragraph->startUtf16 + 1);
+        const core::Position cursor{
+            paragraph->paragraphId,
+            paragraph->startUtf16 +
+                static_cast<std::size_t>(replacement.size())};
+        return apply(
+            {core::ReplaceRange{
+                {{paragraph->paragraphId, paragraph->startUtf16},
+                 {paragraph->paragraphId, paragraph->endUtf16}},
+                replacementText,
+                format.empty()
                     ? std::nullopt
-                    : std::optional<core::CharacterFormat>(sourceFormat)});
-            transforms.push_back({
-                paragraph.id(), static_cast<std::size_t>(found),
-                static_cast<std::size_t>(found + needle.size()),
-                static_cast<std::size_t>(replacement.size())});
-        }
+                    : std::optional<core::CharacterFormat>(format)}},
+            cursor,
+            format.empty()
+                ? std::nullopt
+                : std::optional<core::CharacterFormat>(format),
+            false, std::nullopt, false, true);
     }
-    if (!operations.empty()) {
-        auto resultingCursor = selection_.focus;
-        std::vector<ReplacementTransform> local;
-        for (const auto& transform : transforms) {
-            if (transform.paragraph == resultingCursor.paragraph_id) {
-                local.push_back(transform);
-            }
-        }
-        std::sort(local.begin(), local.end(),
-                  [](const auto& left, const auto& right) {
-            return left.start < right.start;
-        });
-        std::int64_t shift = 0;
-        const auto originalOffset = resultingCursor.utf16_offset;
-        for (const auto& transform : local) {
-            if (originalOffset < transform.start) break;
-            const auto mappedStart = static_cast<std::int64_t>(transform.start) + shift;
-            if (originalOffset <= transform.end) {
-                resultingCursor.utf16_offset = static_cast<std::size_t>(
-                    mappedStart + static_cast<std::int64_t>(
-                                      transform.replacementLength));
-                shift = 0;
-                break;
-            }
-            shift += static_cast<std::int64_t>(transform.replacementLength) -
-                     static_cast<std::int64_t>(transform.end - transform.start);
-            resultingCursor.utf16_offset = static_cast<std::size_t>(
-                static_cast<std::int64_t>(originalOffset) + shift);
-        }
-        if (!apply(std::move(operations), resultingCursor)) {
-            return 0;
-        }
+
+    const auto& cellHit = std::get<TableCellSearchHit>(hit.target);
+    const auto* table = snap.document.findTable(cellHit.tableId);
+    const auto* cell = table
+        ? table->cell(cellHit.row, cellHit.column)
+        : nullptr;
+    if (!cell || cell->id != cellHit.cellId ||
+        cellHit.startUtf16 >= cellHit.endUtf16 ||
+        cellHit.endUtf16 > cell->text.size()) {
+        emit operationFailed(tr("The search result is no longer valid."));
+        return false;
     }
-    return count;
+    const auto format = cell->characterFormatAt(cellHit.startUtf16 + 1);
+    const TableCursor cursor{
+        cellHit.tableId, cellHit.row, cellHit.column,
+        cellHit.startUtf16 + static_cast<std::size_t>(replacement.size())};
+    return apply(
+        {core::ReplaceTableCellRange{
+            cellHit.tableId, cellHit.row, cellHit.column,
+            cellHit.startUtf16, cellHit.endUtf16, replacementText,
+            format.empty()
+                ? std::nullopt
+                : std::optional<core::CharacterFormat>(format)}},
+        std::nullopt,
+        format.empty()
+            ? std::nullopt
+            : std::optional<core::CharacterFormat>(format),
+        false, std::nullopt, false, true, cursor, cellHit.tableId);
+}
+
+bool DocumentCanvas::replaceCurrent(
+    const QString& needle, const QString& replacement,
+    DocumentSearchOptions options) {
+    if (rejectLiveEditDuringPreview()) return false;
+    const auto current = currentSearchHit();
+    if (!current) return false;
+    const auto hits = searchHits(needle, options);
+    if (std::find(hits.begin(), hits.end(), *current) == hits.end()) {
+        return false;
+    }
+    return replaceSearchHit(*current, replacement);
+}
+
+int DocumentCanvas::replaceAllMatches(
+    const QString& needle, const QString& replacement,
+    DocumentSearchOptions options) {
+    if (rejectLiveEditDuringPreview()) return 0;
+    endTypingGroup();
+    resetVerticalNavigation();
+    clearPendingSpellingWord();
+    const auto hits = searchHits(needle, options);
+    if (hits.empty()) return 0;
+    const auto snap = session_->snapshot();
+    const auto replacementText = toUtf16(replacement);
+    std::vector<core::Operation> operations;
+    operations.reserve(hits.size());
+
+    // Reverse document order makes every UTF-16 offset remain valid while the
+    // atomic batch is evaluated, including several matches in one paragraph
+    // or cell.
+    for (auto iterator = hits.rbegin(); iterator != hits.rend(); ++iterator) {
+        if (const auto* paragraph =
+                std::get_if<BodyParagraphSearchHit>(&iterator->target)) {
+            const auto* source = snap.document.findParagraph(
+                paragraph->paragraphId);
+            if (!source) return 0;
+            const auto format = source->characterFormatAt(
+                paragraph->startUtf16 + 1);
+            operations.push_back(core::ReplaceRange{
+                {{paragraph->paragraphId, paragraph->startUtf16},
+                 {paragraph->paragraphId, paragraph->endUtf16}},
+                replacementText,
+                format.empty()
+                    ? std::nullopt
+                    : std::optional<core::CharacterFormat>(format)});
+            continue;
+        }
+        const auto& cellHit = std::get<TableCellSearchHit>(iterator->target);
+        const auto* table = snap.document.findTable(cellHit.tableId);
+        const auto* cell = table
+            ? table->cell(cellHit.row, cellHit.column)
+            : nullptr;
+        if (!cell || cell->id != cellHit.cellId) return 0;
+        const auto format = cell->characterFormatAt(cellHit.startUtf16 + 1);
+        operations.push_back(core::ReplaceTableCellRange{
+            cellHit.tableId, cellHit.row, cellHit.column,
+            cellHit.startUtf16, cellHit.endUtf16, replacementText,
+            format.empty()
+                ? std::nullopt
+                : std::optional<core::CharacterFormat>(format)});
+    }
+
+    std::variant<BodyParagraphSearchHit, TableCellSearchHit> cursorTarget =
+        hits.front().target;
+    std::size_t cursorOffset = searchHitStart(hits.front());
+    if (tableCursor_) {
+        const auto* table = snap.document.findTable(tableCursor_->tableId);
+        const auto* cell = table
+            ? table->cell(tableCursor_->row, tableCursor_->column)
+            : nullptr;
+        if (cell) {
+            cursorOffset = std::min(tableCursor_->utf16Offset,
+                                    cell->text.size());
+            cursorTarget = TableCellSearchHit{
+                table->id(), cell->id, tableCursor_->row,
+                tableCursor_->column, cursorOffset, cursorOffset};
+        }
+    } else if (!selectedTable_) {
+        cursorOffset = selection_.focus.utf16_offset;
+        cursorTarget = BodyParagraphSearchHit{
+            selection_.focus.paragraph_id, cursorOffset, cursorOffset};
+    }
+
+    std::vector<SearchMatchRange> localMatches;
+    for (const auto& hit : hits) {
+        if (!sameSearchUnit(cursorTarget, hit.target)) continue;
+        localMatches.push_back({
+            std::visit([](const auto& value) { return value.startUtf16; },
+                       hit.target),
+            std::visit([](const auto& value) { return value.endUtf16; },
+                       hit.target)});
+    }
+    cursorOffset = mapSearchOffset(
+        cursorOffset, localMatches,
+        static_cast<std::size_t>(replacement.size()));
+
+    bool applied = false;
+    if (const auto* paragraph =
+            std::get_if<BodyParagraphSearchHit>(&cursorTarget)) {
+        applied = apply(
+            std::move(operations),
+            core::Position{paragraph->paragraphId, cursorOffset},
+            std::nullopt, false, std::nullopt, false, true);
+    } else {
+        const auto& cell = std::get<TableCellSearchHit>(cursorTarget);
+        applied = apply(
+            std::move(operations), std::nullopt, std::nullopt, false,
+            std::nullopt, false, true,
+            TableCursor{cell.tableId, cell.row, cell.column, cursorOffset},
+            cell.tableId);
+    }
+    if (!applied) return 0;
+    return static_cast<int>(std::min<std::size_t>(
+        hits.size(), static_cast<std::size_t>(
+                         std::numeric_limits<int>::max())));
+}
+
+bool DocumentCanvas::findNext(const QString& needle, bool caseSensitive) {
+    return findNextHit(
+               needle, DocumentSearchOptions{caseSensitive, false})
+        .has_value();
+}
+
+int DocumentCanvas::replaceAll(const QString& needle,
+                               const QString& replacement,
+                               bool caseSensitive) {
+    return replaceAllMatches(
+        needle, replacement,
+        DocumentSearchOptions{caseSensitive, false});
 }
 
 bool DocumentCanvas::exportPdf(const QString& path, QString& error) {
@@ -8329,6 +8915,7 @@ bool DocumentCanvas::createOperationsPreview(
                   .arg(changedParagraphs);
     invalidateLayout();
     viewport()->update();
+    emit previewStateChanged(true);
     return true;
 }
 
@@ -8401,6 +8988,7 @@ bool DocumentCanvas::acceptPreview(QString& error) {
     updateStatus();
     viewport()->update();
     revealCursor();
+    emit previewStateChanged(false);
     return true;
 }
 
@@ -8408,6 +8996,16 @@ void DocumentCanvas::discardPreview() {
     endTypingGroup();
     resetVerticalNavigation();
     clearPendingSpellingWord();
+    const bool hadPreview = previewId_.has_value();
+    std::optional<core::NodeId> visibleCellId;
+    if (hadPreview && selectedTable_ && tableCursor_) {
+        const auto visible = visibleDocumentSnapshot();
+        const auto* table = visible.document.findTable(*selectedTable_);
+        const auto* cell = table
+            ? table->cell(tableCursor_->row, tableCursor_->column)
+            : nullptr;
+        if (cell) visibleCellId = cell->id;
+    }
     if (previewId_) {
         static_cast<void>(session_->discardPreview(*previewId_));
         previewId_.reset();
@@ -8419,6 +9017,86 @@ void DocumentCanvas::discardPreview() {
     previewCursor_.reset();
     previewOperations_.clear();
     previewHasNonTextChanges_ = false;
+    if (!hadPreview) return;
+
+    const auto live = session_->snapshot();
+    bool hasSafeTableSelection = false;
+    if (selectedTable_) {
+        const auto* table = live.document.findTable(*selectedTable_);
+        if (table && tableCursor_ && visibleCellId) {
+            for (std::size_t row = 0;
+                 row < table->rowCount() && !hasSafeTableSelection; ++row) {
+                for (std::size_t column = 0;
+                     column < table->columnCount(); ++column) {
+                    const auto* cell = table->cell(row, column);
+                    if (!cell || cell->id != *visibleCellId) continue;
+                    const auto clampOffset = [&cell](std::size_t offset) {
+                        offset = std::min(offset, cell->text.size());
+                        while (offset > 0 &&
+                               !core::isUtf16Boundary(cell->text, offset)) {
+                            --offset;
+                        }
+                        return offset;
+                    };
+                    tableCursor_->row = row;
+                    tableCursor_->column = column;
+                    tableCursor_->utf16Offset = clampOffset(
+                        tableCursor_->utf16Offset);
+                    if (tableSelectionAnchor_) {
+                        tableSelectionAnchor_ = clampOffset(
+                            *tableSelectionAnchor_);
+                    }
+                    hasSafeTableSelection = true;
+                    break;
+                }
+            }
+        } else if (table && !tableCursor_ && !tableCellSelection_) {
+            // A whole-table selection remains valid when the live table still
+            // exists. Search-result activation always takes the cursor path
+            // above, but preserve this pre-existing read-only selection too.
+            hasSafeTableSelection = true;
+        }
+    }
+
+    if (!hasSafeTableSelection) {
+        tableCursor_.reset();
+        tableSelectionAnchor_.reset();
+        tableCellSelection_.reset();
+        tableMouseSelectionAnchor_.reset();
+        selectedTable_.reset();
+        const auto clampPosition = [&live](core::Position position)
+            -> std::optional<core::Position> {
+            const auto* paragraph = live.document.findParagraph(
+                position.paragraph_id);
+            if (!paragraph) return std::nullopt;
+            position.utf16_offset = std::min(
+                position.utf16_offset, paragraph->text().size());
+            while (position.utf16_offset > 0 &&
+                   !core::isUtf16Boundary(paragraph->text(),
+                                          position.utf16_offset)) {
+                --position.utf16_offset;
+            }
+            return position;
+        };
+        const auto anchor = clampPosition(selection_.anchor);
+        const auto focus = clampPosition(selection_.focus);
+        if (anchor && focus) {
+            selection_ = {*anchor, *focus};
+        } else {
+            const auto& first = live.document.paragraphs().front();
+            selection_ = {{first.id(), 0}, {first.id(), 0}};
+        }
+    }
+    typingFormat_ = selection_.anchor == selection_.focus
+        ? currentCharacterFormat()
+        : selectedCharacterFormat();
+    emit selectionChanged();
+    emitCursorFormat();
+    updateStatus();
+    viewport()->update();
+    revealCursor();
+    updateMicroFocus();
+    emit previewStateChanged(false);
 }
 
 int DocumentCanvas::paragraphIndex(core::NodeId id) const {

@@ -21,11 +21,20 @@ complete only when the features below work together in normal keyboard- and
 mouse-driven workflows, survive save/reopen and recovery, and meet the stated
 performance and privacy gates.
 
+The 0.4.2 checkpoint completes the initial modeless Navigation/Find-Replace
+slice for body paragraphs and supported semantic table cells, including
+per-document state, case and whole-word options, caret-relative keyboard
+navigation, revision/preview-aware results, and one-transaction Replace All.
+Heading, page, and object browsing remain later Navigation-pane work. M1 as a
+whole remains active.
+
 - Complete multi-document file workflows, recovery, printing, shared-layout
   PDF export, recent files, and file associations.
-- Finish the everyday editing surface: page view, zoom, rulers, navigation,
-  find/replace, clipboard, drag/drop, standard shortcuts, command palette, and
-  the Home, Insert, Layout, Review, and View ribbon surfaces.
+- Complete the everyday editing surface around the implemented page view,
+  zoom, and initial text Navigation/Find-Replace slice: add rulers,
+  heading/page/object navigation, drag/drop, remaining standard shortcuts, and
+  finish the clipboard, command palette, and Home, Insert, Layout, Review, and
+  View ribbon surfaces.
 - Complete direct character and paragraph formatting, styles, tabs, borders,
   page breaks, sections, page geometry, columns, lists, and the daily-use table
   subset.

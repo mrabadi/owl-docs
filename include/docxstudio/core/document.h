@@ -136,6 +136,10 @@ private:
                                            std::u16string text,
                                            const std::optional<CharacterFormat>&
                                                inserted_format);
+    [[nodiscard]] Result<void> replaceCellRange(
+        std::size_t row, std::size_t column, std::size_t start,
+        std::size_t end, const std::u16string& text,
+        const std::optional<CharacterFormat>& inserted_format);
     [[nodiscard]] Result<void> applyCellCharacterFormat(
         std::size_t row, std::size_t column, std::size_t start,
         std::size_t end, const CharacterFormatDelta& delta);
@@ -388,6 +392,10 @@ public:
                                                 std::u16string text,
                                                 const std::optional<CharacterFormat>&
                                                     inserted_format = std::nullopt);
+    [[nodiscard]] Result<void> replaceTableCellRange(
+        NodeId table_id, std::size_t row, std::size_t column,
+        std::size_t start, std::size_t end, const std::u16string& text,
+        const std::optional<CharacterFormat>& inserted_format = std::nullopt);
     [[nodiscard]] Result<void> applyTableCellCharacterFormat(
         NodeId table_id, std::size_t row, std::size_t column,
         std::size_t start, std::size_t end,

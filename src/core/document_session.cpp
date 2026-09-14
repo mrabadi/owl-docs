@@ -61,6 +61,11 @@ Result<void> applyOne(Document& document, const Operation& operation) {
                                                  typed.column, typed.text,
                                                  typed.inserted_format);
             } else if constexpr (
+                std::is_same_v<Type, ReplaceTableCellRange>) {
+                return document.replaceTableCellRange(
+                    typed.table_id, typed.row, typed.column, typed.start,
+                    typed.end, typed.text, typed.format);
+            } else if constexpr (
                 std::is_same_v<Type, SetTableCellCharacterFormat>) {
                 return document.applyTableCellCharacterFormat(
                     typed.table_id, typed.row, typed.column, typed.start,

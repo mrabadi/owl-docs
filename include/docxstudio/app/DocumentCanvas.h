@@ -16,6 +16,7 @@
 #include <optional>
 #include <string>
 #include <utility>
+#include <variant>
 #include <vector>
 
 class QInputMethodEvent;
@@ -82,6 +83,61 @@ struct ImportedTablePresentation {
     std::vector<ImportedTableCellPresentation> cells;
     std::optional<core::TableStyle> sourceSemanticStyle;
     std::optional<std::string> sourceStyleId;
+};
+
+struct DocumentSearchOptions {
+    bool caseSensitive{false};
+    bool wholeWord{false};
+
+    auto operator<=>(const DocumentSearchOptions&) const = default;
+};
+
+struct BodyParagraphSearchHit {
+    core::NodeId paragraphId;
+    std::size_t startUtf16{};
+    std::size_t endUtf16{};
+
+    auto operator<=>(const BodyParagraphSearchHit&) const = default;
+};
+
+struct TableCellSearchHit {
+    core::NodeId tableId;
+    core::NodeId cellId;
+    std::size_t row{};
+    std::size_t column{};
+    std::size_t startUtf16{};
+    std::size_t endUtf16{};
+
+    auto operator<=>(const TableCellSearchHit&) const = default;
+};
+
+// Search hits carry the document revision that produced their UTF-16 ranges.
+// Activation and replacement reject stale hits instead of guessing after an
+// intervening edit or table-structure change.
+struct DocumentSearchHit {
+    core::Revision revision;
+    // Live and preview revisions advance independently and can have the same
+    // numeric value. Branch identity prevents a preview hit from becoming a
+    // coincidentally valid live edit target after accept/discard.
+    std::optional<core::PreviewId> previewId;
+    std::variant<BodyParagraphSearchHit, TableCellSearchHit> target;
+
+    auto operator<=>(const DocumentSearchHit&) const = default;
+};
+
+struct DocumentSearchMatch {
+    DocumentSearchHit hit;
+    QString containerText;
+    // One-based paragraph or table ordinal, depending on hit.target. It is
+    // computed from the same visible snapshot as the hit and container text,
+    // so preview insertions/reordering cannot produce live-document labels.
+    std::size_t containerOrdinal{};
+    // Zero-based ordinal across every searchable body paragraph and table
+    // cell. Navigation compares this once-computed value with the caret unit
+    // instead of rescanning the complete document for every match.
+    std::size_t searchUnitOrdinal{};
+
+    auto operator<=>(const DocumentSearchMatch&) const = default;
 };
 
 class DocumentCanvas final : public QAbstractScrollArea {
@@ -212,6 +268,38 @@ public:
                                double bottom, double left);
     void toggleOrientation();
 
+    std::vector<DocumentSearchHit> searchHits(
+        const QString& needle,
+        DocumentSearchOptions options = {}) const;
+    // Returns hits and their containing text from one immutable snapshot so
+    // navigation panes can build many snippets without copying the document
+    // once per result.
+    std::vector<DocumentSearchMatch> searchMatches(
+        const QString& needle,
+        DocumentSearchOptions options = {}) const;
+    // Returns the complete searchable paragraph/cell text for a valid hit in
+    // the currently displayed branch. Callers can build snippets without
+    // mixing preview targets with a live-document snapshot.
+    std::optional<QString> searchHitContainerText(
+        const DocumentSearchHit& hit) const;
+    std::optional<DocumentSearchHit> currentSearchHit() const;
+    bool activateSearchHit(const DocumentSearchHit& hit);
+    std::optional<DocumentSearchHit> findNextHit(
+        const QString& needle,
+        DocumentSearchOptions options = {});
+    std::optional<DocumentSearchHit> findPreviousHit(
+        const QString& needle,
+        DocumentSearchOptions options = {});
+    bool replaceSearchHit(const DocumentSearchHit& hit,
+                          const QString& replacement);
+    bool replaceCurrent(const QString& needle, const QString& replacement,
+                        DocumentSearchOptions options = {});
+    int replaceAllMatches(const QString& needle, const QString& replacement,
+                          DocumentSearchOptions options = {});
+
+    // Compatibility wrappers for the original find dialog. New UI should use
+    // the typed API above so whole-word options and stable table-cell targets
+    // remain available.
     bool findNext(const QString& needle, bool caseSensitive = false);
     int replaceAll(const QString& needle, const QString& replacement,
                    bool caseSensitive = false);
@@ -244,6 +332,9 @@ signals:
     void listPropertiesRequested();
     void pageStatusChanged(int currentPage, int pageCount, int wordCount);
     void zoomChanged(int percent);
+    // The displayed branch changed between the live document and an isolated
+    // Codex preview even when the live document revision did not change.
+    void previewStateChanged(bool active);
     void operationFailed(const QString& message);
 
 protected:
@@ -345,6 +436,7 @@ private:
     void invalidateLayout();
     void ensureLayout() const;
     void rebuildLayout() const;
+    core::DocumentSnapshot visibleDocumentSnapshot() const;
     void updateScrollBars() const;
     void updateStatus();
     void revealCursor();

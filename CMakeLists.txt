@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.22)
 
-project(OwlDocs VERSION 0.4.1 LANGUAGES CXX)
+project(OwlDocs VERSION 0.4.2 LANGUAGES CXX)
 
 include(GNUInstallDirs)
 include(CTest)
@@ -112,6 +112,9 @@ docxstudio_warnings(docxstudio_codex)
 
 if(DOCXSTUDIO_BUILD_APP)
     find_package(Qt6 6.2 REQUIRED COMPONENTS Core Gui Widgets PrintSupport)
+    if(BUILD_TESTING)
+        find_package(Qt6 6.2 REQUIRED COMPONENTS Test)
+    endif()
     find_package(SQLite3 REQUIRED)
     pkg_check_modules(HUNSPELL REQUIRED IMPORTED_TARGET hunspell)
 
@@ -121,6 +124,7 @@ if(DOCXSTUDIO_BUILD_APP)
         src/app/EditorPreferences.cpp
         src/app/FontFamilyPicker.cpp
         src/app/ListPropertiesDialog.cpp
+        src/app/NavigationDock.cpp
         src/app/FileFingerprint.cpp
         src/app/CommandRegistry.cpp
         src/app/RibbonWidget.cpp
@@ -140,6 +144,7 @@ if(DOCXSTUDIO_BUILD_APP)
         include/docxstudio/app/EditorPreferences.h
         include/docxstudio/app/FontFamilyPicker.h
         include/docxstudio/app/ListPropertiesDialog.h
+        include/docxstudio/app/NavigationDock.h
         include/docxstudio/app/FileFingerprint.h
         include/docxstudio/app/CommandRegistry.h
         include/docxstudio/app/RibbonWidget.h
@@ -305,6 +310,23 @@ if(BUILD_TESTING)
                  COMMAND main_window_preferences_tests)
         set_tests_properties(main_window_preferences_tests PROPERTIES
             ENVIRONMENT "QT_QPA_PLATFORM=offscreen;XDG_DATA_HOME=/tmp/owl-docs-main-window-preferences-tests")
+
+        add_executable(navigation_dock_tests
+            tests/navigation_dock_tests.cpp)
+        target_link_libraries(navigation_dock_tests PRIVATE docxstudio_app)
+        docxstudio_warnings(navigation_dock_tests)
+        add_test(NAME navigation_dock_tests COMMAND navigation_dock_tests)
+        set_tests_properties(navigation_dock_tests PROPERTIES
+            ENVIRONMENT "QT_QPA_PLATFORM=offscreen;XDG_DATA_HOME=/tmp/owl-docs-navigation-dock-tests")
+
+        add_executable(navigation_workflow_tests
+            tests/navigation_workflow_tests.cpp)
+        target_link_libraries(navigation_workflow_tests PRIVATE
+            docxstudio_app Qt6::Test)
+        docxstudio_warnings(navigation_workflow_tests)
+        add_test(NAME navigation_workflow_tests COMMAND navigation_workflow_tests)
+        set_tests_properties(navigation_workflow_tests PROPERTIES
+            ENVIRONMENT "QT_QPA_PLATFORM=offscreen;XDG_DATA_HOME=/tmp/owl-docs-navigation-workflow-tests")
 
         add_executable(list_properties_ui_tests
             tests/list_properties_ui_tests.cpp)

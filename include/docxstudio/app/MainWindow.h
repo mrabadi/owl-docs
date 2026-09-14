@@ -30,6 +30,7 @@ namespace docxstudio::app {
 class ChatDock;
 class CodexController;
 class DocumentCanvas;
+class NavigationDock;
 class RibbonWidget;
 
 class MainWindow final : public QMainWindow {
@@ -72,7 +73,12 @@ private:
     void exportPdf();
     void printPreview();
     void printDocument();
-    void showFindReplace();
+    void showFindReplace(bool replaceMode = false);
+    void loadNavigationForActiveDocument();
+    void refreshNavigationResults();
+    void synchronizeNavigationSelection();
+    void activateNavigationResult(int index);
+    void navigateSearchResult(bool forward);
     void showCommandPalette();
     void showEditorOptions();
     void applyEditorPreferences();
@@ -106,6 +112,7 @@ private:
     QTabWidget* tabs_{};
     RibbonWidget* ribbon_{};
     ChatDock* chat_{};
+    NavigationDock* navigation_{};
     CodexController* codex_{};
     QLabel* pageStatus_{};
     QLabel* saveStatus_{};
@@ -116,6 +123,7 @@ private:
     QMenu* recentMenu_{};
     QTimer* recoveryDebounce_{};
     QTimer* recoveryPeriodic_{};
+    QTimer* navigationSearchDebounce_{};
     QPointer<QColorDialog> textColorPicker_;
     QPointer<QColorDialog> highlightColorPicker_;
     bool recoveryOwner_{false};

@@ -504,6 +504,73 @@ Result<void> Table::setCellText(
     return {};
 }
 
+Result<void> Table::replaceCellRange(
+    std::size_t row, std::size_t column, std::size_t start,
+    std::size_t end, const std::u16string& text,
+    const std::optional<CharacterFormat>& inserted_format) {
+    if (row >= rows_ || column >= columns_) {
+        return Error{ErrorCode::invalid_range,
+                     "Table cell coordinates are out of range"};
+    }
+    auto& cell = cells_[row * columns_ + column];
+    if (start > end || end > cell.text.size() ||
+        !isUtf16Boundary(cell.text, start) ||
+        !isUtf16Boundary(cell.text, end)) {
+        return Error{ErrorCode::invalid_range,
+                     "Table cell replacement range is invalid"};
+    }
+    if (!isValidUtf16(text)) {
+        return Error{ErrorCode::invalid_utf16,
+                     "Table cell replacement contains malformed UTF-16"};
+    }
+    if (containsParagraphBreak(text)) {
+        return Error{ErrorCode::invalid_operation,
+                     "Table cell replacement cannot contain a paragraph separator"};
+    }
+    if (containsInlineObjectPlaceholder(text)) {
+        return Error{ErrorCode::invalid_operation,
+                     "Table cell replacement cannot create an orphan inline-object placeholder"};
+    }
+    if (inserted_format) {
+        const auto validation = inserted_format->validate();
+        if (!validation) return validation.error();
+    }
+    if (cell.text.substr(start, end - start) == text) return {};
+
+    const auto old_formats = denseCellFormats(cell);
+    CharacterFormat replacement_format = cell.default_character_format;
+    if (inserted_format) {
+        replacement_format = *inserted_format;
+    } else if (start < old_formats.size()) {
+        replacement_format = old_formats[start];
+    } else if (start > 0 && start - 1 < old_formats.size()) {
+        replacement_format = old_formats[start - 1];
+    }
+
+    std::u16string updated;
+    updated.reserve(cell.text.size() - (end - start) + text.size());
+    updated.append(cell.text, 0, start);
+    updated.append(text);
+    updated.append(cell.text, end, cell.text.size() - end);
+
+    std::vector<CharacterFormat> updated_formats;
+    updated_formats.reserve(updated.size());
+    updated_formats.insert(
+        updated_formats.end(), old_formats.begin(),
+        old_formats.begin() + static_cast<std::ptrdiff_t>(start));
+    updated_formats.insert(updated_formats.end(), text.size(),
+                           replacement_format);
+    updated_formats.insert(
+        updated_formats.end(),
+        old_formats.begin() + static_cast<std::ptrdiff_t>(end),
+        old_formats.end());
+    if (updated.empty() && !cell.text.empty()) {
+        cell.default_character_format = replacement_format;
+    }
+    setCellContent(cell, std::move(updated), std::move(updated_formats));
+    return {};
+}
+
 Result<void> Table::applyCellCharacterFormat(
     std::size_t row, std::size_t column, std::size_t start,
     std::size_t end, const CharacterFormatDelta& delta) {
@@ -1910,6 +1977,16 @@ Result<void> Document::setTableCellText(NodeId table_id, std::size_t row,
     }
     return tables_[*index].setCellText(
         row, column, std::move(text), inserted_format);
+}
+
+Result<void> Document::replaceTableCellRange(
+    NodeId table_id, std::size_t row, std::size_t column,
+    std::size_t start, std::size_t end, const std::u16string& text,
+    const std::optional<CharacterFormat>& inserted_format) {
+    const auto index = tableIndex(table_id);
+    if (!index) return tableMissing(table_id);
+    return tables_[*index].replaceCellRange(
+        row, column, start, end, text, inserted_format);
 }
 
 Result<void> Document::applyTableCellCharacterFormat(

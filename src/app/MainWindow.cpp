@@ -7,6 +7,7 @@
 #include "docxstudio/app/FileFingerprint.h"
 #include "docxstudio/app/FontFamilyPicker.h"
 #include "docxstudio/app/ListPropertiesDialog.h"
+#include "docxstudio/app/NavigationDock.h"
 #include "docxstudio/app/OwlDocsIcon.h"
 #include "docxstudio/app/RasterDecoder.h"
 #include "docxstudio/app/RecoveryCodec.h"
@@ -74,6 +75,7 @@
 #include <string_view>
 #include <type_traits>
 #include <variant>
+#include <vector>
 
 namespace docxstudio::app {
 namespace {
@@ -2209,6 +2211,12 @@ struct MainWindow::TabState {
     // must not silently rewrite an already-open document's Normal style or
     // default tab stop on the next formatting/structural save.
     std::optional<ooxml::DocumentDefaults> regenerationDefaults;
+    QString navigationQuery;
+    QString navigationReplacement;
+    bool navigationMatchCase{false};
+    bool navigationWholeWords{false};
+    bool navigationReplaceMode{false};
+    std::vector<DocumentSearchHit> navigationHits;
     bool recovered{false};
 };
 
@@ -2238,6 +2246,104 @@ MainWindow::MainWindow(QWidget* parent)
     layout->addWidget(tabs_, 1);
     setCentralWidget(central);
     connectRibbon();
+
+    navigationSearchDebounce_ = new QTimer(this);
+    navigationSearchDebounce_->setSingleShot(true);
+    navigationSearchDebounce_->setInterval(120);
+    connect(navigationSearchDebounce_, &QTimer::timeout, this,
+            &MainWindow::refreshNavigationResults);
+
+    navigation_ = new NavigationDock(this);
+    addDockWidget(Qt::LeftDockWidgetArea, navigation_);
+    navigation_->hide();
+    auto* navigationAction = commands_.action(QStringLiteral("view.navigation"));
+    connect(navigation_, &QDockWidget::visibilityChanged, navigationAction,
+            [navigationAction](bool visible) {
+        const QSignalBlocker blocker(navigationAction);
+        navigationAction->setChecked(visible);
+    });
+    connect(navigation_, &NavigationDock::queryChanged, this,
+            [this](const QString& query, bool matchCase, bool wholeWords) {
+        if (auto* state = activeState()) {
+            state->navigationQuery = query;
+            state->navigationMatchCase = matchCase;
+            state->navigationWholeWords = wholeWords;
+            state->navigationHits.clear();
+        }
+        navigationSearchDebounce_->start();
+    });
+    connect(navigation_, &NavigationDock::replacementChanged, this,
+            [this](const QString& replacement) {
+        if (auto* state = activeState()) {
+            state->navigationReplacement = replacement;
+        }
+    });
+    connect(navigation_, &NavigationDock::modeChanged, this,
+            [this](NavigationDock::Mode mode) {
+        if (auto* state = activeState()) {
+            state->navigationReplaceMode = mode == NavigationDock::Mode::replace;
+        }
+    });
+    connect(navigation_, &NavigationDock::nextRequested, this,
+            [this] { navigateSearchResult(true); });
+    connect(navigation_, &NavigationDock::previousRequested, this,
+            [this] { navigateSearchResult(false); });
+    connect(navigation_, &NavigationDock::resultActivated, this,
+            &MainWindow::activateNavigationResult);
+    connect(navigation_, &NavigationDock::replaceRequested, this,
+            [this](const QString&, const QString& replacement, bool, bool) {
+        auto* canvas = activeCanvas();
+        if (!canvas) return;
+        if (canvas->hasPreview()) {
+            statusBar()->showMessage(
+                tr("Accept or discard the Codex preview before replacing text."),
+                5000);
+            return;
+        }
+        const int index = navigation_->currentResultIndex();
+        const auto options = DocumentSearchOptions{
+            navigation_->matchCase(), navigation_->wholeWords()};
+        const auto hits = canvas->searchHits(navigation_->query(), options);
+        if (index < 0 || static_cast<std::size_t>(index) >= hits.size() ||
+            !canvas->replaceSearchHit(
+                hits[static_cast<std::size_t>(index)], replacement)) {
+            statusBar()->showMessage(tr("The selected match is no longer available."),
+                                     3500);
+            refreshNavigationResults();
+            return;
+        }
+        // Search from the resulting caret, not from the old presentation row:
+        // replacements that still contain the query must advance, and
+        // replacing the final match must wrap to the first remaining match.
+        static_cast<void>(canvas->findNextHit(
+            navigation_->query(), options));
+        refreshNavigationResults();
+    });
+    connect(navigation_, &NavigationDock::replaceAllRequested, this,
+            [this](const QString& query, const QString& replacement,
+                   bool matchCase, bool wholeWords) {
+        auto* canvas = activeCanvas();
+        if (!canvas) return;
+        if (canvas->hasPreview()) {
+            statusBar()->showMessage(
+                tr("Accept or discard the Codex preview before replacing text."),
+                5000);
+            return;
+        }
+        const int count = canvas->replaceAllMatches(
+            query, replacement,
+            DocumentSearchOptions{matchCase, wholeWords});
+        statusBar()->showMessage(
+            count == 1 ? tr("Replaced 1 match")
+                       : tr("Replaced %1 matches").arg(count),
+            4000);
+        refreshNavigationResults();
+    });
+    connect(navigation_, &NavigationDock::dismissRequested, this, [this] {
+        if (auto* canvas = activeCanvas()) {
+            canvas->setFocus(Qt::ShortcutFocusReason);
+        }
+    });
 
     chat_ = new ChatDock(this);
     addDockWidget(Qt::RightDockWidgetArea, chat_);
@@ -2446,6 +2552,7 @@ MainWindow::MainWindow(QWidget* parent)
         if (highlightColorPicker_) delete highlightColorPicker_.data();
         updateWindowTitle();
         loadChatForActiveDocument();
+        loadNavigationForActiveDocument();
         if (auto* canvas = activeCanvas()) {
             synchronizeZoomControls(canvas);
             ribbon_->setFontFamily(canvas->currentFontFamily());
@@ -2503,7 +2610,16 @@ void MainWindow::registerCommands() {
         [this] {
             if (activeCanvas()) activeCanvas()->pasteTextOnly();
         });
-    add("edit.find", tr("Find and Replace…"), QKeySequence::Find, [this] { showFindReplace(); });
+    add("edit.find", tr("Find"), QKeySequence::Find,
+        [this] { showFindReplace(false); });
+    add("edit.replace", tr("Replace"), QKeySequence::Replace,
+        [this] { showFindReplace(true); });
+    add("edit.findNext", tr("Find Next"),
+        QKeySequence(QStringLiteral("F3")),
+        [this] { navigateSearchResult(true); });
+    add("edit.findPrevious", tr("Find Previous"),
+        QKeySequence(QStringLiteral("Shift+F3")),
+        [this] { navigateSearchResult(false); });
     add("edit.commandPalette", tr("Command Palette…"), QKeySequence(QStringLiteral("Ctrl+Shift+P")),
         [this] { showCommandPalette(); });
     add("format.bold", tr("Bold"), QKeySequence::Bold, [this] { if (activeCanvas()) activeCanvas()->toggleBold(); }, true);
@@ -2680,7 +2796,15 @@ void MainWindow::registerCommands() {
     add("review.acceptChange", tr("Accept"), QKeySequence(), [] {});
     add("review.rejectChange", tr("Reject"), QKeySequence(), [] {});
     add("review.compatibility", tr("Compatibility Report"), QKeySequence(), [this] { showCompatibilityReport(); });
-    add("view.navigation", tr("Navigation"), QKeySequence(), [] {}, true);
+    add("view.navigation", tr("Navigation"), QKeySequence(), [this] {
+        if (!navigation_) return;
+        const auto* action = commands_.action(QStringLiteral("view.navigation"));
+        navigation_->setVisible(action && action->isChecked());
+        if (navigation_->isVisible()) {
+            refreshNavigationResults();
+            navigation_->focusQuery(false);
+        }
+    }, true);
     add("view.ruler", tr("Ruler"), QKeySequence(), [] {}, true);
     add("view.pageWidth", tr("Page Width"), QKeySequence(), [this] { if (activeCanvas()) activeCanvas()->setZoomPercent(125); });
     add("codex.toggle", tr("Codex Chat"), QKeySequence(QStringLiteral("Ctrl+Alt+C")), [this] { chat_->setVisible(!chat_->isVisible()); }, true);
@@ -2747,7 +2871,7 @@ void MainWindow::registerCommands() {
              "layout.orientation", "layout.columns", "layout.lineSpacing",
              "layout.paragraphSpacing", "review.spelling", "review.comment",
              "review.trackChanges", "review.acceptChange", "review.rejectChange",
-             "review.compatibility", "view.navigation", "view.ruler",
+             "review.compatibility", "view.ruler",
              "view.pageWidth"}) {
         auto* action = commands_.action(QString::fromLatin1(id));
         if (!action) continue;
@@ -2778,6 +2902,7 @@ void MainWindow::buildMenus() {
     auto* edit = menuBar()->addMenu(tr("&Edit"));
     for (const auto* id : {"edit.undo", "edit.redo", "edit.cut", "edit.copy",
                            "edit.paste", "edit.pasteTextOnly", "edit.find",
+                           "edit.replace", "edit.findNext", "edit.findPrevious",
                            "edit.commandPalette"})
         edit->addAction(commands_.action(QString::fromLatin1(id)));
     auto* insert = menuBar()->addMenu(tr("&Insert"));
@@ -2787,6 +2912,9 @@ void MainWindow::buildMenus() {
     review->addAction(commands_.action("review.spelling"));
     review->addAction(commands_.action("review.compatibility"));
     auto* view = menuBar()->addMenu(tr("&View"));
+    view->addAction(commands_.action("view.navigation"));
+    view->addAction(commands_.action("view.pageWidth"));
+    view->addSeparator();
     view->addAction(commands_.action("codex.toggle"));
 }
 
@@ -3009,6 +3137,27 @@ DocumentCanvas* MainWindow::createDocumentTab(core::Document document,
     connect(canvas, &DocumentCanvas::documentChanged, this, [this, canvas] {
         updateTabTitle(canvas);
         recoveryDebounce_->start();
+        if (canvas == activeCanvas() && navigation_->isVisible()) {
+            if (auto* tabState = stateFor(canvas)) {
+                tabState->navigationHits.clear();
+            }
+            navigation_->clearSearchResults();
+            navigationSearchDebounce_->start();
+        }
+    });
+    connect(canvas, &DocumentCanvas::previewStateChanged, this,
+            [this, canvas](bool active) {
+        if (canvas != activeCanvas()) return;
+        navigation_->setReplacementLocked(active);
+        if (!navigation_->isVisible()) return;
+        if (auto* tabState = stateFor(canvas)) {
+            tabState->navigationHits.clear();
+        }
+        navigation_->clearSearchResults();
+        // Preview creation and dismissal replace the complete visible search
+        // corpus. Refresh immediately so no live-branch row remains actionable
+        // against a preview (or vice versa).
+        refreshNavigationResults();
     });
     connect(canvas, &DocumentCanvas::cursorFormatChanged, this,
             [this](const QString& family, double points, const QColor& textColor) {
@@ -3046,6 +3195,7 @@ DocumentCanvas* MainWindow::createDocumentTab(core::Document document,
             ribbon_->setPictureContext(
                 pictureLayout.has_value(),
                 pictureLayout.value_or(core::ImageLayout{}).placement);
+            synchronizeNavigationSelection();
         }
     });
     connect(canvas, &DocumentCanvas::listPropertiesRequested,
@@ -3070,6 +3220,7 @@ DocumentCanvas* MainWindow::createDocumentTab(core::Document document,
         pictureLayout.has_value(),
         pictureLayout.value_or(core::ImageLayout{}).placement);
     synchronizeZoomControls(canvas);
+    loadNavigationForActiveDocument();
     canvas->refreshCursorFormat();
     canvas->setFocus();
     updateWindowTitle();
@@ -3560,17 +3711,170 @@ void MainWindow::printDocument() {
     statusBar()->showMessage(tr("Print job sent"), 5000);
 }
 
-void MainWindow::showFindReplace() {
-    auto* canvas = activeCanvas(); if (!canvas) return;
-    QDialog dialog(this); dialog.setWindowTitle(tr("Find and Replace"));
-    QFormLayout layout(&dialog); QLineEdit find; QLineEdit replacement;
-    layout.addRow(tr("Find:"), &find); layout.addRow(tr("Replace with:"), &replacement);
-    QDialogButtonBox buttons; auto* next = buttons.addButton(tr("Find Next"), QDialogButtonBox::ActionRole);
-    auto* replaceAll = buttons.addButton(tr("Replace All"), QDialogButtonBox::ActionRole);
-    buttons.addButton(QDialogButtonBox::Close); layout.addWidget(&buttons);
-    connect(next, &QPushButton::clicked, &dialog, [&] { if (!canvas->findNext(find.text())) statusBar()->showMessage(tr("No match"), 2500); });
-    connect(replaceAll, &QPushButton::clicked, &dialog, [&] { statusBar()->showMessage(tr("Replaced %1 matches").arg(canvas->replaceAll(find.text(), replacement.text())), 4000); });
-    connect(&buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject); dialog.exec();
+void MainWindow::showFindReplace(bool replaceMode) {
+    if (!activeCanvas() || !navigation_) return;
+    if (auto* state = activeState()) {
+        state->navigationReplaceMode = replaceMode;
+    }
+    navigation_->setMode(replaceMode ? NavigationDock::Mode::replace
+                                     : NavigationDock::Mode::find);
+    navigation_->show();
+    navigation_->raise();
+    refreshNavigationResults();
+    navigation_->focusQuery();
+}
+
+void MainWindow::loadNavigationForActiveDocument() {
+    if (!navigation_) return;
+    const QSignalBlocker blocker(navigation_);
+    if (const auto* state = activeState()) {
+        navigation_->setMode(
+            state->navigationReplaceMode ? NavigationDock::Mode::replace
+                                         : NavigationDock::Mode::find);
+        navigation_->setQuery(state->navigationQuery);
+        navigation_->setReplacement(state->navigationReplacement);
+        navigation_->setMatchCase(state->navigationMatchCase);
+        navigation_->setWholeWords(state->navigationWholeWords);
+    } else {
+        navigation_->setMode(NavigationDock::Mode::find);
+        navigation_->setQuery({});
+        navigation_->setReplacement({});
+        navigation_->setMatchCase(false);
+        navigation_->setWholeWords(false);
+    }
+    refreshNavigationResults();
+}
+
+void MainWindow::refreshNavigationResults() {
+    if (navigationSearchDebounce_) navigationSearchDebounce_->stop();
+    auto* canvas = activeCanvas();
+    if (!navigation_ || !canvas) {
+        if (navigation_) navigation_->clearSearchResults();
+        return;
+    }
+    navigation_->setReplacementLocked(canvas->hasPreview());
+    // A remembered per-document query must not turn every keystroke into a
+    // whole-document scan after the user closes the modeless pane. Reopening
+    // it triggers a fresh search through visibilityChanged.
+    if (!navigation_->isVisible()) return;
+    const QString query = navigation_->query();
+    if (query.isEmpty()) {
+        if (auto* state = activeState()) state->navigationHits.clear();
+        navigation_->clearSearchResults();
+        return;
+    }
+
+    const auto matches = canvas->searchMatches(
+        query, DocumentSearchOptions{navigation_->matchCase(),
+                                     navigation_->wholeWords()});
+    auto* state = activeState();
+    if (state) {
+        state->navigationHits.clear();
+        state->navigationHits.reserve(matches.size());
+        for (const auto& match : matches) {
+            state->navigationHits.push_back(match.hit);
+        }
+    }
+    const auto current = canvas->currentSearchHit();
+    QList<NavigationResult> results;
+    results.reserve(static_cast<qsizetype>(matches.size()));
+    int currentIndex = -1;
+
+    const auto snippetFor = [](const QString& text, std::size_t startOffset,
+                               std::size_t endOffset) {
+        constexpr qsizetype context = 36;
+        const auto start = static_cast<qsizetype>(startOffset);
+        const auto end = static_cast<qsizetype>(endOffset);
+        const qsizetype snippetStart = std::max<qsizetype>(0, start - context);
+        const qsizetype snippetEnd = std::min<qsizetype>(
+            text.size(), end + context);
+        QString snippet = text.mid(snippetStart, snippetEnd - snippetStart);
+        snippet.replace(QLatin1Char('\n'), QLatin1Char(' '));
+        snippet.replace(QLatin1Char('\r'), QLatin1Char(' '));
+        if (snippetStart > 0) snippet.prepend(QChar(0x2026));
+        if (snippetEnd < text.size()) snippet.append(QChar(0x2026));
+        return snippet;
+    };
+
+    for (const auto& match : matches) {
+        const auto& hit = match.hit;
+        NavigationResult result;
+        if (const auto* paragraph =
+                std::get_if<BodyParagraphSearchHit>(&hit.target)) {
+            result.title = tr("Paragraph %1").arg(
+                static_cast<qulonglong>(match.containerOrdinal));
+            result.snippet = snippetFor(
+                match.containerText, paragraph->startUtf16,
+                paragraph->endUtf16);
+        } else {
+            const auto& cell = std::get<TableCellSearchHit>(hit.target);
+            result.title = tr("Table %1, row %2, column %3")
+                               .arg(static_cast<qulonglong>(
+                                   match.containerOrdinal))
+                               .arg(static_cast<qulonglong>(cell.row + 1))
+                               .arg(static_cast<qulonglong>(cell.column + 1));
+            result.snippet = snippetFor(
+                match.containerText, cell.startUtf16, cell.endUtf16);
+        }
+        result.accessibleText = result.title + QStringLiteral(": ") +
+                                result.snippet;
+        if (current && *current == hit) {
+            currentIndex = static_cast<int>(results.size());
+        }
+        results.push_back(std::move(result));
+    }
+    navigation_->setSearchResults(results, currentIndex);
+}
+
+void MainWindow::synchronizeNavigationSelection() {
+    if (!navigation_ || !navigation_->isVisible()) return;
+    const auto* state = activeState();
+    const auto* canvas = activeCanvas();
+    if (!state || !canvas || state->navigationHits.empty()) {
+        navigation_->setCurrentResultIndex(-1);
+        return;
+    }
+    const auto current = canvas->currentSearchHit();
+    int currentIndex = -1;
+    if (current) {
+        const auto found = std::find(
+            state->navigationHits.begin(), state->navigationHits.end(),
+            *current);
+        if (found != state->navigationHits.end()) {
+            currentIndex = static_cast<int>(std::distance(
+                state->navigationHits.begin(), found));
+        }
+    }
+    navigation_->setCurrentResultIndex(currentIndex);
+}
+
+void MainWindow::activateNavigationResult(int index) {
+    auto* canvas = activeCanvas();
+    const auto* state = activeState();
+    if (!navigation_ || !canvas || !state || index < 0) return;
+    if (static_cast<std::size_t>(index) >= state->navigationHits.size() ||
+        !canvas->activateSearchHit(
+            state->navigationHits[static_cast<std::size_t>(index)])) {
+        refreshNavigationResults();
+        return;
+    }
+    navigation_->setCurrentResultIndex(index);
+}
+
+void MainWindow::navigateSearchResult(bool forward) {
+    auto* canvas = activeCanvas();
+    if (!navigation_ || !canvas) return;
+    const auto options = DocumentSearchOptions{
+        navigation_->matchCase(), navigation_->wholeWords()};
+    const auto activated = forward
+        ? canvas->findNextHit(navigation_->query(), options)
+        : canvas->findPreviousHit(navigation_->query(), options);
+    if (!activated) {
+        statusBar()->showMessage(tr("No match"), 2500);
+        refreshNavigationResults();
+        return;
+    }
+    refreshNavigationResults();
 }
 
 void MainWindow::showCommandPalette() {
