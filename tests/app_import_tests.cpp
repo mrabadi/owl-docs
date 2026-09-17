@@ -16,11 +16,13 @@
 
 #include <zip.h>
 
+#include <algorithm>
 #include <cstdlib>
 #include <cmath>
 #include <cstring>
 #include <filesystem>
 #include <iostream>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -184,6 +186,281 @@ void createNativeStyleAndNumberingFixture(const QString& path) {
          {"word/_rels/document.xml.rels", relationships}});
 }
 
+void createStyleProvenanceFixture(const QString& path) {
+    docxstudio::ooxml::NewParagraph seed;
+    seed.runs.push_back({"seed", {}});
+    const auto initial = docxstudio::ooxml::DocxDocument::writeNew(
+        std::filesystem::path(QFile::encodeName(path).constData()), {seed});
+    check(static_cast<bool>(initial),
+          "could not create style-provenance fixture package");
+
+    const std::string document =
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+        "<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">"
+        "<w:body>"
+        "<w:p><w:pPr><w:pStyle w:val=\"Heading1\"/></w:pPr>"
+        "<w:r><w:t xml:space=\"preserve\">Inherited </w:t></w:r>"
+        "<w:r><w:rPr><w:color w:val=\"CC0000\"/></w:rPr>"
+        "<w:t>Direct</w:t></w:r></w:p>"
+        "<w:p><w:pPr><w:pStyle w:val=\"FirmBlue\"/></w:pPr>"
+        "<w:r><w:t xml:space=\"preserve\">Inherited </w:t></w:r>"
+        "<w:r><w:rPr><w:color w:val=\"CC0000\"/></w:rPr>"
+        "<w:t>Direct</w:t></w:r></w:p>"
+        "<w:sectPr/></w:body></w:document>";
+    const std::string styles =
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+        "<w:styles xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">"
+        "<w:docDefaults><w:rPrDefault><w:rPr>"
+        "<w:rFonts w:ascii=\"Carlito\" w:hAnsi=\"Carlito\"/>"
+        "<w:sz w:val=\"22\"/></w:rPr></w:rPrDefault></w:docDefaults>"
+        "<w:style w:type=\"paragraph\" w:default=\"1\" w:styleId=\"Normal\">"
+        "<w:name w:val=\"Normal\"/><w:rPr><w:b w:val=\"0\"/>"
+        "<w:color w:val=\"000000\"/></w:rPr></w:style>"
+        "<w:style w:type=\"paragraph\" w:styleId=\"Heading1\">"
+        "<w:name w:val=\"Foreign Heading 1\"/><w:basedOn w:val=\"Normal\"/>"
+        "<w:rPr><w:b/><w:color w:val=\"336699\"/></w:rPr></w:style>"
+        "<w:style w:type=\"paragraph\" w:styleId=\"FirmBlue\">"
+        "<w:name w:val=\"Firm Blue\"/><w:basedOn w:val=\"Normal\"/>"
+        "<w:rPr><w:b/><w:color w:val=\"336699\"/></w:rPr></w:style>"
+        "</w:styles>";
+    replacePackageMembers(
+        path,
+        {{"word/document.xml", document}, {"word/styles.xml", styles}});
+}
+
+void createForeignBuiltInStyleFixture(const QString& path) {
+    createStyleProvenanceFixture(path);
+    const std::string document =
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+        "<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">"
+        "<w:body>"
+        "<w:p><w:pPr><w:pStyle w:val=\"Heading1\"/></w:pPr>"
+        "<w:r><w:t xml:space=\"preserve\">Inherited </w:t></w:r>"
+        "<w:r><w:rPr><w:color w:val=\"CC0000\"/></w:rPr>"
+        "<w:t>Direct</w:t></w:r></w:p>"
+        "<w:sectPr/></w:body></w:document>";
+    replacePackageMembers(path, {{"word/document.xml", document}});
+}
+
+void createEmptyForeignBuiltInStyleFixture(const QString& path,
+                                           bool directMarkOverrides) {
+    createStyleProvenanceFixture(path);
+    const std::string directMark = directMarkOverrides
+        ? "<w:rPr><w:b w:val=\"0\"/><w:i w:val=\"0\"/>"
+          "<w:color w:val=\"CC0000\"/></w:rPr>"
+        : "";
+    const std::string document =
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+        "<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">"
+        "<w:body><w:p><w:pPr><w:pStyle w:val=\"Heading1\"/>" +
+        directMark +
+        "</w:pPr></w:p><w:sectPr/></w:body></w:document>";
+    const std::string styles =
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+        "<w:styles xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">"
+        "<w:docDefaults><w:rPrDefault><w:rPr>"
+        "<w:rFonts w:ascii=\"Carlito\" w:hAnsi=\"Carlito\"/>"
+        "<w:sz w:val=\"22\"/></w:rPr></w:rPrDefault></w:docDefaults>"
+        "<w:style w:type=\"paragraph\" w:default=\"1\" w:styleId=\"Normal\">"
+        "<w:name w:val=\"Normal\"/><w:rPr><w:b w:val=\"0\"/>"
+        "<w:color w:val=\"000000\"/></w:rPr></w:style>"
+        "<w:style w:type=\"paragraph\" w:styleId=\"Heading1\">"
+        "<w:name w:val=\"Foreign Heading 1\"/><w:basedOn w:val=\"Normal\"/>"
+        "<w:pPr><w:rPr><w:i/></w:rPr></w:pPr>"
+        "<w:rPr><w:b/><w:color w:val=\"336699\"/></w:rPr></w:style>"
+        "</w:styles>";
+    replacePackageMembers(
+        path,
+        {{"word/document.xml", document}, {"word/styles.xml", styles}});
+}
+
+docxstudio::app::DocumentCanvas* canvasWithText(
+    docxstudio::app::MainWindow& window, const QString& text);
+
+void testImportedStyleProvenance(QTemporaryDir& temporary) {
+    const QString path = temporary.filePath(
+        QStringLiteral("style-provenance.docx"));
+    createStyleProvenanceFixture(path);
+    docxstudio::app::MainWindow window;
+    check(window.openPath(path),
+          "desktop shell could not open style-provenance fixture");
+    docxstudio::app::DocumentCanvas* canvas = nullptr;
+    for (auto* candidate :
+         window.findChildren<docxstudio::app::DocumentCanvas*>()) {
+        if (candidate->snapshot().document.paragraphs().size() == 2) {
+            canvas = candidate;
+            break;
+        }
+    }
+    check(canvas != nullptr,
+          "style-provenance fixture did not map to the editor");
+    const auto imported = canvas->snapshot();
+    for (const auto& paragraph : imported.document.paragraphs()) {
+        check(paragraph.styleProvenance().has_value() &&
+                  paragraph.characterFormatAt(1).foreground_argb ==
+                      0xff336699U &&
+                  paragraph.characterFormatAt(11).foreground_argb ==
+                      0xffcc0000U,
+              "import lost a source style baseline or direct red override");
+    }
+    check(imported.document.paragraphs()[0].styleId() ==
+                  std::optional<std::string>{"Heading1"} &&
+              imported.document.paragraphs()[1].styleId() ==
+                  std::optional<std::string>{"FirmBlue"},
+          "style-provenance fixture lost built-in/custom identities");
+
+    canvas->selectAll();
+    canvas->applyParagraphStyle(QStringLiteral("Normal"));
+    const auto normalized = canvas->snapshot();
+    for (const auto& paragraph : normalized.document.paragraphs()) {
+        check(paragraph.styleId() ==
+                      std::optional<std::string>{"Normal"} &&
+                  paragraph.characterFormatAt(1).foreground_argb ==
+                      0xff000000U &&
+                  paragraph.characterFormatAt(1).bold == false &&
+                  paragraph.characterFormatAt(11).foreground_argb ==
+                      0xffcc0000U &&
+                  paragraph.characterFormatAt(11).bold == false &&
+                  paragraph.styleProvenance() &&
+                  paragraph.styleProvenance()
+                          ->inherited_character_format.foreground_argb ==
+                      0xff000000U &&
+                  paragraph.styleProvenance()
+                          ->character_overrides.size() == 1 &&
+                  paragraph.styleProvenance()
+                          ->character_overrides.front().start == 10 &&
+                  paragraph.styleProvenance()
+                          ->character_overrides.front().end == 16 &&
+                  paragraph.styleProvenance()
+                          ->character_overrides.front()
+                          .properties.foreground_argb,
+              "Normal failed to replace inherited source formatting while preserving a direct override");
+    }
+}
+
+void testForeignBuiltInSimplifiedSavePreservesAppearance(
+    QTemporaryDir& temporary) {
+    const QString sourcePath = temporary.filePath(
+        QStringLiteral("foreign-heading-source.docx"));
+    const QString simplifiedPath = temporary.filePath(
+        QStringLiteral("foreign-heading-simplified.docx"));
+    createForeignBuiltInStyleFixture(sourcePath);
+
+    docxstudio::app::MainWindow imported;
+    check(imported.openPath(sourcePath),
+          "could not open foreign built-in style fixture");
+    auto* canvas = canvasWithText(imported, QStringLiteral("Inherited Direct"));
+    auto* saveAs = imported.findChild<QAction*>(
+        QStringLiteral("file.saveAs"));
+    check(canvas && saveAs,
+          "could not reach foreign built-in style Save As controls");
+    const auto before = canvas->snapshot();
+    const auto& sourceParagraph = before.document.paragraphs().front();
+    check(sourceParagraph.styleId() ==
+                  std::optional<std::string>{"Heading1"} &&
+              sourceParagraph.characterFormatAt(1).font_size_half_points ==
+                  22 &&
+              sourceParagraph.characterFormatAt(1).foreground_argb ==
+                  0xff336699U &&
+              sourceParagraph.characterFormatAt(1).bold == true &&
+              sourceParagraph.characterFormatAt(11).foreground_argb ==
+                  0xffcc0000U &&
+              sourceParagraph.format().space_before_emu == std::nullopt &&
+              sourceParagraph.format().space_after_emu == std::nullopt,
+          "foreign built-in style fixture did not expose its source appearance");
+
+    // Imported packages only regenerate after a supported structural or
+    // formatting edit.  A harmless page-layout change deliberately exercises
+    // the explicit simplified-copy path rather than the byte-copy Save As.
+    canvas->setMarginsPoints(
+        canvas->marginTopPoints() + 1.0, canvas->marginRightPoints(),
+        canvas->marginBottomPoints(), canvas->marginLeftPoints());
+    check(canvas->hasNonTextChanges(),
+          "foreign style fixture was not marked for structural regeneration");
+
+    bool selectedDestination = false;
+    bool confirmedSimplification = false;
+    bool unexpectedDialog = false;
+    QTimer monitor;
+    monitor.setInterval(1);
+    QObject::connect(&monitor, &QTimer::timeout, &imported, [&] {
+        for (auto* widget : QApplication::topLevelWidgets()) {
+            if (auto* dialog = qobject_cast<QFileDialog*>(widget);
+                dialog && dialog->isVisible() && !selectedDestination) {
+                dialog->selectFile(simplifiedPath);
+                selectedDestination = true;
+                check(QMetaObject::invokeMethod(
+                          dialog, "accept", Qt::DirectConnection),
+                      "could not accept foreign style Save As destination");
+                continue;
+            }
+            auto* box = qobject_cast<QMessageBox*>(widget);
+            if (!box || !box->isVisible()) continue;
+            if (box->windowTitle() ==
+                QStringLiteral("Compatibility warning")) {
+                confirmedSimplification = true;
+                box->done(QMessageBox::Yes);
+            } else {
+                unexpectedDialog = true;
+                box->accept();
+            }
+        }
+    });
+    monitor.start();
+    saveAs->trigger();
+    monitor.stop();
+    check(selectedDestination && confirmedSimplification &&
+              !unexpectedDialog && QFileInfo::exists(simplifiedPath) &&
+              !canvas->isModified(),
+          "foreign style fixture did not save as an explicit simplified copy");
+
+    docxstudio::ooxml::Error parsedError;
+    auto parsed = docxstudio::ooxml::DocxDocument::open(
+        std::filesystem::path(
+            QFile::encodeName(simplifiedPath).constData()),
+        &parsedError);
+    check(parsed && parsed->paragraphs().size() == 1 &&
+              parsed->paragraphs()[0].style_id ==
+                  std::optional<std::string>{"Heading1"} &&
+              parsed->paragraphs()[0].style_provenance &&
+              parsed->paragraphs()[0]
+                      .style_provenance->direct_space_before_twips == 0 &&
+              parsed->paragraphs()[0]
+                      .style_provenance->direct_space_after_twips == 0 &&
+              parsed->paragraphs()[0].runs.size() == 2 &&
+              parsed->paragraphs()[0].runs[0]
+                      .paragraph_style_overrides.font_size_half_points == 22 &&
+              parsed->paragraphs()[0].runs[0]
+                      .paragraph_style_overrides.foreground_rgb == 0x00336699U &&
+              parsed->paragraphs()[0].runs[1]
+                      .paragraph_style_overrides.font_size_half_points == 22 &&
+              parsed->paragraphs()[0].runs[1]
+                      .paragraph_style_overrides.foreground_rgb == 0x00cc0000U,
+          "simplified foreign Heading 1 did not serialize differences from Owl's generated baseline");
+
+    docxstudio::app::MainWindow reopened;
+    check(reopened.openPath(simplifiedPath),
+          "could not reopen simplified foreign built-in style fixture");
+    auto* reopenedCanvas = canvasWithText(
+        reopened, QStringLiteral("Inherited Direct"));
+    check(reopenedCanvas != nullptr,
+          "could not reach reopened simplified foreign style fixture");
+    const auto after = reopenedCanvas->snapshot();
+    const auto& reopenedParagraph = after.document.paragraphs().front();
+    check(reopenedParagraph.styleId() ==
+                  std::optional<std::string>{"Heading1"} &&
+              reopenedParagraph.characterFormatAt(1).font_size_half_points ==
+                  22 &&
+              reopenedParagraph.characterFormatAt(1).foreground_argb ==
+                  0xff336699U &&
+              reopenedParagraph.characterFormatAt(1).bold == true &&
+              reopenedParagraph.characterFormatAt(11).foreground_argb ==
+                  0xffcc0000U &&
+              reopenedParagraph.format().space_before_emu == 0 &&
+              reopenedParagraph.format().space_after_emu == 0,
+          "simplified foreign built-in style changed appearance after reopen");
+}
+
 docxstudio::app::DocumentCanvas* canvasWithText(
     docxstudio::app::MainWindow& window, const QString& text) {
     for (auto* canvas :
@@ -191,6 +468,284 @@ docxstudio::app::DocumentCanvas* canvasWithText(
         if (textOf(*canvas) == text) return canvas;
     }
     return nullptr;
+}
+
+docxstudio::app::DocumentCanvas* canvasWithStyle(
+    docxstudio::app::MainWindow& window, const std::string& styleId) {
+    for (auto* canvas :
+         window.findChildren<docxstudio::app::DocumentCanvas*>()) {
+        const auto snapshot = canvas->snapshot();
+        if (snapshot.document.paragraphs().size() == 1 &&
+            snapshot.document.paragraphs().front().styleId() == styleId) {
+            return canvas;
+        }
+    }
+    return nullptr;
+}
+
+void saveAsForTest(docxstudio::app::MainWindow& window, QAction& saveAs,
+                   const QString& path, bool expectSimplification) {
+    bool selectedDestination = false;
+    bool confirmedSimplification = false;
+    bool unexpectedDialog = false;
+    QTimer monitor;
+    monitor.setInterval(1);
+    QObject::connect(&monitor, &QTimer::timeout, &window, [&] {
+        for (auto* widget : QApplication::topLevelWidgets()) {
+            if (auto* dialog = qobject_cast<QFileDialog*>(widget);
+                dialog && dialog->isVisible() && !selectedDestination) {
+                dialog->selectFile(path);
+                selectedDestination = true;
+                check(QMetaObject::invokeMethod(
+                          dialog, "accept", Qt::DirectConnection),
+                      "could not accept styled-empty Save As destination");
+                continue;
+            }
+            auto* box = qobject_cast<QMessageBox*>(widget);
+            if (!box || !box->isVisible()) continue;
+            if (box->windowTitle() ==
+                QStringLiteral("Compatibility warning")) {
+                confirmedSimplification = true;
+                box->done(QMessageBox::Yes);
+            } else {
+                unexpectedDialog = true;
+                box->accept();
+            }
+        }
+    });
+    monitor.start();
+    saveAs.trigger();
+    monitor.stop();
+    check(selectedDestination &&
+              confirmedSimplification == expectSimplification &&
+              !unexpectedDialog && QFileInfo::exists(path),
+          "styled-empty document did not complete the expected Save As path");
+}
+
+void testImportedEmptyStyledParagraphMarkLifecycle(
+    QTemporaryDir& temporary) {
+    const QString inheritedPath = temporary.filePath(
+        QStringLiteral("foreign-empty-heading-inherited.docx"));
+    createEmptyForeignBuiltInStyleFixture(inheritedPath, false);
+
+    // Opening and typing directly into an empty styled paragraph must use the
+    // resolved source style baseline, including style-chain pPr/rPr.
+    docxstudio::app::MainWindow typedSource;
+    check(typedSource.openPath(inheritedPath),
+          "could not open inherited empty Heading 1 fixture");
+    auto* typedCanvas = canvasWithStyle(typedSource, "Heading1");
+    check(typedCanvas != nullptr,
+          "could not reach inherited empty Heading 1 canvas");
+    const auto inheritedEmpty = typedCanvas->snapshot();
+    const auto& inheritedParagraph =
+        inheritedEmpty.document.paragraphs().front();
+    const auto& inheritedMark =
+        inheritedParagraph.paragraphMarkCharacterFormat();
+    check(inheritedParagraph.text().empty() &&
+              inheritedMark.font_size_half_points == 22 &&
+              inheritedMark.bold == true && inheritedMark.italic == true &&
+              inheritedMark.foreground_argb == 0xff336699U &&
+              inheritedParagraph.styleProvenance() &&
+              inheritedParagraph.styleProvenance()
+                      ->inherited_character_format.italic == std::nullopt &&
+              inheritedParagraph.styleProvenance()
+                      ->inherited_paragraph_mark_character_format.italic ==
+                  true,
+          "empty Heading 1 did not resolve a distinct inherited mark baseline");
+    typedCanvas->insertText(QStringLiteral("Inherited typing"));
+    const auto typed = typedCanvas->snapshot();
+    check(typed.document.paragraphs().front()
+                  .characterFormatAt(1) == inheritedMark,
+          "typing into an imported empty Heading 1 used editor defaults");
+
+    // A style transition while still empty replaces inherited mark values;
+    // they must not be mistaken for direct formatting.
+    docxstudio::app::MainWindow transitionedEmpty;
+    check(transitionedEmpty.openPath(inheritedPath),
+          "could not reopen inherited empty Heading 1 fixture");
+    auto* transitionedCanvas = canvasWithStyle(
+        transitionedEmpty, "Heading1");
+    check(transitionedCanvas != nullptr,
+          "could not reach empty Heading 1 for a style transition");
+    transitionedCanvas->applyParagraphStyle(QStringLiteral("Heading2"));
+    const auto transitioned = transitionedCanvas->snapshot();
+    const auto& transitionedParagraph =
+        transitioned.document.paragraphs().front();
+    const auto& transitionedMark =
+        transitionedParagraph.paragraphMarkCharacterFormat();
+    check(transitionedParagraph.text().empty() &&
+              transitionedParagraph.styleId() ==
+                  std::optional<std::string>{"Heading2"} &&
+              transitionedMark.font_size_half_points == 26 &&
+              transitionedMark.bold == true &&
+              !transitionedMark.italic.value_or(false) &&
+              transitionedMark.foreground_argb == 0xff77216fU &&
+              transitionedParagraph.styleProvenance() &&
+              transitionedParagraph.styleProvenance()
+                      ->paragraph_mark_overrides.empty(),
+          "empty style transition retained inherited source mark formatting");
+    transitionedCanvas->insertText(QStringLiteral("Transitioned typing"));
+    check(transitionedCanvas->snapshot().document.paragraphs().front()
+                  .characterFormatAt(1) == transitionedMark,
+          "typing after an empty style transition lost the target baseline");
+
+    // Direct pPr/rPr values, including explicit false values, survive a style
+    // transition and a simplified DOCX round trip.
+    const QString directPath = temporary.filePath(
+        QStringLiteral("foreign-empty-heading-direct.docx"));
+    const QString directCopy = temporary.filePath(
+        QStringLiteral("foreign-empty-heading-direct-copy.docx"));
+    createEmptyForeignBuiltInStyleFixture(directPath, true);
+    docxstudio::app::MainWindow direct;
+    check(direct.openPath(directPath),
+          "could not open direct empty Heading 1 fixture");
+    auto* directCanvas = canvasWithStyle(direct, "Heading1");
+    auto* directSaveAs = direct.findChild<QAction*>(
+        QStringLiteral("file.saveAs"));
+    check(directCanvas && directSaveAs,
+          "could not reach direct empty Heading 1 controls");
+    const auto directEmpty = directCanvas->snapshot();
+    const auto& directParagraph = directEmpty.document.paragraphs().front();
+    const auto& directMark = directParagraph.paragraphMarkCharacterFormat();
+    check(directMark.font_size_half_points == 22 &&
+              directMark.bold == false && directMark.italic == false &&
+              directMark.foreground_argb == 0xffcc0000U &&
+              directParagraph.styleProvenance() &&
+              directParagraph.styleProvenance()
+                      ->paragraph_mark_overrides.bold &&
+              directParagraph.styleProvenance()
+                      ->paragraph_mark_overrides.italic &&
+              directParagraph.styleProvenance()
+                      ->paragraph_mark_overrides.foreground_argb,
+          "direct empty paragraph-mark clears/formatting were not imported");
+    directCanvas->insertText(QStringLiteral("Direct typing"));
+    directCanvas->applyParagraphStyle(QStringLiteral("Heading2"));
+    const auto directTransition = directCanvas->snapshot();
+    const auto& directTransitionParagraph =
+        directTransition.document.paragraphs().front();
+    check(directTransitionParagraph.characterFormatAt(1)
+                  .font_size_half_points == 26 &&
+              directTransitionParagraph.characterFormatAt(1).bold == false &&
+              directTransitionParagraph.characterFormatAt(1).italic == false &&
+              directTransitionParagraph.characterFormatAt(1)
+                      .foreground_argb == 0xffcc0000U &&
+              directTransitionParagraph.paragraphMarkCharacterFormat()
+                      .bold == false &&
+              directTransitionParagraph.paragraphMarkCharacterFormat()
+                      .italic == false &&
+              directTransitionParagraph.paragraphMarkCharacterFormat()
+                      .foreground_argb == 0xffcc0000U,
+          "style transition discarded direct paragraph-mark clears/formatting");
+    saveAsForTest(direct, *directSaveAs, directCopy, true);
+    check(!directCanvas->isModified(),
+          "direct empty-style simplified copy remained modified");
+
+    docxstudio::ooxml::Error directError;
+    auto directPackage = docxstudio::ooxml::DocxDocument::open(
+        std::filesystem::path(QFile::encodeName(directCopy).constData()),
+        &directError);
+    check(directPackage && directPackage->paragraphs().size() == 1 &&
+              directPackage->paragraphs()[0].style_id ==
+                  std::optional<std::string>{"Heading2"} &&
+              directPackage->paragraphs()[0].runs.size() == 1 &&
+              directPackage->paragraphs()[0].runs[0]
+                      .paragraph_style_overrides.bold == false &&
+              directPackage->paragraphs()[0].runs[0]
+                      .paragraph_style_overrides.italic == false &&
+              directPackage->paragraphs()[0].runs[0]
+                      .paragraph_style_overrides.foreground_rgb == 0x00cc0000U &&
+              directPackage->paragraphs()[0].style_provenance &&
+              directPackage->paragraphs()[0]
+                      .style_provenance->direct_paragraph_mark_format.bold ==
+                  false &&
+              directPackage->paragraphs()[0]
+                      .style_provenance->direct_paragraph_mark_format.italic ==
+                  false &&
+              directPackage->paragraphs()[0]
+                      .style_provenance->direct_paragraph_mark_format
+                      .foreground_rgb == 0x00cc0000U,
+          "direct paragraph-mark formatting was not native after simplified save");
+
+    docxstudio::app::MainWindow directReopened;
+    check(directReopened.openPath(directCopy),
+          "could not reopen direct paragraph-mark simplified copy");
+    auto* directReopenedCanvas = canvasWithText(
+        directReopened, QStringLiteral("Direct typing"));
+    check(directReopenedCanvas != nullptr,
+          "could not reach reopened direct paragraph-mark copy");
+    const auto directAfter = directReopenedCanvas->snapshot();
+    const auto& directAfterParagraph =
+        directAfter.document.paragraphs().front();
+    check(directAfterParagraph.characterFormatAt(1)
+                  .font_size_half_points == 26 &&
+              directAfterParagraph.characterFormatAt(1).bold == false &&
+              directAfterParagraph.characterFormatAt(1).italic == false &&
+              directAfterParagraph.characterFormatAt(1).foreground_argb ==
+                  0xffcc0000U &&
+              directAfterParagraph.paragraphMarkCharacterFormat().bold ==
+                  false &&
+              directAfterParagraph.paragraphMarkCharacterFormat().italic ==
+                  false &&
+              directAfterParagraph.paragraphMarkCharacterFormat()
+                      .foreground_argb == 0xffcc0000U,
+          "direct paragraph-mark formatting changed after simplified reopen");
+}
+
+void testAuthoredEmptyStyledParagraphRoundTrip(QTemporaryDir& temporary) {
+    const QString path = temporary.filePath(
+        QStringLiteral("authored-empty-heading.docx"));
+    docxstudio::app::MainWindow authored;
+    auto* canvas = authored.findChild<docxstudio::app::DocumentCanvas*>();
+    auto* saveAs = authored.findChild<QAction*>(
+        QStringLiteral("file.saveAs"));
+    check(canvas && saveAs,
+          "could not reach authored empty Heading 1 controls");
+    canvas->applyParagraphStyle(QStringLiteral("Heading1"));
+    const auto authoredEmpty = canvas->snapshot();
+    const auto& authoredParagraph =
+        authoredEmpty.document.paragraphs().front();
+    check(authoredParagraph.text().empty() &&
+              authoredParagraph.styleId() ==
+                  std::optional<std::string>{"Heading1"} &&
+              authoredParagraph.paragraphMarkCharacterFormat()
+                      .font_size_half_points == 32 &&
+              authoredParagraph.paragraphMarkCharacterFormat().bold == true &&
+              authoredParagraph.paragraphMarkCharacterFormat()
+                      .foreground_argb == 0xffe95420U,
+          "authored empty Heading 1 did not establish its insertion baseline");
+    saveAsForTest(authored, *saveAs, path, false);
+    check(!canvas->isModified(),
+          "authored empty Heading 1 remained modified after Save As");
+
+    docxstudio::ooxml::Error error;
+    auto package = docxstudio::ooxml::DocxDocument::open(
+        std::filesystem::path(QFile::encodeName(path).constData()), &error);
+    check(package && package->paragraphs().size() == 1 &&
+              package->paragraphs()[0].style_id ==
+                  std::optional<std::string>{"Heading1"} &&
+              package->paragraphs()[0].style_provenance &&
+              package->paragraphs()[0]
+                      .style_provenance->direct_paragraph_mark_format ==
+                  docxstudio::ooxml::BasicRunFormat{} &&
+              package->paragraphs()[0]
+                      .style_provenance->inherited_paragraph_mark_format ==
+                  package->paragraphs()[0]
+                      .style_provenance->inherited_character_format,
+          "authored empty Heading 1 wrote its inherited mark as direct rPr");
+
+    docxstudio::app::MainWindow reopened;
+    check(reopened.openPath(path),
+          "could not reopen authored empty Heading 1");
+    auto* reopenedCanvas = canvasWithStyle(reopened, "Heading1");
+    check(reopenedCanvas != nullptr,
+          "could not reach reopened authored empty Heading 1");
+    reopenedCanvas->insertText(QStringLiteral("Authored typing"));
+    const auto after = reopenedCanvas->snapshot();
+    const auto& format =
+        after.document.paragraphs().front().characterFormatAt(1);
+    check(format.font_size_half_points == 32 && format.bold == true &&
+              format.foreground_argb == 0xffe95420U,
+          "typing into reopened authored Heading 1 used editor defaults");
 }
 
 void testCanonicalSimpleSaveGuard(QTemporaryDir& temporary) {
@@ -272,7 +827,7 @@ void testCanonicalSimpleSaveGuard(QTemporaryDir& temporary) {
         check(canvas->isModified() && canvas->hasNonTextChanges(),
               "defaults-mismatch formatting edit was not classified correctly");
 
-        bool defaultsMismatchWarning = false;
+        int defaultsMismatchWarnings = 0;
         QTimer defaultsMonitor;
         defaultsMonitor.setInterval(1);
         QObject::connect(
@@ -280,18 +835,43 @@ void testCanonicalSimpleSaveGuard(QTemporaryDir& temporary) {
                 for (auto* widget : QApplication::topLevelWidgets()) {
                     auto* box = qobject_cast<QMessageBox*>(widget);
                     if (!box || !box->isVisible()) continue;
-                    defaultsMismatchWarning = box->text().contains(
-                        QStringLiteral(
-                            "preserves but cannot safely rewrite"));
-                    box->accept();
+                    if (box->windowTitle() ==
+                            QStringLiteral("Compatibility warning") &&
+                        box->text().contains(QStringLiteral(
+                            "preserves but cannot safely rewrite"))) {
+                        ++defaultsMismatchWarnings;
+                        box->done(QMessageBox::Yes);
+                    } else {
+                        box->reject();
+                    }
                 }
             });
         defaultsMonitor.start();
         save->trigger();
         defaultsMonitor.stop();
-        check(defaultsMismatchWarning && canvas->isModified() &&
-                  readFile(path) == beforeDefaultsChange,
-              "changed editor defaults silently rewrote a reopened document");
+        check(defaultsMismatchWarnings == 1 && !canvas->isModified() &&
+                  readFile(path) != beforeDefaultsChange,
+              "confirmed compatibility save did not overwrite the reopened document");
+
+        canvas->selectAll();
+        canvas->toggleUnderline();
+        bool repeatedWarning = false;
+        QTimer repeatMonitor;
+        repeatMonitor.setInterval(1);
+        QObject::connect(
+            &repeatMonitor, &QTimer::timeout, &reopened, [&] {
+                for (auto* widget : QApplication::topLevelWidgets()) {
+                    auto* box = qobject_cast<QMessageBox*>(widget);
+                    if (!box || !box->isVisible()) continue;
+                    repeatedWarning = true;
+                    box->reject();
+                }
+            });
+        repeatMonitor.start();
+        save->trigger();
+        repeatMonitor.stop();
+        check(!repeatedWarning && !canvas->isModified(),
+              "compatibility warning repeated after the confirmed rebuild");
     }
 
     const QString opaquePath = temporary.filePath(
@@ -314,7 +894,7 @@ void testCanonicalSimpleSaveGuard(QTemporaryDir& temporary) {
         canvas->selectAll();
         canvas->toggleItalic();
 
-        bool preservationWarning = false;
+        int preservationWarnings = 0;
         QString warningText;
         QTimer monitor;
         monitor.setInterval(1);
@@ -322,20 +902,381 @@ void testCanonicalSimpleSaveGuard(QTemporaryDir& temporary) {
             for (auto* widget : QApplication::topLevelWidgets()) {
                 auto* box = qobject_cast<QMessageBox*>(widget);
                 if (!box || !box->isVisible()) continue;
-                preservationWarning = true;
-                warningText = box->text();
-                box->accept();
+                if (box->windowTitle() ==
+                    QStringLiteral("Compatibility warning")) {
+                    ++preservationWarnings;
+                    warningText = box->text();
+                    box->done(QMessageBox::Yes);
+                } else {
+                    box->reject();
+                }
             }
         });
         monitor.start();
         save->trigger();
         monitor.stop();
-        check(preservationWarning &&
+        check(preservationWarnings == 1 &&
                   warningText.contains(
                       QStringLiteral("preserves but cannot safely rewrite")) &&
-                  canvas->isModified() && readFile(opaquePath) == opaqueBefore,
-              "opaque imported content bypassed the structural/formatting Save As guard");
+                  !canvas->isModified() &&
+                  readFile(opaquePath) != opaqueBefore,
+              "confirmed opaque-content warning did not permit atomic overwrite");
     }
+}
+
+void testNativeParagraphStyleRoundTrip(QTemporaryDir& temporary) {
+    const QString path = temporary.filePath(
+        QStringLiteral("owl-native-paragraph-styles.docx"));
+    {
+        docxstudio::app::MainWindow authored;
+        auto* canvas = authored.findChild<docxstudio::app::DocumentCanvas*>();
+        auto* saveAs = authored.findChild<QAction*>(
+            QStringLiteral("file.saveAs"));
+        check(canvas && saveAs,
+              "could not reach native-style authoring controls");
+        canvas->insertText(QStringLiteral("Native heading"));
+        canvas->applyParagraphStyle(QStringLiteral("Heading1"));
+        QKeyEvent enter(QEvent::KeyPress, Qt::Key_Return, Qt::NoModifier);
+        QApplication::sendEvent(canvas, &enter);
+        canvas->insertText(QStringLiteral("Normal body"));
+        check(canvas->findNext(QStringLiteral("heading")),
+              "could not select the native heading override span");
+        canvas->setForeground(QColor(QStringLiteral("#cc0000")));
+        docxstudio::core::CharacterFormatDelta explicitEqualBold;
+        explicitEqualBold.bold =
+            docxstudio::core::PropertyDelta<bool>::set(true);
+        canvas->applyCharacterFormat(explicitEqualBold);
+        canvas->setAlignment(docxstudio::core::ParagraphAlignment::left);
+
+        bool selectedDestination = false;
+        QTimer::singleShot(0, &authored, [&] {
+            auto* dialog = authored.findChild<QFileDialog*>();
+            check(dialog != nullptr,
+                  "native-style Save As did not open a file dialog");
+            dialog->selectFile(path);
+            selectedDestination = true;
+            check(QMetaObject::invokeMethod(
+                      dialog, "accept", Qt::DirectConnection),
+                  "could not accept native-style Save As destination");
+        });
+        saveAs->trigger();
+        check(selectedDestination && QFileInfo::exists(path) &&
+                  !canvas->isModified(),
+              "native-style document was not saved");
+    }
+
+    docxstudio::ooxml::Error writtenError;
+    auto written = docxstudio::ooxml::DocxDocument::open(
+        std::filesystem::path(QFile::encodeName(path).constData()),
+        &writtenError);
+    check(written && written->paragraphs().size() == 2 &&
+              written->paragraphs()[0].style_id ==
+                  std::optional<std::string>{"Heading1"} &&
+              written->paragraphs()[1].style_id ==
+                  std::optional<std::string>{"Normal"},
+          "authored style identity or next-style identity was not native DOCX");
+    check(written->paragraphs()[0].runs.size() == 2 &&
+              written->paragraphs()[0].runs[0]
+                  .paragraph_style_overrides ==
+                  docxstudio::ooxml::BasicRunFormat{} &&
+              written->paragraphs()[0].runs[1]
+                      .paragraph_style_overrides.foreground_rgb ==
+                  0x00cc0000U &&
+              written->paragraphs()[0].runs[1]
+                      .paragraph_style_overrides.bold == true,
+          "native style save flattened inheritance or lost a direct run override");
+    check(written->paragraphs()[0].style_provenance &&
+              written->paragraphs()[0]
+                      .style_provenance->direct_alignment ==
+                  docxstudio::ooxml::BasicParagraphAlignment::left,
+          "native style save lost an explicit equal-valued paragraph override");
+
+    docxstudio::app::MainWindow reopened;
+    check(reopened.openPath(path),
+          "could not reopen native-style Owl Docs package");
+    auto* canvas = canvasWithText(reopened, QStringLiteral("Native heading"));
+    auto* save = reopened.findChild<QAction*>(QStringLiteral("file.save"));
+    check(canvas && save &&
+              canvas->snapshot().document.paragraphs()[0].styleId() ==
+                  std::optional<std::string>{"Heading1"} &&
+              canvas->snapshot().document.paragraphs()[1].styleId() ==
+                  std::optional<std::string>{"Normal"},
+          "desktop import dropped native paragraph-style identity");
+
+    // The initial caret is in the first paragraph. Changing its named style
+    // is a supported canonical rewrite and must not force a simplified copy.
+    canvas->applyParagraphStyle(QStringLiteral("Heading2"));
+    const auto headingTwoSnapshot = canvas->snapshot();
+    const auto& headingTwo = headingTwoSnapshot.document.paragraphs()[0];
+    check(headingTwo.characterFormatAt(1).font_size_half_points == 26 &&
+              headingTwo.characterFormatAt(1).foreground_argb ==
+                  0xff77216fU &&
+              headingTwo.characterFormatAt(8).foreground_argb ==
+                  0xffcc0000U &&
+              headingTwo.characterFormatAt(8).bold == true &&
+              headingTwo.format().space_before_emu == 10 * 12'700 &&
+              headingTwo.format().space_after_emu == 4 * 12'700,
+          "save/reopen turned inherited Heading 1 properties into direct overrides");
+    bool unexpectedWarning = false;
+    QTimer monitor;
+    monitor.setInterval(1);
+    QObject::connect(&monitor, &QTimer::timeout, &reopened, [&] {
+        for (auto* widget : QApplication::topLevelWidgets()) {
+            auto* box = qobject_cast<QMessageBox*>(widget);
+            if (!box || !box->isVisible()) continue;
+            unexpectedWarning = true;
+            box->accept();
+        }
+    });
+    monitor.start();
+    save->trigger();
+    monitor.stop();
+    check(!unexpectedWarning && !canvas->isModified(),
+          "canonical named-style edit incorrectly required simplified Save As");
+
+    docxstudio::ooxml::Error reopenedError;
+    auto resaved = docxstudio::ooxml::DocxDocument::open(
+        std::filesystem::path(QFile::encodeName(path).constData()),
+        &reopenedError);
+    check(resaved && resaved->paragraphs().size() == 2 &&
+              resaved->paragraphs()[0].style_id ==
+                  std::optional<std::string>{"Heading2"} &&
+              resaved->paragraphs()[1].style_id ==
+                  std::optional<std::string>{"Normal"},
+          "normal Save did not persist the changed native style");
+    check(resaved->paragraphs()[0].runs.size() == 2 &&
+              resaved->paragraphs()[0].runs[0]
+                  .paragraph_style_overrides ==
+                  docxstudio::ooxml::BasicRunFormat{} &&
+              resaved->paragraphs()[0].runs[1]
+                      .paragraph_style_overrides.foreground_rgb ==
+                  0x00cc0000U &&
+              resaved->paragraphs()[0].runs[1]
+                      .paragraph_style_overrides.bold == true &&
+              resaved->paragraphs()[0].style_provenance &&
+              resaved->paragraphs()[0]
+                      .style_provenance->direct_alignment ==
+                  docxstudio::ooxml::BasicParagraphAlignment::left &&
+              !resaved->paragraphs()[0].style_provenance->direct_space_before_twips &&
+              !resaved->paragraphs()[0].style_provenance->direct_space_after_twips,
+          "resaved Heading 2 flattened its style baseline into direct formatting");
+
+    docxstudio::app::MainWindow reopenedAgain;
+    check(reopenedAgain.openPath(path),
+          "could not reopen the resaved Heading 2 package");
+    auto* normalCanvas = canvasWithText(
+        reopenedAgain, QStringLiteral("Native heading"));
+    check(normalCanvas != nullptr,
+          "could not reach the twice-reopened native-style document");
+    normalCanvas->applyParagraphStyle(QStringLiteral("Normal"));
+    const auto normalSnapshot = normalCanvas->snapshot();
+    const auto& normal = normalSnapshot.document.paragraphs()[0];
+    check(normal.characterFormatAt(1).font_size_half_points == 22 &&
+              normal.characterFormatAt(1).foreground_argb == 0xff000000U &&
+              normal.characterFormatAt(1).bold == false &&
+              normal.characterFormatAt(8).foreground_argb == 0xffcc0000U &&
+              normal.characterFormatAt(8).bold == true &&
+              normal.format().space_before_emu == 0 &&
+              normal.format().space_after_emu == 0,
+          "second style transition did not update inheritance while preserving direct red");
+}
+
+void testNativeStyledObjectFormatsAreSparse(QTemporaryDir& temporary) {
+    const QString path = temporary.filePath(
+        QStringLiteral("owl-native-styled-objects.docx"));
+    docxstudio::app::MainWindow authored;
+    auto* canvas = authored.findChild<docxstudio::app::DocumentCanvas*>();
+    auto* saveAs = authored.findChild<QAction*>(
+        QStringLiteral("file.saveAs"));
+    check(canvas && saveAs,
+          "could not reach styled-object authoring controls");
+    canvas->insertText(QStringLiteral("Styled objects "));
+    canvas->applyParagraphStyle(QStringLiteral("Heading1"));
+    check(canvas->insertEquation(QStringLiteral("x^2")),
+          "could not insert a styled equation");
+    check(canvas->insertInlineImage(
+              solidPng(QColor(0, 96, 192)),
+              QStringLiteral("Styled picture")),
+          "could not insert a styled picture");
+
+    bool selectedDestination = false;
+    QTimer::singleShot(0, &authored, [&] {
+        auto* dialog = authored.findChild<QFileDialog*>();
+        check(dialog != nullptr,
+              "styled-object Save As did not open a file dialog");
+        dialog->selectFile(path);
+        selectedDestination = true;
+        check(QMetaObject::invokeMethod(
+                  dialog, "accept", Qt::DirectConnection),
+              "could not accept styled-object Save As destination");
+    });
+    saveAs->trigger();
+    check(selectedDestination && QFileInfo::exists(path),
+          "styled-object document was not saved");
+
+    docxstudio::ooxml::Error error;
+    auto reopened = docxstudio::ooxml::DocxDocument::open(
+        std::filesystem::path(QFile::encodeName(path).constData()), &error);
+    check(reopened && reopened->paragraphs().size() == 1 &&
+              reopened->paragraphs()[0].style_id ==
+                  std::optional<std::string>{"Heading1"},
+          "styled-object document did not reopen with its native style");
+    bool sawEquation = false;
+    bool sawImage = false;
+    for (const auto& run : reopened->paragraphs()[0].runs) {
+        const bool hasTypedObject = std::any_of(
+            run.fragments.begin(), run.fragments.end(),
+            [&](const auto& fragment) {
+                sawEquation = sawEquation ||
+                    fragment.kind ==
+                        docxstudio::ooxml::FragmentKind::equation;
+                sawImage = sawImage ||
+                    fragment.kind ==
+                        docxstudio::ooxml::FragmentKind::inline_image;
+                return fragment.kind ==
+                           docxstudio::ooxml::FragmentKind::equation ||
+                       fragment.kind ==
+                           docxstudio::ooxml::FragmentKind::inline_image;
+            });
+        if (hasTypedObject) {
+            check(run.paragraph_style_overrides ==
+                      docxstudio::ooxml::BasicRunFormat{},
+                  "equation/image run serialized inherited style properties directly");
+        }
+    }
+    check(sawEquation && sawImage,
+          "styled equation or picture was lost during save/reopen");
+    check(reopened->paragraphs()[0].style_provenance &&
+              !reopened->paragraphs()[0]
+                   .style_provenance->direct_space_before_twips &&
+              !reopened->paragraphs()[0]
+                   .style_provenance->direct_space_after_twips,
+          "styled object paragraph serialized inherited spacing directly");
+}
+
+void testNativeEquationDirectFormatSurvivesStyleTransitions(
+    QTemporaryDir& temporary) {
+    const QString path = temporary.filePath(
+        QStringLiteral("owl-native-direct-equation.docx"));
+    const QString transitionedPath = temporary.filePath(
+        QStringLiteral("owl-native-direct-equation-heading2.docx"));
+    docxstudio::app::MainWindow authored;
+    auto* canvas = authored.findChild<docxstudio::app::DocumentCanvas*>();
+    auto* saveAs = authored.findChild<QAction*>(
+        QStringLiteral("file.saveAs"));
+    check(canvas && saveAs,
+          "could not reach direct-equation authoring controls");
+    canvas->insertText(QStringLiteral("Equation "));
+    canvas->applyParagraphStyle(QStringLiteral("Heading1"));
+    canvas->toggleBold();
+    canvas->setForeground(QColor(QStringLiteral("#cc0000")));
+    check(canvas->insertEquation(QStringLiteral("x^2")),
+          "could not insert a directly formatted equation");
+    const auto authoredSnapshot = canvas->snapshot();
+    const auto& authoredParagraph =
+        authoredSnapshot.document.paragraphs().front();
+    check(authoredParagraph.equations().size() == 1,
+          "authored equation atom is absent");
+    const auto equationOffset =
+        authoredParagraph.equations().front().utf16_offset;
+    const auto authoredEquationFormat =
+        authoredParagraph.characterFormatAt(equationOffset + 1);
+    const auto authoredEquationMask =
+        authoredParagraph.styleOverrideMaskAt(equationOffset + 1);
+    check(authoredEquationFormat.font_size_half_points == 32 &&
+              authoredEquationFormat.bold == false &&
+              authoredEquationFormat.foreground_argb == 0xffcc0000U &&
+              authoredEquationMask.foreground_argb &&
+              !authoredEquationMask.font_size_half_points &&
+              authoredEquationMask.bold,
+          "authored equation did not separate direct red/explicit bold clear from Heading 1 inheritance");
+    saveAsForTest(authored, *saveAs, path, false);
+
+    docxstudio::ooxml::Error packageError;
+    auto package = docxstudio::ooxml::DocxDocument::open(
+        std::filesystem::path(QFile::encodeName(path).constData()),
+        &packageError);
+    check(package && package->paragraphs().size() == 1,
+          packageError.message.empty()
+              ? "direct-equation package did not reopen"
+              : packageError.message.c_str());
+    const auto equationRun = std::find_if(
+        package->paragraphs()[0].runs.begin(),
+        package->paragraphs()[0].runs.end(), [](const auto& run) {
+            return std::any_of(
+                run.fragments.begin(), run.fragments.end(),
+                [](const auto& fragment) {
+                    return fragment.kind ==
+                        docxstudio::ooxml::FragmentKind::equation;
+                });
+        });
+    check(equationRun != package->paragraphs()[0].runs.end() &&
+              equationRun->format.font_size_half_points == 32 &&
+              equationRun->format.bold == false &&
+              equationRun->format.foreground_rgb == 0x00cc0000U &&
+              equationRun->paragraph_style_overrides.foreground_rgb ==
+                  0x00cc0000U &&
+              !equationRun->paragraph_style_overrides
+                   .font_size_half_points &&
+              equationRun->paragraph_style_overrides.bold == false,
+          "direct equation w:rPr did not reopen with sparse native formatting");
+
+    docxstudio::app::MainWindow reopened;
+    check(reopened.openPath(path),
+          "could not reopen direct-equation document in the editor");
+    auto* reopenedCanvas = canvasWithStyle(reopened, "Heading1");
+    auto* transitionSaveAs = reopened.findChild<QAction*>(
+        QStringLiteral("file.saveAs"));
+    check(reopenedCanvas && transitionSaveAs,
+          "could not reach reopened direct-equation controls");
+    reopenedCanvas->applyParagraphStyle(QStringLiteral("Heading2"));
+    const auto headingTwoSnapshot = reopenedCanvas->snapshot();
+    const auto& headingTwo =
+        headingTwoSnapshot.document.paragraphs().front();
+    check(headingTwo.equations().size() == 1,
+          "equation atom was lost during Heading 2 transition");
+    const auto headingTwoEquationOffset =
+        headingTwo.equations().front().utf16_offset;
+    check(headingTwo.characterFormatAt(1).font_size_half_points == 26 &&
+              headingTwo.characterFormatAt(1).foreground_argb ==
+                  0xff77216fU &&
+              headingTwo.characterFormatAt(headingTwoEquationOffset + 1)
+                      .font_size_half_points == 26 &&
+              headingTwo.characterFormatAt(headingTwoEquationOffset + 1)
+                      .bold == false &&
+              headingTwo.characterFormatAt(headingTwoEquationOffset + 1)
+                      .foreground_argb == 0xffcc0000U,
+          "equation style transition failed to update inheritance or retain direct red/bold clear");
+    // Imported packages containing equations are deliberately outside the
+    // narrow current-writer canonical-envelope proof. Exercise the explicit
+    // simplified-copy path rather than weakening that safety gate.
+    saveAsForTest(
+        reopened, *transitionSaveAs, transitionedPath, true);
+    check(!reopenedCanvas->isModified(),
+          "direct-equation Heading 2 simplified Save As did not complete");
+
+    docxstudio::app::MainWindow reopenedAgain;
+    check(reopenedAgain.openPath(transitionedPath),
+          "could not reopen direct equation after Heading 2 save");
+    auto* normalCanvas = canvasWithStyle(reopenedAgain, "Heading2");
+    check(normalCanvas != nullptr,
+          "could not reach saved Heading 2 equation paragraph");
+    normalCanvas->applyParagraphStyle(QStringLiteral("Normal"));
+    const auto normalSnapshot = normalCanvas->snapshot();
+    const auto& normal = normalSnapshot.document.paragraphs().front();
+    check(normal.equations().size() == 1,
+          "equation atom was lost after save/reopen");
+    const auto normalEquationOffset = normal.equations().front().utf16_offset;
+    check(normal.characterFormatAt(1).font_size_half_points == 22 &&
+              normal.characterFormatAt(1).bold == false &&
+              normal.characterFormatAt(1).foreground_argb == 0xff000000U &&
+              normal.characterFormatAt(normalEquationOffset + 1)
+                      .font_size_half_points == 22 &&
+              normal.characterFormatAt(normalEquationOffset + 1).bold ==
+                  false &&
+              normal.characterFormatAt(normalEquationOffset + 1)
+                      .foreground_argb == 0xffcc0000U,
+          "equation direct formatting changed after save/reopen and Normal transition");
 }
 
 }  // namespace
@@ -345,6 +1286,13 @@ int main(int argc, char** argv) {
     QTemporaryDir temporary;
     check(temporary.isValid(), "temporary directory failed");
     testCanonicalSimpleSaveGuard(temporary);
+    testNativeParagraphStyleRoundTrip(temporary);
+    testNativeStyledObjectFormatsAreSparse(temporary);
+    testNativeEquationDirectFormatSurvivesStyleTransitions(temporary);
+    testForeignBuiltInSimplifiedSavePreservesAppearance(temporary);
+    testImportedEmptyStyledParagraphMarkLifecycle(temporary);
+    testAuthoredEmptyStyledParagraphRoundTrip(temporary);
+    testImportedStyleProvenance(temporary);
     const QString path = temporary.filePath(QStringLiteral("styled.docx"));
 
     docxstudio::ooxml::BasicRunFormat format;
@@ -491,7 +1439,9 @@ int main(int argc, char** argv) {
     check(nativeSnapshot.document.paragraphs().size() == 3,
           "native style/list import changed paragraph count");
     const auto& heading = nativeSnapshot.document.paragraphs()[0];
-    check(heading.format().alignment ==
+    check(heading.styleId() ==
+              std::optional<std::string>{"SampleHeading"} &&
+              heading.format().alignment ==
               docxstudio::core::ParagraphAlignment::center &&
               heading.characterFormatAt(1).font_family == "Theme Serif" &&
               heading.characterFormatAt(1).bold == true,

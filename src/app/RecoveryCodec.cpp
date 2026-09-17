@@ -610,6 +610,21 @@ Json encodeCharacterFormat(const core::CharacterFormat& format) {
     return output;
 }
 
+Json encodeCharacterFormatMask(const core::CharacterFormatMask& mask) {
+    Json output = Json::object();
+    if (mask.font_family) output["font_family"] = true;
+    if (mask.font_size_half_points) output["font_size_half_points"] = true;
+    if (mask.bold) output["bold"] = true;
+    if (mask.italic) output["italic"] = true;
+    if (mask.underline) output["underline"] = true;
+    if (mask.strike) output["strike"] = true;
+    if (mask.foreground_argb) output["foreground_argb"] = true;
+    if (mask.highlight_argb) output["highlight_argb"] = true;
+    if (mask.baseline) output["baseline"] = true;
+    if (mask.language) output["language"] = true;
+    return output;
+}
+
 Json encodeParagraphFormat(const core::ParagraphFormat& format) {
     Json output = Json::object();
     if (format.alignment) output["alignment"] = alignmentName(*format.alignment);
@@ -635,6 +650,86 @@ Json encodeParagraphFormat(const core::ParagraphFormat& format) {
         output["list_layout"] = {{"levels", std::move(levels)}};
     }
     return output;
+}
+
+Json encodeParagraphFormatMask(const core::ParagraphFormatMask& mask) {
+    Json output = Json::object();
+    if (mask.alignment) output["alignment"] = true;
+    if (mask.left_indent_emu) output["left_indent_emu"] = true;
+    if (mask.right_indent_emu) output["right_indent_emu"] = true;
+    if (mask.first_line_indent_emu) output["first_line_indent_emu"] = true;
+    if (mask.space_before_emu) output["space_before_emu"] = true;
+    if (mask.space_after_emu) output["space_after_emu"] = true;
+    if (mask.line_spacing_emu) output["line_spacing_emu"] = true;
+    if (mask.line_spacing_rule) output["line_spacing_rule"] = true;
+    if (mask.keep_with_next) output["keep_with_next"] = true;
+    if (mask.keep_lines) output["keep_lines"] = true;
+    if (mask.page_break_before) output["page_break_before"] = true;
+    return output;
+}
+
+bool decodeMaskProperty(const Json& input, const char* name, bool& output,
+                        std::string& error) {
+    const auto found = input.find(name);
+    if (found == input.end()) return true;
+    if (!found->is_boolean()) {
+        error = std::string("Recovery style-provenance mask property '") +
+                name + "' is not a boolean";
+        return false;
+    }
+    output = found->get<bool>();
+    return true;
+}
+
+bool decodeCharacterFormatMask(const Json& input,
+                               core::CharacterFormatMask& mask,
+                               std::string& error) {
+    if (!input.is_object()) {
+        error = "Recovery character style-provenance mask is not an object";
+        return false;
+    }
+    return decodeMaskProperty(input, "font_family", mask.font_family, error) &&
+           decodeMaskProperty(input, "font_size_half_points",
+                              mask.font_size_half_points, error) &&
+           decodeMaskProperty(input, "bold", mask.bold, error) &&
+           decodeMaskProperty(input, "italic", mask.italic, error) &&
+           decodeMaskProperty(input, "underline", mask.underline, error) &&
+           decodeMaskProperty(input, "strike", mask.strike, error) &&
+           decodeMaskProperty(input, "foreground_argb",
+                              mask.foreground_argb, error) &&
+           decodeMaskProperty(input, "highlight_argb",
+                              mask.highlight_argb, error) &&
+           decodeMaskProperty(input, "baseline", mask.baseline, error) &&
+           decodeMaskProperty(input, "language", mask.language, error);
+}
+
+bool decodeParagraphFormatMask(const Json& input,
+                               core::ParagraphFormatMask& mask,
+                               std::string& error) {
+    if (!input.is_object()) {
+        error = "Recovery paragraph style-provenance mask is not an object";
+        return false;
+    }
+    return decodeMaskProperty(input, "alignment", mask.alignment, error) &&
+           decodeMaskProperty(input, "left_indent_emu",
+                              mask.left_indent_emu, error) &&
+           decodeMaskProperty(input, "right_indent_emu",
+                              mask.right_indent_emu, error) &&
+           decodeMaskProperty(input, "first_line_indent_emu",
+                              mask.first_line_indent_emu, error) &&
+           decodeMaskProperty(input, "space_before_emu",
+                              mask.space_before_emu, error) &&
+           decodeMaskProperty(input, "space_after_emu",
+                              mask.space_after_emu, error) &&
+           decodeMaskProperty(input, "line_spacing_emu",
+                              mask.line_spacing_emu, error) &&
+           decodeMaskProperty(input, "line_spacing_rule",
+                              mask.line_spacing_rule, error) &&
+           decodeMaskProperty(input, "keep_with_next",
+                              mask.keep_with_next, error) &&
+           decodeMaskProperty(input, "keep_lines", mask.keep_lines, error) &&
+           decodeMaskProperty(input, "page_break_before",
+                              mask.page_break_before, error);
 }
 
 bool decodeCharacterFormat(const Json& input, core::CharacterFormat& format,
@@ -861,6 +956,43 @@ std::optional<std::string> RecoveryCodec::encode(const RecoveryDocument& recover
     std::size_t totalImageBytes = 0;
     std::unordered_set<core::NodeId, core::NodeIdHash> imageIds;
     for (const auto& paragraph : recovery.document.paragraphs()) {
+        if (paragraph.styleId()) {
+            const auto styleValidation =
+                core::validateParagraphStyleId(*paragraph.styleId());
+            if (!styleValidation) {
+                error = styleValidation.error().message;
+                return std::nullopt;
+            }
+        }
+        if (paragraph.styleProvenance()) {
+            if (!paragraph.styleId()) {
+                error = "Paragraph style provenance requires a style ID";
+                return std::nullopt;
+            }
+            const auto& provenance = *paragraph.styleProvenance();
+            const auto characterValidation =
+                provenance.inherited_character_format.validate();
+            const auto markCharacterValidation =
+                provenance.inherited_paragraph_mark_character_format
+                    .validate();
+            const auto paragraphValidation =
+                provenance.inherited_paragraph_format.validate();
+            if (!characterValidation || !markCharacterValidation ||
+                !paragraphValidation) {
+                error = !characterValidation
+                    ? characterValidation.error().message
+                    : !markCharacterValidation
+                    ? markCharacterValidation.error().message
+                    : paragraphValidation.error().message;
+                return std::nullopt;
+            }
+            if (provenance.character_overrides.size() >
+                kMaximumFormatRuns - totalFormatRuns) {
+                error = "Recovery document has too many formatting runs";
+                return std::nullopt;
+            }
+            totalFormatRuns += provenance.character_overrides.size();
+        }
         const auto markFormatValidation =
             paragraph.paragraphMarkCharacterFormat().validate();
         if (!markFormatValidation) {
@@ -972,16 +1104,49 @@ std::optional<std::string> RecoveryCodec::encode(const RecoveryDocument& recover
                  {"format", imageFormatName(image.format)},
                  {"encoded_base64", base64Encode(image.encoded_payload.bytes())}});
         }
-        root["paragraphs"].push_back(
-            {{"id", paragraph.id().toString()},
-             {"text_utf16", encodeUtf16(paragraph.text())},
-             {"format", encodeParagraphFormat(paragraph.format())},
-             {"paragraph_mark_character_format",
-              encodeCharacterFormat(
-                  paragraph.paragraphMarkCharacterFormat())},
-             {"runs", std::move(runs)},
-             {"equations", std::move(equations)},
-             {"images", std::move(images)}});
+        Json encodedParagraph{
+            {"id", paragraph.id().toString()},
+            {"text_utf16", encodeUtf16(paragraph.text())},
+            {"format", encodeParagraphFormat(paragraph.format())},
+            {"paragraph_mark_character_format",
+             encodeCharacterFormat(
+                 paragraph.paragraphMarkCharacterFormat())},
+            {"runs", std::move(runs)},
+            {"equations", std::move(equations)},
+            {"images", std::move(images)}};
+        if (paragraph.styleId()) {
+            encodedParagraph["style_id"] = *paragraph.styleId();
+        }
+        if (paragraph.styleProvenance()) {
+            const auto& provenance = *paragraph.styleProvenance();
+            Json overrides = Json::array();
+            for (const auto& run : provenance.character_overrides) {
+                overrides.push_back(
+                    {{"start", run.start},
+                     {"end", run.end},
+                     {"properties",
+                      encodeCharacterFormatMask(run.properties)}});
+            }
+            encodedParagraph["style_provenance"] = {
+                {"inherited_character_format",
+                 encodeCharacterFormat(
+                     provenance.inherited_character_format)},
+                {"inherited_paragraph_mark_character_format",
+                 encodeCharacterFormat(
+                     provenance
+                         .inherited_paragraph_mark_character_format)},
+                {"inherited_paragraph_format",
+                 encodeParagraphFormat(
+                     provenance.inherited_paragraph_format)},
+                {"character_overrides", std::move(overrides)},
+                {"paragraph_mark_overrides",
+                 encodeCharacterFormatMask(
+                     provenance.paragraph_mark_overrides)},
+                {"paragraph_overrides",
+                 encodeParagraphFormatMask(
+                     provenance.paragraph_overrides)}};
+        }
+        root["paragraphs"].push_back(std::move(encodedParagraph));
     }
     root["tables"] = Json::array();
     for (const auto& table : recovery.document.tables()) {
@@ -1080,6 +1245,10 @@ std::optional<RecoveryDocument> RecoveryCodec::decode(std::string_view payload,
             core::NodeId paragraph_id;
             core::ParagraphFormat format;
         };
+        struct PendingStyleProvenance {
+            core::NodeId paragraph_id;
+            core::ParagraphStyleProvenance provenance;
+        };
         struct PendingEquation {
             core::NodeId paragraph_id;
             core::NodeId equation_id;
@@ -1102,6 +1271,7 @@ std::optional<RecoveryDocument> RecoveryCodec::decode(std::string_view payload,
         std::vector<core::Paragraph> paragraphs;
         std::vector<PendingRun> runs;
         std::vector<PendingParagraphFormat> paragraphFormats;
+        std::vector<PendingStyleProvenance> styleProvenance;
         std::vector<PendingEquation> equations;
         std::vector<PendingImage> images;
         std::unordered_map<core::NodeId, std::vector<std::size_t>,
@@ -1393,14 +1563,160 @@ std::optional<RecoveryDocument> RecoveryCodec::decode(std::string_view payload,
                     return std::nullopt;
                 }
             }
-            auto paragraph = core::Paragraph::create(
+            std::optional<std::string> styleId;
+            if (const auto encodedStyleId =
+                    encodedParagraph.find("style_id");
+                encodedStyleId != encodedParagraph.end()) {
+                if (!encodedStyleId->is_string()) {
+                    error = "Recovery paragraph style ID is not a string";
+                    return std::nullopt;
+                }
+                const auto& value =
+                    encodedStyleId->get_ref<const std::string&>();
+                const auto validation =
+                    core::validateParagraphStyleId(value);
+                if (!validation) {
+                    error = validation.error().message;
+                    return std::nullopt;
+                }
+                styleId = value;
+            }
+            std::optional<core::ParagraphStyleProvenance>
+                paragraphStyleProvenance;
+            if (version >= 10) {
+                const auto encodedProvenance =
+                    encodedParagraph.find("style_provenance");
+                if (encodedProvenance != encodedParagraph.end()) {
+                    if (!styleId) {
+                        error =
+                            "Recovery paragraph style provenance requires a style ID";
+                        return std::nullopt;
+                    }
+                    if (!encodedProvenance->is_object()) {
+                        error =
+                            "Recovery paragraph style provenance is not an object";
+                        return std::nullopt;
+                    }
+                    core::ParagraphStyleProvenance provenance;
+                    const auto inheritedCharacter = encodedProvenance->find(
+                        "inherited_character_format");
+                    const auto inheritedParagraphMark =
+                        encodedProvenance->find(
+                            "inherited_paragraph_mark_character_format");
+                    const auto inheritedParagraph = encodedProvenance->find(
+                        "inherited_paragraph_format");
+                    const auto encodedOverrides = encodedProvenance->find(
+                        "character_overrides");
+                    const auto markOverrides = encodedProvenance->find(
+                        "paragraph_mark_overrides");
+                    const auto paragraphOverrides = encodedProvenance->find(
+                        "paragraph_overrides");
+                    if (inheritedCharacter == encodedProvenance->end() ||
+                        inheritedParagraph == encodedProvenance->end() ||
+                        encodedOverrides == encodedProvenance->end() ||
+                        markOverrides == encodedProvenance->end() ||
+                        paragraphOverrides == encodedProvenance->end() ||
+                        !decodeCharacterFormat(
+                            *inheritedCharacter,
+                            provenance.inherited_character_format, error) ||
+                        !decodeParagraphFormat(
+                            *inheritedParagraph,
+                            provenance.inherited_paragraph_format, error) ||
+                        !decodeCharacterFormatMask(
+                            *markOverrides,
+                            provenance.paragraph_mark_overrides, error) ||
+                        !decodeParagraphFormatMask(
+                            *paragraphOverrides,
+                            provenance.paragraph_overrides, error)) {
+                        if (error.empty()) {
+                            error =
+                                "Recovery paragraph style provenance is incomplete";
+                        }
+                        return std::nullopt;
+                    }
+                    if (version >= 11) {
+                        if (inheritedParagraphMark ==
+                                encodedProvenance->end() ||
+                            !decodeCharacterFormat(
+                                *inheritedParagraphMark,
+                                provenance
+                                    .inherited_paragraph_mark_character_format,
+                                error)) {
+                            if (error.empty()) {
+                                error =
+                                    "Recovery paragraph style provenance is incomplete";
+                            }
+                            return std::nullopt;
+                        }
+                    } else {
+                        // Version 10 predated a distinct paragraph-mark style
+                        // baseline.  Its only safe interpretation is the run
+                        // baseline used by the old transition code.
+                        provenance.inherited_paragraph_mark_character_format =
+                            provenance.inherited_character_format;
+                    }
+                    if (!encodedOverrides->is_array() ||
+                        encodedOverrides->size() >
+                            kMaximumFormatRuns - totalFormatRuns) {
+                        error =
+                            "Recovery style-provenance override list is invalid";
+                        return std::nullopt;
+                    }
+                    totalFormatRuns += encodedOverrides->size();
+                    std::size_t previousEnd = 0;
+                    for (const auto& encodedOverride : *encodedOverrides) {
+                        if (!encodedOverride.is_object()) {
+                            error =
+                                "Recovery style-provenance override is not an object";
+                            return std::nullopt;
+                        }
+                        const auto start64 =
+                            encodedOverride.at("start").get<std::uint64_t>();
+                        const auto end64 =
+                            encodedOverride.at("end").get<std::uint64_t>();
+                        if (start64 > std::numeric_limits<std::size_t>::max() ||
+                            end64 > std::numeric_limits<std::size_t>::max()) {
+                            error =
+                                "Recovery style-provenance override is too large";
+                            return std::nullopt;
+                        }
+                        const auto start = static_cast<std::size_t>(start64);
+                        const auto end = static_cast<std::size_t>(end64);
+                        core::CharacterFormatMask mask;
+                        if (start >= end || end > text.size() ||
+                            start < previousEnd ||
+                            !core::isUtf16Boundary(text, start) ||
+                            !core::isUtf16Boundary(text, end) ||
+                            !decodeCharacterFormatMask(
+                                encodedOverride.at("properties"), mask,
+                                error) ||
+                            mask.empty()) {
+                            if (error.empty()) {
+                                error =
+                                    "Recovery style-provenance override range is invalid";
+                            }
+                            return std::nullopt;
+                        }
+                        provenance.character_overrides.push_back(
+                            {start, end, mask});
+                        previousEnd = end;
+                    }
+                    paragraphStyleProvenance = std::move(provenance);
+                }
+            }
+            auto paragraph = core::Paragraph::restore(
                 std::move(plainText), *id,
-                std::move(paragraphMarkCharacterFormat));
+                std::move(paragraphMarkCharacterFormat),
+                std::move(styleId));
             if (!paragraph) {
                 error = paragraph.error().message;
                 return std::nullopt;
             }
             paragraphs.push_back(std::move(paragraph.value()));
+            if (paragraphStyleProvenance) {
+                styleProvenance.push_back(
+                    {*id, std::move(*paragraphStyleProvenance)});
+            }
             equations.insert(equations.end(),
                              std::make_move_iterator(paragraphEquations.begin()),
                              std::make_move_iterator(paragraphEquations.end()));
@@ -1521,6 +1837,15 @@ std::optional<RecoveryDocument> RecoveryCodec::decode(std::string_view payload,
                 completeDelta(run.format));
             if (!applied) {
                 error = applied.error().message;
+                return std::nullopt;
+            }
+        }
+        for (auto& pending : styleProvenance) {
+            const auto attached =
+                document.value().setParagraphStyleProvenance(
+                    pending.paragraph_id, std::move(pending.provenance));
+            if (!attached) {
+                error = attached.error().message;
                 return std::nullopt;
             }
         }

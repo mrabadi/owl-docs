@@ -5,6 +5,10 @@
 /_CPack_Packages/
 /CMakeFiles/
 /dist/
+third_party/excalidraw-figure-editor/dist/
+third_party/excalidraw-figure-editor/node_modules
+third_party/excalidraw-figure-editor/public/fonts/
+node_modules/
 /output/
 /corpus/
 /tests/corpus/cache/

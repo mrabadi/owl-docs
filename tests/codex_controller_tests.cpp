@@ -7,6 +7,7 @@
 #include <QString>
 #include <QStringList>
 
+#include <algorithm>
 #include <iostream>
 #include <memory>
 #include <string>
@@ -200,6 +201,15 @@ void testExperimentalHandshakePrecedesDynamicTools() {
           "document thread did not retain its restricted legacy policy");
     check(threadStart.at("params").contains("dynamicTools"),
           "thread/start omitted the editor.v1 dynamic tools");
+    const std::string instructions =
+        threadStart.at("params").value("developerInstructions", std::string());
+    check(instructions.find("set_text_style") != std::string::npos &&
+              instructions.find("set_paragraph_style") != std::string::npos &&
+              instructions.find("do not merely explain") != std::string::npos &&
+              instructions.find("insert_excalidraw_figure") != std::string::npos &&
+              instructions.find("replace_excalidraw_figure") != std::string::npos &&
+              instructions.find("always render in Professional mode") != std::string::npos,
+          "document-mode instructions do not teach Codex to apply formatting");
     check(threadStart.at("params").contains("config"),
           "thread/start omitted the restricted Codex config");
     if (threadStart.at("params").contains("config")) {
@@ -226,6 +236,17 @@ void testExperimentalHandshakePrecedesDynamicTools() {
                   tools.front().value("name", std::string()) ==
                       docxstudio::codex::kEditorReadTool,
               "thread/start registered the wrong editor.v1 catalog");
+        const auto preview = std::find_if(
+            tools.begin(), tools.end(), [](const Json& tool) {
+                return tool.value("name", std::string()) ==
+                       docxstudio::codex::kEditorPreviewTool;
+            });
+        check(preview != tools.end() &&
+                  preview->value("description", std::string()).find(
+                      "set_text_style") != std::string::npos &&
+                  preview->value("description", std::string()).find(
+                      "set_paragraph_style") != std::string::npos,
+              "preview tool description does not advertise formatting operations");
     }
     check(initialize.at("id").get<std::int64_t>() <
               threadStart.at("id").get<std::int64_t>(),
@@ -250,6 +271,31 @@ void testExperimentalHandshakePrecedesDynamicTools() {
                      {"turn", {{"id", "turn-new"},
                                 {"status", "completed"}}}}}});
 
+    controller.sendMessage(QStringLiteral("Now center it"),
+                           QStringLiteral("gpt-test"),
+                           QStringLiteral("medium"),
+                           QStringLiteral("default"),
+                           QStringLiteral("document:test"),
+                           QStringLiteral("Selected text"),
+                           QStringLiteral("Outline"));
+    check(process->writes.size() == 8,
+          "controller did not accept a second turn in the same conversation");
+    const Json secondTurn = writtenMessage(*process, 7);
+    check(secondTurn.value("method", std::string()) == "turn/start" &&
+              secondTurn.at("params").value("threadId", std::string()) ==
+                  "thread-new",
+          "second message did not continue the existing document thread");
+    process->emitStdout(
+        {{"id", secondTurn.at("id")},
+         {"result", {{"turn", {{"id", "turn-second"},
+                                  {"status", "inProgress"},
+                                  {"items", Json::array()}}}}}});
+    process->emitStdout(
+        {{"method", "turn/completed"},
+         {"params", {{"threadId", "thread-new"},
+                     {"turn", {{"id", "turn-second"},
+                                {"status", "completed"}}}}}});
+
     controller.restoreDocumentThread(QStringLiteral("document:resume"),
                                      QStringLiteral("thread-saved"));
     controller.sendMessage(QStringLiteral("Continue editing"),
@@ -259,14 +305,17 @@ void testExperimentalHandshakePrecedesDynamicTools() {
                            QStringLiteral("document:resume"),
                            QStringLiteral("More text"),
                            QStringLiteral("More outline"));
-    check(process->writes.size() == 8,
+    check(process->writes.size() == 9,
           "controller did not resume the saved document thread");
-    const Json threadResume = writtenMessage(*process, 7);
+    const Json threadResume = writtenMessage(*process, 8);
     check(threadResume.value("method", std::string()) == "thread/resume",
           "saved document did not use thread/resume");
     check(threadResume.at("params").at("config") ==
               threadStart.at("params").at("config"),
           "thread/resume did not reapply inherited MCP isolation");
+    check(threadResume.at("params").value("developerInstructions", std::string()) ==
+              instructions,
+          "thread/resume did not restore the formatting-capable instructions");
     controller.shutdown();
 }
 

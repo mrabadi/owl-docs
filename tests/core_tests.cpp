@@ -212,6 +212,715 @@ void testSparseFormatting() {
     CHECK(paragraph_snapshot.document.paragraphs().front().format().space_after_emu == 152400);
 }
 
+void testBuiltInParagraphStyleCatalog() {
+    constexpr std::array<std::string_view, 14> expected_ids{
+        "Normal",   "NoSpacing", "Title",    "Subtitle", "Quote",
+        "Heading1", "Heading2",  "Heading3", "Heading4", "Heading5",
+        "Heading6", "Heading7",  "Heading8", "Heading9",
+    };
+
+    const auto styles = builtInParagraphStyles();
+    CHECK(styles.size() == expected_ids.size());
+    for (std::size_t index = 0; index < styles.size(); ++index) {
+        const auto& style = styles[index];
+        CHECK(style.id == expected_ids[index]);
+        CHECK(!style.display_name.empty());
+        CHECK(validateParagraphStyleId(style.id));
+        CHECK(findBuiltInParagraphStyle(style.id) == &style);
+        CHECK(findBuiltInParagraphStyle(style.next_style_id) != nullptr);
+        CHECK(style.character_format.validate());
+        CHECK(style.paragraph_format.validate());
+        CHECK(!style.character_format.font_family.has_value());
+
+        for (std::size_t previous = 0; previous < index; ++previous) {
+            CHECK(styles[previous].id != style.id);
+        }
+        if (index < 5) {
+            CHECK(!style.outline_level.has_value());
+        } else {
+            CHECK(style.outline_level ==
+                  std::optional<std::uint8_t>{
+                      static_cast<std::uint8_t>(index - 5)});
+        }
+    }
+    CHECK(findBuiltInParagraphStyle("heading1") == nullptr);
+    CHECK(findBuiltInParagraphStyle("CustomLegal") == nullptr);
+
+    const auto* normal = findBuiltInParagraphStyle("Normal");
+    CHECK(normal != nullptr);
+    if (normal != nullptr) {
+        CHECK(normal->display_name == "Normal");
+        CHECK(normal->next_style_id == "Normal");
+        CHECK(normal->character_format.font_size_half_points == 22);
+        CHECK(normal->character_format.bold == false);
+        CHECK(normal->character_format.italic == false);
+        CHECK(normal->character_format.foreground_argb == 0xff000000U);
+        CHECK(normal->paragraph_format.space_before_emu == 0);
+        CHECK(normal->paragraph_format.space_after_emu == 0);
+        CHECK(normal->paragraph_format.line_spacing_emu == 12 * 12700);
+        CHECK(normal->paragraph_format.line_spacing_rule ==
+              LineSpacingRule::automatic);
+
+        CharacterFormat character;
+        character.font_family = "Existing Font";
+        character.font_size_half_points = 72;
+        character.bold = true;
+        character.highlight_argb = 0xffffff00U;
+        character.language = "en-US";
+        normal->characterBaselineDelta().applyTo(character);
+        CHECK(character.font_family == "Existing Font");
+        CHECK(character.font_size_half_points == 22);
+        CHECK(character.bold == false);
+        CHECK(character.foreground_argb == 0xff000000U);
+        // A paragraph style baseline does not erase orthogonal direct
+        // properties which the catalog does not specify.
+        CHECK(character.highlight_argb == 0xffffff00U);
+        CHECK(character.language == "en-US");
+
+        ParagraphFormat paragraph;
+        paragraph.alignment = ParagraphAlignment::right;
+        paragraph.space_before_emu = 999;
+        paragraph.space_after_emu = 999;
+        paragraph.list_id = NodeId::generate();
+        paragraph.list_level = std::uint8_t{3};
+        paragraph.list_layout = ListLayout{};
+        normal->paragraphBaselineDelta().applyTo(paragraph);
+        CHECK(paragraph.alignment == ParagraphAlignment::left);
+        CHECK(paragraph.space_before_emu == 0);
+        CHECK(paragraph.space_after_emu == 0);
+        CHECK(paragraph.line_spacing_emu == 12 * 12700);
+        CHECK(paragraph.list_id.has_value());
+        CHECK(paragraph.list_level == std::uint8_t{3});
+        CHECK(paragraph.list_layout == ListLayout{});
+    }
+
+    const auto* title = findBuiltInParagraphStyle("Title");
+    const auto* heading_one = findBuiltInParagraphStyle("Heading1");
+    const auto* heading_two = findBuiltInParagraphStyle("Heading2");
+    CHECK(title != nullptr);
+    CHECK(heading_one != nullptr);
+    CHECK(heading_two != nullptr);
+    if (title != nullptr) {
+        CHECK(title->character_format.font_size_half_points == 56);
+        CHECK(title->character_format.foreground_argb == 0xff77216fU);
+    }
+    if (heading_one != nullptr) {
+        CHECK(heading_one->character_format.font_size_half_points == 32);
+        CHECK(heading_one->character_format.foreground_argb == 0xffe95420U);
+        CHECK(heading_one->paragraph_format.keep_with_next == true);
+        CHECK(heading_one->paragraph_format.keep_lines == true);
+    }
+    if (heading_two != nullptr) {
+        CHECK(heading_two->character_format.foreground_argb == 0xff77216fU);
+    }
+}
+
+void testParagraphStyleIdentityAndValidation() {
+    const auto paragraph_id = NodeId::generate();
+    const std::string custom_style{"Firm Legal \xe2\x80\x93 2026"};
+    const auto styled = Paragraph::create(
+        u"Clause", paragraph_id, {},
+        std::optional<std::string>{custom_style});
+    CHECK(styled);
+    if (!styled) return;
+    CHECK(styled.value().styleId() ==
+          std::optional<std::string>{custom_style});
+    CHECK(findBuiltInParagraphStyle(custom_style) == nullptr);
+
+    const auto restored = Paragraph::restore(
+        u"Clause", paragraph_id, {},
+        std::optional<std::string>{custom_style});
+    CHECK(restored);
+    if (restored) CHECK(restored.value() == styled.value());
+
+    const auto unstyled = Paragraph::create(u"Clause", paragraph_id);
+    CHECK(unstyled);
+    if (unstyled) {
+        const auto styled_document = Document::create({styled.value()});
+        const auto unstyled_document = Document::create({unstyled.value()});
+        CHECK(styled_document);
+        CHECK(unstyled_document);
+        if (styled_document && unstyled_document) {
+            CHECK(styled_document.value() != unstyled_document.value());
+        }
+    }
+
+    CHECK(!validateParagraphStyleId(""));
+    CHECK(!validateParagraphStyleId("Bad\nStyle"));
+    const std::string malformed_utf8{"\xc0\xaf", 2};
+    CHECK(!validateParagraphStyleId(malformed_utf8));
+    const std::string oversized(kMaximumParagraphStyleIdBytes + 1, 'x');
+    CHECK(!validateParagraphStyleId(oversized));
+    CHECK(validateParagraphStyleId(
+        std::string(kMaximumParagraphStyleIdBytes, 'x')));
+
+    const auto empty_style = Paragraph::create(
+        u"Clause", NodeId::generate(), {}, std::string{});
+    CHECK(!empty_style);
+    CHECK(empty_style.error().code == ErrorCode::invalid_formatting);
+    const auto malformed_style = Paragraph::restore(
+        u"Clause", NodeId::generate(), {}, malformed_utf8);
+    CHECK(!malformed_style);
+    CHECK(malformed_style.error().code == ErrorCode::invalid_formatting);
+    const auto oversized_style = Paragraph::create(
+        u"Clause", NodeId::generate(), {}, oversized);
+    CHECK(!oversized_style);
+    CHECK(oversized_style.error().code == ErrorCode::invalid_formatting);
+
+    auto corrupted = styled.value();
+    auto& mutable_style = const_cast<std::optional<std::string>&>(
+        corrupted.styleId());
+    mutable_style = std::string{"\x01", 1};
+    const auto corrupted_document = Document::create({corrupted});
+    CHECK(!corrupted_document);
+    CHECK(corrupted_document.error().code == ErrorCode::invalid_formatting);
+}
+
+void testParagraphStyleOperationsAndHistory() {
+    const auto first_id = NodeId::generate();
+    const auto second_id = NodeId::generate();
+    const auto first = Paragraph::create(u"First", first_id);
+    const auto second = Paragraph::create(u"Second", second_id);
+    CHECK(first);
+    CHECK(second);
+    if (!first || !second) return;
+    const auto created = Document::create({first.value(), second.value()});
+    CHECK(created);
+    if (!created) return;
+
+    auto direct = created.value();
+    const std::string custom_style{"FirmClause"};
+    CHECK(direct.setParagraphStyle(
+        {first_id, first_id, second_id}, custom_style));
+    CHECK(direct.paragraphs()[0].styleId() ==
+          std::optional<std::string>{custom_style});
+    CHECK(direct.paragraphs()[1].styleId() ==
+          std::optional<std::string>{custom_style});
+    const auto before_missing = direct;
+    const auto missing_result = direct.setParagraphStyle(
+        {first_id, NodeId::generate()}, std::string{"Normal"});
+    CHECK(!missing_result);
+    CHECK(missing_result.error().code == ErrorCode::paragraph_not_found);
+    CHECK(direct == before_missing);
+    const auto invalid_result = direct.setParagraphStyle(
+        {first_id}, std::string{"Bad\nStyle"});
+    CHECK(!invalid_result);
+    CHECK(invalid_result.error().code == ErrorCode::invalid_formatting);
+    CHECK(direct == before_missing);
+    CHECK(direct.setParagraphStyle({first_id, second_id}, std::nullopt));
+    CHECK(!direct.paragraphs()[0].styleId().has_value());
+    CHECK(!direct.paragraphs()[1].styleId().has_value());
+
+    DocumentSession session(created.value());
+    const auto before = session.snapshot();
+    const auto applied = session.applyBatch(
+        before.revision,
+        std::vector<Operation>{SetParagraphStyle{
+            {first_id, second_id}, std::string{"Heading1"}}});
+    CHECK(applied);
+    CHECK(applied.value().changed);
+    const auto after = session.snapshot();
+    CHECK(after.document.paragraphs()[0].styleId() ==
+          std::optional<std::string>{"Heading1"});
+    CHECK(after.document.paragraphs()[1].styleId() ==
+          std::optional<std::string>{"Heading1"});
+
+    const auto no_op = session.applyBatch(
+        after.revision,
+        std::vector<Operation>{SetParagraphStyle{
+            {first_id, second_id}, std::string{"Heading1"}}});
+    CHECK(no_op);
+    CHECK(!no_op.value().changed);
+    CHECK(no_op.value().revision == after.revision);
+    CHECK(session.historyDepths().undo == 1);
+
+    CHECK(session.undo(after.revision));
+    const auto undone = session.snapshot();
+    CHECK(undone.document == before.document);
+    CHECK(session.redo(undone.revision));
+    CHECK(session.snapshot().document == after.document);
+
+    const auto before_atomic_rejection = session.snapshot();
+    const auto rejected = session.applyBatch(
+        before_atomic_rejection.revision,
+        std::vector<Operation>{
+            SetParagraphStyle{{first_id}, std::string{"Title"}},
+            SetParagraphStyle{{NodeId::generate()},
+                              std::string{"Subtitle"}},
+        });
+    CHECK(!rejected);
+    CHECK(rejected.error().code == ErrorCode::paragraph_not_found);
+    CHECK(session.snapshot().revision == before_atomic_rejection.revision);
+    CHECK(session.snapshot().document == before_atomic_rejection.document);
+}
+
+void testParagraphStyleSplitMergeAndPreview() {
+    const auto first_id = NodeId::generate();
+    const auto styled = Paragraph::create(
+        u"abcd", first_id, {}, std::string{"Heading1"});
+    CHECK(styled);
+    if (!styled) return;
+    const auto created = Document::create({styled.value()});
+    CHECK(created);
+    if (!created) return;
+
+    DocumentSession session(created.value());
+    const auto before_split = session.snapshot();
+    const auto second_id = NodeId::generate();
+    CHECK(session.applyBatch(
+        before_split.revision,
+        std::vector<Operation>{SplitParagraph{{first_id, 2}, second_id}}));
+    auto snapshot = session.snapshot();
+    CHECK(snapshot.document.paragraphs().size() == 2);
+    CHECK(snapshot.document.paragraphs()[0].styleId() ==
+          std::optional<std::string>{"Heading1"});
+    CHECK(snapshot.document.paragraphs()[1].styleId() ==
+          std::optional<std::string>{"Heading1"});
+
+    CHECK(session.applyBatch(
+        snapshot.revision,
+        std::vector<Operation>{SetParagraphStyle{
+            {second_id}, std::string{"CustomContinuation"}}}));
+    snapshot = session.snapshot();
+    CHECK(session.applyBatch(
+        snapshot.revision,
+        std::vector<Operation>{MergeWithNextParagraph{first_id}}));
+    const auto merged = session.snapshot();
+    CHECK(merged.document.paragraphs().size() == 1);
+    CHECK(merged.document.paragraphs().front().text() == u"abcd");
+    // Merging keeps the semantic identity of the first paragraph rather than
+    // allowing the removed paragraph's style to leak backward.
+    CHECK(merged.document.paragraphs().front().styleId() ==
+          std::optional<std::string>{"Heading1"});
+    CHECK(session.undo(merged.revision));
+    const auto merge_undone = session.snapshot();
+    CHECK(merge_undone.document.paragraphs().size() == 2);
+    CHECK(merge_undone.document.paragraphs()[0].styleId() ==
+          std::optional<std::string>{"Heading1"});
+    CHECK(merge_undone.document.paragraphs()[1].styleId() ==
+          std::optional<std::string>{"CustomContinuation"});
+
+    DocumentSession preview_session(documentWithText(u"Preview"));
+    const auto live_before = preview_session.snapshot();
+    const auto preview_paragraph_id =
+        live_before.document.paragraphs().front().id();
+    const auto preview =
+        preview_session.createPreview(live_before.revision);
+    CHECK(preview);
+    if (!preview) return;
+    const auto preview_applied = preview_session.applyPreviewBatch(
+        preview.value().id, Revision{},
+        std::vector<Operation>{SetParagraphStyle{
+            {preview_paragraph_id}, std::string{"Heading2"}}});
+    CHECK(preview_applied);
+    CHECK(!preview_session.snapshot().document.paragraphs().front()
+               .styleId().has_value());
+    const auto preview_snapshot =
+        preview_session.previewSnapshot(preview.value().id);
+    CHECK(preview_snapshot);
+    if (preview_snapshot) {
+        CHECK(preview_snapshot.value().document.paragraphs().front().styleId() ==
+              std::optional<std::string>{"Heading2"});
+    }
+    CHECK(preview_session.acceptPreview(
+        preview.value().id, live_before.revision, Revision{1}));
+    const auto accepted = preview_session.snapshot();
+    CHECK(accepted.document.paragraphs().front().styleId() ==
+          std::optional<std::string>{"Heading2"});
+    CHECK(preview_session.undo(accepted.revision));
+    CHECK(preview_session.snapshot().document == live_before.document);
+}
+
+void testParagraphStyleProvenanceEditingLifecycle() {
+    const auto* headingOne = findBuiltInParagraphStyle("Heading1");
+    const auto* headingTwo = findBuiltInParagraphStyle("Heading2");
+    CHECK(headingOne != nullptr);
+    CHECK(headingTwo != nullptr);
+    if (!headingOne || !headingTwo) return;
+
+    const auto firstId = NodeId::generate();
+    const auto secondId = NodeId::generate();
+    auto first = Paragraph::create(
+        u"ABC", firstId, headingOne->character_format,
+        std::string{"Heading1"});
+    auto second = Paragraph::create(
+        u"xyz", secondId, headingTwo->character_format,
+        std::string{"Heading2"});
+    CHECK(first && second);
+    if (!first || !second) return;
+    auto created = Document::create({first.value(), second.value()});
+    CHECK(created);
+    if (!created) return;
+    auto mergedStyles = std::move(created.value());
+    CHECK(mergedStyles.applyCharacterFormat(
+        {{firstId, 0}, {firstId, 3}},
+        headingOne->characterBaselineDelta()));
+    CHECK(mergedStyles.applyCharacterFormat(
+        {{secondId, 0}, {secondId, 3}},
+        headingTwo->characterBaselineDelta()));
+    CHECK(mergedStyles.applyParagraphFormat(
+        {firstId}, headingOne->paragraphBaselineDelta()));
+    CHECK(mergedStyles.applyParagraphFormat(
+        {secondId}, headingTwo->paragraphBaselineDelta()));
+
+    ParagraphStyleProvenance firstProvenance;
+    firstProvenance.inherited_character_format =
+        headingOne->character_format;
+    firstProvenance.inherited_paragraph_mark_character_format =
+        headingOne->character_format;
+    firstProvenance.inherited_paragraph_format =
+        headingOne->paragraph_format;
+    ParagraphStyleProvenance secondProvenance;
+    secondProvenance.inherited_character_format =
+        headingTwo->character_format;
+    secondProvenance.inherited_paragraph_mark_character_format =
+        headingTwo->character_format;
+    secondProvenance.inherited_paragraph_format =
+        headingTwo->paragraph_format;
+    CHECK(mergedStyles.setParagraphStyleProvenance(
+        firstId, firstProvenance));
+    CHECK(mergedStyles.setParagraphStyleProvenance(
+        secondId, secondProvenance));
+
+    CharacterFormatDelta explicitBold;
+    explicitBold.bold = PropertyDelta<bool>::set(true);
+    CHECK(mergedStyles.applyCharacterFormat(
+        {{secondId, 1}, {secondId, 2}}, explicitBold));
+    CharacterFormatDelta explicitFirstStyleColor;
+    explicitFirstStyleColor.foreground_argb =
+        PropertyDelta<std::uint32_t>::set(0xffe95420U);
+    CHECK(mergedStyles.applyCharacterFormat(
+        {{secondId, 2}, {secondId, 3}}, explicitFirstStyleColor));
+
+    CHECK(mergedStyles.mergeWithNext(firstId));
+    CHECK(mergedStyles.paragraphs().size() == 1);
+    const auto& merged = mergedStyles.paragraphs().front();
+    CHECK(merged.styleId() ==
+          std::optional<std::string>{"Heading1"});
+    CHECK(merged.styleProvenance().has_value());
+    // Heading 2's inherited size/color become visible direct formatting when
+    // its paragraph mark is removed. The equal-by-value bold override and a
+    // color equal to Heading 1's baseline must retain their exact directness.
+    const auto inheritedSecond = merged.styleOverrideMaskAt(4);
+    CHECK(inheritedSecond.font_size_half_points);
+    CHECK(inheritedSecond.foreground_argb);
+    CHECK(!inheritedSecond.bold);
+    const auto equalBold = merged.styleOverrideMaskAt(5);
+    CHECK(equalBold.font_size_half_points);
+    CHECK(equalBold.foreground_argb);
+    CHECK(equalBold.bold);
+    const auto equalFirstColor = merged.styleOverrideMaskAt(6);
+    CHECK(equalFirstColor.font_size_half_points);
+    CHECK(equalFirstColor.foreground_argb);
+    CHECK(!equalFirstColor.bold);
+
+    CharacterFormat importedBaseline;
+    importedBaseline.font_size_half_points = 30;
+    importedBaseline.bold = true;
+    importedBaseline.foreground_argb = 0xff223344U;
+    const auto editingId = NodeId::generate();
+    auto editingParagraph = Paragraph::create(
+        u"abcd", editingId, importedBaseline,
+        std::string{"ImportedBody"});
+    CHECK(editingParagraph);
+    if (!editingParagraph) return;
+    auto editingCreated = Document::create({editingParagraph.value()});
+    CHECK(editingCreated);
+    if (!editingCreated) return;
+    auto editing = std::move(editingCreated.value());
+    CharacterFormatDelta importedBaselineDelta;
+    importedBaselineDelta.font_size_half_points =
+        PropertyDelta<std::int32_t>::set(30);
+    importedBaselineDelta.bold = PropertyDelta<bool>::set(true);
+    importedBaselineDelta.foreground_argb =
+        PropertyDelta<std::uint32_t>::set(0xff223344U);
+    CHECK(editing.applyCharacterFormat(
+        {{editingId, 0}, {editingId, 4}}, importedBaselineDelta));
+    ParagraphStyleProvenance editingProvenance;
+    editingProvenance.inherited_character_format = importedBaseline;
+    editingProvenance.inherited_paragraph_mark_character_format =
+        importedBaseline;
+    CHECK(editing.setParagraphStyleProvenance(
+        editingId, editingProvenance));
+
+    // An explicit value equal to the inherited value is still direct. Text
+    // typed immediately after it inherits that mask, while also recording the
+    // new typing-format difference.
+    CHECK(editing.applyCharacterFormat(
+        {{editingId, 1}, {editingId, 2}}, explicitBold));
+    auto typedFormat = importedBaseline;
+    typedFormat.italic = true;
+    CHECK(editing.insertText({editingId, 2}, u"XY", typedFormat));
+    const auto typedMask =
+        editing.paragraphs().front().styleOverrideMaskAt(3);
+    CHECK(typedMask.bold);
+    CHECK(typedMask.italic);
+    CHECK(!typedMask.font_size_half_points);
+    CHECK(!typedMask.foreground_argb);
+    CHECK(editing.paragraphs().front().styleOverrideMaskAt(4) ==
+          typedMask);
+
+    auto replacementFormat = importedBaseline;
+    replacementFormat.underline = UnderlineStyle::single;
+    replacementFormat.foreground_argb = 0xffaa0000U;
+    CHECK(editing.replaceRange(
+        {{editingId, 5}, {editingId, 6}}, u"Q", replacementFormat));
+    const auto replacementMask =
+        editing.paragraphs().front().styleOverrideMaskAt(6);
+    CHECK(replacementMask.underline);
+    CHECK(replacementMask.foreground_argb);
+    CHECK(!replacementMask.bold);
+    CHECK(!replacementMask.font_size_half_points);
+    CHECK(editing.paragraphs().front().styleOverrideMaskAt(3) ==
+          typedMask);
+
+    // A partial replacement continues the first removed character's direct
+    // provenance, even when those values look identical to the inherited
+    // style. The surrounding inherited characters must remain inherited.
+    CharacterFormat equalBaseline;
+    equalBaseline.bold = false;
+    equalBaseline.foreground_argb = 0xff000000U;
+    const auto partialReplaceId = NodeId::generate();
+    auto partialReplaceParagraph = Paragraph::create(
+        u"AoldZ", partialReplaceId, equalBaseline,
+        std::string{"Normal"});
+    CHECK(partialReplaceParagraph);
+    if (!partialReplaceParagraph) return;
+    auto partialReplaceCreated = Document::create(
+        {std::move(partialReplaceParagraph.value())});
+    CHECK(partialReplaceCreated);
+    if (!partialReplaceCreated) return;
+    auto partialReplaceDocument =
+        std::move(partialReplaceCreated.value());
+    CharacterFormatDelta equalBaselineDelta;
+    equalBaselineDelta.bold = PropertyDelta<bool>::set(false);
+    equalBaselineDelta.foreground_argb =
+        PropertyDelta<std::uint32_t>::set(0xff000000U);
+    CHECK(partialReplaceDocument.applyCharacterFormat(
+        {{partialReplaceId, 0}, {partialReplaceId, 5}},
+        equalBaselineDelta));
+    CharacterFormatMask equalDirectMask;
+    equalDirectMask.bold = true;
+    equalDirectMask.foreground_argb = true;
+    ParagraphStyleProvenance partialReplaceProvenance;
+    partialReplaceProvenance.inherited_character_format = equalBaseline;
+    partialReplaceProvenance.inherited_paragraph_mark_character_format =
+        equalBaseline;
+    partialReplaceProvenance.character_overrides = {
+        {1, 4, equalDirectMask}};
+    CHECK(partialReplaceDocument.setParagraphStyleProvenance(
+        partialReplaceId, partialReplaceProvenance));
+    CHECK(partialReplaceDocument.replaceRange(
+        {{partialReplaceId, 1}, {partialReplaceId, 4}}, u"new",
+        equalBaseline));
+    const auto& partialReplacement =
+        partialReplaceDocument.paragraphs().front();
+    CHECK(partialReplacement.text() == u"AnewZ");
+    CHECK(partialReplacement.styleOverrideMaskAt(1).empty());
+    CHECK(partialReplacement.styleOverrideMaskAt(2) == equalDirectMask);
+    CHECK(partialReplacement.styleOverrideMaskAt(3) == equalDirectMask);
+    CHECK(partialReplacement.styleOverrideMaskAt(4) == equalDirectMask);
+    CHECK(partialReplacement.styleOverrideMaskAt(5).empty());
+
+    // A non-empty replacement must not let delete-to-empty promotion leak a
+    // character mask into the paragraph mark. The original equal-by-value
+    // mark override remains exact while the replacement keeps its own mask.
+    CharacterFormat markBaseline;
+    markBaseline.bold = true;
+    markBaseline.foreground_argb = 0xff123456U;
+    const auto replaceId = NodeId::generate();
+    auto replaceParagraph = Paragraph::create(
+        u"old", replaceId, markBaseline,
+        std::string{"ImportedReplace"});
+    CHECK(replaceParagraph);
+    if (!replaceParagraph) return;
+    auto replaceCreated = Document::create({replaceParagraph.value()});
+    CHECK(replaceCreated);
+    if (!replaceCreated) return;
+    auto replaceDocument = std::move(replaceCreated.value());
+    CharacterFormatDelta markBaselineDelta;
+    markBaselineDelta.bold = PropertyDelta<bool>::set(true);
+    markBaselineDelta.foreground_argb =
+        PropertyDelta<std::uint32_t>::set(0xff123456U);
+    CHECK(replaceDocument.applyCharacterFormat(
+        {{replaceId, 0}, {replaceId, 3}}, markBaselineDelta));
+    CharacterFormatMask equalColorMask;
+    equalColorMask.foreground_argb = true;
+    ParagraphStyleProvenance replaceProvenance;
+    replaceProvenance.inherited_character_format = markBaseline;
+    replaceProvenance.inherited_paragraph_mark_character_format =
+        markBaseline;
+    replaceProvenance.character_overrides = {
+        {0, 3, equalColorMask}};
+    replaceProvenance.paragraph_mark_overrides.bold = true;
+    CHECK(replaceDocument.setParagraphStyleProvenance(
+        replaceId, replaceProvenance));
+    CHECK(replaceDocument.replaceRange(
+        {{replaceId, 0}, {replaceId, 3}}, u"new", markBaseline));
+    const auto& replaced = replaceDocument.paragraphs().front();
+    CHECK(replaced.paragraphMarkCharacterFormat() == markBaseline);
+    CHECK(replaced.styleProvenance()->paragraph_mark_overrides.bold);
+    CHECK(!replaced.styleProvenance()
+               ->paragraph_mark_overrides.foreground_argb);
+    CHECK(replaced.styleOverrideMaskAt(1).foreground_argb);
+
+    // Deleting across differently styled paragraphs and leaving an empty
+    // survivor promotes the removed paragraph's insertion context. Its mask
+    // must be rebased to the retained style just like ordinary merged text.
+    const auto emptyId = NodeId::generate();
+    const auto removedId = NodeId::generate();
+    auto emptyFirst = Paragraph::create(
+        u"", emptyId, {}, std::string{"Heading1"});
+    auto removedSecond = Paragraph::create(
+        u"x", removedId, headingTwo->character_format,
+        std::string{"Heading2"});
+    CHECK(emptyFirst && removedSecond);
+    if (!emptyFirst || !removedSecond) return;
+    auto deleteCreated = Document::create(
+        {emptyFirst.value(), removedSecond.value()});
+    CHECK(deleteCreated);
+    if (!deleteCreated) return;
+    auto deleteDocument = std::move(deleteCreated.value());
+    CHECK(deleteDocument.applyCharacterFormat(
+        {{removedId, 0}, {removedId, 1}},
+        headingTwo->characterBaselineDelta()));
+    ParagraphStyleProvenance retainedProvenance;
+    retainedProvenance.inherited_character_format =
+        headingOne->character_format;
+    retainedProvenance.inherited_paragraph_mark_character_format =
+        headingOne->character_format;
+    retainedProvenance.inherited_paragraph_format =
+        headingOne->paragraph_format;
+    ParagraphStyleProvenance removedProvenance;
+    removedProvenance.inherited_character_format =
+        headingTwo->character_format;
+    removedProvenance.inherited_paragraph_mark_character_format =
+        headingTwo->character_format;
+    removedProvenance.inherited_paragraph_format =
+        headingTwo->paragraph_format;
+    CharacterFormatMask removedBoldMask;
+    removedBoldMask.bold = true;
+    removedProvenance.character_overrides = {
+        {0, 1, removedBoldMask}};
+    CHECK(deleteDocument.setParagraphStyleProvenance(
+        emptyId, retainedProvenance));
+    CHECK(deleteDocument.setParagraphStyleProvenance(
+        removedId, removedProvenance));
+    CHECK(deleteDocument.deleteRange(
+        {{emptyId, 0}, {removedId, 1}}));
+    CHECK(deleteDocument.paragraphs().size() == 1);
+    const auto& emptied = deleteDocument.paragraphs().front();
+    CHECK(emptied.text().empty());
+    CHECK(emptied.paragraphMarkCharacterFormat() ==
+          headingTwo->character_format);
+    CHECK(emptied.styleProvenance()->paragraph_mark_overrides.bold);
+    CHECK(emptied.styleProvenance()
+              ->paragraph_mark_overrides.font_size_half_points);
+    CHECK(emptied.styleProvenance()
+              ->paragraph_mark_overrides.foreground_argb);
+
+    CharacterFormatMask boldMask;
+    boldMask.bold = true;
+    CharacterFormatMask colorMask;
+    colorMask.foreground_argb = true;
+    CharacterFormatMask italicMask;
+    italicMask.italic = true;
+    ParagraphStyleProvenance splitProvenance;
+    splitProvenance.character_overrides = {
+        {0, 2, boldMask}, {2, 5, colorMask}, {5, 6, italicMask}};
+    splitProvenance.paragraph_mark_overrides.underline = true;
+    const auto splitId = NodeId::generate();
+    auto splitParagraph = Paragraph::create(
+        u"abcdef", splitId, {}, std::string{"ImportedSplit"},
+        splitProvenance);
+    CHECK(splitParagraph);
+    if (!splitParagraph) return;
+    auto splitCreated = Document::create({splitParagraph.value()});
+    CHECK(splitCreated);
+    if (!splitCreated) return;
+    auto splitDocument = std::move(splitCreated.value());
+    const auto rightId = NodeId::generate();
+    CHECK(splitDocument.splitParagraph({splitId, 3}, rightId));
+    CHECK(splitDocument.paragraphs().size() == 2);
+    const auto& leftProvenance =
+        *splitDocument.paragraphs()[0].styleProvenance();
+    const auto& rightProvenance =
+        *splitDocument.paragraphs()[1].styleProvenance();
+    CHECK(leftProvenance.character_overrides.size() == 2);
+    CHECK((leftProvenance.character_overrides[0] ==
+           ParagraphStyleProvenance::OverrideRun{0, 2, boldMask}));
+    CHECK((leftProvenance.character_overrides[1] ==
+           ParagraphStyleProvenance::OverrideRun{2, 3, colorMask}));
+    CHECK(rightProvenance.character_overrides.size() == 2);
+    CHECK((rightProvenance.character_overrides[0] ==
+           ParagraphStyleProvenance::OverrideRun{0, 2, colorMask}));
+    CHECK((rightProvenance.character_overrides[1] ==
+           ParagraphStyleProvenance::OverrideRun{2, 3, italicMask}));
+    CHECK(leftProvenance.paragraph_mark_overrides.underline);
+    CHECK(rightProvenance.paragraph_mark_overrides.foreground_argb);
+    CHECK(!rightProvenance.paragraph_mark_overrides.underline);
+    CHECK(splitDocument.mergeWithNext(splitId));
+    CHECK(splitDocument.paragraphs().front().styleProvenance()
+              ->character_overrides ==
+          splitProvenance.character_overrides);
+
+    CharacterFormat inheritedHeadingMark;
+    inheritedHeadingMark.font_size_half_points = 32;
+    inheritedHeadingMark.bold = true;
+    inheritedHeadingMark.foreground_argb = 0xffe95420U;
+    ParagraphStyleProvenance headingMarkProvenance;
+    headingMarkProvenance.inherited_character_format =
+        inheritedHeadingMark;
+    headingMarkProvenance.inherited_paragraph_mark_character_format =
+        inheritedHeadingMark;
+    const auto headingMarkId = NodeId::generate();
+    auto headingMarkParagraph = Paragraph::create(
+        u"heading", headingMarkId, inheritedHeadingMark,
+        std::string{"Heading1"}, headingMarkProvenance);
+    CHECK(headingMarkParagraph);
+    if (!headingMarkParagraph) return;
+    auto headingMarkDocument = Document::create(
+        {std::move(headingMarkParagraph.value())});
+    CHECK(headingMarkDocument);
+    if (!headingMarkDocument) return;
+    auto transientMark = inheritedHeadingMark;
+    transientMark.foreground_argb = 0xffcc0000U;
+    const auto headingMarkRightId = NodeId::generate();
+    CHECK(headingMarkDocument.value().splitParagraph(
+        {headingMarkId, 7}, headingMarkRightId, transientMark));
+    const auto& splitHeadingMark =
+        headingMarkDocument.value().paragraphs()[1];
+    CHECK(splitHeadingMark.paragraphMarkCharacterFormat() == transientMark);
+    CHECK(splitHeadingMark.styleProvenance().has_value());
+    CHECK(splitHeadingMark.styleProvenance()
+              ->paragraph_mark_overrides.foreground_argb);
+    CHECK(!splitHeadingMark.styleProvenance()
+               ->paragraph_mark_overrides.font_size_half_points);
+    CHECK(!splitHeadingMark.styleProvenance()
+               ->paragraph_mark_overrides.bold);
+
+    // Provenance replacement is a first-class operation so style changes can
+    // remain one undoable transaction without publishing an intermediate
+    // identity/format state.
+    DocumentSession provenanceSession(mergedStyles);
+    const auto before = provenanceSession.snapshot();
+    ParagraphStyleProvenance replacementProvenance;
+    replacementProvenance.inherited_character_format =
+        headingTwo->character_format;
+    replacementProvenance.inherited_paragraph_mark_character_format =
+        headingTwo->character_format;
+    const auto applied = provenanceSession.applyBatch(
+        before.revision,
+        std::vector<Operation>{SetParagraphStyleProvenance{
+            firstId, replacementProvenance}});
+    CHECK(applied && applied.value().changed);
+    CHECK(provenanceSession.snapshot().document.paragraphs().front()
+              .styleProvenance() == replacementProvenance);
+    CHECK(provenanceSession.undo(
+        provenanceSession.snapshot().revision));
+    CHECK(provenanceSession.snapshot().document == before.document);
+}
+
 void testParagraphMarkCharacterFormatting() {
     const auto default_paragraph = Paragraph::create(u"");
     CHECK(default_paragraph);
@@ -2213,6 +2922,11 @@ int main() {
     testNodeIdsAndRevision();
     testUtf16BoundariesAndAtomicBatch();
     testSparseFormatting();
+    testBuiltInParagraphStyleCatalog();
+    testParagraphStyleIdentityAndValidation();
+    testParagraphStyleOperationsAndHistory();
+    testParagraphStyleSplitMergeAndPreview();
+    testParagraphStyleProvenanceEditingLifecycle();
     testParagraphMarkCharacterFormatting();
     testSemanticListFormatting();
     testParagraphStructureAndHistory();

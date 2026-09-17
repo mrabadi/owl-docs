@@ -29,6 +29,12 @@ Result<void> applyOne(Document& document, const Operation& operation) {
             } else if constexpr (std::is_same_v<Type, ResizeImage>) {
                 return document.resizeImage(
                     typed.image_id, typed.width_emu, typed.height_emu);
+            } else if constexpr (
+                std::is_same_v<Type, ReplaceImagePayload>) {
+                return document.replaceImagePayload(
+                    typed.image_id, typed.encoded_payload,
+                    typed.image_format, typed.width_emu,
+                    typed.height_emu);
             } else if constexpr (std::is_same_v<Type, SetImageLayout>) {
                 return document.setImageLayout(typed.image_id, typed.layout);
             } else if constexpr (
@@ -48,6 +54,13 @@ Result<void> applyOne(Document& document, const Operation& operation) {
                     typed.paragraph_id, typed.delta);
             } else if constexpr (std::is_same_v<Type, SetParagraphFormat>) {
                 return document.applyParagraphFormat(typed.paragraph_ids, typed.delta);
+            } else if constexpr (std::is_same_v<Type, SetParagraphStyle>) {
+                return document.setParagraphStyle(
+                    typed.paragraph_ids, typed.style_id);
+            } else if constexpr (
+                std::is_same_v<Type, SetParagraphStyleProvenance>) {
+                return document.setParagraphStyleProvenance(
+                    typed.paragraph_id, typed.provenance);
             } else if constexpr (std::is_same_v<Type, SplitParagraph>) {
                 return document.splitParagraph(
                     typed.position, typed.new_paragraph_id,

@@ -270,13 +270,51 @@ struct ImageAtom {
     auto operator<=>(const ImageAtom&) const = default;
 };
 
+// A DOCX paragraph style can have the same identity as one of Owl Docs'
+// built-ins while resolving to a different visual definition in the source
+// package.  Keep that resolved source baseline separate from the effective
+// formats stored on the paragraph.  Style transitions can then distinguish
+// inherited appearance from direct run/paragraph overrides without making
+// the portable DOCX depend on application-private metadata.
+struct ParagraphStyleProvenance {
+    CharacterFormat inherited_character_format;
+    // Effective insertion/paragraph-mark baseline contributed by docDefaults
+    // and the paragraph-style chain.  This can differ from ordinary run
+    // inheritance when a style carries paragraph-mark run properties.
+    CharacterFormat inherited_paragraph_mark_character_format;
+    ParagraphFormat inherited_paragraph_format;
+    struct OverrideRun {
+        std::size_t start{0};
+        std::size_t end{0};
+        CharacterFormatMask properties;
+
+        auto operator<=>(const OverrideRun&) const = default;
+    };
+    std::vector<OverrideRun> character_overrides;
+    CharacterFormatMask paragraph_mark_overrides;
+    ParagraphFormatMask paragraph_overrides;
+
+    auto operator<=>(const ParagraphStyleProvenance&) const = default;
+};
+
 class Paragraph {
 public:
     Paragraph();
 
     [[nodiscard]] static Result<Paragraph> create(
         std::u16string text, NodeId id = NodeId::generate(),
-        CharacterFormat paragraph_mark_character_format = {});
+        CharacterFormat paragraph_mark_character_format = {},
+        std::optional<std::string> style_id = std::nullopt,
+        std::optional<ParagraphStyleProvenance> style_provenance =
+            std::nullopt);
+    // Recovery/import code uses the same validation as ordinary creation but
+    // may make the intent to retain an external style identity explicit.
+    [[nodiscard]] static Result<Paragraph> restore(
+        std::u16string text, NodeId id,
+        CharacterFormat paragraph_mark_character_format,
+        std::optional<std::string> style_id = std::nullopt,
+        std::optional<ParagraphStyleProvenance> style_provenance =
+            std::nullopt);
 
     [[nodiscard]] NodeId id() const noexcept { return id_; }
     [[nodiscard]] const std::u16string& text() const noexcept { return text_; }
@@ -293,6 +331,15 @@ public:
     [[nodiscard]] const ImageAtom* imageAt(
         std::size_t utf16_offset) const noexcept;
     [[nodiscard]] const ParagraphFormat& format() const noexcept { return format_; }
+    [[nodiscard]] const std::optional<std::string>& styleId() const noexcept {
+        return style_id_;
+    }
+    [[nodiscard]] const std::optional<ParagraphStyleProvenance>&
+    styleProvenance() const noexcept {
+        return style_provenance_;
+    }
+    [[nodiscard]] CharacterFormatMask styleOverrideMaskAt(
+        std::size_t utf16_offset) const noexcept;
     // Character properties carried by the paragraph mark. They provide the
     // durable insertion format when the paragraph has no text.
     [[nodiscard]] const CharacterFormat& paragraphMarkCharacterFormat()
@@ -305,10 +352,16 @@ public:
 
 private:
     Paragraph(NodeId id, std::u16string text,
-              CharacterFormat paragraph_mark_character_format = {});
+              CharacterFormat paragraph_mark_character_format = {},
+              std::optional<std::string> style_id = std::nullopt,
+              std::optional<ParagraphStyleProvenance> style_provenance =
+                  std::nullopt);
 
     [[nodiscard]] std::vector<CharacterFormat> denseFormats() const;
+    [[nodiscard]] std::vector<CharacterFormatMask>
+    denseStyleOverrideMasks() const;
     void setContent(std::u16string text, std::vector<CharacterFormat> formats);
+    void setStyleOverrideMasks(std::vector<CharacterFormatMask> masks);
     [[nodiscard]] Result<void> insertText(std::size_t offset, const std::u16string& text,
                                           const std::optional<CharacterFormat>& format);
     [[nodiscard]] Result<void> insertEquation(
@@ -328,6 +381,8 @@ private:
     std::vector<ImageAtom> images_;
     ParagraphFormat format_;
     CharacterFormat paragraph_mark_character_format_;
+    std::optional<std::string> style_id_;
+    std::optional<ParagraphStyleProvenance> style_provenance_;
 
     friend class Document;
 };
@@ -365,6 +420,10 @@ public:
         ImageLayout layout = {});
     [[nodiscard]] Result<void> resizeImage(
         NodeId image_id, std::int64_t width_emu, std::int64_t height_emu);
+    [[nodiscard]] Result<void> replaceImagePayload(
+        NodeId image_id, EncodedImagePayload encoded_payload,
+        ImageFormat image_format, std::int64_t width_emu,
+        std::int64_t height_emu);
     [[nodiscard]] Result<void> setImageLayout(NodeId image_id,
                                               ImageLayout layout);
     [[nodiscard]] Result<void> setImageAccessibleName(
@@ -381,6 +440,15 @@ public:
         NodeId paragraph_id, const CharacterFormatDelta& delta);
     [[nodiscard]] Result<void> applyParagraphFormat(const std::vector<NodeId>& paragraph_ids,
                                                     const ParagraphFormatDelta& delta);
+    [[nodiscard]] Result<void> setParagraphStyle(
+        const std::vector<NodeId>& paragraph_ids,
+        std::optional<std::string> style_id);
+    // Import and recovery attach provenance only after restoring effective
+    // formatting so those restoration operations are not mistaken for user
+    // direct formatting.
+    [[nodiscard]] Result<void> setParagraphStyleProvenance(
+        NodeId paragraph_id,
+        std::optional<ParagraphStyleProvenance> provenance);
     [[nodiscard]] Result<void> splitParagraph(
         const Position& position, NodeId new_paragraph_id,
         std::optional<CharacterFormat> new_paragraph_mark_format = std::nullopt);

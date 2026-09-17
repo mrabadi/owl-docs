@@ -54,6 +54,17 @@ struct ResizeImage {
     std::int64_t height_emu{0};
 };
 
+// Replaces the rendered bytes of an existing image while retaining its
+// semantic identity, anchor, alt text, and wrapping. This is used by embedded
+// figure editors so a save is one undoable document transaction.
+struct ReplaceImagePayload {
+    NodeId image_id;
+    EncodedImagePayload encoded_payload;
+    ImageFormat image_format{ImageFormat::png};
+    std::int64_t width_emu{0};
+    std::int64_t height_emu{0};
+};
+
 struct SetImageLayout {
     NodeId image_id;
     ImageLayout layout;
@@ -96,6 +107,23 @@ struct SetParagraphMarkCharacterFormat {
 struct SetParagraphFormat {
     std::vector<NodeId> paragraph_ids;
     ParagraphFormatDelta delta;
+};
+
+// Style identity is distinct from the effective/direct formatting currently
+// stored on the paragraph. UI callers can combine this with catalog baseline
+// deltas in one atomic batch, while importers can retain an unknown custom ID.
+struct SetParagraphStyle {
+    std::vector<NodeId> paragraph_ids;
+    std::optional<std::string> style_id;
+};
+
+// Style changes are assembled as atomic batches: effective formatting is
+// rebased first, then the target baseline and exact direct-override masks are
+// attached. Keeping this as an operation makes that provenance participate in
+// preview, undo, and revision handling just like the visible style change.
+struct SetParagraphStyleProvenance {
+    NodeId paragraph_id;
+    std::optional<ParagraphStyleProvenance> provenance;
 };
 
 struct SplitParagraph {
@@ -219,11 +247,12 @@ struct DeleteTable {
 };
 
 using Operation = std::variant<InsertText, InsertEquation, InsertImage,
-                               ResizeImage, SetImageLayout,
+                               ResizeImage, ReplaceImagePayload, SetImageLayout,
                                SetImageAccessibleName, DeleteRange, ReplaceRange,
                                SetCharacterFormat,
                                SetParagraphMarkCharacterFormat,
-                               SetParagraphFormat,
+                               SetParagraphFormat, SetParagraphStyle,
+                               SetParagraphStyleProvenance,
                                SplitParagraph, MergeWithNextParagraph,
                                InsertTable, SetTableCellText,
                                ReplaceTableCellRange,

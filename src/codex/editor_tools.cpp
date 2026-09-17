@@ -120,6 +120,13 @@ Json previewSchema() {
       "type": "object",
       "additionalProperties": false,
       "properties": {
+        "styleId": {
+          "oneOf": [
+            {"type": "string", "minLength": 1, "maxLength": 1024},
+            {"type": "null"}
+          ],
+          "description": "Set a bounded semantic paragraph-style ID, or null to clear it. IDs are additionally limited to 1024 UTF-8 bytes. Recognized built-ins also apply their catalog baseline; unknown IDs retain identity without invented formatting."
+        },
         "alignment": {"type": "string", "enum": ["left", "center", "right", "justify"]},
         "lineSpacing": {"type": "number", "exclusiveMinimum": 0, "maximum": 20},
         "spaceBeforePoints": {"type": "number", "minimum": 0, "maximum": 10000},
@@ -127,6 +134,91 @@ Json previewSchema() {
         "keepWithNext": {"type": "boolean"}
       },
       "minProperties": 1
+    },
+    "excalidrawColor": {
+      "type": "string",
+      "pattern": "^#[0-9A-Fa-f]{6}$"
+    },
+    "excalidrawLabel": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "text": {"type": "string", "minLength": 1, "maxLength": 2000},
+        "fontSize": {"type": "number", "minimum": 8, "maximum": 96}
+      },
+      "required": ["text"]
+    },
+    "excalidrawElement": {
+      "oneOf": [
+        {
+          "type": "object", "additionalProperties": false,
+          "properties": {
+            "id": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,64}$"},
+            "type": {"enum": ["rectangle", "ellipse", "diamond"]},
+            "x": {"type": "number", "minimum": -10000, "maximum": 10000},
+            "y": {"type": "number", "minimum": -10000, "maximum": 10000},
+            "width": {"type": "number", "exclusiveMinimum": 0, "maximum": 10000},
+            "height": {"type": "number", "exclusiveMinimum": 0, "maximum": 10000},
+            "strokeColor": {"$ref": "#/$defs/excalidrawColor"},
+            "backgroundColor": {"$ref": "#/$defs/excalidrawColor"},
+            "strokeWidth": {"type": "number", "minimum": 1, "maximum": 4},
+            "opacity": {"type": "integer", "minimum": 0, "maximum": 100},
+            "label": {"$ref": "#/$defs/excalidrawLabel"}
+          },
+          "required": ["id", "type", "x", "y", "width", "height"]
+        },
+        {
+          "type": "object", "additionalProperties": false,
+          "properties": {
+            "id": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,64}$"},
+            "type": {"const": "text"},
+            "x": {"type": "number", "minimum": -10000, "maximum": 10000},
+            "y": {"type": "number", "minimum": -10000, "maximum": 10000},
+            "text": {"type": "string", "minLength": 1, "maxLength": 4000},
+            "fontSize": {"type": "number", "minimum": 8, "maximum": 96},
+            "strokeColor": {"$ref": "#/$defs/excalidrawColor"},
+            "opacity": {"type": "integer", "minimum": 0, "maximum": 100}
+          },
+          "required": ["id", "type", "x", "y", "text"]
+        },
+        {
+          "type": "object", "additionalProperties": false,
+          "properties": {
+            "id": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,64}$"},
+            "type": {"enum": ["line", "arrow"]},
+            "x": {"type": "number", "minimum": -10000, "maximum": 10000},
+            "y": {"type": "number", "minimum": -10000, "maximum": 10000},
+            "points": {
+              "type": "array", "minItems": 2, "maxItems": 16,
+              "items": {
+                "type": "array", "prefixItems": [
+                  {"type": "number", "minimum": -10000, "maximum": 10000},
+                  {"type": "number", "minimum": -10000, "maximum": 10000}
+                ], "items": false
+              }
+            },
+            "strokeColor": {"$ref": "#/$defs/excalidrawColor"},
+            "strokeWidth": {"type": "number", "minimum": 1, "maximum": 4},
+            "opacity": {"type": "integer", "minimum": 0, "maximum": 100},
+            "label": {"$ref": "#/$defs/excalidrawLabel"}
+          },
+          "required": ["id", "type", "x", "y", "points"]
+        }
+      ]
+    },
+    "excalidrawFigure": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "elements": {
+          "type": "array", "minItems": 1, "maxItems": 128,
+          "items": {"$ref": "#/$defs/excalidrawElement"}
+        },
+        "accessibleName": {"type": "string", "minLength": 1, "maxLength": 500},
+        "widthPoints": {"type": "number", "minimum": 36, "maximum": 936},
+        "heightPoints": {"type": "number", "minimum": 36, "maximum": 936}
+      },
+      "required": ["elements", "accessibleName"]
     },
     "operation": {
       "oneOf": [
@@ -162,21 +254,18 @@ Json previewSchema() {
         },
         {
           "type": "object", "additionalProperties": false,
-          "properties": {
-            "kind": {"const": "insert_image"},
-            "target": {"$ref": "#/$defs/target"},
-            "fileCapabilityId": {"type": "string", "minLength": 16, "maxLength": 128, "pattern": "^[A-Za-z0-9_-]+$"},
-            "altText": {"type": "string"},
-            "widthPoints": {"type": "number", "exclusiveMinimum": 0, "maximum": 10000},
-            "heightPoints": {"type": "number", "exclusiveMinimum": 0, "maximum": 10000},
-            "wrap": {"type": "string", "enum": ["inline", "square", "tight", "topBottom", "behind", "inFront"]}
-          },
-          "required": ["kind", "target", "fileCapabilityId"]
+          "properties": {"kind": {"const": "insert_page_break"}, "target": {"$ref": "#/$defs/target"}},
+          "required": ["kind", "target"]
         },
         {
           "type": "object", "additionalProperties": false,
-          "properties": {"kind": {"const": "insert_page_break"}, "target": {"$ref": "#/$defs/target"}},
-          "required": ["kind", "target"]
+          "properties": {"kind": {"const": "insert_excalidraw_figure"}, "target": {"$ref": "#/$defs/target"}, "figure": {"$ref": "#/$defs/excalidrawFigure"}},
+          "required": ["kind", "target", "figure"]
+        },
+        {
+          "type": "object", "additionalProperties": false,
+          "properties": {"kind": {"const": "replace_excalidraw_figure"}, "imageId": {"type": "string", "minLength": 1}, "figure": {"$ref": "#/$defs/excalidrawFigure"}},
+          "required": ["kind", "imageId", "figure"]
         }
       ]
     }
@@ -379,8 +468,10 @@ std::vector<EditorToolDefinition> editorV1ToolDefinitions() {
     tools.push_back(
         {std::string(kEditorReadTool),
          "Read a bounded snapshot of the active document, including explicit "
-         "table-cell targets returned by search. Use the returned revision "
-         "and stable block identifiers when preparing edits.",
+         "selection and table-cell targets returned by search. Request "
+         "includeFormatting when a user asks about or requests formatting. "
+         "Use the returned revision, stable block identifiers, and UTF-16 "
+         "offsets when preparing edits.",
          readSchema(), readOutputSchema(), readAnnotations()});
     tools.push_back(
         {std::string(kEditorSearchTool),
@@ -392,8 +483,18 @@ std::vector<EditorToolDefinition> editorV1ToolDefinitions() {
     tools.push_back(
         {std::string(kEditorPreviewTool),
          "Create an atomic, revision-checked preview of semantic document "
-         "operations. This never commits changes; the user reviews the "
-         "preview in Owl Docs before it enters the undo stack.",
+         "operations, including text replacement, character formatting with "
+         "set_text_style (font, size, bold, italic, underline, colors, "
+         "highlight, superscript/subscript), paragraph formatting with "
+         "set_paragraph_style (style, alignment, line/paragraph spacing, "
+         "keep-with-next), equations, and page breaks. When the user asks "
+         "for a diagram, insert_excalidraw_figure and "
+         "replace_excalidraw_figure create or revise a native editable "
+         "Professional-mode scene using the bundled offline renderer. "
+         "When the user asks "
+         "you to edit or format the document, use this tool instead of only "
+         "describing the steps. This never commits changes; the user reviews "
+         "the preview in Owl Docs before it enters the undo stack.",
          previewSchema(), previewOutputSchema(), previewAnnotations()});
     tools.push_back(
         {std::string(kEditorFileCapabilityTool),

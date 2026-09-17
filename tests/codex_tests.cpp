@@ -543,6 +543,8 @@ void testEditorToolSchemas() {
               .at("wholeWord").at("type") == "boolean");
     CHECK(definitions[1].outputSchema.at("properties")
               .at("results").at("maxItems") == 500);
+    CHECK(definitions[2].inputSchema.dump().find("insert_image") ==
+          std::string::npos);
     CHECK(!definitions[3].inputSchema.at("properties").contains("path"));
     CHECK(definitions[3].inputSchema.at("properties")
               .contains("capabilityId"));

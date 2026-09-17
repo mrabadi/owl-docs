@@ -5,6 +5,7 @@
 
 #include <QAction>
 #include <QApplication>
+#include <QComboBox>
 #include <QCoreApplication>
 #include <QDialog>
 #include <QDialogButtonBox>
@@ -214,6 +215,63 @@ void testPreferencesReload(const QString& selectedFamily) {
     check(canvases.size() == 1,
           "reopened window did not create its initial document");
     checkCanvasDefaults(*canvases.front(), selectedFamily, 13.5, 7);
+
+    canvases.front()->insertText(QStringLiteral("Configured body"));
+    canvases.front()->applyParagraphStyle(QStringLiteral("Heading1"));
+    canvases.front()->applyParagraphStyle(QStringLiteral("Normal"));
+    const auto normalFormat = canvases.front()->snapshot().document
+                                  .paragraphs().front().characterFormatAt(1);
+    check(normalFormat.font_family == selectedFamily.toStdString() &&
+              normalFormat.font_size_half_points == 27,
+          "Normal style did not resolve the saved editor font and size defaults");
+
+    auto* stylePicker = window.findChild<QComboBox*>(
+        QStringLiteral("ribbon.paragraphStyle"));
+    check(stylePicker && stylePicker->isEnabled(),
+          "paragraph-style picker is unavailable in a normal body paragraph");
+    check(canvases.front()->insertTable(1, 1, false),
+          "could not enter a table context for paragraph-style testing");
+    QApplication::processEvents();
+    check(!canvases.front()->paragraphStylesAvailable() &&
+              !stylePicker->isEnabled() &&
+              stylePicker->currentText().contains(QStringLiteral("tables")),
+          "active table cell did not explicitly disable the paragraph-style picker");
+    const auto tableId =
+        canvases.front()->snapshot().document.tables().front().id();
+    check(canvases.front()->selectTableCells(tableId, 0, 0, 0, 0),
+          "could not create a rectangular table-cell selection");
+    QApplication::processEvents();
+    check(!canvases.front()->paragraphStylesAvailable() &&
+              !stylePicker->isEnabled(),
+          "rectangular table-cell selection left paragraph styles actionable");
+    check(canvases.front()->selectTable(tableId),
+          "could not select the whole table object");
+    QApplication::processEvents();
+    check(!canvases.front()->paragraphStylesAvailable() &&
+              !stylePicker->isEnabled(),
+          "whole-table selection left paragraph styles actionable");
+
+    canvases.front()->undo();
+    QApplication::processEvents();
+    check(canvases.front()->paragraphStylesAvailable() &&
+              stylePicker->isEnabled(),
+          "leaving a table did not re-enable the paragraph-style picker");
+
+    QString previewSummary;
+    QString previewError;
+    check(canvases.front()->createReplacementPreview(
+              QStringLiteral("preview"), previewSummary, previewError),
+          "could not create a preview for paragraph-style availability testing");
+    QApplication::processEvents();
+    check(!canvases.front()->paragraphStylesAvailable() &&
+              !stylePicker->isEnabled() &&
+              stylePicker->currentText().contains(QStringLiteral("preview")),
+          "active preview did not explicitly disable the paragraph-style picker");
+    canvases.front()->discardPreview();
+    QApplication::processEvents();
+    check(canvases.front()->paragraphStylesAvailable() &&
+              stylePicker->isEnabled(),
+          "discarding a preview did not restore paragraph-style availability");
 }
 
 }  // namespace

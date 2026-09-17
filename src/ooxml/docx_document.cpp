@@ -88,6 +88,110 @@ constexpr std::int64_t kMaximumInlineExtentEmu = 3'600'000'000LL;
 // ECMA-376/ISO 29500 numbering levels are zero-based ilvl 0 through 8.
 constexpr std::uint8_t kMaximumNativeNumberingLevel = 8;
 constexpr std::size_t kNativeNumberingLevelCount = 9;
+constexpr std::size_t kMaximumParagraphStyleIdBytes = 253;
+// A legitimate Word style hierarchy is shallow.  Bound adversarial acyclic
+// basedOn chains explicitly so resolution cannot exhaust the parser worker's
+// stack or repeat unbounded work once per paragraph/run.
+constexpr std::size_t kMaximumStyleChainDepth = 64;
+
+struct BuiltInParagraphStyleDescriptor {
+    std::string_view id;
+    std::string_view name;
+    std::string_view next;
+    std::uint16_t ui_priority;
+    std::uint16_t space_before_twips;
+    std::uint16_t space_after_twips;
+    std::int16_t left_indent_twips;
+    std::int16_t right_indent_twips;
+    std::int16_t font_size_half_points;
+    std::int8_t outline_level;
+    bool keep_with_next;
+    bool keep_lines;
+    bool bold;
+    bool italic;
+    std::optional<std::uint32_t> foreground_rgb;
+    std::optional<BasicParagraphAlignment> alignment;
+};
+
+// Stable ordering is intentional: styles.xml must not depend on the order in
+// which paragraphs happen to use a style.
+constexpr std::array<BuiltInParagraphStyleDescriptor, 13>
+    kBuiltInParagraphStyles{{
+        {"NoSpacing", "No Spacing", "NoSpacing", 1, 0, 0, 0, 0, 0, -1,
+         false, false, false, false, std::nullopt,
+         BasicParagraphAlignment::left},
+        {"Title", "Title", "Normal", 10, 0, 240, 0, 0, 56, -1,
+         true, true, true, false, 0x0077216fU,
+         BasicParagraphAlignment::left},
+        {"Subtitle", "Subtitle", "Normal", 11, 0, 240, 0, 0, 28, -1,
+         true, true, false, true, 0x005e2750U,
+         BasicParagraphAlignment::left},
+        {"Quote", "Quote", "Normal", 29, 120, 120, 720, 720, 22, -1,
+         false, true, false, true, 0x005e2750U,
+         BasicParagraphAlignment::left},
+        {"Heading1", "Heading 1", "Normal", 9, 240, 120, 0, 0, 32, 0,
+         true, true, true, false, 0x00e95420U,
+         BasicParagraphAlignment::left},
+        {"Heading2", "Heading 2", "Normal", 9, 200, 80, 0, 0, 26, 1,
+         true, true, true, false, 0x0077216fU,
+         BasicParagraphAlignment::left},
+        {"Heading3", "Heading 3", "Normal", 9, 160, 60, 0, 0, 24, 2,
+         true, true, true, false, 0x005e2750U,
+         BasicParagraphAlignment::left},
+        {"Heading4", "Heading 4", "Normal", 9, 160, 40, 0, 0, 22, 3,
+         true, true, true, false, 0x005e2750U,
+         BasicParagraphAlignment::left},
+        {"Heading5", "Heading 5", "Normal", 9, 140, 40, 0, 0, 22, 4,
+         true, true, true, true, 0x0077216fU,
+         BasicParagraphAlignment::left},
+        {"Heading6", "Heading 6", "Normal", 9, 120, 40, 0, 0, 22, 5,
+         true, true, false, true, 0x0077216fU,
+         BasicParagraphAlignment::left},
+        {"Heading7", "Heading 7", "Normal", 9, 120, 40, 0, 0, 20, 6,
+         true, true, true, false, 0x002c001eU,
+         BasicParagraphAlignment::left},
+        {"Heading8", "Heading 8", "Normal", 9, 100, 40, 0, 0, 20, 7,
+         true, true, false, true, 0x002c001eU,
+         BasicParagraphAlignment::left},
+        {"Heading9", "Heading 9", "Normal", 9, 80, 40, 0, 0, 20, 8,
+         true, true, true, true, 0x002c001eU,
+         BasicParagraphAlignment::left},
+    }};
+
+const BuiltInParagraphStyleDescriptor* builtInParagraphStyle(
+    std::string_view style_id) noexcept {
+    const auto found = std::find_if(
+        kBuiltInParagraphStyles.begin(), kBuiltInParagraphStyles.end(),
+        [style_id](const BuiltInParagraphStyleDescriptor& descriptor) {
+            return descriptor.id == style_id;
+        });
+    return found == kBuiltInParagraphStyles.end() ? nullptr : &*found;
+}
+
+bool supportedBuiltInParagraphStyle(std::string_view style_id) noexcept {
+    return style_id == "Normal" || builtInParagraphStyle(style_id) != nullptr;
+}
+
+bool safeParagraphStyleIdToken(std::string_view style_id) noexcept {
+    if (style_id.empty() ||
+        style_id.size() > kMaximumParagraphStyleIdBytes) {
+        return false;
+    }
+    const auto first = static_cast<unsigned char>(style_id.front());
+    const auto ascii_letter = [](unsigned char byte) {
+        return (byte >= 'A' && byte <= 'Z') ||
+               (byte >= 'a' && byte <= 'z');
+    };
+    if (!(ascii_letter(first) || first == '_')) return false;
+    return std::all_of(
+        style_id.begin() + 1, style_id.end(), [ascii_letter](char character) {
+            const auto byte = static_cast<unsigned char>(character);
+            return ascii_letter(byte) || (byte >= '0' && byte <= '9') ||
+                   byte == '_' || byte == '-' || byte == '.';
+        });
+}
+
+using NewParagraphStyleCatalog = std::set<std::string>;
 
 struct BasicTableStyleDescriptor {
     BasicTableStyle style;
@@ -195,6 +299,22 @@ struct ImportContext {
     std::unordered_map<std::int32_t, NumberInstanceDefinition> numbering;
 };
 
+struct ParsedOmmlEquation {
+    EquationPayload payload;
+    BasicRunFormat direct_format;
+    std::optional<std::string> style_id;
+};
+
+bool hasOnlyWordAttributes(
+    const pugi::xml_node& node,
+    std::initializer_list<std::string_view> allowed_names);
+void parseBasicRunProperties(
+    const pugi::xml_node& properties,
+    BasicRunFormat& format,
+    bool& format_is_basic,
+    const ThemeData* theme,
+    std::optional<std::string>* style_id);
+
 struct ParsedPackage {
     std::vector<std::uint8_t> bytes;
     std::uint32_t source_mode{0600};
@@ -210,7 +330,9 @@ struct ParsedPackage {
     std::optional<DocumentDefaults> canonical_simple_regeneration_defaults;
 };
 
-std::string buildNewStylesXml(const DocumentDefaults& defaults);
+std::string buildNewStylesXml(
+    const DocumentDefaults& defaults,
+    const NewParagraphStyleCatalog& paragraph_styles);
 std::string buildNewSettingsXml(const DocumentDefaults& defaults);
 
 void setError(Error* error, ErrorCode code, std::string message) {
@@ -782,7 +904,56 @@ std::optional<std::string> parseOmmlNode(const pugi::xml_node& node) {
     return std::nullopt;
 }
 
-std::optional<EquationPayload> parseOmmlEquation(const pugi::xml_node& node) {
+bool collectUniformOmmlRunFormat(
+    const pugi::xml_node& node,
+    const ThemeData* theme,
+    std::optional<BasicRunFormat>& uniform_format,
+    std::optional<std::optional<std::string>>& uniform_style_id,
+    bool& saw_math_run) {
+    if (isMathElement(node, "r")) {
+        pugi::xml_node word_properties;
+        for (const pugi::xml_node child : node.children()) {
+            if (!isWordElement(child, "rPr")) continue;
+            if (word_properties) return false;
+            word_properties = child;
+        }
+
+        BasicRunFormat direct_format;
+        std::optional<std::string> style_id;
+        bool format_is_basic = true;
+        if (word_properties) {
+            format_is_basic = hasOnlyWordAttributes(word_properties, {});
+            parseBasicRunProperties(
+                word_properties, direct_format, format_is_basic,
+                theme, &style_id);
+        }
+        if (!format_is_basic) return false;
+
+        if (!saw_math_run) {
+            uniform_format = direct_format;
+            uniform_style_id = style_id;
+            saw_math_run = true;
+        } else if (*uniform_format != direct_format ||
+                   *uniform_style_id != style_id) {
+            return false;
+        }
+        return true;
+    }
+
+    for (const pugi::xml_node child : node.children()) {
+        if (child.type() != pugi::node_element) continue;
+        if (!collectUniformOmmlRunFormat(
+                child, theme, uniform_format, uniform_style_id,
+                saw_math_run)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+std::optional<ParsedOmmlEquation> parseOmmlEquation(
+    const pugi::xml_node& node,
+    const ThemeData* theme = nullptr) {
     bool display = false;
     pugi::xml_node equation = node;
     if (isMathElement(node, "oMathPara")) {
@@ -799,7 +970,19 @@ std::optional<EquationPayload> parseOmmlEquation(const pugi::xml_node& node) {
     if (!source || source->empty()) return std::nullopt;
     const auto parsed = math::parseLatex(*source);
     if (!parsed) return std::nullopt;
-    return EquationPayload{math::toCanonicalLatex(parsed.value()), display};
+
+    std::optional<BasicRunFormat> direct_format;
+    std::optional<std::optional<std::string>> style_id;
+    bool saw_math_run = false;
+    if (!collectUniformOmmlRunFormat(
+            equation, theme, direct_format, style_id, saw_math_run)) {
+        return std::nullopt;
+    }
+
+    return ParsedOmmlEquation{
+        EquationPayload{math::toCanonicalLatex(parsed.value()), display},
+        direct_format.value_or(BasicRunFormat{}),
+        style_id.value_or(std::optional<std::string>{})};
 }
 
 bool hasOnlyWordAttributes(
@@ -1038,7 +1221,9 @@ bool directRunStructureSupported(const pugi::xml_node& run) {
     return true;
 }
 
-bool directParagraphStructureSupported(const pugi::xml_node& paragraph) {
+bool directParagraphStructureSupported(
+    const pugi::xml_node& paragraph,
+    const ThemeData* theme = nullptr) {
     for (pugi::xml_node child : paragraph.children()) {
         if (ignorableNode(child)) {
             continue;
@@ -1052,7 +1237,7 @@ bool directParagraphStructureSupported(const pugi::xml_node& paragraph) {
             return false;
         }
         if ((isMathElement(child, "oMath") || isMathElement(child, "oMathPara")) &&
-            !parseOmmlEquation(child)) {
+            !parseOmmlEquation(child, theme)) {
             return false;
         }
     }
@@ -1451,7 +1636,8 @@ std::optional<SectionBreakKind> parseSectionBreakKind(
 
 void parseParagraphFormat(const pugi::xml_node& paragraph_node,
                           Paragraph& paragraph,
-                          const ThemeData* theme = nullptr) {
+                          const ThemeData* theme = nullptr,
+                          bool allow_style_outline_level = false) {
     pugi::xml_node properties;
     for (pugi::xml_node child : paragraph_node.children()) {
         if (isWordElement(child, "pPr")) {
@@ -1660,6 +1846,13 @@ void parseParagraphFormat(const pugi::xml_node& paragraph_node,
         } else if (isWordElement(property, "pageBreakBefore")) {
             recognized = hasOnlyWordAttributes(property, {"val"}) && recognized;
             paragraph.page_break_before = onOffValue(property, recognized);
+        } else if (allow_style_outline_level &&
+                   isWordElement(property, "outlineLvl")) {
+            recognized =
+                hasOnlyWordAttributes(property, {"val"}) && recognized;
+            const auto level = parseUnsignedIntegerAttribute(
+                property, "val", recognized);
+            recognized = recognized && level.has_value() && *level <= 8U;
         } else if (isWordElement(property, "rPr")) {
             if (paragraph.paragraph_mark_format.has_value()) {
                 recognized = false;
@@ -1858,7 +2051,13 @@ void parseStylesData(std::string_view xml, const OpenOptions& options,
                 value->empty() || *value == "1" || *value == "true" ||
                 *value == "on";
         }
-        parseParagraphFormat(child, style.paragraph, &context.theme);
+        // Outline levels are a supported part of Owl Docs' deterministic
+        // heading definitions. The current semantic paragraph surface does
+        // not expose them independently, so accept them only inside a style;
+        // a direct w:pPr/w:outlineLvl remains conservatively non-basic.
+        parseParagraphFormat(
+            child, style.paragraph, &context.theme,
+            /*allow_style_outline_level=*/true);
         Run run;
         parseRunFormat(child, run, &context.theme);
         style.run_format = std::move(run.format);
@@ -2055,7 +2254,12 @@ void parseNumberingData(std::string_view xml, const OpenOptions& options,
 void applyParagraphStyleChain(
     const ImportContext& context, std::string_view style_id,
     Paragraph& paragraph, BasicRunFormat& run_format, bool& supported,
-    std::unordered_set<std::string>& visiting) {
+    std::unordered_set<std::string>& visiting,
+    std::size_t depth = 0) {
+    if (depth >= kMaximumStyleChainDepth) {
+        supported = false;
+        return;
+    }
     const auto found = context.styles.find(std::string(style_id));
     if (found == context.styles.end() || !found->second.paragraph_style ||
         !visiting.insert(found->first).second) {
@@ -2066,7 +2270,7 @@ void applyParagraphStyleChain(
     if (style.based_on) {
         applyParagraphStyleChain(
             context, *style.based_on, paragraph, run_format, supported,
-            visiting);
+            visiting, depth + 1);
     }
     overlayParagraphFormat(paragraph, style.paragraph);
     overlayRunFormat(run_format, style.run_format);
@@ -2078,7 +2282,12 @@ void applyParagraphStyleChain(
 void applyRunStyleChain(
     const ImportContext& context, std::string_view style_id,
     BasicRunFormat& run_format, bool& supported,
-    std::unordered_set<std::string>& visiting) {
+    std::unordered_set<std::string>& visiting,
+    std::size_t depth = 0) {
+    if (depth >= kMaximumStyleChainDepth) {
+        supported = false;
+        return;
+    }
     const auto found = context.styles.find(std::string(style_id));
     if (found == context.styles.end() || found->second.paragraph_style ||
         !visiting.insert(found->first).second) {
@@ -2088,7 +2297,8 @@ void applyRunStyleChain(
     const auto& style = found->second;
     if (style.based_on) {
         applyRunStyleChain(
-            context, *style.based_on, run_format, supported, visiting);
+            context, *style.based_on, run_format, supported, visiting,
+            depth + 1);
     }
     overlayRunFormat(run_format, style.run_format);
     supported = supported && style.run_format_is_basic;
@@ -3061,6 +3271,7 @@ std::optional<ImportedTableBlock> parseSimpleImportedTable(
     const pugi::xml_node& table_node,
     const ParagraphIndexByNode& paragraph_indices,
     const std::vector<Paragraph>& paragraphs,
+    const ThemeData* theme,
     std::string& reason) {
     std::vector<pugi::xml_node> rows;
     std::optional<std::size_t> declared_columns;
@@ -3333,7 +3544,8 @@ std::optional<ImportedTableBlock> parseSimpleImportedTable(
                 reason = "a cell contains nested or non-paragraph body content";
                 return std::nullopt;
             }
-            if (!cell_paragraph || !directParagraphStructureSupported(cell_paragraph)) {
+            if (!cell_paragraph ||
+                !directParagraphStructureSupported(cell_paragraph, theme)) {
                 reason = "a cell does not contain one basic direct paragraph";
                 return std::nullopt;
             }
@@ -3455,6 +3667,64 @@ bool parseDocumentXml(
                 paragraph_run_format, inherited_format_is_basic, visiting);
         }
 
+        // Capture the resolved paragraph-style contribution before numbering
+        // and direct pPr are overlaid.  An explicit source pStyle is required:
+        // provenance must never float independently from the identity it
+        // describes.
+        if (direct_paragraph.style_id && inherited_format_is_basic) {
+            ParagraphStyleProvenance provenance;
+            provenance.inherited_character_format = paragraph_run_format;
+            provenance.inherited_paragraph_mark_format =
+                paragraph_run_format;
+            if (paragraph.paragraph_mark_format) {
+                overlayRunFormat(
+                    provenance.inherited_paragraph_mark_format,
+                    *paragraph.paragraph_mark_format);
+            }
+            provenance.inherited_alignment = paragraph.alignment;
+            provenance.inherited_left_indent_twips =
+                paragraph.left_indent_twips;
+            provenance.inherited_right_indent_twips =
+                paragraph.right_indent_twips;
+            provenance.inherited_first_line_indent_twips =
+                paragraph.first_line_indent_twips;
+            provenance.inherited_space_before_twips =
+                paragraph.space_before_twips;
+            provenance.inherited_space_after_twips =
+                paragraph.space_after_twips;
+            provenance.inherited_line_spacing = paragraph.line_spacing;
+            provenance.inherited_line_spacing_rule =
+                paragraph.line_spacing_rule;
+            provenance.inherited_keep_with_next = paragraph.keep_with_next;
+            provenance.inherited_keep_lines = paragraph.keep_lines;
+            provenance.inherited_page_break_before =
+                paragraph.page_break_before;
+            provenance.direct_alignment = direct_paragraph.alignment;
+            provenance.direct_left_indent_twips =
+                direct_paragraph.left_indent_twips;
+            provenance.direct_right_indent_twips =
+                direct_paragraph.right_indent_twips;
+            provenance.direct_first_line_indent_twips =
+                direct_paragraph.first_line_indent_twips;
+            provenance.direct_space_before_twips =
+                direct_paragraph.space_before_twips;
+            provenance.direct_space_after_twips =
+                direct_paragraph.space_after_twips;
+            provenance.direct_line_spacing = direct_paragraph.line_spacing;
+            provenance.direct_line_spacing_rule =
+                direct_paragraph.line_spacing_rule;
+            provenance.direct_keep_with_next =
+                direct_paragraph.keep_with_next;
+            provenance.direct_keep_lines = direct_paragraph.keep_lines;
+            provenance.direct_page_break_before =
+                direct_paragraph.page_break_before;
+            if (direct_paragraph.paragraph_mark_format) {
+                provenance.direct_paragraph_mark_format =
+                    *direct_paragraph.paragraph_mark_format;
+            }
+            paragraph.style_provenance = std::move(provenance);
+        }
+
         const auto effective_num_id = direct_paragraph.numbering_id
             ? direct_paragraph.numbering_id
             : paragraph.numbering_id;
@@ -3488,7 +3758,8 @@ bool parseDocumentXml(
             ? std::optional<std::uint8_t>(effective_num_level.value_or(0))
             : std::nullopt;
         paragraph.direct_body_child = paragraph_node.parent() == body;
-        paragraph.has_unsupported_content = !directParagraphStructureSupported(paragraph_node);
+        paragraph.has_unsupported_content =
+            !directParagraphStructureSupported(paragraph_node, &context.theme);
         paragraph.format_is_basic = direct_paragraph.format_is_basic &&
                                     inherited_format_is_basic &&
                                     numbering_is_basic;
@@ -3518,16 +3789,51 @@ bool parseDocumentXml(
             Run run;
             if (isMathElement(content_node, "oMath") ||
                 isMathElement(content_node, "oMathPara")) {
-                const auto equation = parseOmmlEquation(content_node);
+                const auto equation = parseOmmlEquation(
+                    content_node, &context.theme);
                 run.has_unsupported_content = !equation.has_value() ||
                                               content_node.parent() != paragraph_node;
                 if (equation) {
+                    run.style_id = equation->style_id;
                     run.format = paragraph_run_format;
-                    RunFragment fragment;
-                    fragment.kind = FragmentKind::equation;
-                    fragment.equation = *equation;
-                    run.fragments.push_back(std::move(fragment));
-                } else {
+                    bool run_style_is_basic = true;
+                    if (run.style_id) {
+                        std::unordered_set<std::string> visiting;
+                        applyRunStyleChain(
+                            context, *run.style_id, run.format,
+                            run_style_is_basic, visiting);
+                        std::unordered_set<std::string> override_visiting;
+                        applyRunStyleChain(
+                            context, *run.style_id,
+                            run.paragraph_style_overrides,
+                            run_style_is_basic, override_visiting);
+                    }
+                    overlayRunFormat(run.format, equation->direct_format);
+                    overlayRunFormat(
+                        run.paragraph_style_overrides,
+                        equation->direct_format);
+                    run.format_is_basic = run_style_is_basic &&
+                                          inherited_format_is_basic;
+                    if (run.format_is_basic) {
+                        RunFragment fragment;
+                        fragment.kind = FragmentKind::equation;
+                        fragment.equation = equation->payload;
+                        run.fragments.push_back(std::move(fragment));
+                    } else {
+                        run.has_unsupported_content = true;
+                        paragraph.has_unsupported_content = true;
+                        appendIssueOnce(
+                            report.issues,
+                            seen_issues,
+                            CompatibilityIssue{
+                                IssueSeverity::warning,
+                                IssueCode::unsupported_formatting,
+                                std::string(kDocumentPart),
+                                "Office Math object uses an unresolved or unsupported character style and was preserved unchanged",
+                                paragraph_index});
+                    }
+                }
+                if (!equation || !run.format_is_basic) {
                     basic_body = false;
                     appendIssueOnce(
                         report.issues,
@@ -3555,8 +3861,15 @@ bool parseDocumentXml(
                 applyRunStyleChain(
                     context, *direct_run.style_id, run.format,
                     run_style_is_basic, visiting);
+                std::unordered_set<std::string> override_visiting;
+                applyRunStyleChain(
+                    context, *direct_run.style_id,
+                    run.paragraph_style_overrides,
+                    run_style_is_basic, override_visiting);
             }
             overlayRunFormat(run.format, direct_run.format);
+            overlayRunFormat(
+                run.paragraph_style_overrides, direct_run.format);
             run.format_is_basic = direct_run.format_is_basic &&
                                   run_style_is_basic &&
                                   inherited_format_is_basic;
@@ -3627,7 +3940,7 @@ bool parseDocumentXml(
             if (source != paragraph_indices.end()) {
                 body_blocks.emplace_back(ImportedParagraphBlock{source->second});
             }
-            if (!directParagraphStructureSupported(child)) {
+            if (!directParagraphStructureSupported(child, &context.theme)) {
                 basic_body = false;
                 appendIssueOnce(
                     report.issues, seen_issues,
@@ -3646,7 +3959,7 @@ bool parseDocumentXml(
         if (isWordElement(child, "tbl")) {
             std::string reason;
             auto table = parseSimpleImportedTable(
-                child, paragraph_indices, paragraphs, reason);
+                child, paragraph_indices, paragraphs, &context.theme, reason);
             if (table) {
                 body_blocks.emplace_back(std::move(*table));
                 continue;
@@ -4311,18 +4624,26 @@ bool canonicalWriterParagraphProperties(const pugi::xml_node& properties) {
 
         int order = -1;
         bool recognized = false;
-        if (isCanonicalWriterWordElement(property, "keepNext")) {
+        if (isCanonicalWriterWordElement(property, "pStyle")) {
             order = 0;
+            recognized =
+                canonicalWriterEmptyLeaf(property, "pStyle", {"val"});
+            const auto value = wordAttribute(property, "val");
+            recognized = recognized && value &&
+                         safeParagraphStyleIdToken(*value) &&
+                         supportedBuiltInParagraphStyle(*value);
+        } else if (isCanonicalWriterWordElement(property, "keepNext")) {
+            order = 1;
             recognized = canonicalWriterOnOffProperty(property, "keepNext");
         } else if (isCanonicalWriterWordElement(property, "keepLines")) {
-            order = 1;
+            order = 2;
             recognized = canonicalWriterOnOffProperty(property, "keepLines");
         } else if (isCanonicalWriterWordElement(property, "pageBreakBefore")) {
-            order = 2;
+            order = 3;
             recognized = canonicalWriterOnOffProperty(
                 property, "pageBreakBefore");
         } else if (isCanonicalWriterWordElement(property, "tabs")) {
-            order = 3;
+            order = 4;
             recognized = hasNoAttributes(property);
             bool saw_tab = false;
             std::uint32_t previous_position = 0;
@@ -4347,7 +4668,7 @@ bool canonicalWriterParagraphProperties(const pugi::xml_node& properties) {
             }
             recognized = recognized && saw_tab;
         } else if (isCanonicalWriterWordElement(property, "spacing")) {
-            order = 4;
+            order = 5;
             recognized = canonicalWriterEmptyLeaf(
                 property, "spacing",
                 {"before", "after", "line", "lineRule"});
@@ -4361,7 +4682,7 @@ bool canonicalWriterParagraphProperties(const pugi::xml_node& properties) {
                            *rule == "exact")) &&
                          (!rule || line);
         } else if (isCanonicalWriterWordElement(property, "ind")) {
-            order = 5;
+            order = 6;
             recognized = canonicalWriterEmptyLeaf(
                 property, "ind",
                 {"left", "right", "firstLine", "hanging"});
@@ -4373,14 +4694,14 @@ bool canonicalWriterParagraphProperties(const pugi::xml_node& properties) {
                          (left || right || first_line || hanging) &&
                          !(first_line && hanging);
         } else if (isCanonicalWriterWordElement(property, "jc")) {
-            order = 6;
+            order = 7;
             recognized = canonicalWriterEmptyLeaf(property, "jc", {"val"});
             const auto value = wordAttribute(property, "val");
             recognized = recognized && value &&
                          (*value == "left" || *value == "center" ||
                           *value == "right" || *value == "both");
         } else if (isCanonicalWriterWordElement(property, "rPr")) {
-            order = 7;
+            order = 8;
             recognized = canonicalWriterRunProperties(property);
         }
         if (!recognized || order <= previous_order) return false;
@@ -4564,7 +4885,10 @@ bool canonicalSimpleDocumentEnvelope(
     if (parsed.paragraphs.size() != paragraph_count) return false;
     for (const auto& paragraph : parsed.paragraphs) {
         if (!paragraph.direct_body_child || paragraph.has_unsupported_content ||
-            !paragraph.format_is_basic || paragraph.style_id ||
+            !paragraph.format_is_basic ||
+            (paragraph.style_id &&
+             (!safeParagraphStyleIdToken(*paragraph.style_id) ||
+              !supportedBuiltInParagraphStyle(*paragraph.style_id))) ||
             paragraph.numbering || paragraph.numbering_id ||
             paragraph.numbering_level) {
             return false;
@@ -4631,7 +4955,16 @@ std::optional<DocumentDefaults> canonicalSimpleRegenerationDefaults(
     defaults.font_size_half_points =
         *context.default_run_format.font_size_half_points;
     defaults.default_tab_stop_twips = *tab_stop;
-    if (styles_xml != buildNewStylesXml(defaults) ||
+    NewParagraphStyleCatalog paragraph_styles;
+    for (const auto& paragraph : parsed.paragraphs) {
+        if (!paragraph.style_id) continue;
+        if (!safeParagraphStyleIdToken(*paragraph.style_id) ||
+            !supportedBuiltInParagraphStyle(*paragraph.style_id)) {
+            return std::nullopt;
+        }
+        paragraph_styles.insert(*paragraph.style_id);
+    }
+    if (styles_xml != buildNewStylesXml(defaults, paragraph_styles) ||
         settings_xml != buildNewSettingsXml(defaults)) {
         return std::nullopt;
     }
@@ -6246,6 +6579,7 @@ bool buildNewDocumentXml(
         const NewParagraph& paragraph = paragraphs[paragraph_index];
         document << "<w:p>";
         const bool has_paragraph_format =
+            paragraph.style_id.has_value() ||
             paragraph.alignment.has_value() || paragraph.left_indent_twips.has_value() ||
             paragraph.right_indent_twips.has_value() ||
             paragraph.first_line_indent_twips.has_value() ||
@@ -6320,6 +6654,10 @@ bool buildNewDocumentXml(
         };
         // CT_PPr children are emitted in schema order. Word is lenient about
         // this, but other validators and editors are not required to be.
+        if (paragraph.style_id) {
+            document << "<w:pStyle w:val=\""
+                     << escapeXmlAttribute(*paragraph.style_id) << "\"/>";
+        }
         write_on_off("keepNext", paragraph.keep_with_next);
         write_on_off("keepLines", paragraph.keep_lines);
         write_on_off("pageBreakBefore", paragraph.page_break_before);
@@ -6953,6 +7291,69 @@ std::string_view numberSuffixName(BasicNumberSuffix suffix) {
     return "tab";
 }
 
+bool addNewParagraphStyleToCatalog(
+    const NewParagraph& paragraph, NewParagraphStyleCatalog& catalog,
+    LossReport& loss, Error* error,
+    std::optional<std::size_t> paragraph_index = std::nullopt) {
+    if (!paragraph.style_id) return true;
+
+    IssueCode issue_code = IssueCode::invalid_utf8;
+    std::string detail;
+    if (!isValidUtf8XmlText(*paragraph.style_id, issue_code, detail)) {
+        const std::string message =
+            "Paragraph style ID is not valid UTF-8/XML text";
+        loss.issues.push_back(blockingIssue(
+            issue_code, message, paragraph_index));
+        setError(error, ErrorCode::unsafe_edit, message);
+        return false;
+    }
+    if (!safeParagraphStyleIdToken(*paragraph.style_id)) {
+        const std::string message =
+            "Paragraph style ID must be a 1-253 byte OOXML-safe token "
+            "beginning with an ASCII letter or underscore";
+        loss.issues.push_back(blockingIssue(
+            IssueCode::structural_rewrite_required, message,
+            paragraph_index));
+        setError(error, ErrorCode::unsafe_edit, message);
+        return false;
+    }
+    if (!supportedBuiltInParagraphStyle(*paragraph.style_id)) {
+        const std::string message =
+            "Paragraph style '" + *paragraph.style_id +
+            "' has no supported deterministic definition";
+        loss.issues.push_back(blockingIssue(
+            IssueCode::unsupported_formatting, message, paragraph_index));
+        setError(error, ErrorCode::unsafe_edit, message);
+        return false;
+    }
+    catalog.insert(*paragraph.style_id);
+    return true;
+}
+
+bool collectNewParagraphStyles(
+    const NewDocumentBody& body, NewParagraphStyleCatalog& catalog,
+    LossReport& loss, Error* error) {
+    for (std::size_t block_index = 0; block_index < body.blocks.size();
+         ++block_index) {
+        const auto& block = body.blocks[block_index];
+        if (const auto* paragraph = std::get_if<NewParagraph>(&block)) {
+            if (!addNewParagraphStyleToCatalog(
+                    *paragraph, catalog, loss, error, block_index)) {
+                return false;
+            }
+            continue;
+        }
+        const auto& table = std::get<NewTable>(block);
+        for (const auto& paragraph : table.cell_paragraphs) {
+            if (!addNewParagraphStyleToCatalog(
+                    paragraph, catalog, loss, error, block_index)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 using NewNumberingCatalog =
     std::map<std::int32_t, std::map<std::uint8_t, NewNumbering>>;
 
@@ -7126,7 +7527,9 @@ std::string newDocumentRelationships(
     return result;
 }
 
-std::string buildNewStylesXml(const DocumentDefaults& defaults) {
+std::string buildNewStylesXml(
+    const DocumentDefaults& defaults,
+    const NewParagraphStyleCatalog& paragraph_styles) {
     const std::string family = escapeXmlAttribute(defaults.font_family);
     std::ostringstream styles;
     styles
@@ -7148,7 +7551,77 @@ std::string buildNewStylesXml(const DocumentDefaults& defaults) {
         << family << "\" w:hAnsi=\"" << family << "\" w:cs=\"" << family
         << "\"/><w:sz w:val=\"" << defaults.font_size_half_points
         << "\"/><w:szCs w:val=\"" << defaults.font_size_half_points
-        << "\"/></w:rPr></w:style></w:styles>";
+        << "\"/></w:rPr></w:style>";
+
+    for (const auto& descriptor : kBuiltInParagraphStyles) {
+        if (!paragraph_styles.contains(std::string(descriptor.id))) {
+            continue;
+        }
+        styles << "<w:style w:type=\"paragraph\" w:styleId=\""
+               << descriptor.id << "\"><w:name w:val=\""
+               << escapeXmlAttribute(descriptor.name)
+               << "\"/><w:basedOn w:val=\"Normal\"/><w:next w:val=\""
+               << descriptor.next << "\"/><w:uiPriority w:val=\""
+               << descriptor.ui_priority << "\"/><w:qFormat/><w:pPr>";
+        if (descriptor.keep_with_next) styles << "<w:keepNext/>";
+        if (descriptor.keep_lines) styles << "<w:keepLines/>";
+        styles << "<w:spacing w:before=\""
+               << descriptor.space_before_twips << "\" w:after=\""
+               << descriptor.space_after_twips
+               << "\" w:line=\"240\" w:lineRule=\"auto\"/>";
+        if (descriptor.left_indent_twips != 0 ||
+            descriptor.right_indent_twips != 0) {
+            styles << "<w:ind";
+            if (descriptor.left_indent_twips != 0) {
+                styles << " w:left=\"" << descriptor.left_indent_twips
+                       << "\"";
+            }
+            if (descriptor.right_indent_twips != 0) {
+                styles << " w:right=\"" << descriptor.right_indent_twips
+                       << "\"";
+            }
+            styles << "/>";
+        }
+        if (descriptor.alignment) {
+            std::string_view value = "left";
+            switch (*descriptor.alignment) {
+                case BasicParagraphAlignment::left: value = "left"; break;
+                case BasicParagraphAlignment::center: value = "center"; break;
+                case BasicParagraphAlignment::right: value = "right"; break;
+                case BasicParagraphAlignment::justified: value = "both"; break;
+            }
+            styles << "<w:jc w:val=\"" << value << "\"/>";
+        }
+        if (descriptor.outline_level >= 0) {
+            styles << "<w:outlineLvl w:val=\""
+                   << static_cast<unsigned int>(descriptor.outline_level)
+                   << "\"/>";
+        }
+        styles << "</w:pPr>";
+
+        const bool has_run_properties =
+            descriptor.bold || descriptor.italic ||
+            descriptor.foreground_rgb.has_value() ||
+            descriptor.font_size_half_points > 0;
+        if (has_run_properties) {
+            styles << "<w:rPr>";
+            if (descriptor.bold) styles << "<w:b/>";
+            if (descriptor.italic) styles << "<w:i/>";
+            if (descriptor.foreground_rgb) {
+                styles << "<w:color w:val=\""
+                       << rgbHex(*descriptor.foreground_rgb) << "\"/>";
+            }
+            if (descriptor.font_size_half_points > 0) {
+                styles << "<w:sz w:val=\""
+                       << descriptor.font_size_half_points
+                       << "\"/><w:szCs w:val=\""
+                       << descriptor.font_size_half_points << "\"/>";
+            }
+            styles << "</w:rPr>";
+        }
+        styles << "</w:style>";
+    }
+    styles << "</w:styles>";
     return styles.str();
 }
 
@@ -7552,6 +8025,12 @@ SaveResult DocxDocument::writeNew(
         return result;
     }
     Error save_error;
+    NewParagraphStyleCatalog paragraph_styles;
+    if (!collectNewParagraphStyles(
+            body, paragraph_styles, result.loss_report, &save_error)) {
+        result.error = std::move(save_error);
+        return result;
+    }
     std::vector<AuthoredImagePart> images;
     if (!collectBodyImages(
             body, images, result.loss_report, &save_error)) {
@@ -7593,7 +8072,7 @@ SaveResult DocxDocument::writeNew(
             content_types,
             kNewRootRelationships,
             document_relationships,
-            buildNewStylesXml(defaults),
+            buildNewStylesXml(defaults, paragraph_styles),
             buildNewSettingsXml(defaults),
             numbering_xml,
             document_xml,
@@ -7641,6 +8120,15 @@ SaveResult DocxDocument::writeNew(
     }
 
     Error save_error;
+    NewParagraphStyleCatalog paragraph_styles;
+    for (const auto& section : body.sections) {
+        if (!collectNewParagraphStyles(
+                section.body, paragraph_styles, result.loss_report,
+                &save_error)) {
+            result.error = std::move(save_error);
+            return result;
+        }
+    }
     std::vector<AuthoredImagePart> images;
     for (const auto& section : body.sections) {
         if (!collectBodyImages(
@@ -7675,7 +8163,8 @@ SaveResult DocxDocument::writeNew(
     if (!temporary->closeDescriptor(&save_error) ||
         !writeNewArchive(
             temporary->path(), content_types, kNewRootRelationships,
-            document_relationships, buildNewStylesXml(defaults),
+            document_relationships,
+            buildNewStylesXml(defaults, paragraph_styles),
             buildNewSettingsXml(defaults), numbering_xml, document_xml,
             images, &save_error) ||
         !temporary->syncClosedFile(&save_error) ||

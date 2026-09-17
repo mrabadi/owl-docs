@@ -4,6 +4,7 @@
 #include "docxstudio/app/CodexController.h"
 #include "docxstudio/app/DocumentCanvas.h"
 #include "docxstudio/app/EditorToolBridge.h"
+#include "docxstudio/app/ExcalidrawFigure.h"
 #include "docxstudio/app/FileFingerprint.h"
 #include "docxstudio/app/FontFamilyPicker.h"
 #include "docxstudio/app/ListPropertiesDialog.h"
@@ -370,6 +371,39 @@ core::CharacterFormat importedCharacterFormat(
     return result;
 }
 
+void overlayCharacterFormat(core::CharacterFormat& destination,
+                            const core::CharacterFormat& source) {
+    const auto overlay = [](auto& target, const auto& value) {
+        if (value) target = value;
+    };
+    overlay(destination.font_family, source.font_family);
+    overlay(destination.font_size_half_points,
+            source.font_size_half_points);
+    overlay(destination.bold, source.bold);
+    overlay(destination.italic, source.italic);
+    overlay(destination.underline, source.underline);
+    overlay(destination.strike, source.strike);
+    overlay(destination.foreground_argb, source.foreground_argb);
+    overlay(destination.highlight_argb, source.highlight_argb);
+    overlay(destination.baseline, source.baseline);
+    overlay(destination.language, source.language);
+}
+
+core::CharacterFormatMask importedCharacterFormatMask(
+    const ooxml::BasicRunFormat& source) {
+    core::CharacterFormatMask result;
+    result.font_family = source.font_family.has_value();
+    result.font_size_half_points = source.font_size_half_points.has_value();
+    result.bold = source.bold.has_value();
+    result.italic = source.italic.has_value();
+    result.underline = source.underline.has_value();
+    result.strike = source.strike.has_value();
+    result.foreground_argb = source.foreground_rgb.has_value();
+    result.highlight_argb = source.highlight_rgb.has_value();
+    result.baseline = source.baseline.has_value();
+    return result;
+}
+
 std::optional<core::ParagraphAlignment> importedParagraphAlignment(
     const std::optional<ooxml::BasicParagraphAlignment>& source) {
     if (!source) return std::nullopt;
@@ -384,6 +418,75 @@ std::optional<core::ParagraphAlignment> importedParagraphAlignment(
             return core::ParagraphAlignment::justified;
     }
     return std::nullopt;
+}
+
+core::ParagraphStyleProvenance importedStyleProvenance(
+    const ooxml::ParagraphStyleProvenance& source) {
+    constexpr std::int64_t kEmuPerTwip = 635;
+    core::ParagraphStyleProvenance result;
+    result.inherited_character_format =
+        importedCharacterFormat(source.inherited_character_format);
+    result.inherited_paragraph_mark_character_format =
+        importedCharacterFormat(source.inherited_paragraph_mark_format);
+    result.inherited_paragraph_format.alignment =
+        importedParagraphAlignment(source.inherited_alignment);
+    const auto signedTwips = [](const std::optional<std::int32_t>& value) {
+        return value ? std::optional<std::int64_t>(
+                           static_cast<std::int64_t>(*value) * kEmuPerTwip)
+                     : std::nullopt;
+    };
+    const auto unsignedTwips = [](const std::optional<std::uint32_t>& value) {
+        return value ? std::optional<std::int64_t>(
+                           static_cast<std::int64_t>(*value) * kEmuPerTwip)
+                     : std::nullopt;
+    };
+    auto& inherited = result.inherited_paragraph_format;
+    inherited.left_indent_emu =
+        signedTwips(source.inherited_left_indent_twips);
+    inherited.right_indent_emu =
+        signedTwips(source.inherited_right_indent_twips);
+    inherited.first_line_indent_emu =
+        signedTwips(source.inherited_first_line_indent_twips);
+    inherited.space_before_emu =
+        unsignedTwips(source.inherited_space_before_twips);
+    inherited.space_after_emu =
+        unsignedTwips(source.inherited_space_after_twips);
+    inherited.line_spacing_emu =
+        unsignedTwips(source.inherited_line_spacing);
+    if (source.inherited_line_spacing_rule) {
+        switch (*source.inherited_line_spacing_rule) {
+            case ooxml::BasicLineSpacingRule::automatic:
+                inherited.line_spacing_rule =
+                    core::LineSpacingRule::automatic;
+                break;
+            case ooxml::BasicLineSpacingRule::at_least:
+                inherited.line_spacing_rule = core::LineSpacingRule::at_least;
+                break;
+            case ooxml::BasicLineSpacingRule::exact:
+                inherited.line_spacing_rule = core::LineSpacingRule::exact;
+                break;
+        }
+    }
+    inherited.keep_with_next = source.inherited_keep_with_next;
+    inherited.keep_lines = source.inherited_keep_lines;
+    inherited.page_break_before = source.inherited_page_break_before;
+
+    auto& direct = result.paragraph_overrides;
+    direct.alignment = source.direct_alignment.has_value();
+    direct.left_indent_emu = source.direct_left_indent_twips.has_value();
+    direct.right_indent_emu = source.direct_right_indent_twips.has_value();
+    direct.first_line_indent_emu =
+        source.direct_first_line_indent_twips.has_value();
+    direct.space_before_emu = source.direct_space_before_twips.has_value();
+    direct.space_after_emu = source.direct_space_after_twips.has_value();
+    direct.line_spacing_emu = source.direct_line_spacing.has_value();
+    direct.line_spacing_rule = source.direct_line_spacing_rule.has_value();
+    direct.keep_with_next = source.direct_keep_with_next.has_value();
+    direct.keep_lines = source.direct_keep_lines.has_value();
+    direct.page_break_before = source.direct_page_break_before.has_value();
+    result.paragraph_mark_overrides = importedCharacterFormatMask(
+        source.direct_paragraph_mark_format);
+    return result;
 }
 
 std::optional<core::TableStyle> importedTableStyle(
@@ -587,6 +690,7 @@ core::Result<core::Document> documentFromOoxmlParagraphs(
         std::size_t start{};
         std::size_t end{};
         ooxml::BasicRunFormat format;
+        ooxml::BasicRunFormat paragraphStyleOverrides;
     };
     struct PendingEquation {
         std::size_t paragraphIndex{};
@@ -595,12 +699,18 @@ core::Result<core::Document> documentFromOoxmlParagraphs(
     };
     std::vector<core::Paragraph> paragraphs;
     std::vector<RunStyle> styles;
+    std::vector<std::optional<core::ParagraphStyleProvenance>>
+        styleProvenance(sourceParagraphs.size());
     std::vector<PendingEquation> equations;
     if (sourceTextPrefixes) sourceTextPrefixes->clear();
     paragraphs.reserve(std::max<std::size_t>(1, sourceParagraphs.size()));
     for (std::size_t paragraphIndex = 0;
          paragraphIndex < sourceParagraphs.size(); ++paragraphIndex) {
         const auto& source = sourceParagraphs[paragraphIndex];
+        if (source.style_id && source.style_provenance) {
+            styleProvenance[paragraphIndex] =
+                importedStyleProvenance(*source.style_provenance);
+        }
         QString text;
         QString semanticPrefix;
         if (source.numbering && !source.numbering->marker_text.empty()) {
@@ -634,7 +744,7 @@ core::Result<core::Document> documentFromOoxmlParagraphs(
         if (!semanticPrefix.isEmpty()) {
             auto markerFormat = nativeListMarkerFormat(source);
             styles.push_back(
-                {paragraphIndex, 0, finalOffset, std::move(markerFormat)});
+                {paragraphIndex, 0, finalOffset, std::move(markerFormat), {}});
         }
         for (const auto& run : source.runs) {
             const std::size_t start = finalOffset;
@@ -673,17 +783,36 @@ core::Result<core::Document> documentFromOoxmlParagraphs(
             }
             const std::size_t end = finalOffset;
             if (end > start) {
-                styles.push_back({paragraphIndex, start, end, run.format});
+                styles.push_back(
+                    {paragraphIndex, start, end, run.format,
+                     run.paragraph_style_overrides});
+                if (styleProvenance[paragraphIndex]) {
+                    const auto mask = importedCharacterFormatMask(
+                        run.paragraph_style_overrides);
+                    if (!mask.empty()) {
+                        styleProvenance[paragraphIndex]
+                            ->character_overrides.push_back(
+                                {start, end, mask});
+                    }
+                }
             }
         }
         core::CharacterFormat paragraphMarkFormat;
-        if (source.paragraph_mark_format) {
+        if (styleProvenance[paragraphIndex] && source.style_provenance) {
+            paragraphMarkFormat = styleProvenance[paragraphIndex]
+                                      ->inherited_paragraph_mark_character_format;
+            overlayCharacterFormat(
+                paragraphMarkFormat,
+                importedCharacterFormat(
+                    source.style_provenance
+                        ->direct_paragraph_mark_format));
+        } else if (source.paragraph_mark_format) {
             paragraphMarkFormat = importedCharacterFormat(
                 *source.paragraph_mark_format);
         }
         auto created = core::Paragraph::create(
             text.toStdU16String(), core::NodeId::generate(),
-            std::move(paragraphMarkFormat));
+            std::move(paragraphMarkFormat), source.style_id);
         if (!created) return created.error();
         paragraphs.push_back(std::move(created.value()));
     }
@@ -1036,6 +1165,16 @@ core::Result<core::Document> documentFromOoxmlParagraphs(
         const auto applied = document.applyParagraphFormat(
             {document.paragraphs()[index].id()}, delta);
         if (!applied) return applied.error();
+    }
+    for (std::size_t index = 0; index < styleProvenance.size(); ++index) {
+        if (!styleProvenance[index] ||
+            index >= document.paragraphs().size()) {
+            continue;
+        }
+        const auto attached = document.setParagraphStyleProvenance(
+            document.paragraphs()[index].id(),
+            std::move(styleProvenance[index]));
+        if (!attached) return attached.error();
     }
     return document;
 }
@@ -1439,6 +1578,133 @@ ooxml::BasicRunFormat toOoxmlFormat(
     return result;
 }
 
+bool ooxmlRunFormatIsEmpty(const ooxml::BasicRunFormat& format) {
+    return !format.font_family && !format.font_size_half_points &&
+           !format.bold && !format.italic && !format.underline &&
+           !format.strike && !format.foreground_rgb &&
+           !format.highlight_rgb && !format.baseline;
+}
+
+core::CharacterFormat builtInStyleCharacterBaseline(
+    const core::ParagraphStyleDefinition& style,
+    const QString& defaultFontFamily, double defaultFontPointSize) {
+    auto result = style.character_format;
+    const bool followsEditorDefaults =
+        style.id == "Normal" || style.id == "NoSpacing";
+    if (followsEditorDefaults || !result.font_family) {
+        result.font_family = defaultFontFamily.toStdString();
+    }
+    if (followsEditorDefaults || !result.font_size_half_points) {
+        result.font_size_half_points = static_cast<std::int32_t>(
+            std::lround(defaultFontPointSize * 2.0));
+    }
+    return result;
+}
+
+// Paragraphs carrying a native style store effective formatting in the core
+// so layout never has to consult OOXML.  Serializing that effective baseline
+// as direct rPr would, however, turn every inherited style property into an
+// override after reopening the generated DOCX.  Compare against the built-in
+// definition that this writer actually emits, not an imported style's source
+// definition: a foreign built-in with the same style id may have completely
+// different values, and those differences must become direct properties in a
+// simplified copy to preserve its appearance.  Provenance masks still force
+// exact source-direct properties (including explicit false/equal values).
+// Missing effective values use the same local defaults as the renderer so a
+// direct clear can still override a non-default style property.
+ooxml::BasicRunFormat toOoxmlStyledFormat(
+    const core::CharacterFormat& format,
+    const core::CharacterFormat& inherited,
+    const core::CharacterFormatMask& direct,
+    const QString& defaultFontFamily, double defaultFontPointSize) {
+    ooxml::BasicRunFormat result;
+    const std::string defaultFamily = defaultFontFamily.toStdString();
+    const auto defaultHalfPoints = static_cast<std::int32_t>(
+        std::lround(defaultFontPointSize * 2.0));
+
+    const std::string currentFamily =
+        format.font_family.value_or(defaultFamily);
+    const std::string inheritedFamily =
+        inherited.font_family.value_or(defaultFamily);
+    if (direct.font_family || currentFamily != inheritedFamily) {
+        result.font_family = currentFamily;
+    }
+
+    const auto currentSize =
+        format.font_size_half_points.value_or(defaultHalfPoints);
+    const auto inheritedSize =
+        inherited.font_size_half_points.value_or(defaultHalfPoints);
+    if (direct.font_size_half_points || currentSize != inheritedSize) {
+        result.font_size_half_points = currentSize;
+    }
+
+    const auto onOff = [](const std::optional<bool>& value) {
+        return value.value_or(false);
+    };
+    const bool currentBold = onOff(format.bold);
+    const bool inheritedBold = onOff(inherited.bold);
+    if (direct.bold || currentBold != inheritedBold) {
+        result.bold = currentBold;
+    }
+    const bool currentItalic = onOff(format.italic);
+    const bool inheritedItalic = onOff(inherited.italic);
+    if (direct.italic || currentItalic != inheritedItalic) {
+        result.italic = currentItalic;
+    }
+    const auto currentUnderline =
+        format.underline.value_or(core::UnderlineStyle::none);
+    const auto inheritedUnderline =
+        inherited.underline.value_or(core::UnderlineStyle::none);
+    if (direct.underline || currentUnderline != inheritedUnderline) {
+        result.underline = currentUnderline != core::UnderlineStyle::none;
+    }
+    const bool currentStrike = onOff(format.strike);
+    const bool inheritedStrike = onOff(inherited.strike);
+    if (direct.strike || currentStrike != inheritedStrike) {
+        result.strike = currentStrike;
+    }
+
+    constexpr std::uint32_t kDefaultForeground = 0xff000000U;
+    const auto currentForeground =
+        format.foreground_argb.value_or(kDefaultForeground);
+    const auto inheritedForeground =
+        inherited.foreground_argb.value_or(kDefaultForeground);
+    if (direct.foreground_argb ||
+        currentForeground != inheritedForeground) {
+        result.foreground_rgb = currentForeground & 0x00ffffffU;
+    }
+
+    // BasicRunFormat currently models a concrete shading fill but not an
+    // explicit "no shading" token.  Concrete direct/different highlights are
+    // safe to emit; an absent value remains inherited/transparent.
+    if ((direct.highlight_argb ||
+         format.highlight_argb != inherited.highlight_argb) &&
+        format.highlight_argb) {
+        result.highlight_rgb = *format.highlight_argb & 0x00ffffffU;
+    }
+
+    const auto currentBaseline =
+        format.baseline.value_or(core::BaselinePosition::normal);
+    const auto inheritedBaseline =
+        inherited.baseline.value_or(core::BaselinePosition::normal);
+    if (direct.baseline || currentBaseline != inheritedBaseline) {
+        switch (currentBaseline) {
+            case core::BaselinePosition::normal:
+                result.baseline = ooxml::BasicBaseline::normal;
+                break;
+            case core::BaselinePosition::superscript:
+                result.baseline = ooxml::BasicBaseline::superscript;
+                break;
+            case core::BaselinePosition::subscript:
+                result.baseline = ooxml::BasicBaseline::subscript;
+                break;
+        }
+    }
+    // Language is retained in the semantic provenance mask, but the current
+    // deliberately-small BasicRunFormat vocabulary cannot author w:lang yet.
+    return result;
+}
+
 ooxml::NewParagraph toOoxmlTableCellParagraph(
     const core::TableCell& cell, QStringList& losses,
     const QString& defaultFontFamily, double defaultFontPointSize,
@@ -1729,9 +1995,72 @@ std::vector<ooxml::NewParagraph> toOoxmlParagraphs(
     std::vector<ooxml::NewParagraph> output;
     for (const auto& paragraph : snapshot.document.paragraphs()) {
         ooxml::NewParagraph out;
+        const core::ParagraphStyleDefinition* builtInStyle = nullptr;
+        if (paragraph.styleId()) {
+            builtInStyle =
+                core::findBuiltInParagraphStyle(*paragraph.styleId());
+            if (builtInStyle) {
+                out.style_id = *paragraph.styleId();
+            } else {
+                losses.push_back(QObject::tr(
+                    "Custom paragraph style '%1' will be flattened to its "
+                    "visible formatting in this simplified copy")
+                    .arg(QString::fromUtf8(
+                        paragraph.styleId()->data(),
+                        static_cast<qsizetype>(paragraph.styleId()->size()))));
+            }
+        }
+        std::optional<core::CharacterFormat> styleCharacterBaseline;
+        std::optional<core::ParagraphFormat> styleParagraphBaseline;
+        core::CharacterFormatMask paragraphMarkOverrides;
+        core::ParagraphFormatMask paragraphOverrides;
+        if (builtInStyle) {
+            // A regenerated styles.xml always contains Owl's deterministic
+            // built-in definitions.  Use those as the sparsification target
+            // even when the effective formatting was inherited from a
+            // different source definition with the same style id.
+            styleCharacterBaseline = builtInStyleCharacterBaseline(
+                *builtInStyle, defaultFontFamily, defaultFontPointSize);
+            styleParagraphBaseline = builtInStyle->paragraph_format;
+            if (paragraph.styleProvenance()) {
+                // Source provenance determines which properties were
+                // explicitly direct.  It must not determine what may be
+                // omitted, because the source style definition is not copied
+                // into a simplified package.
+                paragraphMarkOverrides = paragraph.styleProvenance()
+                                             ->paragraph_mark_overrides;
+                paragraphOverrides = paragraph.styleProvenance()
+                                         ->paragraph_overrides;
+            }
+        }
+        const auto exportCharacterFormat = [&]
+            (const core::CharacterFormat& source,
+             const core::CharacterFormatMask& direct) {
+            return styleCharacterBaseline
+                ? toOoxmlStyledFormat(
+                      source, *styleCharacterBaseline, direct,
+                      defaultFontFamily, defaultFontPointSize)
+                : toOoxmlFormat(
+                      source, defaultFontFamily, defaultFontPointSize);
+        };
         const auto& format = paragraph.format();
-        if (format.alignment) {
-            switch (*format.alignment) {
+        const auto serializeParagraphProperty = [&]
+            (const auto& current, const auto& inherited,
+             const auto& fallback, bool direct) {
+            return !styleParagraphBaseline
+                ? current.has_value()
+                : direct || current.value_or(fallback) !=
+                                inherited.value_or(fallback);
+        };
+        const auto inheritedParagraph = styleParagraphBaseline.value_or(
+            core::ParagraphFormat{});
+        const bool serializeAlignment = serializeParagraphProperty(
+            format.alignment, inheritedParagraph.alignment,
+            core::ParagraphAlignment::left, paragraphOverrides.alignment);
+        if (serializeAlignment) {
+            const auto alignment = format.alignment.value_or(
+                core::ParagraphAlignment::left);
+            switch (alignment) {
                 case core::ParagraphAlignment::left: out.alignment = ooxml::BasicParagraphAlignment::left; break;
                 case core::ParagraphAlignment::center: out.alignment = ooxml::BasicParagraphAlignment::center; break;
                 case core::ParagraphAlignment::right: out.alignment = ooxml::BasicParagraphAlignment::right; break;
@@ -1764,14 +2093,66 @@ std::vector<ooxml::NewParagraph> toOoxmlParagraphs(
             }
             return static_cast<std::uint32_t>(rounded);
         };
-        out.left_indent_twips = signed_twips(format.left_indent_emu);
-        out.right_indent_twips = signed_twips(format.right_indent_emu);
-        out.first_line_indent_twips = signed_twips(format.first_line_indent_emu);
-        out.space_before_twips = unsigned_twips(format.space_before_emu);
-        out.space_after_twips = unsigned_twips(format.space_after_emu);
-        out.line_spacing = unsigned_twips(format.line_spacing_emu);
-        if (format.line_spacing_rule) {
-            switch (*format.line_spacing_rule) {
+        const auto effectiveLeftIndentTwips =
+            signed_twips(format.left_indent_emu);
+        const auto effectiveRightIndentTwips =
+            signed_twips(format.right_indent_emu);
+        const auto effectiveFirstLineIndentTwips =
+            signed_twips(format.first_line_indent_emu);
+        const auto effectiveSpaceBeforeTwips =
+            unsigned_twips(format.space_before_emu);
+        const auto effectiveSpaceAfterTwips =
+            unsigned_twips(format.space_after_emu);
+        const auto effectiveLineSpacing =
+            unsigned_twips(format.line_spacing_emu);
+        if (serializeParagraphProperty(
+                format.left_indent_emu,
+                inheritedParagraph.left_indent_emu, std::int64_t{0},
+                paragraphOverrides.left_indent_emu)) {
+            out.left_indent_twips = effectiveLeftIndentTwips.value_or(0);
+        }
+        if (serializeParagraphProperty(
+                format.right_indent_emu,
+                inheritedParagraph.right_indent_emu, std::int64_t{0},
+                paragraphOverrides.right_indent_emu)) {
+            out.right_indent_twips = effectiveRightIndentTwips.value_or(0);
+        }
+        if (serializeParagraphProperty(
+                format.first_line_indent_emu,
+                inheritedParagraph.first_line_indent_emu, std::int64_t{0},
+                paragraphOverrides.first_line_indent_emu)) {
+            out.first_line_indent_twips =
+                effectiveFirstLineIndentTwips.value_or(0);
+        }
+        if (serializeParagraphProperty(
+                format.space_before_emu,
+                inheritedParagraph.space_before_emu, std::int64_t{0},
+                paragraphOverrides.space_before_emu)) {
+            out.space_before_twips = effectiveSpaceBeforeTwips.value_or(0);
+        }
+        if (serializeParagraphProperty(
+                format.space_after_emu,
+                inheritedParagraph.space_after_emu, std::int64_t{0},
+                paragraphOverrides.space_after_emu)) {
+            out.space_after_twips = effectiveSpaceAfterTwips.value_or(0);
+        }
+
+        constexpr std::int64_t kSingleLineSpacingEmu = 12 * 12'700;
+        const bool serializeLineSpacing = serializeParagraphProperty(
+            format.line_spacing_emu,
+            inheritedParagraph.line_spacing_emu, kSingleLineSpacingEmu,
+            paragraphOverrides.line_spacing_emu);
+        const bool serializeLineSpacingRule = serializeParagraphProperty(
+            format.line_spacing_rule,
+            inheritedParagraph.line_spacing_rule,
+            core::LineSpacingRule::automatic,
+            paragraphOverrides.line_spacing_rule);
+        // OOXML's lineRule qualifies one concrete line value, so emit the
+        // pair together if either half is a direct/different property.
+        if (serializeLineSpacing || serializeLineSpacingRule) {
+            out.line_spacing = effectiveLineSpacing.value_or(240U);
+            switch (format.line_spacing_rule.value_or(
+                        core::LineSpacingRule::automatic)) {
                 case core::LineSpacingRule::automatic:
                     out.line_spacing_rule = ooxml::BasicLineSpacingRule::automatic; break;
                 case core::LineSpacingRule::at_least:
@@ -1779,18 +2160,30 @@ std::vector<ooxml::NewParagraph> toOoxmlParagraphs(
                 case core::LineSpacingRule::exact:
                     out.line_spacing_rule = ooxml::BasicLineSpacingRule::exact; break;
             }
-            if (!out.line_spacing) {
-                losses.push_back(QObject::tr(
-                    "A paragraph line-spacing rule has no serializable spacing value"));
-                out.line_spacing_rule.reset();
-            }
         }
-        out.keep_with_next = format.keep_with_next;
-        out.keep_lines = format.keep_lines;
-        out.page_break_before = format.page_break_before;
-        if (!paragraph.paragraphMarkCharacterFormat().empty()) {
-            out.paragraph_mark_format = toOoxmlSparseFormat(
-                paragraph.paragraphMarkCharacterFormat());
+        if (serializeParagraphProperty(
+                format.keep_with_next,
+                inheritedParagraph.keep_with_next, false,
+                paragraphOverrides.keep_with_next)) {
+            out.keep_with_next = format.keep_with_next.value_or(false);
+        }
+        if (serializeParagraphProperty(
+                format.keep_lines, inheritedParagraph.keep_lines, false,
+                paragraphOverrides.keep_lines)) {
+            out.keep_lines = format.keep_lines.value_or(false);
+        }
+        if (serializeParagraphProperty(
+                format.page_break_before,
+                inheritedParagraph.page_break_before, false,
+                paragraphOverrides.page_break_before)) {
+            out.page_break_before =
+                format.page_break_before.value_or(false);
+        }
+        const auto paragraphMarkFormat = exportCharacterFormat(
+            paragraph.paragraphMarkCharacterFormat(),
+            paragraphMarkOverrides);
+        if (!ooxmlRunFormatIsEmpty(paragraphMarkFormat)) {
+            out.paragraph_mark_format = paragraphMarkFormat;
         }
 
         const auto& text = paragraph.text();
@@ -1815,8 +2208,11 @@ std::vector<ooxml::NewParagraph> toOoxmlParagraphs(
                         metric->second.spaceAdvance;
                 const bool nativeNumberingLevel =
                     level < kNativeOoxmlListLevelCount;
+                // A style-inherited indent is intentionally absent from pPr,
+                // but list geometry is measured from the effective paragraph
+                // position.  Do not let sparse style export shift list text.
                 const std::int64_t baseLeft =
-                    out.left_indent_twips.value_or(0);
+                    effectiveLeftIndentTwips.value_or(0);
                 const std::int64_t left =
                     baseLeft + std::llround(textOffset * 20.0);
                 const std::int64_t hanging = std::llround(
@@ -1966,9 +2362,9 @@ std::vector<ooxml::NewParagraph> toOoxmlParagraphs(
             const auto formatOffset = std::min(
                 paragraph.text().size(), image.utf16_offset + 1U);
             ooxml::NewRun imageRun;
-            imageRun.format = toOoxmlFormat(
+            imageRun.format = exportCharacterFormat(
                 paragraph.characterFormatAt(formatOffset),
-                defaultFontFamily, defaultFontPointSize);
+                paragraph.styleOverrideMaskAt(formatOffset));
             imageRun.inline_image = std::move(serialized);
             out.runs.push_back(std::move(imageRun));
         };
@@ -1978,10 +2374,9 @@ std::vector<ooxml::NewParagraph> toOoxmlParagraphs(
             const std::size_t sourceOffset = sourceOffsets[cursor];
             if (const auto* equation = paragraph.equationAt(sourceOffset)) {
                 out.runs.push_back({
-                    {}, toOoxmlFormat(
+                    {}, exportCharacterFormat(
                             paragraph.characterFormatAt(sourceOffset + 1),
-                                      defaultFontFamily,
-                                      defaultFontPointSize),
+                            paragraph.styleOverrideMaskAt(sourceOffset + 1)),
                     ooxml::EquationPayload{equation->canonical_latex,
                                            equation->display}});
                 ++cursor;
@@ -1994,27 +2389,36 @@ std::vector<ooxml::NewParagraph> toOoxmlParagraphs(
             }
             const auto runFormat =
                 paragraph.characterFormatAt(sourceOffset + 1);
+            const auto serializedRunFormat = exportCharacterFormat(
+                runFormat,
+                paragraph.styleOverrideMaskAt(sourceOffset + 1));
             const std::size_t start = cursor;
             do {
                 ++cursor;
             } while (cursor < sourceOffsets.size() &&
                      paragraph.equationAt(sourceOffsets[cursor]) == nullptr &&
                      paragraph.imageAt(sourceOffsets[cursor]) == nullptr &&
-                     paragraph.characterFormatAt(sourceOffsets[cursor] + 1) ==
-                         runFormat);
+                     exportCharacterFormat(
+                         paragraph.characterFormatAt(
+                             sourceOffsets[cursor] + 1),
+                         paragraph.styleOverrideMaskAt(
+                             sourceOffsets[cursor] + 1)) ==
+                         serializedRunFormat);
             out.runs.push_back({
                 serializedText
                     .mid(static_cast<qsizetype>(start),
                          static_cast<qsizetype>(cursor - start))
                     .toUtf8().toStdString(),
-                toOoxmlFormat(runFormat, defaultFontFamily,
-                              defaultFontPointSize),
+                serializedRunFormat,
                 std::nullopt});
         }
         if (out.runs.empty()) {
             out.runs.push_back({
-                {}, toOoxmlFormat({}, defaultFontFamily,
-                                  defaultFontPointSize),
+                {}, styleCharacterBaseline
+                        ? ooxml::BasicRunFormat{}
+                        : toOoxmlFormat(
+                              {}, defaultFontFamily,
+                              defaultFontPointSize),
                 std::nullopt});
         }
         output.push_back(std::move(out));
@@ -2273,6 +2677,7 @@ struct MainWindow::TabState {
     std::vector<DocumentSearchHit> navigationHits;
     bool recovered{false};
     bool replaceOnSuccessfulOpen{false};
+    bool simplificationWarningAcknowledged{false};
 };
 
 MainWindow::MainWindow(QWidget* parent)
@@ -2286,6 +2691,7 @@ MainWindow::MainWindow(QWidget* parent)
         const QSettings settings;
         editorPreferences_ = EditorPreferences::load(settings);
     }
+    figureEditor_ = std::make_unique<ExcalidrawFigureEditor>(this);
     registerCommands();
     buildMenus();
 
@@ -2612,6 +3018,8 @@ MainWindow::MainWindow(QWidget* parent)
         loadNavigationForActiveDocument();
         if (auto* canvas = activeCanvas()) {
             synchronizeZoomControls(canvas);
+            ribbon_->setParagraphStyle(canvas->currentParagraphStyleId());
+            synchronizeParagraphStyleAvailability(canvas);
             ribbon_->setFontFamily(canvas->currentFontFamily());
             ribbon_->setFontPointSize(canvas->currentFontPointSize());
             ribbon_->setTextColor(canvas->currentTextColor());
@@ -2623,6 +3031,8 @@ MainWindow::MainWindow(QWidget* parent)
             canvas->refreshCursorFormat();
         } else {
             synchronizeZoomControls(nullptr);
+            ribbon_->setParagraphStyle({});
+            synchronizeParagraphStyleAvailability(nullptr);
             ribbon_->setListContext(false, 1);
             ribbon_->setTableContext(false);
             ribbon_->setPictureContext(false);
@@ -2687,6 +3097,35 @@ void MainWindow::registerCommands() {
         [this] { if (activeCanvas()) activeCanvas()->toggleBaseline(core::BaselinePosition::superscript); }, true);
     add("format.subscript", tr("Subscript"), QKeySequence(QStringLiteral("Ctrl+=")),
         [this] { if (activeCanvas()) activeCanvas()->toggleBaseline(core::BaselinePosition::subscript); }, true);
+    const auto applyParagraphStyle = [this](const char* styleId) {
+        if (auto* canvas = activeCanvas()) {
+            canvas->applyParagraphStyle(QString::fromLatin1(styleId));
+        }
+    };
+    add("style.normal", tr("Normal"),
+        QKeySequence(QStringLiteral("Ctrl+Shift+N")),
+        [applyParagraphStyle] { applyParagraphStyle("Normal"); });
+    add("style.noSpacing", tr("No Spacing"), QKeySequence(),
+        [applyParagraphStyle] { applyParagraphStyle("NoSpacing"); });
+    add("style.title", tr("Title"), QKeySequence(),
+        [applyParagraphStyle] { applyParagraphStyle("Title"); });
+    add("style.subtitle", tr("Subtitle"), QKeySequence(),
+        [applyParagraphStyle] { applyParagraphStyle("Subtitle"); });
+    add("style.quote", tr("Quote"), QKeySequence(),
+        [applyParagraphStyle] { applyParagraphStyle("Quote"); });
+    for (int level = 1; level <= 9; ++level) {
+        const QString id = QStringLiteral("style.heading%1").arg(level);
+        const QString name = tr("Heading %1").arg(level);
+        const QKeySequence shortcut = level <= 3
+            ? QKeySequence(QStringLiteral("Ctrl+Alt+%1").arg(level))
+            : QKeySequence{};
+        add(id, name, shortcut, [this, level] {
+            if (auto* canvas = activeCanvas()) {
+                canvas->applyParagraphStyle(
+                    QStringLiteral("Heading%1").arg(level));
+            }
+        });
+    }
     add("paragraph.alignLeft", tr("Align Left"), QKeySequence(QStringLiteral("Ctrl+L")),
         [this] { if (activeCanvas()) activeCanvas()->setAlignment(core::ParagraphAlignment::left); });
     add("paragraph.alignCenter", tr("Center"), QKeySequence(QStringLiteral("Ctrl+E")),
@@ -2769,11 +3208,17 @@ void MainWindow::registerCommands() {
         }
     });
     add("insert.image", tr("Picture"), QKeySequence(), [this] { insertImage(); });
+    add("insert.excalidraw", tr("Excalidraw Figure"), QKeySequence(),
+        [this] { insertExcalidrawFigure(); });
     add("picture.size", tr("Picture Size…"), QKeySequence(), [this] {
         if (auto* canvas = activeCanvas()) {
             canvas->showSelectedImageSizeDialog();
         }
     });
+    add("picture.editExcalidraw", tr("Edit Figure…"), QKeySequence(),
+        [this] {
+            editSelectedExcalidrawFigure(activeCanvas());
+        });
     add("picture.altText", tr("Alt Text…"), QKeySequence(), [this] {
         if (auto* canvas = activeCanvas()) {
             canvas->showSelectedImageAltTextDialog();
@@ -2875,6 +3320,8 @@ void MainWindow::registerCommands() {
              "edit.pasteTextOnly",
              "format.bold", "format.italic", "format.underline",
              "format.superscript", "format.subscript",
+             "style.normal", "style.heading1", "style.heading2",
+             "style.heading3",
              "paragraph.alignLeft", "paragraph.alignCenter",
              "paragraph.alignRight", "paragraph.justify", "paragraph.bullets",
              "paragraph.listProperties",
@@ -2912,17 +3359,24 @@ void MainWindow::registerCommands() {
              "edit.pasteTextOnly",
              "format.bold", "format.italic", "format.underline", "format.strike",
              "format.superscript", "format.subscript",
+             "style.normal", "style.noSpacing", "style.title",
+             "style.subtitle", "style.quote", "style.heading1",
+             "style.heading2", "style.heading3", "style.heading4",
+             "style.heading5", "style.heading6", "style.heading7",
+             "style.heading8", "style.heading9",
              "paragraph.bullets", "paragraph.numbering",
              "paragraph.listProperties",
              "paragraph.alignLeft", "paragraph.alignCenter",
              "paragraph.alignRight", "paragraph.justify",
              "paragraph.decreaseIndent", "paragraph.increaseIndent",
              "insert.pageBreak", "insert.table", "insert.image",
+             "insert.excalidraw",
              "insert.equation", "insert.textBox", "insert.comment",
              "table.insertRowAbove", "table.insertRowBelow",
              "table.insertColumnLeft", "table.insertColumnRight",
              "table.deleteRows", "table.deleteColumns",
              "picture.size", "picture.altText", "picture.layoutOptions",
+             "picture.editExcalidraw",
              "picture.wrapInline", "picture.wrapSquare",
              "picture.wrapTopBottom", "picture.delete",
              "layout.orientation", "layout.columns", "layout.lineSpacing",
@@ -2967,7 +3421,9 @@ void MainWindow::buildMenus() {
                            "edit.commandPalette"})
         edit->addAction(commands_.action(QString::fromLatin1(id)));
     auto* insert = menuBar()->addMenu(tr("&Insert"));
-    for (const auto* id : {"insert.table", "insert.image", "insert.equation", "insert.pageBreak"})
+    for (const auto* id : {"insert.table", "insert.image",
+                           "insert.excalidraw", "insert.equation",
+                           "insert.pageBreak"})
         insert->addAction(commands_.action(QString::fromLatin1(id)));
     auto* review = menuBar()->addMenu(tr("&Review"));
     review->addAction(commands_.action("review.spelling"));
@@ -2980,6 +3436,13 @@ void MainWindow::buildMenus() {
 }
 
 void MainWindow::connectRibbon() {
+    connect(ribbon_, &RibbonWidget::paragraphStyleRequested, this,
+            [this](const QString& styleId) {
+        auto* canvas = activeCanvas();
+        if (!canvas) return;
+        canvas->applyParagraphStyle(styleId);
+        restoreCanvasFocus(canvas);
+    });
     connect(ribbon_, &RibbonWidget::fontFamilyRequested, this,
             [this](const QString& family) {
         auto* canvas = activeCanvas();
@@ -3087,6 +3550,23 @@ void MainWindow::synchronizeZoomControls(DocumentCanvas* canvas) {
             available && percent < DocumentCanvas::kMaximumZoomPercent);
     }
     if (ribbon_) ribbon_->setZoomPercent(percent);
+}
+
+void MainWindow::synchronizeParagraphStyleAvailability(
+    DocumentCanvas* canvas) {
+    if (!ribbon_) return;
+    if (!canvas) {
+        ribbon_->setParagraphStyleAvailable(
+            false, tr("Paragraph styles unavailable without a document"));
+    } else if (canvas->hasPreview()) {
+        ribbon_->setParagraphStyleAvailable(
+            false, tr("Paragraph styles unavailable during preview"));
+    } else if (!canvas->paragraphStylesAvailable()) {
+        ribbon_->setParagraphStyleAvailable(
+            false, tr("Paragraph styles unavailable in tables"));
+    } else {
+        ribbon_->setParagraphStyleAvailable(true);
+    }
 }
 
 void MainWindow::applyTextColor(const QColor& color) {
@@ -3209,6 +3689,7 @@ DocumentCanvas* MainWindow::createDocumentTab(core::Document document,
     connect(canvas, &DocumentCanvas::previewStateChanged, this,
             [this, canvas](bool active) {
         if (canvas != activeCanvas()) return;
+        synchronizeParagraphStyleAvailability(canvas);
         navigation_->setReplacementLocked(active);
         if (!navigation_->isVisible()) return;
         if (auto* tabState = stateFor(canvas)) {
@@ -3240,6 +3721,10 @@ DocumentCanvas* MainWindow::createDocumentTab(core::Document document,
         commands_.action(QStringLiteral("format.superscript"))->setChecked(superscript);
         commands_.action(QStringLiteral("format.subscript"))->setChecked(subscript);
     });
+    connect(canvas, &DocumentCanvas::cursorParagraphStyleChanged, this,
+            [this, canvas](const QString& styleId) {
+        if (canvas == activeCanvas()) ribbon_->setParagraphStyle(styleId);
+    });
     connect(canvas, &DocumentCanvas::cursorListStateChanged, this,
             [this](bool bullets, bool numbering) {
         commands_.action(QStringLiteral("paragraph.bullets"))->setChecked(bullets);
@@ -3252,15 +3737,21 @@ DocumentCanvas* MainWindow::createDocumentTab(core::Document document,
     connect(canvas, &DocumentCanvas::selectionChanged, this, [this, canvas] {
         if (canvas == activeCanvas()) {
             ribbon_->setTableContext(canvas->selectedTableId().has_value());
+            synchronizeParagraphStyleAvailability(canvas);
             const auto pictureLayout = canvas->selectedImageLayout();
             ribbon_->setPictureContext(
                 pictureLayout.has_value(),
-                pictureLayout.value_or(core::ImageLayout{}).placement);
+                pictureLayout.value_or(core::ImageLayout{}).placement,
+                canvas->selectedExcalidrawScene().has_value());
             synchronizeNavigationSelection();
         }
     });
     connect(canvas, &DocumentCanvas::listPropertiesRequested,
             this, &MainWindow::showListProperties);
+    connect(canvas, &DocumentCanvas::editExcalidrawFigureRequested,
+            this, [this, canvas] {
+                editSelectedExcalidrawFigure(canvas);
+            });
     connect(canvas, &DocumentCanvas::pageStatusChanged, this, [this](int page, int count, int words) {
         pageStatus_->setText(tr("Page %1 of %2   %3 words").arg(page).arg(count).arg(words));
     });
@@ -3271,6 +3762,8 @@ DocumentCanvas* MainWindow::createDocumentTab(core::Document document,
     connect(canvas, &DocumentCanvas::operationFailed, this, [this](const QString& message) {
         QMessageBox::warning(this, tr("Edit could not be applied"), message);
     });
+    ribbon_->setParagraphStyle(canvas->currentParagraphStyleId());
+    synchronizeParagraphStyleAvailability(canvas);
     ribbon_->setFontFamily(canvas->currentFontFamily());
     ribbon_->setFontPointSize(canvas->currentFontPointSize());
     ribbon_->setTextColor(canvas->currentTextColor());
@@ -3527,30 +4020,45 @@ bool MainWindow::saveCanvas(DocumentCanvas* canvas, bool saveAs) {
     bool regenerate = state->regeneratable &&
                       regenerationDefaultsStillMatch &&
                       (canvas->isModified() || !state->package);
-    bool simplificationConfirmed = false;
+    bool simplificationConfirmed =
+        state->simplificationWarningAcknowledged;
     const auto confirmSimplification = [&]() {
+        if (state->simplificationWarningAcknowledged) {
+            simplificationConfirmed = true;
+            return true;
+        }
         const QString protectedSource = !state->path.isEmpty()
                                             ? state->path
                                             : state->recoverySourcePath;
-        if (sameFileDestination(target, protectedSource)) {
-            QMessageBox::critical(
-                this, tr("Choose a different file"),
-                tr("A simplified DOCX cannot overwrite the imported original. "
-                   "Choose a different Save As destination so preserved objects "
-                   "remain recoverable."));
-            return false;
-        }
+        const bool overwritingOriginal =
+            sameFileDestination(target, protectedSource);
         QMessageBox box(
-            QMessageBox::Warning, tr("Create simplified DOCX?"),
-            tr("The copy will keep editable body text and supported formatting, "
-               "but may omit preserved view-only objects."),
+            QMessageBox::Warning, tr("Compatibility warning"),
+            tr("This imported document contains content that this build "
+               "preserves but cannot safely rewrite after structural or "
+               "formatting changes. Saving anyway will rebuild the DOCX with "
+               "Owl Docs' supported content."),
             QMessageBox::Yes | QMessageBox::No, this);
         box.setDefaultButton(QMessageBox::No);
-        box.setDetailedText(tr(
+        if (auto* saveAnyway = box.button(QMessageBox::Yes)) {
+            saveAnyway->setText(tr("Save Anyway"));
+        }
+        if (auto* cancel = box.button(QMessageBox::No)) {
+            cancel->setText(tr("Cancel"));
+        }
+        QString details = tr(
             "Potential losses include headers/footers, comments, tracked revisions, "
             "fields, charts, SmartArt, text boxes, floating drawings, and custom XML. "
-            "The imported original will not be overwritten."));
+            "Editable body text and supported formatting will be retained.");
+        details += QLatin1Char('\n');
+        details += overwritingOriginal
+            ? tr("Continuing will atomically replace the original file. Cancel if "
+                 "you want to use Save As and retain that original separately.")
+            : tr("Continuing will write the selected destination. The imported "
+                 "original will remain unchanged.");
+        box.setDetailedText(details);
         if (box.exec() != QMessageBox::Yes) return false;
+        state->simplificationWarningAcknowledged = true;
         simplificationConfirmed = true;
         return true;
     };
@@ -3559,13 +4067,6 @@ bool MainWindow::saveCanvas(DocumentCanvas* canvas, bool saveAs) {
                      texts.size() != state->baselineTexts.size() ||
                      static_cast<std::size_t>(texts.size()) !=
                          state->sourceParagraphIndices.size();
-        if (regenerate && !destinationMustBeChosen) {
-            QMessageBox box(QMessageBox::Warning, tr("Save As required"),
-                            tr("This imported document contains content that this build preserves but cannot safely rewrite after structural or formatting changes."),
-                            QMessageBox::Ok, this);
-            box.setDetailedText(tr("Use Save As to create an explicitly simplified copy. The original will remain unchanged."));
-            box.exec(); return false;
-        }
         if (regenerate && !confirmSimplification()) return false;
     }
 
@@ -3605,17 +4106,6 @@ bool MainWindow::saveCanvas(DocumentCanvas* canvas, bool saveAs) {
             }
         }
         if (!patchFailure.isEmpty()) {
-            if (!destinationMustBeChosen) {
-                QMessageBox box(
-                    QMessageBox::Warning, tr("Save As required"),
-                    tr("This edit cannot be patched into the imported DOCX safely."),
-                    QMessageBox::Ok, this);
-                box.setDetailedText(
-                    patchFailure + QLatin1Char('\n') +
-                    tr("Use Save As to create an explicitly simplified copy."));
-                box.exec();
-                return false;
-            }
             regenerate = true;
             if (!simplificationConfirmed && !confirmSimplification()) return false;
         } else {
@@ -3632,16 +4122,9 @@ bool MainWindow::saveCanvas(DocumentCanvas* canvas, bool saveAs) {
     // Recovery intentionally stores only the bounded semantic snapshot, never
     // an imported package's opaque ZIP members. A restored imported document
     // therefore cannot take the normal package-preserving save path and must
-    // be treated as an explicitly simplified Save As.
+    // be treated as an explicitly warned simplified save.
     if (!savedWithPackage && !state->package && !state->regeneratable) {
         regenerate = true;
-        if (!destinationMustBeChosen) {
-            QMessageBox::warning(
-                this, tr("Save As required"),
-                tr("This recovered imported document must be saved as a new, "
-                   "simplified DOCX so the original remains unchanged."));
-            return false;
-        }
         if (!simplificationConfirmed && !confirmSimplification()) return false;
     }
     if (!savedWithPackage) {
@@ -3651,7 +4134,7 @@ bool MainWindow::saveCanvas(DocumentCanvas* canvas, bool saveAs) {
             canvas->defaultFontPointSize(),
             state->importedTableStyleSources);
         losses.removeDuplicates();
-        if (!losses.isEmpty()) {
+        if (!losses.isEmpty() && !simplificationConfirmed) {
             QMessageBox box(QMessageBox::Warning, tr("Some formatting is not serializable yet"),
                             tr("Save the DOCX with the supported subset?"),
                             QMessageBox::Yes | QMessageBox::No, this);
@@ -4225,6 +4708,69 @@ void MainWindow::insertImage() {
             tr("Picture inserted in line with text"), 4000);
     }
     canvas->setFocus();
+}
+
+void MainWindow::insertExcalidrawFigure() {
+    auto* canvas = activeCanvas();
+    if (!canvas || !figureEditor_) return;
+    QPointer<DocumentCanvas> guardedCanvas(canvas);
+    figureEditor_->open(
+        std::nullopt,
+        [this, guardedCanvas](
+            std::optional<ExcalidrawFigureEditor::Result> result,
+            const QString& error) {
+            if (!error.isEmpty()) {
+                QMessageBox::warning(
+                    this, tr("Figure editor"), error);
+                return;
+            }
+            if (!result || !guardedCanvas) return;
+            std::vector<std::uint8_t> png(
+                reinterpret_cast<const std::uint8_t*>(
+                    result->png.constData()),
+                reinterpret_cast<const std::uint8_t*>(
+                    result->png.constData()) + result->png.size());
+            if (guardedCanvas->insertInlineImage(
+                    std::move(png), tr("Excalidraw figure"))) {
+                statusBar()->showMessage(
+                    tr("Editable Excalidraw figure inserted"), 4000);
+            }
+            guardedCanvas->setFocus();
+        });
+}
+
+void MainWindow::editSelectedExcalidrawFigure(DocumentCanvas* canvas) {
+    if (!canvas || !figureEditor_) return;
+    const auto scene = canvas->selectedExcalidrawScene();
+    if (!scene) return;
+    const auto imageId = canvas->selectedInlineImageId();
+    QPointer<DocumentCanvas> guardedCanvas(canvas);
+    figureEditor_->open(
+        *scene,
+        [this, guardedCanvas, imageId](
+            std::optional<ExcalidrawFigureEditor::Result> result,
+            const QString& error) {
+            if (!error.isEmpty()) {
+                QMessageBox::warning(
+                    this, tr("Figure editor"), error);
+                return;
+            }
+            if (!result || !guardedCanvas || !imageId ||
+                !guardedCanvas->selectInlineImage(*imageId)) {
+                return;
+            }
+            std::vector<std::uint8_t> png(
+                reinterpret_cast<const std::uint8_t*>(
+                    result->png.constData()),
+                reinterpret_cast<const std::uint8_t*>(
+                    result->png.constData()) + result->png.size());
+            if (guardedCanvas->replaceSelectedExcalidrawFigure(
+                    std::move(png))) {
+                statusBar()->showMessage(
+                    tr("Excalidraw figure updated"), 4000);
+            }
+            guardedCanvas->setFocus();
+        });
 }
 
 void MainWindow::showCompatibilityReport() {

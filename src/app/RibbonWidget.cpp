@@ -242,6 +242,14 @@ QIcon paintedCommandIcon(const QString& id, const QWidget* widget,
         mountains.lineTo(16, 12);
         mountains.lineTo(20, 18);
         painter.drawPath(mountains);
+    } else if (id == QStringLiteral("insert.excalidraw") ||
+               id == QStringLiteral("picture.editExcalidraw")) {
+        // This is Excalidraw's own mark, bundled as a transparent raster so
+        // the ribbon does not depend on an SVG runtime plugin.
+        const QPixmap logo(QStringLiteral(":/icons/excalidraw-logo-96.png"));
+        if (!logo.isNull()) {
+            painter.drawPixmap(QRect(1, 1, 22, 22), logo);
+        }
     } else if (id == QStringLiteral("picture.size")) {
         painter.drawRect(QRectF(5, 5, 14, 14));
         painter.drawLine(2, 2, 9, 2);
@@ -486,6 +494,7 @@ RibbonWidget::RibbonWidget(CommandRegistry& commands, QWidget* parent) : QWidget
     tableTabIndex_ = tabs_->addTab(makeTableTab(commands), tr("Table"));
     pictureTabIndex_ = tabs_->addTab(makePictureTab(commands), tr("Picture"));
     outer->addWidget(tabs_);
+    refreshParagraphStyle();
     setTableContext(false);
     setPictureContext(false);
     setFontFamily(QStringLiteral("Carlito"));
@@ -498,6 +507,43 @@ QWidget* RibbonWidget::makeHomeTab(CommandRegistry& commands) {
     auto* page = makeTabPage(this, layout);
     addButtons(layout, commands, page, {"edit.undo", "edit.redo", "edit.cut", "edit.copy", "edit.paste"});
     layout->addWidget(divider(page));
+
+    paragraphStyle_ = new QComboBox(page);
+    paragraphStyle_->setObjectName(QStringLiteral("ribbon.paragraphStyle"));
+    paragraphStyle_->setAccessibleName(tr("Paragraph style"));
+    paragraphStyle_->setToolTip(tr("Paragraph style"));
+    paragraphStyle_->setMinimumContentsLength(11);
+    paragraphStyle_->setMaximumWidth(150);
+    for (const auto& style : core::builtInParagraphStyles()) {
+        const QString id = QString::fromUtf8(
+            style.id.data(), static_cast<qsizetype>(style.id.size()));
+        const QString name = QString::fromUtf8(
+            style.display_name.data(),
+            static_cast<qsizetype>(style.display_name.size()));
+        paragraphStyle_->addItem(name, id);
+        const int index = paragraphStyle_->count() - 1;
+        QFont previewFont = paragraphStyle_->font();
+        previewFont.setBold(style.character_format.bold.value_or(false));
+        previewFont.setItalic(style.character_format.italic.value_or(false));
+        if (style.character_format.font_size_half_points) {
+            // Preview the hierarchy without allowing a 28-point Title row to
+            // make the compact ribbon popup awkwardly tall.
+            previewFont.setPointSizeF(std::clamp(
+                *style.character_format.font_size_half_points / 2.0,
+                9.0, 14.0));
+        }
+        paragraphStyle_->setItemData(index, previewFont, Qt::FontRole);
+    }
+    connect(paragraphStyle_, qOverload<int>(&QComboBox::activated), this,
+            [this](int index) {
+        if (index < 0 ||
+            paragraphStyle_->itemData(index, Qt::UserRole + 1).toBool()) {
+            return;
+        }
+        const QString id = paragraphStyle_->itemData(index).toString();
+        if (!id.isEmpty()) emit paragraphStyleRequested(id);
+    });
+    layout->addWidget(paragraphStyle_);
 
     fontFamily_ = new FontFamilyPicker(page);
     fontFamily_->setObjectName(QStringLiteral("ribbon.fontFamily"));
@@ -630,7 +676,8 @@ QWidget* RibbonWidget::makeInsertTab(CommandRegistry& commands) {
     QHBoxLayout* layout{};
     auto* page = makeTabPage(this, layout);
     addButtons(layout, commands, page,
-               {"insert.pageBreak", "insert.table", "insert.image", "insert.equation",
+               {"insert.pageBreak", "insert.table", "insert.image",
+                "insert.excalidraw", "insert.equation",
                 "insert.textBox", "insert.comment"});
     layout->addStretch(1);
     return page;
@@ -821,7 +868,10 @@ QWidget* RibbonWidget::makePictureTab(CommandRegistry& commands) {
     page->setObjectName(QStringLiteral("ribbon.pictureTab"));
 
     addButtons(layout, commands, page,
-               {"picture.size", "picture.altText", "picture.layoutOptions"});
+               {"picture.editExcalidraw", "picture.size",
+                "picture.altText", "picture.layoutOptions"});
+    pictureEditExcalidraw_ =
+        commands.action(QStringLiteral("picture.editExcalidraw"));
     layout->addWidget(divider(page));
 
     auto* wrap = new QToolButton(page);
@@ -862,6 +912,74 @@ QWidget* RibbonWidget::makePictureTab(CommandRegistry& commands) {
 void RibbonWidget::setFontFamily(const QString& family) {
     const QSignalBlocker blocker(fontFamily_);
     fontFamily_->setCurrentFont(QFont(family));
+}
+
+void RibbonWidget::setParagraphStyle(const QString& styleId) {
+    if (paragraphStyleId_ == styleId) return;
+    paragraphStyleId_ = styleId;
+    refreshParagraphStyle();
+}
+
+void RibbonWidget::setParagraphStyleAvailable(
+    bool available, const QString& unavailableLabel) {
+    const QString label = available
+        ? QString{}
+        : (unavailableLabel.isEmpty()
+               ? tr("Paragraph styles unavailable")
+               : unavailableLabel);
+    if (paragraphStyleAvailable_ == available &&
+        paragraphStyleUnavailableLabel_ == label) {
+        return;
+    }
+    paragraphStyleAvailable_ = available;
+    paragraphStyleUnavailableLabel_ = label;
+    refreshParagraphStyle();
+}
+
+void RibbonWidget::refreshParagraphStyle() {
+    if (!paragraphStyle_) return;
+    const QSignalBlocker blocker(paragraphStyle_);
+    // A temporary row represents either a mixed selection or an imported
+    // custom style, or an explicitly unavailable editor context. Remove it
+    // only when the semantic context actually changes; the public setters
+    // short-circuit repeated cursor notifications.
+    for (int index = paragraphStyle_->count() - 1; index >= 0; --index) {
+        if (paragraphStyle_->itemData(index, Qt::UserRole + 1).toBool()) {
+            paragraphStyle_->removeItem(index);
+        }
+    }
+
+    paragraphStyle_->setEnabled(paragraphStyleAvailable_);
+    if (!paragraphStyleAvailable_) {
+        paragraphStyle_->addItem(paragraphStyleUnavailableLabel_);
+        const int transient = paragraphStyle_->count() - 1;
+        paragraphStyle_->setItemData(transient, true, Qt::UserRole + 1);
+        paragraphStyle_->setCurrentIndex(transient);
+        paragraphStyle_->setToolTip(paragraphStyleUnavailableLabel_);
+        paragraphStyle_->setAccessibleDescription(
+            paragraphStyleUnavailableLabel_);
+        return;
+    }
+
+    paragraphStyle_->setAccessibleDescription({});
+    const int found = paragraphStyleId_.isEmpty()
+        ? -1
+        : paragraphStyle_->findData(paragraphStyleId_);
+    if (found >= 0) {
+        paragraphStyle_->setCurrentIndex(found);
+        paragraphStyle_->setToolTip(
+            tr("Paragraph style: %1").arg(paragraphStyle_->itemText(found)));
+        return;
+    }
+
+    const QString label = paragraphStyleId_.isEmpty()
+        ? tr("Multiple styles")
+        : tr("Custom: %1").arg(paragraphStyleId_);
+    paragraphStyle_->addItem(label, paragraphStyleId_);
+    const int transient = paragraphStyle_->count() - 1;
+    paragraphStyle_->setItemData(transient, true, Qt::UserRole + 1);
+    paragraphStyle_->setCurrentIndex(transient);
+    paragraphStyle_->setToolTip(label);
 }
 
 void RibbonWidget::setFontPointSize(double points) {
@@ -919,8 +1037,9 @@ void RibbonWidget::setTableContext(bool visible) {
     tabs_->setTabVisible(tableTabIndex_, visible);
 }
 
-void RibbonWidget::setPictureContext(bool visible,
-                                     core::ImagePlacement placement) {
+void RibbonWidget::setPictureContext(
+    bool visible, core::ImagePlacement placement,
+    bool editableExcalidraw) {
     if (!tabs_ || pictureTabIndex_ < 0) return;
     auto* page = tabs_->widget(pictureTabIndex_);
     if (page) {
@@ -936,6 +1055,11 @@ void RibbonWidget::setPictureContext(bool visible,
     for (auto* action : {pictureWrapInline_, pictureWrapSquare_,
                          pictureWrapTopBottom_}) {
         if (action) action->setEnabled(visible);
+    }
+    if (pictureEditExcalidraw_) {
+        pictureEditExcalidraw_->setEnabled(
+            visible && editableExcalidraw);
+        pictureEditExcalidraw_->setVisible(editableExcalidraw);
     }
     if (pictureWrapInline_) {
         const QSignalBlocker blocker(pictureWrapInline_);

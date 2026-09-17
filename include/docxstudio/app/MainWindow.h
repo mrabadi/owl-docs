@@ -33,6 +33,7 @@ namespace docxstudio::app {
 class ChatDock;
 class CodexController;
 class DocumentCanvas;
+class ExcalidrawFigureEditor;
 class NavigationDock;
 class RibbonWidget;
 
@@ -64,6 +65,7 @@ private:
     void restoreCanvasFocus(DocumentCanvas* canvas);
     void setActiveZoomPercent(int percent);
     void synchronizeZoomControls(DocumentCanvas* canvas);
+    void synchronizeParagraphStyleAvailability(DocumentCanvas* canvas);
     DocumentCanvas* createDocumentTab(core::Document document,
                                       std::unique_ptr<TabState> state,
                                       const QString& title);
@@ -92,6 +94,8 @@ private:
     void insertTable();
     void insertEquation();
     void insertImage();
+    void insertExcalidrawFigure();
+    void editSelectedExcalidrawFigure(DocumentCanvas* canvas);
     void showCompatibilityReport();
     void updateWindowTitle();
     void updateTabTitle(DocumentCanvas* canvas);
@@ -119,6 +123,7 @@ private:
     SpellChecker spelling_;
     ChatStore chatStore_;
     std::unique_ptr<QLockFile> instanceLock_;
+    std::unique_ptr<ExcalidrawFigureEditor> figureEditor_;
     QTabWidget* tabs_{};
     RibbonWidget* ribbon_{};
     ChatDock* chat_{};

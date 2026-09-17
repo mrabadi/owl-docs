@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.22)
 
-project(OwlDocs VERSION 0.4.3 LANGUAGES CXX)
+project(OwlDocs VERSION 0.5.5 LANGUAGES CXX)
 
 include(GNUInstallDirs)
 include(CTest)
@@ -8,6 +8,9 @@ find_package(PkgConfig REQUIRED)
 
 option(DOCXSTUDIO_BUILD_APP "Build the Qt desktop application" ON)
 option(DOCXSTUDIO_STRICT_WARNINGS "Treat compiler warnings as errors" OFF)
+option(OWL_DOCS_REQUIRE_FIGURE_EDITOR_BUNDLE
+       "Fail configuration unless the bundled Excalidraw runtime is built"
+       OFF)
 set(OWL_DOCS_ICON_GENERATOR_PYTHON "" CACHE FILEPATH
     "Optional Python interpreter with the pinned Pillow version for icon-generation tests")
 
@@ -111,6 +114,13 @@ target_compile_features(docxstudio_codex PUBLIC cxx_std_20)
 docxstudio_warnings(docxstudio_codex)
 
 if(DOCXSTUDIO_BUILD_APP)
+    set(OWL_DOCS_FIGURE_EDITOR_BUNDLE
+        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/excalidraw-figure-editor/dist/linux-unpacked")
+    if(OWL_DOCS_REQUIRE_FIGURE_EDITOR_BUNDLE AND
+       NOT EXISTS "${OWL_DOCS_FIGURE_EDITOR_BUNDLE}/owl-docs-figure-editor")
+        message(FATAL_ERROR
+            "Build third_party/excalidraw-figure-editor before configuring an official package")
+    endif()
     find_package(Qt6 6.2 REQUIRED COMPONENTS Core Gui Widgets PrintSupport)
     if(BUILD_TESTING)
         find_package(Qt6 6.2 REQUIRED COMPONENTS Test)
@@ -137,6 +147,7 @@ if(DOCXSTUDIO_BUILD_APP)
         src/app/QtProcess.cpp
         src/app/CodexController.cpp
         src/app/EditorToolBridge.cpp
+        src/app/ExcalidrawFigure.cpp
         src/app/OwlDocsIcon.cpp
         src/app/MathLayout.cpp
         include/docxstudio/app/MainWindow.h
@@ -153,6 +164,7 @@ if(DOCXSTUDIO_BUILD_APP)
         include/docxstudio/app/CodexController.h
         include/docxstudio/app/QtProcess.h
         include/docxstudio/app/EditorToolBridge.h
+        include/docxstudio/app/ExcalidrawFigure.h
         include/docxstudio/app/RecoveryCodec.h
         include/docxstudio/app/OwlDocsIcon.h
         include/docxstudio/app/MathLayout.h
@@ -166,7 +178,12 @@ if(DOCXSTUDIO_BUILD_APP)
     )
     target_compile_definitions(docxstudio_app PUBLIC
         DOCXSTUDIO_VERSION="${PROJECT_VERSION}"
-        DOCXSTUDIO_INSTALL_PARSER_WORKER_PATH="${CMAKE_INSTALL_FULL_LIBEXECDIR}/owl-docs/owl-docs-parser-worker")
+        DOCXSTUDIO_INSTALL_PARSER_WORKER_PATH="${CMAKE_INSTALL_FULL_LIBEXECDIR}/owl-docs/owl-docs-parser-worker"
+        DOCXSTUDIO_INSTALL_FIGURE_EDITOR_PATH="${CMAKE_INSTALL_FULL_LIBEXECDIR}/owl-docs/figure-editor/owl-docs-figure-editor")
+    if(NOT OWL_DOCS_REQUIRE_FIGURE_EDITOR_BUNDLE)
+        target_compile_definitions(docxstudio_app PUBLIC
+            DOCXSTUDIO_DEV_FIGURE_EDITOR_PATH="${CMAKE_CURRENT_SOURCE_DIR}/third_party/excalidraw-figure-editor/dist/linux-unpacked/owl-docs-figure-editor")
+    endif()
     add_dependencies(docxstudio_app owl-docs-parser-worker)
     docxstudio_warnings(docxstudio_app)
 
@@ -189,6 +206,12 @@ if(DOCXSTUDIO_BUILD_APP)
     docxstudio_warnings(owl-docs-fidelity-probe)
 
     install(TARGETS owl-docs RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+    if(EXISTS "${OWL_DOCS_FIGURE_EDITOR_BUNDLE}/owl-docs-figure-editor")
+        install(DIRECTORY
+                "${OWL_DOCS_FIGURE_EDITOR_BUNDLE}/"
+                DESTINATION ${CMAKE_INSTALL_LIBEXECDIR}/owl-docs/figure-editor
+                USE_SOURCE_PERMISSIONS)
+    endif()
     install(FILES packaging/debian/owl-docs.desktop
             DESTINATION ${CMAKE_INSTALL_DATADIR}/applications)
     install(FILES packaging/debian/owl-docs.xml
@@ -212,6 +235,9 @@ install(FILES
         docs/M0_CORPUS_EVIDENCE.md
         docs/PRIVACY.md
         docs/ROADMAP.md
+        DESTINATION "${CMAKE_INSTALL_DATAROOTDIR}/doc/owl-docs")
+install(FILES
+        third_party/excalidraw-figure-editor/THIRD_PARTY_NOTICES.md
         DESTINATION "${CMAKE_INSTALL_DATAROOTDIR}/doc/owl-docs")
 
 if(BUILD_TESTING)
@@ -372,6 +398,14 @@ if(BUILD_TESTING)
         set_tests_properties(image_ui_tests PROPERTIES
             ENVIRONMENT "QT_QPA_PLATFORM=offscreen;XDG_DATA_HOME=/tmp/owl-docs-image-ui-tests")
 
+        add_executable(excalidraw_figure_tests
+            tests/excalidraw_figure_tests.cpp)
+        target_link_libraries(excalidraw_figure_tests PRIVATE docxstudio_app)
+        docxstudio_warnings(excalidraw_figure_tests)
+        add_test(NAME excalidraw_figure_tests COMMAND excalidraw_figure_tests)
+        set_tests_properties(excalidraw_figure_tests PROPERTIES
+            ENVIRONMENT "QT_QPA_PLATFORM=offscreen;XDG_DATA_HOME=/tmp/owl-docs-excalidraw-figure-tests")
+
         add_executable(picture_dialog_tests tests/picture_dialog_tests.cpp)
         target_link_libraries(picture_dialog_tests PRIVATE docxstudio_app)
         docxstudio_warnings(picture_dialog_tests)
@@ -493,7 +527,7 @@ set(CPACK_DEBIAN_FILE_NAME DEB-DEFAULT)
 set(CPACK_DEBIAN_PACKAGE_SECTION "editors")
 set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS ON)
 set(CPACK_DEBIAN_PACKAGE_DEPENDS
-    "hunspell-en-us, fonts-crosextra-carlito, qt6-qpa-plugins")
+    "bubblewrap, hunspell-en-us, fonts-crosextra-carlito, qt6-qpa-plugins")
 set(CPACK_DEBIAN_PACKAGE_CONTROL_EXTRA
     "${CMAKE_CURRENT_SOURCE_DIR}/packaging/debian/postinst;${CMAKE_CURRENT_SOURCE_DIR}/packaging/debian/postrm")
 set(CPACK_DEBIAN_PACKAGE_CONTROL_STRICT_PERMISSION ON)

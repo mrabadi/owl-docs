@@ -6,7 +6,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <string>
+#include <string_view>
 
 namespace docxstudio::core {
 
@@ -123,6 +125,27 @@ struct CharacterFormatDelta {
     void applyTo(CharacterFormat& format) const;
 };
 
+// Presence and value are separate in OOXML: an explicit direct `false` (or a
+// direct clear made in the editor) must remain an override even when it looks
+// like an inherited/default value. These masks retain that provenance without
+// polluting the effective CharacterFormat used for shaping and rendering.
+struct CharacterFormatMask {
+    bool font_family{false};
+    bool font_size_half_points{false};
+    bool bold{false};
+    bool italic{false};
+    bool underline{false};
+    bool strike{false};
+    bool foreground_argb{false};
+    bool highlight_argb{false};
+    bool baseline{false};
+    bool language{false};
+
+    [[nodiscard]] bool empty() const noexcept;
+    void mark(const CharacterFormatDelta& delta) noexcept;
+    auto operator<=>(const CharacterFormatMask&) const = default;
+};
+
 struct ParagraphFormatDelta {
     PropertyDelta<ParagraphAlignment> alignment;
     PropertyDelta<std::int64_t> left_indent_emu;
@@ -143,5 +166,57 @@ struct ParagraphFormatDelta {
     [[nodiscard]] Result<void> validate() const;
     void applyTo(ParagraphFormat& format) const;
 };
+
+struct ParagraphFormatMask {
+    bool alignment{false};
+    bool left_indent_emu{false};
+    bool right_indent_emu{false};
+    bool first_line_indent_emu{false};
+    bool space_before_emu{false};
+    bool space_after_emu{false};
+    bool line_spacing_emu{false};
+    bool line_spacing_rule{false};
+    bool keep_with_next{false};
+    bool keep_lines{false};
+    bool page_break_before{false};
+
+    [[nodiscard]] bool empty() const noexcept;
+    void mark(const ParagraphFormatDelta& delta) noexcept;
+    auto operator<=>(const ParagraphFormatMask&) const = default;
+};
+
+// Paragraph style IDs originate in DOCX packages and are therefore retained
+// as bounded UTF-8 strings rather than reduced to an application enum. This
+// lets an imported custom ID survive in the semantic model without falsely
+// claiming that Owl Docs understands its definition.
+inline constexpr std::size_t kMaximumParagraphStyleIdBytes = 1024;
+
+[[nodiscard]] Result<void> validateParagraphStyleId(
+    std::string_view style_id);
+
+// The built-in catalog is deliberately separate from style identity. Exact
+// lookup recognizes only the stable English IDs below; callers can still
+// retain any other valid style ID as an opaque/custom identity.
+struct ParagraphStyleDefinition {
+    std::string_view id;
+    std::string_view display_name;
+    std::string_view next_style_id;
+    std::optional<std::uint8_t> outline_level;
+    CharacterFormat character_format;
+    ParagraphFormat paragraph_format;
+
+    // These deltas contain every property specified by the catalog baseline.
+    // Unspecified properties remain untouched, including semantic list state,
+    // so a UI can apply the baseline and style identity in one operation batch.
+    [[nodiscard]] CharacterFormatDelta characterBaselineDelta() const;
+    [[nodiscard]] ParagraphFormatDelta paragraphBaselineDelta() const;
+
+    auto operator<=>(const ParagraphStyleDefinition&) const = default;
+};
+
+[[nodiscard]] std::span<const ParagraphStyleDefinition>
+builtInParagraphStyles() noexcept;
+[[nodiscard]] const ParagraphStyleDefinition* findBuiltInParagraphStyle(
+    std::string_view style_id) noexcept;
 
 }  // namespace docxstudio::core

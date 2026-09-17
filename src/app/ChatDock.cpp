@@ -111,9 +111,11 @@ ChatDock::ChatDock(QWidget* parent) : QDockWidget(tr("Codex"), parent) {
     typedInput->setMaximumHeight(110);
     typedInput->send = [this] { sendCurrentMessage(); };
     input_ = typedInput;
+    input_->setObjectName(QStringLiteral("codex.input"));
     layout->addWidget(input_);
 
     send_ = new QPushButton(tr("Send"), body);
+    send_->setObjectName(QStringLiteral("codex.send"));
     send_->setDefault(true);
     connect(send_, &QPushButton::clicked, this, &ChatDock::sendCurrentMessage);
     layout->addWidget(send_);
@@ -127,39 +129,49 @@ ChatDock::ChatDock(QWidget* parent) : QDockWidget(tr("Codex"), parent) {
 }
 
 void ChatDock::setConnected(bool connected, const QString& detail) {
+    connected_ = connected;
     status_->setText(connected ? tr("Connected")
                                : detail.isEmpty() ? tr("Offline") : detail);
     if (!detail.isEmpty()) {
         status_->setToolTip(detail);
     }
     enable_->setVisible(!connected);
-    models_->setEnabled(connected);
-    efforts_->setEnabled(connected);
-    tiers_->setEnabled(connected && tiers_->count() > 0);
-    input_->setEnabled(connected);
-    send_->setEnabled(connected);
+    updateInteractionState();
     privacy_->setText(connected
                           ? tr("Codex is enabled. Requested document context may be processed by Codex/OpenAI.")
                           : tr("Chat is off. The document stays local until you enable Codex."));
 }
 
 void ChatDock::setBusy(bool busy) {
-    send_->setEnabled(!busy && input_->isEnabled());
-    input_->setEnabled(!busy && models_->isEnabled());
-    if (!busy) {
+    busy_ = busy;
+    updateInteractionState();
+    if (!busy_ && connected_) {
         input_->setFocus();
     }
+}
+
+void ChatDock::updateInteractionState() {
+    models_->setEnabled(connected_);
+    efforts_->setEnabled(connected_);
+    tiers_->setEnabled(connected_ && tiers_->count() > 0);
+    input_->setEnabled(connected_ && !busy_);
+    send_->setEnabled(connected_ && !busy_);
 }
 
 void ChatDock::setModels(const QStringList& models) {
     models_->clear();
     models_->addItems(models);
+    const int preferred = models_->findText(
+        QStringLiteral("gpt-5.6-luna"), Qt::MatchFixedString);
+    if (preferred >= 0) models_->setCurrentIndex(preferred);
 }
 
 void ChatDock::setEfforts(const QStringList& efforts) {
     efforts_->clear();
     efforts_->addItem(tr("Default"), QString());
     for (const auto& effort : efforts) efforts_->addItem(effort, effort);
+    const int preferred = efforts_->findData(QStringLiteral("low"));
+    if (preferred >= 0) efforts_->setCurrentIndex(preferred);
 }
 
 void ChatDock::setServiceTiers(const QStringList& tiers,
@@ -184,13 +196,12 @@ void ChatDock::setServiceTiers(const QStringList& tiers,
         }
         return -1;
     };
-    int selected = -1;
-    if (!defaultTier.isEmpty() &&
+    int selected = tierIndex(QStringLiteral("default"));
+    if (selected < 0) selected = tierIndex(QStringLiteral("standard"));
+    if (selected < 0 && !defaultTier.isEmpty() &&
         defaultTier.compare(QStringLiteral("fast"), Qt::CaseInsensitive) != 0) {
         selected = tierIndex(defaultTier);
     }
-    if (selected < 0) selected = tierIndex(QStringLiteral("default"));
-    if (selected < 0) selected = tierIndex(QStringLiteral("standard"));
     if (selected < 0 && !tiers.isEmpty()) {
         // An empty value asks app-server to use its ordinary/default tier. It
         // also prevents an advertised Fast tier from becoming active merely
@@ -199,7 +210,7 @@ void ChatDock::setServiceTiers(const QStringList& tiers,
         selected = 0;
     }
     if (selected >= 0) tiers_->setCurrentIndex(selected);
-    tiers_->setEnabled(models_->isEnabled() && tiers_->count() > 0);
+    tiers_->setEnabled(connected_ && tiers_->count() > 0);
     tiers_->setToolTip(warning.isEmpty() ? tr("Speed / service tier") : warning);
 }
 

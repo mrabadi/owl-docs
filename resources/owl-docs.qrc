@@ -8,5 +8,6 @@
     <file alias="owl-docs-128.png">../packaging/icons/hicolor/128x128/apps/owl-docs.png</file>
     <file alias="owl-docs-256.png">../packaging/icons/hicolor/256x256/apps/owl-docs.png</file>
     <file alias="owl-docs-512.png">../packaging/icons/hicolor/512x512/apps/owl-docs.png</file>
+    <file alias="excalidraw-logo-96.png">excalidraw-logo-96.png</file>
   </qresource>
 </RCC>

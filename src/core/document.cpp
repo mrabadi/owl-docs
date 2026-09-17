@@ -173,6 +173,66 @@ Error bodyBlockMissing(NodeId id) {
     return Error{ErrorCode::invalid_operation, "Body block not found: " + id.toString()};
 }
 
+Result<void> validateStyleProvenance(
+    const ParagraphStyleProvenance& provenance,
+    const std::u16string& text) {
+    const auto character_validation =
+        provenance.inherited_character_format.validate();
+    if (!character_validation) return character_validation.error();
+    const auto paragraph_mark_validation =
+        provenance.inherited_paragraph_mark_character_format.validate();
+    if (!paragraph_mark_validation) return paragraph_mark_validation.error();
+    const auto paragraph_validation =
+        provenance.inherited_paragraph_format.validate();
+    if (!paragraph_validation) return paragraph_validation.error();
+    std::size_t previous_end = 0;
+    for (const auto& run : provenance.character_overrides) {
+        if (run.start >= run.end || run.end > text.size() ||
+            run.start < previous_end || run.properties.empty() ||
+            !isUtf16Boundary(text, run.start) ||
+            !isUtf16Boundary(text, run.end)) {
+            return Error{
+                ErrorCode::invalid_formatting,
+                "Paragraph style-provenance override run is invalid"};
+        }
+        previous_end = run.end;
+    }
+    return {};
+}
+
+void mergeMask(CharacterFormatMask& destination,
+               const CharacterFormatMask& source) noexcept {
+    destination.font_family = destination.font_family || source.font_family;
+    destination.font_size_half_points =
+        destination.font_size_half_points || source.font_size_half_points;
+    destination.bold = destination.bold || source.bold;
+    destination.italic = destination.italic || source.italic;
+    destination.underline = destination.underline || source.underline;
+    destination.strike = destination.strike || source.strike;
+    destination.foreground_argb =
+        destination.foreground_argb || source.foreground_argb;
+    destination.highlight_argb =
+        destination.highlight_argb || source.highlight_argb;
+    destination.baseline = destination.baseline || source.baseline;
+    destination.language = destination.language || source.language;
+}
+
+CharacterFormatMask differingProperties(
+    const CharacterFormat& value,
+    const CharacterFormat& baseline) noexcept {
+    return CharacterFormatMask{
+        value.font_family != baseline.font_family,
+        value.font_size_half_points != baseline.font_size_half_points,
+        value.bold != baseline.bold,
+        value.italic != baseline.italic,
+        value.underline != baseline.underline,
+        value.strike != baseline.strike,
+        value.foreground_argb != baseline.foreground_argb,
+        value.highlight_argb != baseline.highlight_argb,
+        value.baseline != baseline.baseline,
+        value.language != baseline.language};
+}
+
 }  // namespace
 
 Result<void> ImageLayout::validate() const {
@@ -764,14 +824,20 @@ Result<void> Table::deleteColumns(std::size_t index, std::size_t count) {
 Paragraph::Paragraph() : id_(NodeId::generate()) {}
 
 Paragraph::Paragraph(NodeId id, std::u16string text,
-                     CharacterFormat paragraph_mark_character_format)
+                     CharacterFormat paragraph_mark_character_format,
+                     std::optional<std::string> style_id,
+                     std::optional<ParagraphStyleProvenance> style_provenance)
     : id_(id), text_(std::move(text)),
       paragraph_mark_character_format_(
-          std::move(paragraph_mark_character_format)) {}
+          std::move(paragraph_mark_character_format)),
+      style_id_(std::move(style_id)),
+      style_provenance_(std::move(style_provenance)) {}
 
 Result<Paragraph> Paragraph::create(
     std::u16string text, NodeId id,
-    CharacterFormat paragraph_mark_character_format) {
+    CharacterFormat paragraph_mark_character_format,
+    std::optional<std::string> style_id,
+    std::optional<ParagraphStyleProvenance> style_provenance) {
     if (!id.isValid()) {
         return Error{ErrorCode::invalid_node_id, "Paragraph NodeId cannot be zero"};
     }
@@ -791,8 +857,32 @@ Result<Paragraph> Paragraph::create(
     if (!mark_format_validation) {
         return mark_format_validation.error();
     }
+    if (style_id) {
+        const auto style_validation = validateParagraphStyleId(*style_id);
+        if (!style_validation) return style_validation.error();
+    }
+    if (style_provenance) {
+        if (!style_id) {
+            return Error{ErrorCode::invalid_formatting,
+                         "Paragraph style provenance requires a style ID"};
+        }
+        const auto provenance_validation =
+            validateStyleProvenance(*style_provenance, text);
+        if (!provenance_validation) return provenance_validation.error();
+    }
     return Paragraph(id, std::move(text),
-                     std::move(paragraph_mark_character_format));
+                     std::move(paragraph_mark_character_format),
+                     std::move(style_id), std::move(style_provenance));
+}
+
+Result<Paragraph> Paragraph::restore(
+    std::u16string text, NodeId id,
+    CharacterFormat paragraph_mark_character_format,
+    std::optional<std::string> style_id,
+    std::optional<ParagraphStyleProvenance> style_provenance) {
+    return create(std::move(text), id,
+                  std::move(paragraph_mark_character_format),
+                  std::move(style_id), std::move(style_provenance));
 }
 
 std::vector<CharacterFormat> Paragraph::denseFormats() const {
@@ -804,6 +894,51 @@ std::vector<CharacterFormat> Paragraph::denseFormats() const {
         }
     }
     return formats;
+}
+
+std::vector<CharacterFormatMask> Paragraph::denseStyleOverrideMasks() const {
+    std::vector<CharacterFormatMask> masks(text_.size());
+    if (!style_provenance_) return masks;
+    for (const auto& run : style_provenance_->character_overrides) {
+        const auto end = std::min(run.end, masks.size());
+        for (auto index = std::min(run.start, end); index < end; ++index) {
+            masks[index] = run.properties;
+        }
+    }
+    return masks;
+}
+
+CharacterFormatMask Paragraph::styleOverrideMaskAt(
+    std::size_t utf16_offset) const noexcept {
+    if (!style_provenance_) return {};
+    if (text_.empty()) return style_provenance_->paragraph_mark_overrides;
+    const auto index = utf16_offset == 0
+        ? 0
+        : std::min(utf16_offset - 1, text_.size() - 1);
+    for (const auto& run : style_provenance_->character_overrides) {
+        if (index >= run.start && index < run.end) return run.properties;
+    }
+    return {};
+}
+
+void Paragraph::setStyleOverrideMasks(
+    std::vector<CharacterFormatMask> masks) {
+    if (!style_provenance_) return;
+    if (masks.size() != text_.size()) masks.resize(text_.size());
+    auto& runs = style_provenance_->character_overrides;
+    runs.clear();
+    std::size_t index = 0;
+    while (index < masks.size()) {
+        if (masks[index].empty()) {
+            ++index;
+            continue;
+        }
+        const auto start = index;
+        const auto mask = masks[index];
+        while (++index < masks.size() && masks[index] == mask) {
+        }
+        runs.push_back({start, index, mask});
+    }
 }
 
 void Paragraph::setContent(std::u16string text, std::vector<CharacterFormat> formats) {
@@ -889,8 +1024,19 @@ Result<void> Paragraph::insertText(std::size_t offset, const std::u16string& tex
     }
 
     auto formats = denseFormats();
+    auto override_masks = denseStyleOverrideMasks();
+    auto insertion_override = styleOverrideMaskAt(offset);
+    if (format && style_provenance_) {
+        mergeMask(insertion_override,
+                  differingProperties(
+                      *format,
+                      style_provenance_->inherited_character_format));
+    }
     const auto insertion_format = format.value_or(characterFormatAt(offset));
     formats.insert(formats.begin() + static_cast<std::ptrdiff_t>(offset), text.size(), insertion_format);
+    override_masks.insert(
+        override_masks.begin() + static_cast<std::ptrdiff_t>(offset),
+        text.size(), insertion_override);
     auto updated_text = text_;
     updated_text.insert(offset, text);
     auto updated_equations = equations_;
@@ -906,6 +1052,7 @@ Result<void> Paragraph::insertText(std::size_t offset, const std::u16string& tex
         }
     }
     setContent(std::move(updated_text), std::move(formats));
+    setStyleOverrideMasks(std::move(override_masks));
     equations_ = std::move(updated_equations);
     images_ = std::move(updated_images);
     return {};
@@ -939,9 +1086,20 @@ Result<void> Paragraph::insertEquation(
     }
 
     auto formats = denseFormats();
+    auto override_masks = denseStyleOverrideMasks();
+    auto insertion_override = styleOverrideMaskAt(offset);
+    if (format && style_provenance_) {
+        mergeMask(insertion_override,
+                  differingProperties(
+                      *format,
+                      style_provenance_->inherited_character_format));
+    }
     const auto insertion_format = format.value_or(characterFormatAt(offset));
     formats.insert(formats.begin() + static_cast<std::ptrdiff_t>(offset),
                    insertion_format);
+    override_masks.insert(
+        override_masks.begin() + static_cast<std::ptrdiff_t>(offset),
+        insertion_override);
     auto updated_text = text_;
     updated_text.insert(offset, 1, kInlineObjectReplacementCharacter);
 
@@ -967,6 +1125,7 @@ Result<void> Paragraph::insertEquation(
     }
 
     setContent(std::move(updated_text), std::move(formats));
+    setStyleOverrideMasks(std::move(override_masks));
     equations_ = std::move(updated_equations);
     images_ = std::move(updated_images);
     return {};
@@ -983,10 +1142,21 @@ Result<void> Paragraph::insertImage(
     // resource limits before this private mutation helper is reached.
 
     auto formats = denseFormats();
+    auto override_masks = denseStyleOverrideMasks();
+    auto insertion_override = styleOverrideMaskAt(offset);
+    if (character_format && style_provenance_) {
+        mergeMask(insertion_override,
+                  differingProperties(
+                      *character_format,
+                      style_provenance_->inherited_character_format));
+    }
     const auto insertion_format =
         character_format.value_or(characterFormatAt(offset));
     formats.insert(formats.begin() + static_cast<std::ptrdiff_t>(offset),
                    insertion_format);
+    override_masks.insert(
+        override_masks.begin() + static_cast<std::ptrdiff_t>(offset),
+        insertion_override);
     auto updated_text = text_;
     updated_text.insert(offset, 1, kInlineObjectReplacementCharacter);
 
@@ -1011,6 +1181,7 @@ Result<void> Paragraph::insertImage(
     updated_images.insert(insertion, std::move(image));
 
     setContent(std::move(updated_text), std::move(formats));
+    setStyleOverrideMasks(std::move(override_masks));
     equations_ = std::move(updated_equations);
     images_ = std::move(updated_images);
     return {};
@@ -1024,15 +1195,21 @@ Result<void> Paragraph::erase(std::size_t start, std::size_t end) {
         return {};
     }
     auto formats = denseFormats();
+    auto override_masks = denseStyleOverrideMasks();
     std::optional<CharacterFormat> emptied_format;
+    std::optional<CharacterFormatMask> emptied_override;
     if (start == 0 && end == text_.size() && !formats.empty()) {
         // Once all text is gone, its first character is the most useful
         // durable insertion context. Without this promotion, navigating away
         // from the newly empty paragraph would expose a stale paragraph mark.
         emptied_format = formats.front();
+        if (!override_masks.empty()) emptied_override = override_masks.front();
     }
     formats.erase(formats.begin() + static_cast<std::ptrdiff_t>(start),
                   formats.begin() + static_cast<std::ptrdiff_t>(end));
+    override_masks.erase(
+        override_masks.begin() + static_cast<std::ptrdiff_t>(start),
+        override_masks.begin() + static_cast<std::ptrdiff_t>(end));
     auto updated_text = text_;
     updated_text.erase(start, end - start);
     auto updated_equations = equations_;
@@ -1054,8 +1231,19 @@ Result<void> Paragraph::erase(std::size_t start, std::size_t end) {
         }
     }
     setContent(std::move(updated_text), std::move(formats));
+    setStyleOverrideMasks(std::move(override_masks));
     if (text_.empty() && emptied_format) {
         paragraph_mark_character_format_ = std::move(*emptied_format);
+        if (style_provenance_ && emptied_override) {
+            auto mark_override = *emptied_override;
+            mergeMask(
+                mark_override,
+                differingProperties(
+                    paragraph_mark_character_format_,
+                    style_provenance_
+                        ->inherited_paragraph_mark_character_format));
+            style_provenance_->paragraph_mark_overrides = mark_override;
+        }
     }
     equations_ = std::move(updated_equations);
     images_ = std::move(updated_images);
@@ -1085,18 +1273,24 @@ Result<void> Paragraph::applyFormat(std::size_t start, std::size_t end,
             return validation.error();
         }
         paragraph_mark_character_format_ = std::move(candidate);
+        if (style_provenance_) {
+            style_provenance_->paragraph_mark_overrides.mark(delta);
+        }
         return {};
     }
 
     auto formats = denseFormats();
+    auto override_masks = denseStyleOverrideMasks();
     for (auto index = start; index < end; ++index) {
         delta.applyTo(formats[index]);
+        override_masks[index].mark(delta);
         const auto validation = formats[index].validate();
         if (!validation) {
             return validation.error();
         }
     }
     setContent(text_, std::move(formats));
+    setStyleOverrideMasks(std::move(override_masks));
     return {};
 }
 
@@ -1214,6 +1408,23 @@ Result<Document> Document::create(std::vector<Paragraph> paragraphs) {
             paragraph.paragraphMarkCharacterFormat().validate();
         if (!mark_format_validation) {
             return mark_format_validation.error();
+        }
+        if (paragraph.styleId()) {
+            const auto style_validation =
+                validateParagraphStyleId(*paragraph.styleId());
+            if (!style_validation) return style_validation.error();
+        }
+        if (paragraph.styleProvenance()) {
+            if (!paragraph.styleId()) {
+                return Error{
+                    ErrorCode::invalid_formatting,
+                    "Paragraph style provenance requires a style ID"};
+            }
+            const auto provenance_validation = validateStyleProvenance(
+                *paragraph.styleProvenance(), paragraph.text());
+            if (!provenance_validation) {
+                return provenance_validation.error();
+            }
         }
         for (const auto& run : paragraph.characterFormats()) {
             if (run.start >= run.end || run.end > paragraph.text().size()) {
@@ -1464,6 +1675,48 @@ Result<void> Document::resizeImage(NodeId image_id, std::int64_t width_emu,
                  "Image not found: " + image_id.toString()};
 }
 
+Result<void> Document::replaceImagePayload(
+    NodeId image_id, EncodedImagePayload encoded_payload,
+    ImageFormat image_format, std::int64_t width_emu,
+    std::int64_t height_emu) {
+    if (!image_id.isValid()) {
+        return Error{ErrorCode::invalid_node_id,
+                     "Image NodeId cannot be zero"};
+    }
+    ImageAtom* target = nullptr;
+    std::size_t encoded_image_bytes = 0;
+    for (auto& paragraph : paragraphs_) {
+        for (auto& image : paragraph.images_) {
+            if (image.id == image_id) {
+                target = &image;
+            } else {
+                encoded_image_bytes += image.encoded_payload.size();
+            }
+        }
+    }
+    if (!target) {
+        return Error{ErrorCode::invalid_operation,
+                     "Image not found: " + image_id.toString()};
+    }
+    ImageAtom replacement = *target;
+    replacement.encoded_payload = std::move(encoded_payload);
+    replacement.format = image_format;
+    replacement.width_emu = width_emu;
+    replacement.height_emu = height_emu;
+    const auto metadata_validation = validateImageMetadata(replacement);
+    if (!metadata_validation) return metadata_validation.error();
+    if (encoded_image_bytes > kMaximumDocumentEncodedImageBytes ||
+        replacement.encoded_payload.size() >
+            kMaximumDocumentEncodedImageBytes - encoded_image_bytes) {
+        return Error{ErrorCode::invalid_operation,
+                     "Document exceeds the encoded-image byte limit"};
+    }
+    const auto payload_validation = validateImagePayload(replacement);
+    if (!payload_validation) return payload_validation.error();
+    *target = std::move(replacement);
+    return {};
+}
+
 Result<void> Document::setImageLayout(NodeId image_id, ImageLayout layout) {
     if (!image_id.isValid()) {
         return Error{ErrorCode::invalid_node_id,
@@ -1541,6 +1794,14 @@ Result<void> Document::deleteRange(
         if (paragraph.text_.empty() && empty_paragraph_format) {
             paragraph.paragraph_mark_character_format_ =
                 *empty_paragraph_format;
+            if (paragraph.style_provenance_) {
+                mergeMask(
+                    paragraph.style_provenance_->paragraph_mark_overrides,
+                    differingProperties(
+                        *empty_paragraph_format,
+                        paragraph.style_provenance_
+                            ->inherited_paragraph_mark_character_format));
+            }
         }
         return {};
     }
@@ -1566,6 +1827,8 @@ Result<void> Document::deleteRange(
     const auto& last = paragraphs_[normalized.end_paragraph_index];
     const auto first_formats = first.denseFormats();
     const auto last_formats = last.denseFormats();
+    const auto first_override_masks = first.denseStyleOverrideMasks();
+    const auto last_override_masks = last.denseStyleOverrideMasks();
 
     std::u16string joined = first.text_.substr(0, normalized.start.utf16_offset);
     joined.append(last.text_.substr(normalized.end.utf16_offset));
@@ -1578,18 +1841,65 @@ Result<void> Document::deleteRange(
                           last_formats.begin() + static_cast<std::ptrdiff_t>(normalized.end.utf16_offset),
                           last_formats.end());
 
+    std::vector<CharacterFormatMask> joined_override_masks;
+    if (first.style_provenance_) {
+        joined_override_masks.insert(
+            joined_override_masks.end(), first_override_masks.begin(),
+            first_override_masks.begin() + static_cast<std::ptrdiff_t>(
+                normalized.start.utf16_offset));
+        for (std::size_t offset = normalized.end.utf16_offset;
+             offset < last_formats.size(); ++offset) {
+            auto mask = last_override_masks[offset];
+            mergeMask(
+                mask,
+                differingProperties(
+                    last_formats[offset],
+                    first.style_provenance_->inherited_character_format));
+            joined_override_masks.push_back(mask);
+        }
+    }
+
     auto joined_empty_format = first.paragraph_mark_character_format_;
+    CharacterFormatMask joined_empty_override;
+    if (first.style_provenance_) {
+        joined_empty_override =
+            first.style_provenance_->paragraph_mark_overrides;
+    }
     if (joined.empty()) {
         if (!first_formats.empty()) {
             joined_empty_format = first_formats.front();
+            if (first.style_provenance_ &&
+                !first_override_masks.empty()) {
+                joined_empty_override = first_override_masks.front();
+            }
         } else if (joined_empty_format.empty() && !last_formats.empty()) {
             const auto deleted_index = normalized.end.utf16_offset == 0
                 ? 0U
                 : std::min(normalized.end.utf16_offset - 1U,
                            last_formats.size() - 1U);
             joined_empty_format = last_formats[deleted_index];
+            if (first.style_provenance_) {
+                joined_empty_override = last_override_masks[deleted_index];
+                mergeMask(
+                    joined_empty_override,
+                    differingProperties(
+                        joined_empty_format,
+                        first.style_provenance_
+                            ->inherited_paragraph_mark_character_format));
+            }
         } else if (joined_empty_format.empty()) {
             joined_empty_format = last.paragraph_mark_character_format_;
+            if (first.style_provenance_) {
+                joined_empty_override = last.style_provenance_
+                    ? last.style_provenance_->paragraph_mark_overrides
+                    : CharacterFormatMask{};
+                mergeMask(
+                    joined_empty_override,
+                    differingProperties(
+                        joined_empty_format,
+                        first.style_provenance_
+                            ->inherited_paragraph_mark_character_format));
+            }
         }
     }
 
@@ -1626,10 +1936,23 @@ Result<void> Document::deleteRange(
         }
     }
     first.setContent(std::move(joined), std::move(joined_formats));
+    first.setStyleOverrideMasks(std::move(joined_override_masks));
     if (first.text_.empty()) {
         first.paragraph_mark_character_format_ =
             empty_paragraph_format.value_or(
                 std::move(joined_empty_format));
+        if (first.style_provenance_) {
+            if (empty_paragraph_format) {
+                mergeMask(
+                    joined_empty_override,
+                    differingProperties(
+                        *empty_paragraph_format,
+                        first.style_provenance_
+                            ->inherited_paragraph_mark_character_format));
+            }
+            first.style_provenance_->paragraph_mark_overrides =
+                joined_empty_override;
+        }
     }
     first.equations_ = std::move(joined_equations);
     first.images_ = std::move(joined_images);
@@ -1683,9 +2006,26 @@ Result<void> Document::replaceRange(const Range& range, const std::u16string& te
 
     const auto insertion = normalized.value().start;
     const bool deletes_content = !normalized.value().empty();
+    std::optional<CharacterFormatMask> original_start_override;
+    if (deletes_content) {
+        const auto& start_paragraph = paragraphs_[
+            normalized.value().start_paragraph_index];
+        if (start_paragraph.style_provenance_ &&
+            insertion.utf16_offset < start_paragraph.text_.size()) {
+            original_start_override = start_paragraph.styleOverrideMaskAt(
+                insertion.utf16_offset + 1);
+        }
+    }
     const auto original_mark = paragraphs_[
         normalized.value().start_paragraph_index]
                                    .paragraph_mark_character_format_;
+    const auto original_mark_override = paragraphs_[
+        normalized.value().start_paragraph_index]
+                                            .style_provenance_
+        ? std::optional<CharacterFormatMask>(
+              paragraphs_[normalized.value().start_paragraph_index]
+                  .style_provenance_->paragraph_mark_overrides)
+        : std::nullopt;
     const auto deletion = deleteRange(range);
     if (!deletion) {
         return deletion.error();
@@ -1704,11 +2044,49 @@ Result<void> Document::replaceRange(const Range& range, const std::u16string& te
         if (!insertion_result) {
             return insertion_result.error();
         }
+        // Replacement text with an explicit effective format semantically
+        // continues the first deleted character. Retain its exact directness,
+        // including equal-to-inherited values and explicit false/clear, rather
+        // than inheriting an adjacent run's mask after deletion. Properties in
+        // the requested format that differ from the style baseline are direct
+        // as well.
+        if (format && paragraph.style_provenance_ &&
+            original_start_override) {
+            auto replacement_override = *original_start_override;
+            mergeMask(
+                replacement_override,
+                differingProperties(
+                    *format,
+                    paragraph.style_provenance_
+                        ->inherited_character_format));
+            auto override_masks = paragraph.denseStyleOverrideMasks();
+            const auto replacement_end =
+                insertion.utf16_offset + text.size();
+            std::fill(
+                override_masks.begin() + static_cast<std::ptrdiff_t>(
+                    insertion.utf16_offset),
+                override_masks.begin() + static_cast<std::ptrdiff_t>(
+                    replacement_end),
+                replacement_override);
+            paragraph.setStyleOverrideMasks(std::move(override_masks));
+        }
         paragraph.paragraph_mark_character_format_ = original_mark;
+        if (paragraph.style_provenance_ && original_mark_override) {
+            paragraph.style_provenance_->paragraph_mark_overrides =
+                *original_mark_override;
+        }
         return {};
     }
     if (deletes_content && paragraph.text_.empty() && format) {
         paragraph.paragraph_mark_character_format_ = *format;
+        if (paragraph.style_provenance_) {
+            mergeMask(
+                paragraph.style_provenance_->paragraph_mark_overrides,
+                differingProperties(
+                    *format,
+                    paragraph.style_provenance_
+                        ->inherited_paragraph_mark_character_format));
+        }
     }
     return {};
 }
@@ -1765,6 +2143,10 @@ Result<void> Document::applyParagraphMarkCharacterFormat(
     }
     paragraphs_[*index].paragraph_mark_character_format_ =
         std::move(candidate);
+    if (paragraphs_[*index].style_provenance_) {
+        paragraphs_[*index].style_provenance_->paragraph_mark_overrides.mark(
+            delta);
+    }
     return {};
 }
 
@@ -1800,7 +2182,62 @@ Result<void> Document::applyParagraphFormat(const std::vector<NodeId>& paragraph
     }
     for (const auto index : indices) {
         delta.applyTo(paragraphs_[index].format_);
+        if (paragraphs_[index].style_provenance_) {
+            paragraphs_[index].style_provenance_->paragraph_overrides.mark(
+                delta);
+        }
     }
+    return {};
+}
+
+Result<void> Document::setParagraphStyle(
+    const std::vector<NodeId>& paragraph_ids,
+    std::optional<std::string> style_id) {
+    if (paragraph_ids.empty()) {
+        return Error{ErrorCode::invalid_operation,
+                     "No paragraphs were supplied"};
+    }
+    if (style_id) {
+        const auto validation = validateParagraphStyleId(*style_id);
+        if (!validation) return validation.error();
+    }
+
+    std::vector<std::size_t> indices;
+    indices.reserve(paragraph_ids.size());
+    for (const auto id : paragraph_ids) {
+        const auto index = paragraphIndex(id);
+        if (!index) return paragraphMissing(id);
+        if (std::find(indices.begin(), indices.end(), *index) ==
+            indices.end()) {
+            indices.push_back(*index);
+        }
+    }
+    for (const auto index : indices) {
+        auto& paragraph = paragraphs_[index];
+        if (paragraph.style_id_ != style_id) {
+            paragraph.style_provenance_.reset();
+        }
+        paragraph.style_id_ = style_id;
+    }
+    return {};
+}
+
+Result<void> Document::setParagraphStyleProvenance(
+    NodeId paragraph_id,
+    std::optional<ParagraphStyleProvenance> provenance) {
+    const auto index = paragraphIndex(paragraph_id);
+    if (!index) return paragraphMissing(paragraph_id);
+    auto& paragraph = paragraphs_[*index];
+    if (provenance && !paragraph.style_id_) {
+        return Error{ErrorCode::invalid_formatting,
+                     "Paragraph style provenance requires a style ID"};
+    }
+    if (provenance) {
+        const auto validation =
+            validateStyleProvenance(*provenance, paragraph.text_);
+        if (!validation) return validation.error();
+    }
+    paragraph.style_provenance_ = std::move(provenance);
     return {};
 }
 
@@ -1831,6 +2268,22 @@ Result<void> Document::splitParagraph(
     const auto inherited_mark_format = new_paragraph_mark_format.value_or(
         original.characterFormatAt(position.utf16_offset));
     const auto formats = original.denseFormats();
+    const auto override_masks = original.denseStyleOverrideMasks();
+    auto inherited_mark_override =
+        original.styleOverrideMaskAt(position.utf16_offset);
+    if (new_paragraph_mark_format && original.style_provenance_) {
+        // An explicit split format is the collapsed-caret typing format. It
+        // can differ from the adjacent character without having changed the
+        // document yet, so carry those differences as direct paragraph-mark
+        // overrides. Otherwise an immediate next-style transition can
+        // mistake the transient choice for inherited formatting and erase it.
+        mergeMask(
+            inherited_mark_override,
+            differingProperties(
+                *new_paragraph_mark_format,
+                original.style_provenance_
+                    ->inherited_paragraph_mark_character_format));
+    }
 
     auto right_text = original.text_.substr(position.utf16_offset);
     std::vector<CharacterFormat> right_formats(
@@ -1838,6 +2291,14 @@ Result<void> Document::splitParagraph(
     auto left_text = original.text_.substr(0, position.utf16_offset);
     std::vector<CharacterFormat> left_formats(
         formats.begin(), formats.begin() + static_cast<std::ptrdiff_t>(position.utf16_offset));
+    std::vector<CharacterFormatMask> right_override_masks(
+        override_masks.begin() +
+            static_cast<std::ptrdiff_t>(position.utf16_offset),
+        override_masks.end());
+    std::vector<CharacterFormatMask> left_override_masks(
+        override_masks.begin(),
+        override_masks.begin() +
+            static_cast<std::ptrdiff_t>(position.utf16_offset));
     std::vector<EquationAtom> left_equations;
     std::vector<EquationAtom> right_equations;
     left_equations.reserve(original.equations_.size());
@@ -1866,11 +2327,18 @@ Result<void> Document::splitParagraph(
     }
 
     original.setContent(std::move(left_text), std::move(left_formats));
+    original.setStyleOverrideMasks(std::move(left_override_masks));
     original.equations_ = std::move(left_equations);
     original.images_ = std::move(left_images);
-    Paragraph right(new_paragraph_id, {}, inherited_mark_format);
+    Paragraph right(new_paragraph_id, {}, inherited_mark_format,
+                    original.style_id_, original.style_provenance_);
+    if (right.style_provenance_) {
+        right.style_provenance_->paragraph_mark_overrides =
+            inherited_mark_override;
+    }
     right.format_ = original_format;
     right.setContent(std::move(right_text), std::move(right_formats));
+    right.setStyleOverrideMasks(std::move(right_override_masks));
     right.equations_ = std::move(right_equations);
     right.images_ = std::move(right_images);
     paragraphs_.insert(paragraphs_.begin() + static_cast<std::ptrdiff_t>(index + 1),
@@ -1915,7 +2383,22 @@ Result<void> Document::mergeWithNext(NodeId paragraph_id) {
     auto formats = first.denseFormats();
     const auto second_formats = second.denseFormats();
     formats.insert(formats.end(), second_formats.begin(), second_formats.end());
+    auto override_masks = first.denseStyleOverrideMasks();
+    if (first.style_provenance_) {
+        const auto second_override_masks =
+            second.denseStyleOverrideMasks();
+        for (std::size_t offset = 0; offset < second_formats.size(); ++offset) {
+            auto mask = second_override_masks[offset];
+            mergeMask(
+                mask,
+                differingProperties(
+                    second_formats[offset],
+                    first.style_provenance_->inherited_character_format));
+            override_masks.push_back(mask);
+        }
+    }
     first.setContent(std::move(text), std::move(formats));
+    first.setStyleOverrideMasks(std::move(override_masks));
     first.equations_.reserve(first.equations_.size() + second_equations.size());
     for (auto equation : second_equations) {
         equation.utf16_offset += first_text_size;

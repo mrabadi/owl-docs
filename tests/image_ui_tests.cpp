@@ -254,6 +254,11 @@ void testCanvasObjectLifecycle(docxstudio::app::SpellChecker& spelling) {
     check(std::abs(static_cast<double>(image.width_emu) / kEmuPerPoint -
                        originalWidth * 2.0) < 0.01,
           "picture resize did not update semantic geometry");
+    const auto resizedPayload = image.encoded_payload.bytes();
+    check(resizedPayload.size() == png.size() &&
+              std::equal(resizedPayload.begin(), resizedPayload.end(),
+                         png.begin()),
+          "picture resize resampled or rewrote the original image payload");
 
     QString previewSummary;
     QString previewError;
@@ -1156,6 +1161,119 @@ void testMixedObjectOrdering(docxstudio::app::SpellChecker& spelling) {
           "adjacent images and equation did not retain semantic run order");
 }
 
+void testInlineObjectTypingOverrideProvenance(
+    docxstudio::app::SpellChecker& spelling) {
+    using namespace docxstudio::core;
+    CharacterFormatDelta exactDefaults;
+    exactDefaults.foreground_argb =
+        PropertyDelta<std::uint32_t>::set(0xff000000U);
+    exactDefaults.bold = PropertyDelta<bool>::set(false);
+    exactDefaults.highlight_argb =
+        PropertyDelta<std::uint32_t>::clear();
+
+    {
+        DocumentCanvas equation(spelling);
+        equation.insertText(QStringLiteral("A"));
+        const auto before = equation.snapshot();
+        equation.applyCharacterFormat(exactDefaults);
+        check(equation.snapshot().revision == before.revision &&
+                  !equation.snapshot().document.paragraphs().front()
+                       .styleProvenance(),
+              "collapsed equation formatting created an invisible edit");
+        int changeSignals = 0;
+        const auto connection = QObject::connect(
+            &equation, &DocumentCanvas::documentChanged,
+            [&](qulonglong) { ++changeSignals; });
+        check(equation.insertEquation(QStringLiteral("x^2")),
+              "could not insert provenance-aware equation");
+        QObject::disconnect(connection);
+
+        auto snapshot = equation.snapshot();
+        const auto& paragraph = snapshot.document.paragraphs().front();
+        const auto mask = paragraph.styleOverrideMaskAt(2);
+        const auto format = paragraph.characterFormatAt(2);
+        check(snapshot.revision.value() == before.revision.value() + 1 &&
+                  changeSignals == 1 && paragraph.text() == u"A\ufffc" &&
+                  paragraph.equations().size() == 1 &&
+                  paragraph.styleId() ==
+                      std::optional<std::string>{"Normal"} &&
+                  paragraph.styleProvenance() &&
+                  format.foreground_argb == 0xff000000U &&
+                  format.bold == false && !format.highlight_argb &&
+                  mask.foreground_argb && mask.bold &&
+                  mask.highlight_argb,
+              "equation insertion lost atomic equal-value provenance");
+        equation.undo();
+        snapshot = equation.snapshot();
+        check(snapshot.document == before.document &&
+                  !snapshot.document.paragraphs().front().styleId() &&
+                  !snapshot.document.paragraphs().front().styleProvenance(),
+              "one Undo did not remove the equation and lazy provenance");
+        equation.redo();
+        equation.applyParagraphStyle(QStringLiteral("Heading1"));
+        equation.applyParagraphStyle(QStringLiteral("Heading2"));
+        snapshot = equation.snapshot();
+        const auto& transitioned = snapshot.document.paragraphs().front();
+        check(transitioned.characterFormatAt(2).foreground_argb ==
+                  0xff000000U &&
+                  transitioned.characterFormatAt(2).bold == false &&
+                  transitioned.styleOverrideMaskAt(2).foreground_argb &&
+                  transitioned.styleOverrideMaskAt(2).bold &&
+                  transitioned.styleOverrideMaskAt(2).highlight_argb,
+              "equation direct intent did not survive style transitions");
+    }
+
+    {
+        DocumentCanvas image(spelling);
+        image.insertText(QStringLiteral("A"));
+        image.applyParagraphStyle(QStringLiteral("Heading1"));
+        image.applyParagraphStyle(QStringLiteral("Normal"));
+        const auto before = image.snapshot();
+        check(static_cast<bool>(
+                  before.document.paragraphs().front().styleProvenance()),
+              "image fixture did not establish Normal provenance");
+        image.applyCharacterFormat(exactDefaults);
+        check(image.snapshot().revision == before.revision,
+              "collapsed image formatting created an invisible edit");
+        int changeSignals = 0;
+        const auto connection = QObject::connect(
+            &image, &DocumentCanvas::documentChanged,
+            [&](qulonglong) { ++changeSignals; });
+        check(image.insertInlineImage(encodedPng(Qt::magenta, 8, 8),
+                                      QStringLiteral("override fixture")),
+              "could not insert provenance-aware image");
+        QObject::disconnect(connection);
+
+        auto snapshot = image.snapshot();
+        const auto& paragraph = snapshot.document.paragraphs().front();
+        const auto mask = paragraph.styleOverrideMaskAt(2);
+        const auto format = paragraph.characterFormatAt(2);
+        check(snapshot.revision.value() == before.revision.value() + 1 &&
+                  changeSignals == 1 && paragraph.text() == u"A\ufffc" &&
+                  paragraph.images().size() == 1 &&
+                  format.foreground_argb == 0xff000000U &&
+                  format.bold == false && !format.highlight_argb &&
+                  mask.foreground_argb && mask.bold &&
+                  mask.highlight_argb,
+              "image insertion lost atomic equal-value provenance");
+        image.undo();
+        check(image.snapshot().document == before.document,
+              "one Undo did not remove the image formatting transaction");
+        image.redo();
+        image.applyParagraphStyle(QStringLiteral("Heading1"));
+        image.applyParagraphStyle(QStringLiteral("Heading2"));
+        snapshot = image.snapshot();
+        const auto& transitioned = snapshot.document.paragraphs().front();
+        check(transitioned.characterFormatAt(2).foreground_argb ==
+                  0xff000000U &&
+                  transitioned.characterFormatAt(2).bold == false &&
+                  transitioned.styleOverrideMaskAt(2).foreground_argb &&
+                  transitioned.styleOverrideMaskAt(2).bold &&
+                  transitioned.styleOverrideMaskAt(2).highlight_argb,
+              "image direct intent did not survive style transitions");
+    }
+}
+
 void testImageBudgetEvictionKeepsCanvasHistoryUsable(
     docxstudio::app::SpellChecker& spelling) {
     docxstudio::core::DocumentSessionLimits limits;
@@ -1406,6 +1524,7 @@ int main(int argc, char** argv) {
     testResizeHandleDragIsOneUndo(spelling);
     testClipboardValidation(spelling);
     testMixedObjectOrdering(spelling);
+    testInlineObjectTypingOverrideProvenance(spelling);
     testImageBudgetEvictionKeepsCanvasHistoryUsable(spelling);
     testDialogSaveAndReopen();
     std::cout << "image UI tests passed\n";

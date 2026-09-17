@@ -1,0 +1,19 @@
+html, body, #root {
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+}
+
+.owl-figure-shell { height: 100%; display: flex; flex-direction: column; background: #fff; }
+.owl-figure-toolbar { min-height: 54px; padding: 8px 14px; box-sizing: border-box; display: flex; align-items: center; gap: 10px; border-bottom: 1px solid #d7d7d7; background: #f7f7f7; font: 14px Ubuntu, sans-serif; }
+.owl-figure-title { font-weight: 700; margin-right: auto; }
+.owl-figure-title span { font-weight: 400; color: #666; }
+.owl-mode-switch { display: inline-flex; padding: 2px; border: 1px solid #aaa; border-radius: 7px; background: #fff; }
+.owl-figure-toolbar .owl-mode-switch button { border: 0; padding: 5px 10px; border-radius: 5px; background: transparent; color: #444; }
+.owl-figure-toolbar .owl-mode-switch button.active { background: #6965db; color: #fff; }
+.owl-figure-error { color: #a51d2d; max-width: 42%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.owl-figure-toolbar button { border-radius: 5px; border: 1px solid #aaa; padding: 7px 14px; font-weight: 600; cursor: pointer; }
+.owl-figure-toolbar button:disabled { opacity: .55; cursor: default; }
+.owl-figure-toolbar .secondary { background: #fff; color: #333; }
+.owl-figure-toolbar .primary { background: #e95420; border-color: #d74714; color: #fff; }
+.owl-figure-canvas { min-height: 0; flex: 1; }

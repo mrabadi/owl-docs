@@ -2,6 +2,7 @@
 
 #include "docxstudio/core/document_session.h"
 #include <QAbstractScrollArea>
+#include <QByteArray>
 #include <QColor>
 #include <QElapsedTimer>
 #include <QImage>
@@ -202,6 +203,9 @@ public:
     // to that text boundary as surrounding content changes.
     bool insertInlineImage(std::vector<std::uint8_t> encodedBytes,
                            const QString& accessibleName);
+    std::optional<QByteArray> selectedExcalidrawScene() const;
+    bool replaceSelectedExcalidrawFigure(
+        std::vector<std::uint8_t> encodedPng);
     bool selectInlineImage(core::NodeId imageId);
     bool deleteSelectedInlineImage();
     bool resizeSelectedInlineImage(double widthPoints, double heightPoints);
@@ -242,6 +246,18 @@ public:
     void insertPageBreak();
     void applyCharacterFormat(const core::CharacterFormatDelta& delta);
     void applyParagraphFormat(const core::ParagraphFormatDelta& delta);
+    void applyParagraphStyle(const QString& styleId);
+    // Produces the same provenance-aware semantic operations used by the UI
+    // for an arbitrary isolated document. The Codex bridge uses this while
+    // constructing preview branches, so AI and direct editor style changes
+    // cannot drift in formatting or configured-default behavior.
+    [[nodiscard]] std::vector<core::Operation> planParagraphStyleOperations(
+        const core::Document& document,
+        const std::vector<core::NodeId>& paragraphIds,
+        const core::ParagraphStyleDefinition& target,
+        bool ensureTargetProvenance = false) const;
+    QString currentParagraphStyleId() const;
+    bool paragraphStylesAvailable() const noexcept;
     void toggleBold();
     void toggleItalic();
     void toggleUnderline();
@@ -327,9 +343,14 @@ signals:
     void cursorHighlightChanged(const QColor& highlightColor);
     void cursorStyleChanged(bool bold, bool italic, bool underline,
                             bool strike, bool superscript, bool subscript);
+    // Empty means that the current selection spans multiple paragraph styles
+    // or that paragraph styles are not applicable (for example, a table
+    // object selection). An unstyled body paragraph reports Normal.
+    void cursorParagraphStyleChanged(const QString& styleId);
     void cursorListStateChanged(bool bullets, bool numbering);
     void cursorListContextChanged(bool active, int oneBasedLevel);
     void listPropertiesRequested();
+    void editExcalidrawFigureRequested();
     void pageStatusChanged(int currentPage, int pageCount, int wordCount);
     void zoomChanged(int percent);
     // The displayed branch changed between the live document and an isolated
@@ -411,6 +432,11 @@ private:
     struct CursorState {
         core::Range selection;
         core::CharacterFormat typingFormat;
+        // Direct-property intent is distinct from the effective insertion
+        // format. In particular, an explicit black/false/clear can equal the
+        // current style baseline and still has to survive a later style
+        // transition.
+        core::CharacterFormatMask typingOverrideMask;
         std::optional<TableCursor> tableCursor;
         std::optional<std::size_t> tableSelectionAnchor;
         std::optional<TableCellSelection> tableCellSelection;
@@ -477,7 +503,9 @@ private:
                bool updateTableSelection = false,
                std::optional<TableCursor> resultingTableCursor = std::nullopt,
                std::optional<core::NodeId> resultingSelectedTable = std::nullopt,
-               std::optional<LineAffinity> resultingLineAffinity = std::nullopt);
+               std::optional<LineAffinity> resultingLineAffinity = std::nullopt,
+               std::optional<core::CharacterFormatMask>
+                   resultingTypingOverrideMask = std::nullopt);
     bool replaceTableCellText(const QString& text, bool coalesceTyping);
     bool moveActiveTableCell(bool forward);
     bool deleteSelectedTable();
@@ -489,7 +517,12 @@ private:
                              std::size_t column) const noexcept;
     void applyCharacterFormatInternal(const core::CharacterFormatDelta& delta,
                                       bool coalesceWithPrevious);
-    void replaceSelection(const QString& text, bool coalesceTyping = false);
+    void applyParagraphStyleInternal(const QString& styleId,
+                                     bool coalesceWithPrevious);
+    void insertParagraphBreak();
+    void replaceSelection(
+        const QString& text, bool coalesceTyping = false,
+        std::optional<std::string> resultingParagraphStyle = std::nullopt);
     bool continuePlainTextList();
     bool resequenceNumberedList(core::NodeId paragraphId,
                                 bool coalesceWithPrevious);
@@ -505,6 +538,7 @@ private:
     std::vector<core::NodeId> selectedParagraphIds() const;
     core::CharacterFormat currentCharacterFormat() const;
     core::CharacterFormat selectedCharacterFormat() const;
+    core::CharacterFormatMask selectedCharacterOverrideMask() const;
     core::CharacterFormat activeCharacterFormat() const;
     int paragraphIndex(core::NodeId id) const;
     QString paragraphText(core::NodeId id) const;
@@ -519,6 +553,7 @@ private:
     std::unique_ptr<core::DocumentSession> session_;
     core::Range selection_;
     core::CharacterFormat typingFormat_;
+    core::CharacterFormatMask typingOverrideMask_;
     bool modified_{false};
     bool nonTextModified_{false};
     bool pageLayoutModified_{false};

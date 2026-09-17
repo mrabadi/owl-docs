@@ -3,6 +3,7 @@
 #include "docxstudio/core/document.h"
 
 #include <QColor>
+#include <QString>
 #include <QWidget>
 
 class QAction;
@@ -23,6 +24,9 @@ class RibbonWidget final : public QWidget {
 public:
     explicit RibbonWidget(CommandRegistry& commands, QWidget* parent = nullptr);
 
+    void setParagraphStyle(const QString& styleId);
+    void setParagraphStyleAvailable(
+        bool available, const QString& unavailableLabel = {});
     void setFontFamily(const QString& family);
     void setFontPointSize(double points);
     void setTextColor(const QColor& color);
@@ -35,10 +39,13 @@ public:
     void setTableContext(bool visible);
     // The contextual Picture tab is available only while one semantic image
     // atom is selected. The active wrap choice is mirrored in its menu.
-    void setPictureContext(bool visible, core::ImagePlacement placement =
-                           core::ImagePlacement::inline_with_text);
+    void setPictureContext(
+        bool visible, core::ImagePlacement placement =
+                          core::ImagePlacement::inline_with_text,
+        bool editableExcalidraw = false);
 
 signals:
+    void paragraphStyleRequested(const QString& styleId);
     void fontFamilyRequested(const QString& family);
     void fontPointSizeRequested(double points);
     void textColorRequested();
@@ -61,8 +68,13 @@ private:
     QWidget* makeListTab(CommandRegistry& commands);
     QWidget* makeTableTab(CommandRegistry& commands);
     QWidget* makePictureTab(CommandRegistry& commands);
+    void refreshParagraphStyle();
 
     QTabWidget* tabs_{};
+    QComboBox* paragraphStyle_{};
+    QString paragraphStyleId_{QStringLiteral("Normal")};
+    QString paragraphStyleUnavailableLabel_;
+    bool paragraphStyleAvailable_{true};
     QFontComboBox* fontFamily_{};
     QComboBox* fontSize_{};
     QToolButton* textColor_{};
@@ -75,6 +87,7 @@ private:
     QAction* pictureWrapInline_{};
     QAction* pictureWrapSquare_{};
     QAction* pictureWrapTopBottom_{};
+    QAction* pictureEditExcalidraw_{};
 };
 
 }  // namespace docxstudio::app

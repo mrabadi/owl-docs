@@ -1,15 +1,20 @@
 #include "docxstudio/app/EditorToolBridge.h"
 
 #include "docxstudio/app/DocumentCanvas.h"
+#include "docxstudio/app/ExcalidrawFigure.h"
 #include "docxstudio/codex/editor_tools.hpp"
 #include "docxstudio/math/latex_parser.h"
 
 #include <QRegularExpression>
+#include <QImage>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QTextBoundaryFinder>
 
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <iterator>
 #include <limits>
 #include <optional>
 #include <set>
@@ -298,6 +303,19 @@ codex::Json formattingFor(const core::TableCell& cell,
     return result;
 }
 
+void appendParagraphStyleMetadata(const core::Paragraph& paragraph,
+                                  codex::Json& attributes) {
+    if (!paragraph.styleId()) return;
+    attributes["styleId"] = *paragraph.styleId();
+    const auto* definition =
+        core::findBuiltInParagraphStyle(*paragraph.styleId());
+    if (!definition) return;
+    attributes["styleDisplayName"] = definition->display_name;
+    if (definition->outline_level) {
+        attributes["outlineLevel"] = *definition->outline_level;
+    }
+}
+
 codex::Json equationsFor(const core::Paragraph& paragraph,
                          std::size_t returnedTextStart,
                          std::size_t returnedTextLength) {
@@ -338,7 +356,7 @@ codex::Json imagesFor(const core::Paragraph& paragraph,
             }
             return "inline";
         }();
-        images.push_back(
+        codex::Json encodedImage =
             {{"id", image.id.toString()},
              {"utf16Offset", image.utf16_offset - returnedTextStart},
              {"accessibleName", image.accessible_name},
@@ -352,7 +370,63 @@ codex::Json imagesFor(const core::Paragraph& paragraph,
                {"distanceBottomEmu", image.layout.distance_bottom_emu},
                {"distanceLeftEmu", image.layout.distance_left_emu},
                {"moveWithText", image.layout.move_with_text}}},
-             {"encodedBytes", image.encoded_payload.size()}});
+             {"encodedBytes", image.encoded_payload.size()}};
+        if (image.format == core::ImageFormat::png) {
+            const auto bytes = image.encoded_payload.bytes();
+            const QByteArray png(
+                reinterpret_cast<const char*>(bytes.data()),
+                static_cast<qsizetype>(bytes.size()));
+            if (const auto scene = excalidrawSceneFromPng(png)) {
+                encodedImage["kind"] = "excalidrawFigure";
+                encodedImage["authoringMode"] = "professional";
+                QJsonParseError parseError;
+                const auto sceneDocument =
+                    QJsonDocument::fromJson(*scene, &parseError);
+                if (parseError.error == QJsonParseError::NoError &&
+                    sceneDocument.isObject()) {
+                    const auto sourceElements =
+                        sceneDocument.object().value(
+                            QStringLiteral("elements")).toArray();
+                    codex::Json elements = codex::Json::array();
+                    const qsizetype maximum =
+                        std::min<qsizetype>(sourceElements.size(), 128);
+                    for (qsizetype index = 0; index < maximum; ++index) {
+                        const auto source = sourceElements.at(index).toObject();
+                        codex::Json element = codex::Json::object();
+                        const auto copyString = [&](const char* name) {
+                            const QString key = QString::fromLatin1(name);
+                            if (source.value(key).isString())
+                                element[name] = toUtf8(source.value(key).toString());
+                        };
+                        const auto copyNumber = [&](const char* name) {
+                            const QString key = QString::fromLatin1(name);
+                            if (source.value(key).isDouble())
+                                element[name] = source.value(key).toDouble();
+                        };
+                        copyString("id"); copyString("type");
+                        copyString("text"); copyString("strokeColor");
+                        copyString("backgroundColor");
+                        copyNumber("x"); copyNumber("y");
+                        copyNumber("width"); copyNumber("height");
+                        copyNumber("fontSize"); copyNumber("strokeWidth");
+                        copyNumber("opacity");
+                        if (source.value(QStringLiteral("points")).isArray()) {
+                            const QByteArray points = QJsonDocument(
+                                source.value(QStringLiteral("points")).toArray())
+                                                          .toJson(QJsonDocument::Compact);
+                            element["points"] = codex::Json::parse(
+                                points.constData(),
+                                points.constData() + points.size());
+                        }
+                        elements.push_back(std::move(element));
+                    }
+                    encodedImage["editableElements"] = std::move(elements);
+                    encodedImage["editableElementsTruncated"] =
+                        sourceElements.size() > maximum;
+                }
+            }
+        }
+        images.push_back(std::move(encodedImage));
     }
     return images;
 }
@@ -526,6 +600,7 @@ codex::Json readDocument(DocumentCanvas& canvas,
                                              ? formattingFor(*paragraph, 0,
                                                              textLength)
                                              : codex::Json::object();
+                appendParagraphStyleMetadata(*paragraph, attributes);
                 attributes["equations"] =
                     equationsFor(*paragraph, 0, textLength);
                 attributes["images"] = imagesFor(*paragraph, 0, textLength);
@@ -623,6 +698,7 @@ codex::Json readDocument(DocumentCanvas& canvas,
                 paragraph, returnedTextStart, returnedTextLength);
         }
         else block["attributes"] = codex::Json::object();
+        appendParagraphStyleMetadata(paragraph, block["attributes"]);
         block["attributes"]["equations"] = equationsFor(
             paragraph, returnedTextStart, returnedTextLength);
         block["attributes"]["images"] = imagesFor(
@@ -892,24 +968,68 @@ bool appendTextStyle(const codex::Json& operation, const Target& target,
 }
 
 bool appendParagraphStyle(const codex::Json& operation, const Target& target,
-                          std::vector<core::Operation>& operations, QString& error) {
+                          const core::Document& working,
+                          const DocumentCanvas& canvas,
+                          std::vector<core::Operation>& operations,
+                          QString& error) {
     const auto style = operation.find("style");
     if (style == operation.end() || !style->is_object()) {
         error = QObject::tr("set_paragraph_style requires a style object.");
         return false;
     }
-    core::ParagraphFormatDelta delta;
-    if (const auto value = style->find("alignment"); value != style->end() && value->is_string()) {
-        const auto name = value->get<std::string>();
-        const auto alignment = name == "center" ? core::ParagraphAlignment::center
-                               : name == "right" ? core::ParagraphAlignment::right
-                               : name == "justify" ? core::ParagraphAlignment::justified
-                                                  : core::ParagraphAlignment::left;
-        delta.alignment = core::PropertyDelta<core::ParagraphAlignment>::set(alignment);
+    const auto* paragraph = working.findParagraph(target.block);
+    if (!paragraph) {
+        error = QObject::tr(
+            "set_paragraph_style must target a paragraph block.");
+        return false;
     }
-    if (const auto value = style->find("lineSpacing"); value != style->end() && value->is_number()) {
+
+    for (auto property = style->begin(); property != style->end(); ++property) {
+        const std::string& name = property.key();
+        if (name != "styleId" && name != "alignment" &&
+            name != "lineSpacing" && name != "spaceBeforePoints" &&
+            name != "spaceAfterPoints" && name != "keepWithNext") {
+            error = QObject::tr(
+                        "set_paragraph_style contains an unsupported property: %1")
+                        .arg(QString::fromStdString(name));
+            return false;
+        }
+    }
+
+    // Explicit tool properties are appended after the native style plan.
+    // They therefore override its inherited baseline and are recorded as
+    // direct properties by the attached target provenance.
+    core::ParagraphFormatDelta delta;
+    if (const auto value = style->find("alignment"); value != style->end()) {
+        if (!value->is_string()) {
+            error = QObject::tr("alignment must be a string.");
+            return false;
+        }
+        const auto name = value->get<std::string>();
+        const auto alignment = name == "left"
+            ? std::optional{core::ParagraphAlignment::left}
+            : name == "center"
+            ? std::optional{core::ParagraphAlignment::center}
+            : name == "right"
+            ? std::optional{core::ParagraphAlignment::right}
+            : name == "justify"
+            ? std::optional{core::ParagraphAlignment::justified}
+            : std::nullopt;
+        if (!alignment) {
+            error = QObject::tr(
+                "alignment must be left, center, right, or justify.");
+            return false;
+        }
+        delta.alignment =
+            core::PropertyDelta<core::ParagraphAlignment>::set(*alignment);
+    }
+    if (const auto value = style->find("lineSpacing"); value != style->end()) {
+        if (!value->is_number()) {
+            error = QObject::tr("lineSpacing must be a number.");
+            return false;
+        }
         const double multiple = value->get<double>();
-        if (!(multiple > 0.0 && multiple <= 20.0)) {
+        if (!std::isfinite(multiple) || multiple <= 0.0 || multiple > 20.0) {
             error = QObject::tr("lineSpacing is outside the supported range.");
             return false;
         }
@@ -918,19 +1038,109 @@ bool appendParagraphStyle(const codex::Json& operation, const Target& target,
         delta.line_spacing_rule = core::PropertyDelta<core::LineSpacingRule>::set(
             core::LineSpacingRule::automatic);
     }
-    if (const auto value = style->find("spaceBeforePoints"); value != style->end() && value->is_number())
+    if (const auto value = style->find("spaceBeforePoints");
+        value != style->end()) {
+        if (!value->is_number()) {
+            error = QObject::tr("spaceBeforePoints must be a number.");
+            return false;
+        }
+        const double points = value->get<double>();
+        if (!std::isfinite(points) || points < 0.0 || points > 10000.0) {
+            error = QObject::tr(
+                "spaceBeforePoints is outside the supported range.");
+            return false;
+        }
         delta.space_before_emu = core::PropertyDelta<std::int64_t>::set(
-            static_cast<std::int64_t>(std::llround(value->get<double>() * 12700.0)));
-    if (const auto value = style->find("spaceAfterPoints"); value != style->end() && value->is_number())
+            static_cast<std::int64_t>(std::llround(points * 12700.0)));
+    }
+    if (const auto value = style->find("spaceAfterPoints");
+        value != style->end()) {
+        if (!value->is_number()) {
+            error = QObject::tr("spaceAfterPoints must be a number.");
+            return false;
+        }
+        const double points = value->get<double>();
+        if (!std::isfinite(points) || points < 0.0 || points > 10000.0) {
+            error = QObject::tr(
+                "spaceAfterPoints is outside the supported range.");
+            return false;
+        }
         delta.space_after_emu = core::PropertyDelta<std::int64_t>::set(
-            static_cast<std::int64_t>(std::llround(value->get<double>() * 12700.0)));
-    if (const auto value = style->find("keepWithNext"); value != style->end() && value->is_boolean())
+            static_cast<std::int64_t>(std::llround(points * 12700.0)));
+    }
+    if (const auto value = style->find("keepWithNext");
+        value != style->end()) {
+        if (!value->is_boolean()) {
+            error = QObject::tr("keepWithNext must be a boolean.");
+            return false;
+        }
         delta.keep_with_next = core::PropertyDelta<bool>::set(value->get<bool>());
-    if (delta.empty()) {
+    }
+
+    bool changesIdentity = false;
+    std::optional<std::string> styleId;
+    const core::ParagraphStyleDefinition* definition = nullptr;
+    if (const auto value = style->find("styleId"); value != style->end()) {
+        changesIdentity = true;
+        if (value->is_null()) {
+            styleId.reset();
+        } else if (value->is_string()) {
+            const auto& encoded = value->get_ref<const std::string&>();
+            const auto validation = core::validateParagraphStyleId(encoded);
+            if (!validation) {
+                error = QString::fromStdString(validation.error().message);
+                return false;
+            }
+            styleId = encoded;
+            definition = core::findBuiltInParagraphStyle(encoded);
+        } else {
+            error = QObject::tr("styleId must be a string or null.");
+            return false;
+        }
+        if (definition) {
+            auto planned = canvas.planParagraphStyleOperations(
+                working, {target.block}, *definition, !delta.empty());
+            operations.insert(
+                operations.end(),
+                std::make_move_iterator(planned.begin()),
+                std::make_move_iterator(planned.end()));
+            // A missing style ID is semantically implicit Normal. Preserve an
+            // explicit Codex request to assign Normal even when no visual
+            // transition or provenance initialization is necessary.
+            if (planned.empty() && paragraph->styleId() != styleId) {
+                operations.push_back(
+                    core::SetParagraphStyle{{target.block}, styleId});
+            }
+        } else {
+            operations.push_back(
+                core::SetParagraphStyle{{target.block}, styleId});
+        }
+    } else if (!delta.empty()) {
+        // Formatting-only requests still need a baseline when the current
+        // paragraph has an implicit or legacy provenance-free built-in style.
+        // Otherwise an explicit value equal to that baseline cannot remain
+        // distinguishable from inheritance during the next style transition.
+        const std::string currentStyleId =
+            paragraph->styleId().value_or("Normal");
+        if (const auto* currentDefinition =
+                core::findBuiltInParagraphStyle(currentStyleId)) {
+            auto planned = canvas.planParagraphStyleOperations(
+                working, {target.block}, *currentDefinition, true);
+            operations.insert(
+                operations.end(),
+                std::make_move_iterator(planned.begin()),
+                std::make_move_iterator(planned.end()));
+        }
+    }
+
+    if (!delta.empty()) {
+        operations.push_back(core::SetParagraphFormat{{target.block}, delta});
+    }
+
+    if (!changesIdentity && delta.empty()) {
         error = QObject::tr("set_paragraph_style contains no supported property.");
         return false;
     }
-    operations.push_back(core::SetParagraphFormat{{target.block}, delta});
     return true;
 }
 
@@ -947,6 +1157,20 @@ bool appendWorkingOperation(core::Document& working,
                 return working.insertEquation(
                     typed.position, typed.canonical_latex, typed.display,
                     typed.equation_id, typed.format);
+            } else if constexpr (std::is_same_v<Type, core::InsertImage>) {
+                return working.insertImage(
+                    typed.position, typed.encoded_payload, typed.image_format,
+                    typed.accessible_name, typed.width_emu, typed.height_emu,
+                    typed.image_id, typed.character_format, typed.layout);
+            } else if constexpr (
+                std::is_same_v<Type, core::ReplaceImagePayload>) {
+                return working.replaceImagePayload(
+                    typed.image_id, typed.encoded_payload,
+                    typed.image_format, typed.width_emu, typed.height_emu);
+            } else if constexpr (
+                std::is_same_v<Type, core::SetImageAccessibleName>) {
+                return working.setImageAccessibleName(
+                    typed.image_id, typed.accessible_name);
             } else if constexpr (std::is_same_v<Type, core::DeleteRange>) {
                 return working.deleteRange(
                     typed.range, typed.empty_paragraph_format);
@@ -954,8 +1178,22 @@ bool appendWorkingOperation(core::Document& working,
                 return working.replaceRange(typed.range, typed.text, typed.format);
             } else if constexpr (std::is_same_v<Type, core::SetCharacterFormat>) {
                 return working.applyCharacterFormat(typed.range, typed.delta);
+            } else if constexpr (
+                std::is_same_v<Type,
+                               core::SetParagraphMarkCharacterFormat>) {
+                return working.applyParagraphMarkCharacterFormat(
+                    typed.paragraph_id, typed.delta);
             } else if constexpr (std::is_same_v<Type, core::SetParagraphFormat>) {
                 return working.applyParagraphFormat(typed.paragraph_ids, typed.delta);
+            } else if constexpr (std::is_same_v<Type,
+                                                core::SetParagraphStyle>) {
+                return working.setParagraphStyle(
+                    typed.paragraph_ids, typed.style_id);
+            } else if constexpr (
+                std::is_same_v<Type,
+                               core::SetParagraphStyleProvenance>) {
+                return working.setParagraphStyleProvenance(
+                    typed.paragraph_id, typed.provenance);
             } else if constexpr (std::is_same_v<Type, core::SplitParagraph>) {
                 return working.splitParagraph(typed.position, typed.new_paragraph_id);
             } else if constexpr (std::is_same_v<Type,
@@ -975,6 +1213,102 @@ bool appendWorkingOperation(core::Document& working,
         return false;
     }
     operations.push_back(std::move(operation));
+    return true;
+}
+
+std::optional<core::NodeId> paragraphContainingImage(
+    const core::Document& document, const core::NodeId imageId) {
+    for (const auto& paragraph : document.paragraphs()) {
+        if (std::any_of(paragraph.images().begin(), paragraph.images().end(),
+                        [&](const auto& image) { return image.id == imageId; })) {
+            return paragraph.id();
+        }
+    }
+    return std::nullopt;
+}
+
+std::optional<ExcalidrawFigureEditor::Result> renderFigure(
+    const codex::Json& source, QString& accessibleName,
+    std::optional<double>& widthPoints, std::optional<double>& heightPoints,
+    QString& error) {
+    const auto figure = source.find("figure");
+    if (figure == source.end() || !figure->is_object()) {
+        error = QObject::tr("An Excalidraw operation requires a figure object.");
+        return std::nullopt;
+    }
+    const auto elements = figure->find("elements");
+    const auto name = figure->find("accessibleName");
+    if (elements == figure->end() || !elements->is_array() ||
+        elements->empty() || elements->size() > 128 ||
+        name == figure->end() || !name->is_string()) {
+        error = QObject::tr(
+            "An Excalidraw figure requires 1–128 elements and an accessible name.");
+        return std::nullopt;
+    }
+    const std::string nameUtf8 = name->get<std::string>();
+    accessibleName = QString::fromUtf8(
+        nameUtf8.data(), static_cast<qsizetype>(nameUtf8.size())).left(500);
+    const auto dimension = [&](const char* key,
+                               std::optional<double>& output) -> bool {
+        const auto value = figure->find(key);
+        if (value == figure->end()) return true;
+        if (!value->is_number()) return false;
+        const double points = value->get<double>();
+        if (!std::isfinite(points) || points < 36.0 || points > 936.0)
+            return false;
+        output = points;
+        return true;
+    };
+    if (!dimension("widthPoints", widthPoints) ||
+        !dimension("heightPoints", heightPoints)) {
+        error = QObject::tr("Excalidraw figure dimensions are outside the supported range.");
+        return std::nullopt;
+    }
+    const std::string serialized = elements->dump();
+    if (serialized.size() > 256U * 1024U) {
+        error = QObject::tr("The Excalidraw element request is too large.");
+        return std::nullopt;
+    }
+    QJsonParseError parseError;
+    const auto document = QJsonDocument::fromJson(
+        QByteArray(serialized.data(), static_cast<qsizetype>(serialized.size())),
+        &parseError);
+    if (parseError.error != QJsonParseError::NoError || !document.isArray()) {
+        error = QObject::tr("The Excalidraw element request is invalid.");
+        return std::nullopt;
+    }
+    return renderProfessionalExcalidrawSkeleton(document.array(), error);
+}
+
+core::EncodedImagePayload imagePayload(const QByteArray& bytes) {
+    return core::EncodedImagePayload(std::vector<std::uint8_t>(
+        reinterpret_cast<const std::uint8_t*>(bytes.constData()),
+        reinterpret_cast<const std::uint8_t*>(bytes.constData()) +
+            bytes.size()));
+}
+
+std::int64_t pointsToEmu(const double points) {
+    return static_cast<std::int64_t>(std::llround(points * 12700.0));
+}
+
+bool appendCurrentBuiltInStyleProvenance(
+    core::Document& working, const DocumentCanvas& canvas,
+    core::NodeId paragraphId, std::vector<core::Operation>& operations,
+    QString& error) {
+    const auto* paragraph = working.findParagraph(paragraphId);
+    if (!paragraph || paragraph->styleProvenance()) return true;
+    const std::string styleId = paragraph->styleId().value_or("Normal");
+    const auto* definition = core::findBuiltInParagraphStyle(styleId);
+    if (!definition) return true;
+
+    auto planned = canvas.planParagraphStyleOperations(
+        working, {paragraphId}, *definition, true);
+    for (auto& operation : planned) {
+        if (!appendWorkingOperation(
+                working, operations, std::move(operation), error)) {
+            return false;
+        }
+    }
     return true;
 }
 
@@ -1007,6 +1341,7 @@ codex::Json createPreview(DocumentCanvas& canvas,
     operations.reserve(sourceOperations->size());
     std::set<std::string> affected;
     std::vector<std::string> warnings;
+    std::size_t figureOperationCount = 0;
     for (const auto& source : *sourceOperations) {
         if (!source.is_object()) {
             error = QObject::tr("Every preview operation must be an object.");
@@ -1016,8 +1351,11 @@ codex::Json createPreview(DocumentCanvas& canvas,
         const bool needsEnd = kind == "replace_text" || kind == "delete_range" ||
                               kind == "set_text_style";
         Target target;
-        if (!parseTarget(source, target, error, needsEnd)) return {};
-        affected.insert(target.block.toString());
+        const bool needsTarget = kind != "replace_excalidraw_figure";
+        if (needsTarget) {
+            if (!parseTarget(source, target, error, needsEnd)) return {};
+            affected.insert(target.block.toString());
+        }
         if (kind == "insert_text" || kind == "replace_text") {
             const auto text = source.find("text");
             if (text == source.end() || !text->is_string()) {
@@ -1070,16 +1408,25 @@ codex::Json createPreview(DocumentCanvas& canvas,
         } else if (kind == "set_text_style") {
             std::vector<core::Operation> generated;
             if (!appendTextStyle(source, target, generated, error)) return {};
+            if (!appendCurrentBuiltInStyleProvenance(
+                    working, canvas, target.block, operations, error)) {
+                return {};
+            }
             if (!appendWorkingOperation(working, operations,
                                         std::move(generated.front()), error)) {
                 return {};
             }
         } else if (kind == "set_paragraph_style") {
             std::vector<core::Operation> generated;
-            if (!appendParagraphStyle(source, target, generated, error)) return {};
-            if (!appendWorkingOperation(working, operations,
-                                        std::move(generated.front()), error)) {
+            if (!appendParagraphStyle(
+                    source, target, working, canvas, generated, error)) {
                 return {};
+            }
+            for (auto& operation : generated) {
+                if (!appendWorkingOperation(
+                        working, operations, std::move(operation), error)) {
+                    return {};
+                }
             }
         } else if (kind == "insert_page_break") {
             const auto newId = core::NodeId::generate();
@@ -1134,6 +1481,103 @@ codex::Json createPreview(DocumentCanvas& canvas,
                         core::NodeId::generate(), std::nullopt},
                     error)) {
                 return {};
+            }
+        } else if (kind == "insert_excalidraw_figure" ||
+                   kind == "replace_excalidraw_figure") {
+            if (++figureOperationCount > 8) {
+                error = QObject::tr(
+                    "A preview may create or revise at most eight Excalidraw figures.");
+                return {};
+            }
+            QString accessibleName;
+            std::optional<double> widthPoints;
+            std::optional<double> heightPoints;
+            const auto rendered = renderFigure(
+                source, accessibleName, widthPoints, heightPoints, error);
+            if (!rendered) {
+                if (error.isEmpty())
+                    error = QObject::tr("The local Excalidraw renderer did not return a figure.");
+                return {};
+            }
+            const QImage previewImage = QImage::fromData(rendered->png, "PNG");
+            if (previewImage.isNull() || previewImage.width() <= 0 ||
+                previewImage.height() <= 0) {
+                error = QObject::tr("The local Excalidraw renderer returned an invalid PNG.");
+                return {};
+            }
+            const double aspect = static_cast<double>(previewImage.height()) /
+                                  static_cast<double>(previewImage.width());
+            if (kind == "insert_excalidraw_figure") {
+                const double width = widthPoints.value_or(432.0);
+                const double height = heightPoints.value_or(
+                    std::clamp(width * aspect, 36.0, 936.0));
+                if (!appendWorkingOperation(
+                        working, operations,
+                        core::InsertImage{
+                            {target.block, target.start},
+                            imagePayload(rendered->png), core::ImageFormat::png,
+                            toUtf8(accessibleName), pointsToEmu(width),
+                            pointsToEmu(height)},
+                        error)) {
+                    return {};
+                }
+            } else {
+                const auto encodedId = source.find("imageId");
+                if (encodedId == source.end() || !encodedId->is_string()) {
+                    error = QObject::tr("replace_excalidraw_figure requires an imageId.");
+                    return {};
+                }
+                const auto imageId = core::NodeId::parse(
+                    encodedId->get<std::string>());
+                const core::ImageAtom* current =
+                    imageId ? working.findImage(*imageId) : nullptr;
+                if (!imageId || !current) {
+                    error = QObject::tr("The editable Excalidraw image no longer exists.");
+                    return {};
+                }
+                const auto currentBytes = current->encoded_payload.bytes();
+                const QByteArray currentPng(
+                    reinterpret_cast<const char*>(currentBytes.data()),
+                    static_cast<qsizetype>(currentBytes.size()));
+                if (current->format != core::ImageFormat::png ||
+                    !excalidrawSceneFromPng(currentPng)) {
+                    error = QObject::tr(
+                        "replace_excalidraw_figure can only revise an editable Excalidraw figure.");
+                    return {};
+                }
+                std::int64_t width = current->width_emu;
+                std::int64_t height = current->height_emu;
+                const std::string previousAccessibleName =
+                    current->accessible_name;
+                if (widthPoints && heightPoints) {
+                    width = pointsToEmu(*widthPoints);
+                    height = pointsToEmu(*heightPoints);
+                } else if (widthPoints) {
+                    width = pointsToEmu(*widthPoints);
+                    height = pointsToEmu(
+                        std::clamp(*widthPoints * aspect, 36.0, 936.0));
+                } else if (heightPoints) {
+                    height = pointsToEmu(*heightPoints);
+                    width = pointsToEmu(
+                        std::clamp(*heightPoints / aspect, 36.0, 936.0));
+                }
+                if (const auto owner = paragraphContainingImage(working, *imageId))
+                    affected.insert(owner->toString());
+                if (!appendWorkingOperation(
+                        working, operations,
+                        core::ReplaceImagePayload{
+                            *imageId, imagePayload(rendered->png),
+                            core::ImageFormat::png, width, height},
+                        error)) {
+                    return {};
+                }
+                if (previousAccessibleName != toUtf8(accessibleName) &&
+                    !appendWorkingOperation(
+                        working, operations,
+                        core::SetImageAccessibleName{
+                            *imageId, toUtf8(accessibleName)}, error)) {
+                    return {};
+                }
             }
         } else if (kind == "insert_image") {
             error = QObject::tr("No user-granted image capability is attached to this request.");

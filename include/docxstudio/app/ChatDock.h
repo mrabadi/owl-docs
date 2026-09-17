@@ -48,6 +48,7 @@ signals:
 
 private:
     void sendCurrentMessage();
+    void updateInteractionState();
     void appendHtmlMessage(const QString& role, const QString& text, const QString& color);
 
     QLabel* privacy_{};
@@ -62,6 +63,8 @@ private:
     QPushButton* previewResponse_{};
     QWidget* preview_{};
     QLabel* previewSummary_{};
+    bool connected_{false};
+    bool busy_{false};
     QString assistantBuffer_;
     QString lastAssistant_;
 };

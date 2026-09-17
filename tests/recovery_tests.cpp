@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <iostream>
 #include <iterator>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -271,10 +272,10 @@ void codecRoundTrip() {
     check(!RecoveryCodec::decode(invalidIndent, error),
           "recovery codec accepted an out-of-range bullet indentation");
 
-    const auto version = futureVersion.find("\"version\":8");
+    const auto version = futureVersion.find("\"version\":11");
     check(version != std::string::npos, "encoded recovery version was absent");
-    futureVersion.replace(version, std::string("\"version\":8").size(),
-                          "\"version\":9");
+    futureVersion.replace(version, std::string("\"version\":11").size(),
+                          "\"version\":12");
     check(!RecoveryCodec::decode(futureVersion, error),
           "recovery codec accepted an unsupported future version");
     check(!RecoveryCodec::decode("{not-json", error),
@@ -464,7 +465,7 @@ void paragraphMarkCharacterFormatRoundTrip() {
     check(encoded.has_value(),
           "recovery codec did not encode paragraph-mark formatting");
     const auto encodedJson = nlohmann::json::parse(*encoded);
-    check(encodedJson["version"] == 8 &&
+    check(encodedJson["version"] == RecoveryCodec::currentVersion &&
               encodedJson["paragraphs"][0]
                          ["paragraph_mark_character_format"]
                          ["font_family"] == "Carlito" &&
@@ -517,6 +518,174 @@ void paragraphMarkCharacterFormatRoundTrip() {
            ["font_size_half_points"] = 0;
     check(!RecoveryCodec::decode(invalid.dump(), error),
           "recovery codec accepted an invalid paragraph-mark format");
+}
+
+void paragraphStyleIdentityRoundTrip() {
+    using namespace docxstudio::app;
+    using namespace docxstudio::core;
+
+    ParagraphStyleProvenance knownProvenance;
+    knownProvenance.inherited_character_format.foreground_argb =
+        0xff336699U;
+    knownProvenance.inherited_paragraph_mark_character_format =
+        knownProvenance.inherited_character_format;
+    knownProvenance.inherited_paragraph_mark_character_format.italic = true;
+    knownProvenance.inherited_paragraph_format.alignment =
+        ParagraphAlignment::center;
+    CharacterFormatMask directRed;
+    directRed.foreground_argb = true;
+    knownProvenance.character_overrides.push_back({0, 8, directRed});
+    knownProvenance.paragraph_overrides.alignment = true;
+    auto known = Paragraph::restore(
+        u"Built-in heading", NodeId{701, 702}, {},
+        std::string("Heading2"), knownProvenance);
+    auto custom = Paragraph::restore(
+        u"Imported custom", NodeId{703, 704}, {},
+        std::string("Firm.Custom-β"));
+    auto unstyled = Paragraph::restore(
+        u"No style identity", NodeId{705, 706}, {});
+    check(known && custom && unstyled,
+          "could not create paragraph-style recovery fixtures");
+    auto document = Document::create(
+        {std::move(known.value()), std::move(custom.value()),
+         std::move(unstyled.value())});
+    check(static_cast<bool>(document),
+          "could not create paragraph-style recovery document");
+
+    std::string error;
+    const auto encoded = RecoveryCodec::encode(
+        {document.value(), {}}, error);
+    check(encoded.has_value(),
+          "recovery codec did not encode paragraph-style identities");
+    const auto encodedJson = nlohmann::json::parse(*encoded);
+    check(encodedJson["version"] == RecoveryCodec::currentVersion &&
+              encodedJson["paragraphs"][0]["style_id"] == "Heading2" &&
+              encodedJson["paragraphs"][0]["style_provenance"]
+                         ["inherited_character_format"]
+                         ["foreground_argb"] == 0xff336699U &&
+              encodedJson["paragraphs"][0]["style_provenance"]
+                         ["inherited_paragraph_mark_character_format"]
+                         ["italic"] == true &&
+              encodedJson["paragraphs"][0]["style_provenance"]
+                         ["character_overrides"][0]["properties"]
+                         ["foreground_argb"] == true &&
+              encodedJson["paragraphs"][1]["style_id"] ==
+                  "Firm.Custom-β" &&
+              !encodedJson["paragraphs"][2].contains("style_id"),
+          "recovery JSON omitted or invented a paragraph-style identity");
+
+    const auto decoded = RecoveryCodec::decode(*encoded, error);
+    check(decoded && decoded->document == document.value() &&
+              decoded->document.paragraphs()[0].styleId() ==
+                  std::optional<std::string>("Heading2") &&
+              decoded->document.paragraphs()[1].styleId() ==
+                  std::optional<std::string>("Firm.Custom-β") &&
+              !decoded->document.paragraphs()[2].styleId(),
+          "recovery round trip changed paragraph-style identities");
+
+    auto version10 = encodedJson;
+    version10["version"] = 10;
+    for (auto& paragraph : version10["paragraphs"]) {
+        if (paragraph.contains("style_provenance")) {
+            paragraph["style_provenance"].erase(
+                "inherited_paragraph_mark_character_format");
+        }
+    }
+    const auto migrated10 = RecoveryCodec::decode(version10.dump(), error);
+    check(migrated10 &&
+              migrated10->document.paragraphs()[0].styleProvenance() &&
+              migrated10->document.paragraphs()[0].styleProvenance()
+                      ->inherited_paragraph_mark_character_format ==
+                  migrated10->document.paragraphs()[0].styleProvenance()
+                      ->inherited_character_format,
+          "version-10 style provenance did not migrate its paragraph-mark baseline safely");
+
+    auto version9 = encodedJson;
+    version9["version"] = 9;
+    for (auto& paragraph : version9["paragraphs"]) {
+        paragraph.erase("style_provenance");
+    }
+    const auto migrated9 = RecoveryCodec::decode(version9.dump(), error);
+    check(migrated9 &&
+              migrated9->document.paragraphs()[0].styleId() ==
+                  std::optional<std::string>("Heading2") &&
+              !migrated9->document.paragraphs()[0].styleProvenance(),
+          "version-9 recovery data did not retain style identity without inventing provenance");
+
+    auto version8 = encodedJson;
+    version8["version"] = 8;
+    for (auto& paragraph : version8["paragraphs"]) {
+        paragraph.erase("style_id");
+    }
+    const auto migrated = RecoveryCodec::decode(version8.dump(), error);
+    check(migrated &&
+              !migrated->document.paragraphs()[0].styleId() &&
+              !migrated->document.paragraphs()[1].styleId() &&
+              !migrated->document.paragraphs()[2].styleId(),
+          "version-8 recovery data without style IDs did not migrate safely");
+
+    auto missingCurrent = encodedJson;
+    missingCurrent["paragraphs"][0].erase("style_id");
+    missingCurrent["paragraphs"][0].erase("style_provenance");
+    const auto missing = RecoveryCodec::decode(
+        missingCurrent.dump(), error);
+    check(missing && !missing->document.paragraphs()[0].styleId() &&
+              missing->document.paragraphs()[1].styleId() ==
+                  std::optional<std::string>("Firm.Custom-β"),
+          "missing current-version style ID did not default safely");
+
+    auto orphanedProvenance = encodedJson;
+    orphanedProvenance["paragraphs"][0].erase("style_id");
+    check(!RecoveryCodec::decode(orphanedProvenance.dump(), error) &&
+              error.find("requires a style ID") != std::string::npos,
+          "recovery codec accepted style provenance without a style ID");
+
+    auto missingMarkBaseline = encodedJson;
+    missingMarkBaseline["paragraphs"][0]["style_provenance"].erase(
+        "inherited_paragraph_mark_character_format");
+    check(!RecoveryCodec::decode(missingMarkBaseline.dump(), error),
+          "current recovery codec accepted provenance without a paragraph-mark baseline");
+
+    auto invalidMarkBaseline = encodedJson;
+    invalidMarkBaseline["paragraphs"][0]["style_provenance"]
+                       ["inherited_paragraph_mark_character_format"]
+                       ["font_size_half_points"] = 0;
+    check(!RecoveryCodec::decode(invalidMarkBaseline.dump(), error),
+          "recovery codec accepted an invalid inherited paragraph-mark baseline");
+
+    auto wrongType = encodedJson;
+    wrongType["paragraphs"][0]["style_id"] = 7;
+    check(!RecoveryCodec::decode(wrongType.dump(), error),
+          "recovery codec accepted a non-string paragraph-style ID");
+
+    auto empty = encodedJson;
+    empty["paragraphs"][0]["style_id"] = "";
+    check(!RecoveryCodec::decode(empty.dump(), error),
+          "recovery codec accepted an empty paragraph-style ID");
+
+    auto control = encodedJson;
+    control["paragraphs"][0]["style_id"] = "Heading\n2";
+    check(!RecoveryCodec::decode(control.dump(), error),
+          "recovery codec accepted a control character in a style ID");
+
+    auto exactBoundary = encodedJson;
+    exactBoundary["paragraphs"][0]["style_id"] =
+        std::string(kMaximumParagraphStyleIdBytes, 'x');
+    const auto exactBoundaryDecoded = RecoveryCodec::decode(
+        exactBoundary.dump(), error);
+    check(exactBoundaryDecoded &&
+              exactBoundaryDecoded->document.paragraphs()[0].styleId() &&
+              exactBoundaryDecoded->document.paragraphs()[0]
+                      .styleId()->size() ==
+                  kMaximumParagraphStyleIdBytes,
+          "recovery codec rejected the exact paragraph-style ID limit");
+
+    auto oversized = encodedJson;
+    oversized["paragraphs"][0]["style_id"] =
+        std::string(kMaximumParagraphStyleIdBytes + 1U, 'x');
+    check(!RecoveryCodec::decode(oversized.dump(), error) &&
+              error.find("size limit") != std::string::npos,
+          "recovery codec accepted an oversized paragraph-style ID");
 }
 
 void legacyImageMigrationAndBoundaries() {
@@ -609,8 +778,8 @@ void semanticImageAdversarialLimits() {
     using namespace docxstudio::app;
     using namespace docxstudio::core;
 
-    check(RecoveryCodec::currentVersion == 8,
-          "recovery schema version was not bumped for paragraph-mark formatting");
+    check(RecoveryCodec::currentVersion == 11,
+          "recovery schema version was not bumped for paragraph-mark style provenance");
     check(kMaximumInlineImagesPerDocument == 512 &&
               kMaximumEncodedImageBytes == 16U * 1024U * 1024U &&
               kMaximumDocumentEncodedImageBytes == 32U * 1024U * 1024U &&
@@ -936,6 +1105,7 @@ int main() {
     frozenVersion4FixtureAndPreflight();
     semanticImageRoundTrip();
     paragraphMarkCharacterFormatRoundTrip();
+    paragraphStyleIdentityRoundTrip();
     legacyImageMigrationAndBoundaries();
     semanticImageAdversarialLimits();
     semanticImageCountBoundary();

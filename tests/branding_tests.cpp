@@ -165,6 +165,39 @@ int main(int argc, char** argv) {
               !QFile::exists(QStringLiteral(":/icons/owl-docs.svg")),
           "stale vector artwork is still packaged or embedded");
 
+    const QString excalidrawSvg = readFile(
+        root + QStringLiteral("/resources/excalidraw-logo.svg"));
+    checkXml(excalidrawSvg, "official Excalidraw logo SVG is not valid XML");
+    check(excalidrawSvg.contains(QStringLiteral("viewBox=\"0 0 40 40\"")) &&
+              excalidrawSvg.contains(QStringLiteral("#6965db")) &&
+              excalidrawSvg.contains(QStringLiteral("Official Excalidraw mark")),
+          "Excalidraw ribbon asset is not the pinned official mark");
+    const QByteArray excalidrawPng = readBytes(
+        root + QStringLiteral("/resources/excalidraw-logo-96.png"));
+    check(readBytes(QStringLiteral(":/icons/excalidraw-logo-96.png")) ==
+              excalidrawPng,
+          "embedded Excalidraw logo does not match its source asset");
+    QImage excalidrawImage;
+    check(excalidrawImage.loadFromData(excalidrawPng, "PNG") &&
+              excalidrawImage.size() == QSize(96, 96) &&
+              excalidrawImage.hasAlphaChannel() &&
+              excalidrawImage.pixelColor(0, 95).alpha() == 0,
+          "Excalidraw ribbon logo lost its transparent official artwork");
+
+    const QString figureEditor = readFile(
+        root + QStringLiteral(
+                   "/third_party/excalidraw-figure-editor/src/main.jsx"));
+    check(figureEditor.contains(
+              QStringLiteral("currentItemRoughness: 0")) &&
+              figureEditor.contains(
+                  QStringLiteral("initialSceneForMode(request.scene, request.mode, request.skeleton)")) &&
+              figureEditor.contains(
+                  QStringLiteral("initialData={initialData}")),
+          "Professional mode is not applied as Architect style during initial scene load");
+    check(!figureEditor.contains(
+              QStringLiteral("api.updateScene(request.scene)")),
+          "changing figure mode can restore the opening scene over unsaved work");
+
     constexpr std::array<int, 8> iconSizes{16, 24, 32, 48, 64, 128, 256, 512};
     const QIcon applicationIcon = docxstudio::app::owlDocsApplicationIcon();
     for (const int size : iconSizes) {
@@ -287,6 +320,25 @@ int main(int argc, char** argv) {
     window.resize(1280, 860);
     window.show();
     QApplication::processEvents();
+
+    auto* excalidrawButton = window.findChild<QToolButton*>(
+        QStringLiteral("ribbonButton.insert.excalidraw"));
+    check(excalidrawButton && !excalidrawButton->icon().isNull(),
+          "Insert Excalidraw Figure is missing its official logo");
+    const QImage excalidrawButtonIcon =
+        excalidrawButton->icon().pixmap(22, 22).toImage();
+    int purplePixels = 0;
+    for (int y = 0; y < excalidrawButtonIcon.height(); ++y) {
+        for (int x = 0; x < excalidrawButtonIcon.width(); ++x) {
+            const QColor pixel = excalidrawButtonIcon.pixelColor(x, y);
+            if (pixel.alpha() > 128 && pixel.blue() > pixel.red() &&
+                pixel.red() > pixel.green()) {
+                ++purplePixels;
+            }
+        }
+    }
+    check(purplePixels > 70,
+          "Insert Excalidraw Figure still uses a non-Excalidraw pictogram");
 
     auto* canvas = window.findChild<docxstudio::app::DocumentCanvas*>();
     auto* sizeEditor = fontSize ? fontSize->lineEdit() : nullptr;

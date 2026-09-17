@@ -1,4 +1,5 @@
 #include "docxstudio/app/DocumentCanvas.h"
+#include "docxstudio/app/ExcalidrawFigure.h"
 
 #include "docxstudio/app/MathLayout.h"
 #include "docxstudio/app/RasterDecoder.h"
@@ -1298,6 +1299,800 @@ std::optional<core::CharacterFormat> insertionFormatFor(
         : std::optional<core::CharacterFormat>(desired);
 }
 
+template <typename T>
+void setStyleTransition(core::PropertyDelta<T>& delta,
+                        const std::optional<T>& current,
+                        const std::optional<T>& previous,
+                        const std::optional<T>& next,
+                        bool replaceUnknownBaseline,
+                        bool authoritativeSourceBaseline,
+                        bool directOverride) {
+    // Source provenance is authoritative when present: explicit overrides
+    // survive even when their value happens to equal the inherited baseline.
+    // Authored/legacy paragraphs without provenance retain the conservative
+    // value-comparison fallback used by earlier recovery snapshots.
+    if (directOverride) return;
+    if (!authoritativeSourceBaseline && !replaceUnknownBaseline && current &&
+        current != previous) {
+        return;
+    }
+    if (!replaceUnknownBaseline && previous == next && current == next) {
+        return;
+    }
+    if (next) {
+        if (current != next) delta = core::PropertyDelta<T>::set(*next);
+    } else if (current) {
+        delta = core::PropertyDelta<T>::clear();
+    }
+}
+
+template <typename T>
+bool stylePropertyIsDirect(const std::optional<T>& current,
+                           const std::optional<T>& previous,
+                           bool replaceUnknownBaseline,
+                           bool authoritativeSourceBaseline,
+                           bool sourceDirectOverride) {
+    if (authoritativeSourceBaseline) return sourceDirectOverride;
+    return !replaceUnknownBaseline && current && current != previous;
+}
+
+core::CharacterFormatMask styleCharacterOverrides(
+    const core::CharacterFormat& current,
+    const core::CharacterFormat& previous,
+    bool replaceUnknownBaseline,
+    bool authoritativeSourceBaseline,
+    const core::CharacterFormatMask& sourceOverrides) {
+    return {
+        stylePropertyIsDirect(
+            current.font_family, previous.font_family,
+            replaceUnknownBaseline, authoritativeSourceBaseline,
+            sourceOverrides.font_family),
+        stylePropertyIsDirect(
+            current.font_size_half_points, previous.font_size_half_points,
+            replaceUnknownBaseline, authoritativeSourceBaseline,
+            sourceOverrides.font_size_half_points),
+        stylePropertyIsDirect(
+            current.bold, previous.bold, replaceUnknownBaseline,
+            authoritativeSourceBaseline, sourceOverrides.bold),
+        stylePropertyIsDirect(
+            current.italic, previous.italic, replaceUnknownBaseline,
+            authoritativeSourceBaseline, sourceOverrides.italic),
+        stylePropertyIsDirect(
+            current.underline, previous.underline, replaceUnknownBaseline,
+            authoritativeSourceBaseline, sourceOverrides.underline),
+        stylePropertyIsDirect(
+            current.strike, previous.strike, replaceUnknownBaseline,
+            authoritativeSourceBaseline, sourceOverrides.strike),
+        stylePropertyIsDirect(
+            current.foreground_argb, previous.foreground_argb,
+            replaceUnknownBaseline, authoritativeSourceBaseline,
+            sourceOverrides.foreground_argb),
+        stylePropertyIsDirect(
+            current.highlight_argb, previous.highlight_argb,
+            replaceUnknownBaseline, authoritativeSourceBaseline,
+            sourceOverrides.highlight_argb),
+        stylePropertyIsDirect(
+            current.baseline, previous.baseline, replaceUnknownBaseline,
+            authoritativeSourceBaseline, sourceOverrides.baseline),
+        stylePropertyIsDirect(
+            current.language, previous.language, replaceUnknownBaseline,
+            authoritativeSourceBaseline, sourceOverrides.language),
+    };
+}
+
+void mergeCharacterFormatMask(
+    core::CharacterFormatMask& destination,
+    const core::CharacterFormatMask& source) noexcept {
+    destination.font_family =
+        destination.font_family || source.font_family;
+    destination.font_size_half_points =
+        destination.font_size_half_points || source.font_size_half_points;
+    destination.bold = destination.bold || source.bold;
+    destination.italic = destination.italic || source.italic;
+    destination.underline = destination.underline || source.underline;
+    destination.strike = destination.strike || source.strike;
+    destination.foreground_argb =
+        destination.foreground_argb || source.foreground_argb;
+    destination.highlight_argb =
+        destination.highlight_argb || source.highlight_argb;
+    destination.baseline = destination.baseline || source.baseline;
+    destination.language = destination.language || source.language;
+}
+
+template <typename T>
+void setMaskedProperty(core::PropertyDelta<T>& delta,
+                       const std::optional<T>& value, bool masked) {
+    if (!masked) return;
+    delta = value ? core::PropertyDelta<T>::set(*value)
+                  : core::PropertyDelta<T>::clear();
+}
+
+core::CharacterFormatDelta maskedCharacterFormatDelta(
+    const core::CharacterFormat& format,
+    const core::CharacterFormatMask& mask) {
+    core::CharacterFormatDelta delta;
+    setMaskedProperty(delta.font_family, format.font_family,
+                      mask.font_family);
+    setMaskedProperty(delta.font_size_half_points,
+                      format.font_size_half_points,
+                      mask.font_size_half_points);
+    setMaskedProperty(delta.bold, format.bold, mask.bold);
+    setMaskedProperty(delta.italic, format.italic, mask.italic);
+    setMaskedProperty(delta.underline, format.underline, mask.underline);
+    setMaskedProperty(delta.strike, format.strike, mask.strike);
+    setMaskedProperty(delta.foreground_argb, format.foreground_argb,
+                      mask.foreground_argb);
+    setMaskedProperty(delta.highlight_argb, format.highlight_argb,
+                      mask.highlight_argb);
+    setMaskedProperty(delta.baseline, format.baseline, mask.baseline);
+    setMaskedProperty(delta.language, format.language, mask.language);
+    return delta;
+}
+
+core::ParagraphFormatMask styleParagraphOverrides(
+    const core::ParagraphFormat& current,
+    const core::ParagraphFormat& previous,
+    bool replaceUnknownBaseline,
+    bool authoritativeSourceBaseline,
+    const core::ParagraphFormatMask& sourceOverrides) {
+    return {
+        stylePropertyIsDirect(
+            current.alignment, previous.alignment,
+            replaceUnknownBaseline, authoritativeSourceBaseline,
+            sourceOverrides.alignment),
+        stylePropertyIsDirect(
+            current.left_indent_emu, previous.left_indent_emu,
+            replaceUnknownBaseline, authoritativeSourceBaseline,
+            sourceOverrides.left_indent_emu),
+        stylePropertyIsDirect(
+            current.right_indent_emu, previous.right_indent_emu,
+            replaceUnknownBaseline, authoritativeSourceBaseline,
+            sourceOverrides.right_indent_emu),
+        stylePropertyIsDirect(
+            current.first_line_indent_emu, previous.first_line_indent_emu,
+            replaceUnknownBaseline, authoritativeSourceBaseline,
+            sourceOverrides.first_line_indent_emu),
+        stylePropertyIsDirect(
+            current.space_before_emu, previous.space_before_emu,
+            replaceUnknownBaseline, authoritativeSourceBaseline,
+            sourceOverrides.space_before_emu),
+        stylePropertyIsDirect(
+            current.space_after_emu, previous.space_after_emu,
+            replaceUnknownBaseline, authoritativeSourceBaseline,
+            sourceOverrides.space_after_emu),
+        stylePropertyIsDirect(
+            current.line_spacing_emu, previous.line_spacing_emu,
+            replaceUnknownBaseline, authoritativeSourceBaseline,
+            sourceOverrides.line_spacing_emu),
+        stylePropertyIsDirect(
+            current.line_spacing_rule, previous.line_spacing_rule,
+            replaceUnknownBaseline, authoritativeSourceBaseline,
+            sourceOverrides.line_spacing_rule),
+        stylePropertyIsDirect(
+            current.keep_with_next, previous.keep_with_next,
+            replaceUnknownBaseline, authoritativeSourceBaseline,
+            sourceOverrides.keep_with_next),
+        stylePropertyIsDirect(
+            current.keep_lines, previous.keep_lines,
+            replaceUnknownBaseline, authoritativeSourceBaseline,
+            sourceOverrides.keep_lines),
+        stylePropertyIsDirect(
+            current.page_break_before, previous.page_break_before,
+            replaceUnknownBaseline, authoritativeSourceBaseline,
+            sourceOverrides.page_break_before),
+    };
+}
+
+core::CharacterFormat effectiveStyleCharacterFormat(
+    const core::ParagraphStyleDefinition& style,
+    const QString& defaultFontFamily, double defaultFontPointSize) {
+    auto result = style.character_format;
+    const bool followsEditorDefaults =
+        style.id == "Normal" || style.id == "NoSpacing";
+    if (followsEditorDefaults || !result.font_family) {
+        result.font_family = defaultFontFamily.toStdString();
+    }
+    if (followsEditorDefaults || !result.font_size_half_points) {
+        result.font_size_half_points = static_cast<std::int32_t>(
+            std::lround(defaultFontPointSize * 2.0));
+    }
+    return result;
+}
+
+template <typename T>
+bool propertyDeltaRequiresMutation(
+    const core::PropertyDelta<T>& delta, const std::optional<T>& current,
+    const std::optional<T>& inherited, bool alreadyDirect,
+    bool directnessIsTrackable, bool directnessCanBeInferredByValue) {
+    if (delta.action == core::DeltaAction::unchanged) return false;
+    auto candidate = current;
+    delta.applyTo(candidate);
+    if (candidate != current) return true;
+    if (!directnessIsTrackable || alreadyDirect) return false;
+    // Legacy/authored paragraphs without provenance can safely infer a
+    // present value that differs from the known built-in baseline as direct.
+    // Materializing provenance for that case would turn a visibly and
+    // semantically redundant toolbar choice into a dirty document.
+    return !(directnessCanBeInferredByValue && current &&
+             current != inherited);
+}
+
+bool characterDeltaRequiresMutation(
+    const core::Paragraph& paragraph, std::size_t utf16Offset,
+    bool paragraphMark, const core::CharacterFormatDelta& delta,
+    const QString& defaultFontFamily, double defaultFontPointSize) {
+    const auto& provenance = paragraph.styleProvenance();
+    const auto* definition = core::findBuiltInParagraphStyle(
+        paragraph.styleId().value_or("Normal"));
+    const bool trackable = provenance.has_value() || definition != nullptr;
+    const bool inferByValue = !provenance && definition != nullptr;
+    const auto inherited = provenance
+        ? (paragraphMark
+               ? provenance->inherited_paragraph_mark_character_format
+               : provenance->inherited_character_format)
+        : definition
+        ? effectiveStyleCharacterFormat(
+              *definition, defaultFontFamily, defaultFontPointSize)
+        : core::CharacterFormat{};
+    const auto current = paragraphMark
+        ? paragraph.paragraphMarkCharacterFormat()
+        : paragraph.characterFormatAt(utf16Offset);
+    const auto mask = paragraphMark && provenance
+        ? provenance->paragraph_mark_overrides
+        : paragraph.styleOverrideMaskAt(utf16Offset);
+
+    return propertyDeltaRequiresMutation(
+               delta.font_family, current.font_family,
+               inherited.font_family, mask.font_family, trackable,
+               inferByValue) ||
+           propertyDeltaRequiresMutation(
+               delta.font_size_half_points,
+               current.font_size_half_points,
+               inherited.font_size_half_points,
+               mask.font_size_half_points, trackable, inferByValue) ||
+           propertyDeltaRequiresMutation(
+               delta.bold, current.bold, inherited.bold, mask.bold,
+               trackable, inferByValue) ||
+           propertyDeltaRequiresMutation(
+               delta.italic, current.italic, inherited.italic, mask.italic,
+               trackable, inferByValue) ||
+           propertyDeltaRequiresMutation(
+               delta.underline, current.underline, inherited.underline,
+               mask.underline, trackable, inferByValue) ||
+           propertyDeltaRequiresMutation(
+               delta.strike, current.strike, inherited.strike, mask.strike,
+               trackable, inferByValue) ||
+           propertyDeltaRequiresMutation(
+               delta.foreground_argb, current.foreground_argb,
+               inherited.foreground_argb, mask.foreground_argb, trackable,
+               inferByValue) ||
+           propertyDeltaRequiresMutation(
+               delta.highlight_argb, current.highlight_argb,
+               inherited.highlight_argb, mask.highlight_argb, trackable,
+               inferByValue) ||
+           propertyDeltaRequiresMutation(
+               delta.baseline, current.baseline, inherited.baseline,
+               mask.baseline, trackable, inferByValue) ||
+           propertyDeltaRequiresMutation(
+               delta.language, current.language, inherited.language,
+               mask.language, trackable, inferByValue);
+}
+
+bool paragraphDeltaRequiresMutation(
+    const core::Paragraph& paragraph,
+    const core::ParagraphFormatDelta& delta) {
+    const auto& provenance = paragraph.styleProvenance();
+    const auto* definition = core::findBuiltInParagraphStyle(
+        paragraph.styleId().value_or("Normal"));
+    const bool trackable = provenance.has_value() || definition != nullptr;
+    const bool inferByValue = !provenance && definition != nullptr;
+    const auto inherited = provenance
+        ? provenance->inherited_paragraph_format
+        : definition ? definition->paragraph_format
+                     : core::ParagraphFormat{};
+    const auto& current = paragraph.format();
+    const auto mask = provenance
+        ? provenance->paragraph_overrides
+        : core::ParagraphFormatMask{};
+
+    return propertyDeltaRequiresMutation(
+               delta.alignment, current.alignment, inherited.alignment,
+               mask.alignment, trackable, inferByValue) ||
+           propertyDeltaRequiresMutation(
+               delta.left_indent_emu, current.left_indent_emu,
+               inherited.left_indent_emu, mask.left_indent_emu, trackable,
+               inferByValue) ||
+           propertyDeltaRequiresMutation(
+               delta.right_indent_emu, current.right_indent_emu,
+               inherited.right_indent_emu, mask.right_indent_emu, trackable,
+               inferByValue) ||
+           propertyDeltaRequiresMutation(
+               delta.first_line_indent_emu,
+               current.first_line_indent_emu,
+               inherited.first_line_indent_emu,
+               mask.first_line_indent_emu, trackable, inferByValue) ||
+           propertyDeltaRequiresMutation(
+               delta.space_before_emu, current.space_before_emu,
+               inherited.space_before_emu, mask.space_before_emu, trackable,
+               inferByValue) ||
+           propertyDeltaRequiresMutation(
+               delta.space_after_emu, current.space_after_emu,
+               inherited.space_after_emu, mask.space_after_emu, trackable,
+               inferByValue) ||
+           propertyDeltaRequiresMutation(
+               delta.line_spacing_emu, current.line_spacing_emu,
+               inherited.line_spacing_emu, mask.line_spacing_emu, trackable,
+               inferByValue) ||
+           propertyDeltaRequiresMutation(
+               delta.line_spacing_rule, current.line_spacing_rule,
+               inherited.line_spacing_rule, mask.line_spacing_rule,
+               trackable, inferByValue) ||
+           propertyDeltaRequiresMutation(
+               delta.keep_with_next, current.keep_with_next,
+               inherited.keep_with_next, mask.keep_with_next, trackable,
+               inferByValue) ||
+           propertyDeltaRequiresMutation(
+               delta.keep_lines, current.keep_lines,
+               inherited.keep_lines, mask.keep_lines, trackable,
+               inferByValue) ||
+           propertyDeltaRequiresMutation(
+               delta.page_break_before, current.page_break_before,
+               inherited.page_break_before, mask.page_break_before,
+               trackable, inferByValue) ||
+           propertyDeltaRequiresMutation(
+               delta.list_id, current.list_id, std::optional<core::NodeId>{},
+               false, false, false) ||
+           propertyDeltaRequiresMutation(
+               delta.list_level, current.list_level,
+               std::optional<std::uint8_t>{}, false, false, false) ||
+           propertyDeltaRequiresMutation(
+               delta.list_layout, current.list_layout,
+               std::optional<core::ListLayout>{}, false, false, false);
+}
+
+core::CharacterFormatDelta styleCharacterTransition(
+    const core::CharacterFormat& current,
+    const core::CharacterFormat& previous,
+    const core::CharacterFormat& next,
+    bool replaceUnknownBaseline,
+    bool authoritativeSourceBaseline = false,
+    const core::CharacterFormatMask& directOverrides = {}) {
+    core::CharacterFormatDelta delta;
+    setStyleTransition(delta.font_family, current.font_family,
+                       previous.font_family, next.font_family,
+                       replaceUnknownBaseline, authoritativeSourceBaseline,
+                       directOverrides.font_family);
+    setStyleTransition(delta.font_size_half_points,
+                       current.font_size_half_points,
+                       previous.font_size_half_points,
+                       next.font_size_half_points,
+                       replaceUnknownBaseline, authoritativeSourceBaseline,
+                       directOverrides.font_size_half_points);
+    setStyleTransition(delta.bold, current.bold, previous.bold, next.bold,
+                       replaceUnknownBaseline, authoritativeSourceBaseline,
+                       directOverrides.bold);
+    setStyleTransition(delta.italic, current.italic, previous.italic,
+                       next.italic, replaceUnknownBaseline,
+                       authoritativeSourceBaseline, directOverrides.italic);
+    setStyleTransition(delta.underline, current.underline,
+                       previous.underline, next.underline,
+                       replaceUnknownBaseline, authoritativeSourceBaseline,
+                       directOverrides.underline);
+    setStyleTransition(delta.strike, current.strike, previous.strike,
+                       next.strike, replaceUnknownBaseline,
+                       authoritativeSourceBaseline, directOverrides.strike);
+    setStyleTransition(delta.foreground_argb, current.foreground_argb,
+                       previous.foreground_argb, next.foreground_argb,
+                       replaceUnknownBaseline, authoritativeSourceBaseline,
+                       directOverrides.foreground_argb);
+    setStyleTransition(delta.highlight_argb, current.highlight_argb,
+                       previous.highlight_argb, next.highlight_argb,
+                       replaceUnknownBaseline, authoritativeSourceBaseline,
+                       directOverrides.highlight_argb);
+    setStyleTransition(delta.baseline, current.baseline,
+                       previous.baseline, next.baseline,
+                       replaceUnknownBaseline, authoritativeSourceBaseline,
+                       directOverrides.baseline);
+    setStyleTransition(delta.language, current.language, previous.language,
+                       next.language, replaceUnknownBaseline,
+                       authoritativeSourceBaseline, directOverrides.language);
+    return delta;
+}
+
+core::ParagraphFormatDelta styleParagraphTransition(
+    const core::ParagraphFormat& current,
+    const core::ParagraphFormat& previous,
+    const core::ParagraphFormat& next,
+    bool replaceUnknownBaseline,
+    bool authoritativeSourceBaseline = false,
+    const core::ParagraphFormatMask& directOverrides = {}) {
+    core::ParagraphFormatDelta delta;
+    setStyleTransition(delta.alignment, current.alignment,
+                       previous.alignment, next.alignment,
+                       replaceUnknownBaseline, authoritativeSourceBaseline,
+                       directOverrides.alignment);
+    setStyleTransition(delta.left_indent_emu, current.left_indent_emu,
+                       previous.left_indent_emu, next.left_indent_emu,
+                       replaceUnknownBaseline, authoritativeSourceBaseline,
+                       directOverrides.left_indent_emu);
+    setStyleTransition(delta.right_indent_emu, current.right_indent_emu,
+                       previous.right_indent_emu, next.right_indent_emu,
+                       replaceUnknownBaseline, authoritativeSourceBaseline,
+                       directOverrides.right_indent_emu);
+    setStyleTransition(delta.first_line_indent_emu,
+                       current.first_line_indent_emu,
+                       previous.first_line_indent_emu,
+                       next.first_line_indent_emu,
+                       replaceUnknownBaseline, authoritativeSourceBaseline,
+                       directOverrides.first_line_indent_emu);
+    setStyleTransition(delta.space_before_emu, current.space_before_emu,
+                       previous.space_before_emu, next.space_before_emu,
+                       replaceUnknownBaseline, authoritativeSourceBaseline,
+                       directOverrides.space_before_emu);
+    setStyleTransition(delta.space_after_emu, current.space_after_emu,
+                       previous.space_after_emu, next.space_after_emu,
+                       replaceUnknownBaseline, authoritativeSourceBaseline,
+                       directOverrides.space_after_emu);
+    setStyleTransition(delta.line_spacing_emu, current.line_spacing_emu,
+                       previous.line_spacing_emu, next.line_spacing_emu,
+                       replaceUnknownBaseline, authoritativeSourceBaseline,
+                       directOverrides.line_spacing_emu);
+    setStyleTransition(delta.line_spacing_rule, current.line_spacing_rule,
+                       previous.line_spacing_rule, next.line_spacing_rule,
+                       replaceUnknownBaseline, authoritativeSourceBaseline,
+                       directOverrides.line_spacing_rule);
+    setStyleTransition(delta.keep_with_next, current.keep_with_next,
+                       previous.keep_with_next, next.keep_with_next,
+                       replaceUnknownBaseline, authoritativeSourceBaseline,
+                       directOverrides.keep_with_next);
+    setStyleTransition(delta.keep_lines, current.keep_lines,
+                       previous.keep_lines, next.keep_lines,
+                       replaceUnknownBaseline, authoritativeSourceBaseline,
+                       directOverrides.keep_lines);
+    setStyleTransition(delta.page_break_before, current.page_break_before,
+                       previous.page_break_before, next.page_break_before,
+                       replaceUnknownBaseline, authoritativeSourceBaseline,
+                       directOverrides.page_break_before);
+    // List identity and geometry are intentionally outside paragraph styles.
+    return delta;
+}
+
+struct ParagraphStyleApplicationPlan {
+    std::vector<core::Operation> operations;
+    std::optional<core::CharacterFormat> resultingTypingFormat;
+    std::optional<core::CharacterFormatMask> resultingTypingOverrideMask;
+};
+
+ParagraphStyleApplicationPlan planParagraphStyleApplication(
+    const core::Document& document,
+    std::span<const core::NodeId> paragraphIds,
+    const core::ParagraphStyleDefinition& target,
+    const QString& defaultFontFamily, double defaultFontPointSize,
+    const core::CharacterFormat& typingFormat,
+    std::optional<core::Position> typingPosition,
+    bool ensureTargetProvenance = false,
+    const core::CharacterFormatMask& typingAdditionalOverrides = {}) {
+    ParagraphStyleApplicationPlan plan;
+    std::vector<core::NodeId> changedIds;
+    const std::string targetId(target.id);
+    const auto targetCharacter = effectiveStyleCharacterFormat(
+        target, defaultFontFamily, defaultFontPointSize);
+
+    for (const auto id : paragraphIds) {
+        const auto* paragraph = document.findParagraph(id);
+        if (!paragraph) continue;
+        const std::string previousId =
+            paragraph->styleId().value_or("Normal");
+        const auto* previous = core::findBuiltInParagraphStyle(previousId);
+        const auto& provenance = paragraph->styleProvenance();
+        if (previousId == targetId &&
+            (!ensureTargetProvenance || provenance)) {
+            continue;
+        }
+        const bool authoritativeSourceBaseline = provenance.has_value();
+        const bool replaceUnknownBaseline =
+            previous == nullptr && !authoritativeSourceBaseline;
+        const auto previousCharacter = provenance
+            ? provenance->inherited_character_format
+            : previous
+            ? effectiveStyleCharacterFormat(
+                  *previous, defaultFontFamily, defaultFontPointSize)
+            : core::CharacterFormat{};
+        const auto previousParagraph = provenance
+            ? provenance->inherited_paragraph_format
+            : previous
+            ? previous->paragraph_format
+            : core::ParagraphFormat{};
+        const auto previousParagraphMarkCharacter = provenance
+            ? provenance->inherited_paragraph_mark_character_format
+            : previousCharacter;
+        // The current built-in catalog has no distinct style pPr/rPr
+        // contribution, so its paragraph-mark baseline is the resolved style
+        // character baseline.  Keep it distinct in provenance for imported
+        // styles where those two baselines can differ.
+        const auto targetParagraphMarkCharacter = targetCharacter;
+        if (paragraph->styleId() != targetId) {
+            changedIds.push_back(id);
+        }
+        core::ParagraphStyleProvenance targetProvenance;
+        targetProvenance.inherited_character_format = targetCharacter;
+        targetProvenance.inherited_paragraph_mark_character_format =
+            targetParagraphMarkCharacter;
+        targetProvenance.inherited_paragraph_format =
+            target.paragraph_format;
+
+        std::vector<std::size_t> boundaries{0, paragraph->text().size()};
+        for (const auto& run : paragraph->characterFormats()) {
+            boundaries.push_back(run.start);
+            boundaries.push_back(run.end);
+        }
+        if (provenance) {
+            for (const auto& run : provenance->character_overrides) {
+                boundaries.push_back(run.start);
+                boundaries.push_back(run.end);
+            }
+        }
+        std::sort(boundaries.begin(), boundaries.end());
+        boundaries.erase(std::unique(boundaries.begin(), boundaries.end()),
+                         boundaries.end());
+        for (std::size_t boundary = 1; boundary < boundaries.size();
+             ++boundary) {
+            const std::size_t start = boundaries[boundary - 1];
+            const std::size_t end = boundaries[boundary];
+            if (start >= end) continue;
+            const auto current = paragraph->characterFormatAt(start + 1);
+            const auto sourceOverrides = paragraph->styleOverrideMaskAt(
+                start + 1);
+            const auto targetOverrides = styleCharacterOverrides(
+                current, previousCharacter, replaceUnknownBaseline,
+                authoritativeSourceBaseline, sourceOverrides);
+            if (!targetOverrides.empty()) {
+                auto& runs = targetProvenance.character_overrides;
+                if (!runs.empty() && runs.back().end == start &&
+                    runs.back().properties == targetOverrides) {
+                    runs.back().end = end;
+                } else {
+                    runs.push_back({start, end, targetOverrides});
+                }
+            }
+            const auto delta = styleCharacterTransition(
+                current, previousCharacter, targetCharacter,
+                replaceUnknownBaseline, authoritativeSourceBaseline,
+                sourceOverrides);
+            if (!delta.empty()) {
+                plan.operations.emplace_back(core::SetCharacterFormat{
+                    {{id, start}, {id, end}}, delta});
+            }
+        }
+        const auto markDelta = styleCharacterTransition(
+            paragraph->paragraphMarkCharacterFormat(),
+            previousParagraphMarkCharacter,
+            targetParagraphMarkCharacter, replaceUnknownBaseline,
+            authoritativeSourceBaseline,
+            provenance ? provenance->paragraph_mark_overrides
+                       : core::CharacterFormatMask{});
+        targetProvenance.paragraph_mark_overrides =
+            styleCharacterOverrides(
+                paragraph->paragraphMarkCharacterFormat(),
+                previousParagraphMarkCharacter, replaceUnknownBaseline,
+                authoritativeSourceBaseline,
+                provenance ? provenance->paragraph_mark_overrides
+                           : core::CharacterFormatMask{});
+        if (!markDelta.empty()) {
+            plan.operations.emplace_back(
+                core::SetParagraphMarkCharacterFormat{id, markDelta});
+        }
+        const auto paragraphDelta = styleParagraphTransition(
+            paragraph->format(), previousParagraph,
+            target.paragraph_format, replaceUnknownBaseline,
+            authoritativeSourceBaseline,
+            provenance ? provenance->paragraph_overrides
+                       : core::ParagraphFormatMask{});
+        targetProvenance.paragraph_overrides = styleParagraphOverrides(
+            paragraph->format(), previousParagraph, replaceUnknownBaseline,
+            authoritativeSourceBaseline,
+            provenance ? provenance->paragraph_overrides
+                       : core::ParagraphFormatMask{});
+        if (!paragraphDelta.empty()) {
+            plan.operations.emplace_back(
+                core::SetParagraphFormat{{id}, paragraphDelta});
+        }
+
+        if (typingPosition && id == typingPosition->paragraph_id) {
+            auto resulting = typingFormat;
+            auto typingOverrides =
+                paragraph->styleOverrideMaskAt(typingPosition->utf16_offset);
+            mergeCharacterFormatMask(
+                typingOverrides, typingAdditionalOverrides);
+            const auto& previousTypingBaseline = paragraph->text().empty()
+                ? previousParagraphMarkCharacter
+                : previousCharacter;
+            const auto& targetTypingBaseline = paragraph->text().empty()
+                ? targetParagraphMarkCharacter
+                : targetCharacter;
+            const auto typingDelta = styleCharacterTransition(
+                resulting, previousTypingBaseline, targetTypingBaseline,
+                replaceUnknownBaseline, authoritativeSourceBaseline,
+                typingOverrides);
+            auto resultingOverrides = styleCharacterOverrides(
+                resulting, previousTypingBaseline, replaceUnknownBaseline,
+                authoritativeSourceBaseline, typingOverrides);
+            // Without source provenance, equality alone cannot distinguish
+            // an inherited value from a transient explicit choice at the
+            // caret. The editor state carries that missing intent.
+            mergeCharacterFormatMask(
+                resultingOverrides, typingAdditionalOverrides);
+            typingDelta.applyTo(resulting);
+            plan.resultingTypingFormat = std::move(resulting);
+            plan.resultingTypingOverrideMask =
+                std::move(resultingOverrides);
+        }
+        plan.operations.emplace_back(core::SetParagraphStyleProvenance{
+            id, std::move(targetProvenance)});
+    }
+    if (!changedIds.empty()) {
+        // Identity precedes effective-format changes so every observer of the
+        // completed batch sees semantic intent and appearance together.
+        plan.operations.insert(
+            plan.operations.begin(),
+            core::SetParagraphStyle{std::move(changedIds), targetId});
+    }
+    return plan;
+}
+
+ParagraphStyleApplicationPlan planBuiltInStyleProvenanceInitialization(
+    const core::Document& document,
+    std::span<const core::NodeId> paragraphIds,
+    const QString& defaultFontFamily, double defaultFontPointSize,
+    const core::CharacterFormat& typingFormat,
+    std::optional<core::Position> typingPosition,
+    const core::CharacterFormatMask& typingAdditionalOverrides = {}) {
+    ParagraphStyleApplicationPlan combined;
+    std::vector<core::NodeId> visited;
+    visited.reserve(paragraphIds.size());
+    for (const auto id : paragraphIds) {
+        if (std::find(visited.begin(), visited.end(), id) != visited.end()) {
+            continue;
+        }
+        visited.push_back(id);
+        const auto* paragraph = document.findParagraph(id);
+        if (!paragraph || paragraph->styleProvenance()) continue;
+        const auto* target = core::findBuiltInParagraphStyle(
+            paragraph->styleId().value_or("Normal"));
+        if (!target) continue;
+        const bool ownsTypingPosition =
+            typingPosition && typingPosition->paragraph_id == id;
+        auto local = planParagraphStyleApplication(
+            document, std::span<const core::NodeId>(&id, 1), *target,
+            defaultFontFamily, defaultFontPointSize, typingFormat,
+            ownsTypingPosition ? typingPosition : std::nullopt, true,
+            ownsTypingPosition ? typingAdditionalOverrides
+                               : core::CharacterFormatMask{});
+        combined.operations.insert(
+            combined.operations.end(),
+            std::make_move_iterator(local.operations.begin()),
+            std::make_move_iterator(local.operations.end()));
+        if (local.resultingTypingFormat) {
+            combined.resultingTypingFormat =
+                std::move(local.resultingTypingFormat);
+        }
+        if (local.resultingTypingOverrideMask) {
+            combined.resultingTypingOverrideMask =
+                std::move(local.resultingTypingOverrideMask);
+        }
+    }
+    return combined;
+}
+
+struct ReplacementFormattingPlan {
+    std::vector<core::Operation> operations;
+    core::CharacterFormat effective_typing_format;
+    core::CharacterFormatMask effective_typing_override_mask;
+    std::optional<core::CharacterFormat> insertion_format;
+    std::optional<core::CharacterFormat> resulting_typing_format;
+    std::optional<core::CharacterFormatMask>
+        resulting_typing_override_mask;
+};
+
+ReplacementFormattingPlan planReplacementFormatting(
+    const core::Document& document, const core::NormalizedRange& normalized,
+    const core::CharacterFormat& typingFormat,
+    const core::CharacterFormatMask& typingOverrideMask,
+    const QString& defaultFontFamily, double defaultFontPointSize) {
+    std::vector<core::NodeId> provenanceParagraphIds;
+    if (!typingOverrideMask.empty()) {
+        provenanceParagraphIds.reserve(
+            normalized.end_paragraph_index -
+            normalized.start_paragraph_index + 1);
+        for (std::size_t index = normalized.start_paragraph_index;
+             index <= normalized.end_paragraph_index; ++index) {
+            provenanceParagraphIds.push_back(
+                document.paragraphs()[index].id());
+        }
+    }
+    auto initialization = planBuiltInStyleProvenanceInitialization(
+        document, provenanceParagraphIds, defaultFontFamily,
+        defaultFontPointSize, typingFormat, normalized.start,
+        typingOverrideMask);
+
+    ReplacementFormattingPlan plan;
+    plan.operations = std::move(initialization.operations);
+    plan.effective_typing_format =
+        initialization.resultingTypingFormat.value_or(typingFormat);
+    plan.effective_typing_override_mask =
+        initialization.resultingTypingOverrideMask.value_or(
+            typingOverrideMask);
+    plan.insertion_format = insertionFormatFor(
+        document, normalized, plan.effective_typing_format);
+    plan.resulting_typing_format =
+        std::move(initialization.resultingTypingFormat);
+    plan.resulting_typing_override_mask =
+        std::move(initialization.resultingTypingOverrideMask);
+    return plan;
+}
+
+void appendInitialReplacementOperations(
+    std::vector<core::Operation>& operations,
+    const core::NormalizedRange& normalized,
+    const core::Range& effectiveSelection, const std::u16string& text,
+    const std::optional<core::CharacterFormat>& insertionFormat,
+    const core::CharacterFormatDelta& directTypingDelta,
+    core::Position& cursor,
+    std::vector<core::NodeId>& emptyTypingCandidates) {
+    const core::Position insertedStart = cursor;
+    if (!normalized.empty()) {
+        operations.emplace_back(core::ReplaceRange{
+            effectiveSelection, text, insertionFormat});
+    } else if (!text.empty()) {
+        operations.emplace_back(core::InsertText{
+            cursor, text, insertionFormat});
+    }
+    cursor.utf16_offset += text.size();
+    if (!text.empty() && !directTypingDelta.empty()) {
+        operations.emplace_back(core::SetCharacterFormat{
+            {insertedStart, cursor}, directTypingDelta});
+    } else if (text.empty() && !directTypingDelta.empty()) {
+        emptyTypingCandidates.push_back(cursor.paragraph_id);
+    }
+}
+
+bool appendEmptyTypingOverrideOperations(
+    const core::Document& source,
+    std::vector<core::Operation>& operations,
+    std::vector<core::NodeId> emptyTypingCandidates,
+    const core::CharacterFormatDelta& directTypingDelta,
+    QString& error) {
+    if (emptyTypingCandidates.empty()) return true;
+
+    // A masked equal-to-baseline typing choice cannot be reconstructed from
+    // CharacterFormat alone. Project the complete edit and stamp the exact
+    // intent only onto result paragraphs that are genuinely empty. Both live
+    // replacement and chat preview use this path, so preview acceptance cannot
+    // silently drop explicit black/false/clear formatting.
+    core::DocumentSession projectedSession(source);
+    const auto projectedBase = projectedSession.snapshot();
+    const auto projected = projectedSession.applyBatch(
+        projectedBase.revision, operations);
+    if (!projected) {
+        error = errorText(projected.error());
+        return false;
+    }
+    const auto projectedSnapshot = projectedSession.snapshot();
+    std::sort(emptyTypingCandidates.begin(), emptyTypingCandidates.end());
+    emptyTypingCandidates.erase(
+        std::unique(emptyTypingCandidates.begin(),
+                    emptyTypingCandidates.end()),
+        emptyTypingCandidates.end());
+    for (const auto id : emptyTypingCandidates) {
+        const auto* paragraph = projectedSnapshot.document.findParagraph(id);
+        if (paragraph && paragraph->text().empty()) {
+            operations.emplace_back(core::SetParagraphMarkCharacterFormat{
+                id, directTypingDelta});
+        }
+    }
+    return true;
+}
+
 }  // namespace
 
 struct DocumentCanvas::VisualLine {
@@ -1435,6 +2230,7 @@ DocumentCanvas::DocumentCanvas(SpellChecker& spelling,
     const auto& paragraph = initial.document.paragraphs().front();
     selection_ = {{paragraph.id(), 0}, {paragraph.id(), 0}};
     typingFormat_ = currentCharacterFormat();
+    typingOverrideMask_ = selectedCharacterOverrideMask();
 
     auto* blink = new QTimer(this);
     blink->setInterval(530);
@@ -1469,13 +2265,14 @@ void DocumentCanvas::setDocument(core::Document document) {
     const std::size_t firstOffset = firstMarker
         ? static_cast<std::size_t>(firstMarker->prefixLength)
         : 0;
-    selection_ = {{first.id(), firstOffset}, {first.id(), firstOffset}};
-    typingFormat_ = currentCharacterFormat();
     tableCursor_.reset();
     tableSelectionAnchor_.reset();
     tableCellSelection_.reset();
     tableMouseSelectionAnchor_.reset();
     selectedTable_.reset();
+    selection_ = {{first.id(), firstOffset}, {first.id(), firstOffset}};
+    typingFormat_ = currentCharacterFormat();
+    typingOverrideMask_ = selectedCharacterOverrideMask();
     draggingTable_ = false;
     tableDropTargetValid_ = false;
     tableDropBefore_.reset();
@@ -1749,7 +2546,8 @@ void DocumentCanvas::markRecovered() {
 
 DocumentCanvas::CursorState DocumentCanvas::captureEditorState() const {
     return CursorState{
-        selection_, typingFormat_, tableCursor_, tableSelectionAnchor_,
+        selection_, typingFormat_, typingOverrideMask_, tableCursor_,
+        tableSelectionAnchor_,
         tableCellSelection_, selectedTable_,
         lineAffinity_, preferredVerticalX_,
         pageWidthPoints_, pageHeightPoints_,
@@ -1761,6 +2559,7 @@ DocumentCanvas::CursorState DocumentCanvas::captureEditorState() const {
 void DocumentCanvas::restoreEditorState(const CursorState& state) {
     selection_ = state.selection;
     typingFormat_ = state.typingFormat;
+    typingOverrideMask_ = state.typingOverrideMask;
     tableCursor_ = state.tableCursor;
     tableSelectionAnchor_ = state.tableSelectionAnchor;
     tableCellSelection_ = state.tableCellSelection;
@@ -3286,6 +4085,11 @@ void DocumentCanvas::renderPage(QPainter& painter, int pageIndexValue,
     painter.scale(scale, scale);
     painter.setClipRect(QRectF(0, 0, pageWidthPoints_, pageHeightPoints_));
     painter.setRenderHint(QPainter::TextAntialiasing, true);
+    // Always paint from the cached full-resolution decode. Qt otherwise uses
+    // its fast raster transform for interactive page scaling, which makes
+    // photographs and screenshots visibly degrade while they are resized or
+    // viewed at non-integral zoom levels. This does not rewrite source bytes.
+    painter.setRenderHint(QPainter::SmoothPixmapTransform, true);
 
     for (const auto& tableVisual : tableVisuals_) {
         const auto& table = *tableVisual;
@@ -3698,7 +4502,9 @@ bool DocumentCanvas::apply(std::vector<core::Operation> operations,
                            bool updateTableSelection,
                            std::optional<TableCursor> resultingTableCursor,
                            std::optional<core::NodeId> resultingSelectedTable,
-                           std::optional<LineAffinity> resultingLineAffinity) {
+                           std::optional<LineAffinity> resultingLineAffinity,
+                           std::optional<core::CharacterFormatMask>
+                               resultingTypingOverrideMask) {
     if (rejectLiveEditDuringPreview()) {
         return false;
     }
@@ -3731,6 +4537,9 @@ bool DocumentCanvas::apply(std::vector<core::Operation> operations,
     }
     if (resultingTypingFormat) {
         typingFormat_ = *resultingTypingFormat;
+    }
+    if (resultingTypingOverrideMask) {
+        typingOverrideMask_ = *resultingTypingOverrideMask;
     }
     if (updateTableSelection) {
         tableCursor_ = resultingTableCursor;
@@ -3779,7 +4588,9 @@ bool DocumentCanvas::apply(std::vector<core::Operation> operations,
     return true;
 }
 
-void DocumentCanvas::replaceSelection(const QString& text, bool coalesceTyping) {
+void DocumentCanvas::replaceSelection(
+    const QString& text, bool coalesceTyping,
+    std::optional<std::string> resultingParagraphStyle) {
     const auto snap = session_->snapshot();
     const auto normalizedResult = snap.document.normalizeRange(selection_);
     if (!normalizedResult) {
@@ -3791,11 +4602,18 @@ void DocumentCanvas::replaceSelection(const QString& text, bool coalesceTyping) 
     QString normalizedText = text;
     normalizedText.replace(QStringLiteral("\r\n"), QStringLiteral("\n"));
     normalizedText.replace(QLatin1Char('\r'), QLatin1Char('\n'));
+    if (normalized.empty() && normalizedText.isEmpty()) return;
     const auto parts = normalizedText.split(QLatin1Char('\n'), Qt::KeepEmptyParts);
-    const auto firstFormat = insertionFormatFor(
-        snap.document, normalized, typingFormat_);
+    auto formattingPlan = planReplacementFormatting(
+        snap.document, normalized, typingFormat_, typingOverrideMask_,
+        defaultFontFamily_, defaultFontPointSize_);
+    const auto effectiveTypingFormat =
+        formattingPlan.effective_typing_format;
+    const auto effectiveTypingOverrideMask =
+        formattingPlan.effective_typing_override_mask;
+    const auto firstFormat = formattingPlan.insertion_format;
     const auto followingFormat =
-        std::optional<core::CharacterFormat>(typingFormat_);
+        std::optional<core::CharacterFormat>(effectiveTypingFormat);
     bool clearResultingList = false;
     const auto* startParagraph = snap.document.findParagraph(
         normalized.start.paragraph_id);
@@ -3852,7 +4670,8 @@ void DocumentCanvas::replaceSelection(const QString& text, bool coalesceTyping) 
         }
     }
 
-    std::vector<core::Operation> operations;
+    std::vector<core::Operation> operations =
+        std::move(formattingPlan.operations);
     if (prefixNormalization) {
         operations.push_back(std::move(*prefixNormalization));
     }
@@ -3862,13 +4681,12 @@ void DocumentCanvas::replaceSelection(const QString& text, bool coalesceTyping) 
     }
     core::Position cursor = normalized.start;
     const auto first = toUtf16(parts.front());
-    if (!normalized.empty()) {
-        operations.push_back(core::ReplaceRange{
-            effectiveSelection, first, firstFormat});
-    } else if (!first.empty()) {
-        operations.push_back(core::InsertText{cursor, first, firstFormat});
-    }
-    cursor.utf16_offset += first.size();
+    const auto directTypingDelta = maskedCharacterFormatDelta(
+        effectiveTypingFormat, effectiveTypingOverrideMask);
+    std::vector<core::NodeId> emptyTypingCandidates;
+    appendInitialReplacementOperations(
+        operations, normalized, effectiveSelection, first, firstFormat,
+        directTypingDelta, cursor, emptyTypingCandidates);
     if (clearResultingList) {
         operations.push_back(core::SetParagraphFormat{
             {normalized.start.paragraph_id}, clearSemanticListDelta()});
@@ -3896,8 +4714,15 @@ void DocumentCanvas::replaceSelection(const QString& text, bool coalesceTyping) 
         }
         const auto part = toUtf16(insertedPart);
         if (!part.empty()) {
+            const core::Position partStart = cursor;
             operations.push_back(core::InsertText{cursor, part, followingFormat});
             cursor.utf16_offset = part.size();
+            if (!directTypingDelta.empty()) {
+                operations.push_back(core::SetCharacterFormat{
+                    {partStart, cursor}, directTypingDelta});
+            }
+        } else if (!directTypingDelta.empty()) {
+            emptyTypingCandidates.push_back(cursor.paragraph_id);
         }
     }
     if (adoptContinuedList && !continuedParagraphIds.empty()) {
@@ -3905,6 +4730,14 @@ void DocumentCanvas::replaceSelection(const QString& text, bool coalesceTyping) 
             std::move(continuedParagraphIds),
             semanticListDelta(continuedListId, continuedListLevel,
                               continuedListLayout)});
+    }
+
+    QString planningError;
+    if (!appendEmptyTypingOverrideOperations(
+            snap.document, operations, std::move(emptyTypingCandidates),
+            directTypingDelta, planningError)) {
+        emit operationFailed(planningError);
+        return;
     }
 
     if (operations.empty()) {
@@ -3916,13 +4749,78 @@ void DocumentCanvas::replaceSelection(const QString& text, bool coalesceTyping) 
         resultingLineAffinity = LineAffinity{
             cursor.paragraph_id, static_cast<int>(cursor.utf16_offset)};
     }
+    std::optional<core::CharacterFormat> resultingTypingFormat =
+        std::move(formattingPlan.resulting_typing_format);
+    if (resultingParagraphStyle) {
+        const auto* target =
+            core::findBuiltInParagraphStyle(*resultingParagraphStyle);
+        if (!target) {
+            emit operationFailed(tr("Unknown next paragraph style."));
+            return;
+        }
+
+        // Plan against the exact post-replacement document, but do not expose
+        // it as a live revision. This handles a replacement spanning several
+        // paragraphs and formatting runs without ever publishing the
+        // intermediate inherited-style paragraph.
+        core::DocumentSession projectedSession(snap.document);
+        const auto projectedBase = projectedSession.snapshot();
+        const auto projected = projectedSession.applyBatch(
+            projectedBase.revision, operations);
+        if (!projected) {
+            emit operationFailed(errorText(projected.error()));
+            return;
+        }
+        const auto projectedSnapshot = projectedSession.snapshot();
+        const std::array<core::NodeId, 1> targetParagraphs{
+            cursor.paragraph_id};
+        auto stylePlan = planParagraphStyleApplication(
+            projectedSnapshot.document, targetParagraphs, *target,
+            defaultFontFamily_, defaultFontPointSize_,
+            effectiveTypingFormat,
+            cursor, false, effectiveTypingOverrideMask);
+        operations.insert(
+            operations.end(),
+            std::make_move_iterator(stylePlan.operations.begin()),
+            std::make_move_iterator(stylePlan.operations.end()));
+        resultingTypingFormat =
+            std::move(stylePlan.resultingTypingFormat);
+        formattingPlan.resulting_typing_override_mask =
+            std::move(stylePlan.resultingTypingOverrideMask);
+    }
+
     const bool shouldResequence = continuedListMarker &&
         continuedListMarker->kind == PlainTextListMarker::Kind::numbered;
-    if (apply(std::move(operations), cursor, std::nullopt, coalesceTyping,
+    if (apply(std::move(operations), cursor,
+              std::move(resultingTypingFormat), coalesceTyping,
               std::nullopt, false, false, std::nullopt, std::nullopt,
-              resultingLineAffinity) && shouldResequence) {
+              resultingLineAffinity,
+              formattingPlan.resulting_typing_override_mask.value_or(
+                  effectiveTypingOverrideMask)) && shouldResequence) {
         static_cast<void>(resequenceNumberedList(cursor.paragraph_id, true));
     }
+}
+
+void DocumentCanvas::insertParagraphBreak() {
+    const auto before = session_->snapshot();
+    const auto normalized = before.document.normalizeRange(selection_);
+    const core::ParagraphStyleDefinition* previousStyle = nullptr;
+    if (normalized) {
+        if (const auto* paragraph = before.document.findParagraph(
+                normalized.value().start.paragraph_id)) {
+            previousStyle = core::findBuiltInParagraphStyle(
+                paragraph->styleId().value_or("Normal"));
+        }
+    }
+    const std::string nextStyleId = previousStyle
+        ? std::string(previousStyle->next_style_id)
+        : std::string{};
+    const bool changesStyle = !nextStyleId.empty() &&
+        (!previousStyle || previousStyle->id != nextStyleId);
+    replaceSelection(
+        QStringLiteral("\n"), false,
+        changesStyle ? std::optional<std::string>(nextStyleId)
+                     : std::nullopt);
 }
 
 void DocumentCanvas::insertText(const QString& text) {
@@ -3967,17 +4865,32 @@ bool DocumentCanvas::insertEquation(const QString& latex, bool display) {
         return false;
     }
     const core::Position insertion = normalized.value().start;
-    std::vector<core::Operation> operations;
+    auto formattingPlan = planReplacementFormatting(
+        snap.document, normalized.value(), typingFormat_,
+        typingOverrideMask_, defaultFontFamily_, defaultFontPointSize_);
+    const auto directTypingDelta = maskedCharacterFormatDelta(
+        formattingPlan.effective_typing_format,
+        formattingPlan.effective_typing_override_mask);
+    auto operations = std::move(formattingPlan.operations);
     if (!normalized.value().empty()) {
         operations.push_back(core::DeleteRange{selection_});
     }
     operations.push_back(core::InsertEquation{
         insertion, math::toCanonicalLatex(parsed.value()), display,
         core::NodeId::generate(),
-        insertionFormatFor(snap.document, normalized.value(), typingFormat_)});
+        formattingPlan.insertion_format});
     core::Position cursor = insertion;
     ++cursor.utf16_offset;
-    return apply(std::move(operations), cursor);
+    if (!directTypingDelta.empty()) {
+        operations.emplace_back(core::SetCharacterFormat{
+            {insertion, cursor}, directTypingDelta});
+    }
+    return apply(
+        std::move(operations), cursor,
+        std::move(formattingPlan.resulting_typing_format), false,
+        std::nullopt, false, false, std::nullopt, std::nullopt,
+        std::nullopt,
+        std::move(formattingPlan.resulting_typing_override_mask));
 }
 
 bool DocumentCanvas::insertInlineImage(
@@ -3985,6 +4898,61 @@ bool DocumentCanvas::insertInlineImage(
     const QString& accessibleName) {
     return insertInlineImageWithGeometry(
         std::move(encodedBytes), accessibleName, std::nullopt, std::nullopt);
+}
+
+std::optional<QByteArray> DocumentCanvas::selectedExcalidrawScene() const {
+    const auto selected = selectedInlineImage();
+    if (!selected || selected->second.format != core::ImageFormat::png) {
+        return std::nullopt;
+    }
+    const auto bytes = selected->second.encoded_payload.bytes();
+    return excalidrawSceneFromPng(QByteArray(
+        reinterpret_cast<const char*>(bytes.data()),
+        static_cast<qsizetype>(bytes.size())));
+}
+
+bool DocumentCanvas::replaceSelectedExcalidrawFigure(
+    std::vector<std::uint8_t> encodedPng) {
+    if (rejectLiveEditDuringPreview()) return false;
+    const auto selected = selectedInlineImage();
+    if (!selected || !selectedExcalidrawScene()) return false;
+    RasterDecodeLimits limits;
+    limits.maximum_encoded_bytes = core::kMaximumEncodedImageBytes;
+    limits.maximum_decoded_bytes = kMaximumAggregateDecodedRasterBytes;
+    auto decoded = decodeRasterImage(encodedPng, limits);
+    if (!decoded.ok() || decoded.format != raster::Format::png) {
+        emit operationFailed(tr(
+            "The edited figure did not return a valid bounded PNG preview."));
+        return false;
+    }
+    const auto& old = selected->second;
+    const double aspect = static_cast<double>(decoded.image.height()) /
+        static_cast<double>(decoded.image.width());
+    const auto height = static_cast<std::int64_t>(std::llround(
+        static_cast<double>(old.width_emu) * aspect));
+    if (height <= 0 ||
+        height > core::kMaximumInlineImageDimensionEmu) {
+        emit operationFailed(tr(
+            "The edited figure's display dimensions are invalid."));
+        return false;
+    }
+    if (!apply({core::ReplaceImagePayload{
+            old.id, core::EncodedImagePayload(std::move(encodedPng)),
+            core::ImageFormat::png, old.width_emu, height}},
+            std::nullopt, std::nullopt, false, selection_)) {
+        return false;
+    }
+    const auto cached = decodedImages_.find(old.id);
+    if (cached != decodedImages_.end()) {
+        decodedImageBytes_ -= cached->second.sizeInBytes();
+        decodedImages_.erase(cached);
+    }
+    const auto [inserted, wasInserted] =
+        decodedImages_.emplace(old.id, std::move(decoded.image));
+    if (wasInserted) decodedImageBytes_ += inserted->second.sizeInBytes();
+    invalidateLayout();
+    viewport()->update();
+    return true;
 }
 
 bool DocumentCanvas::insertInlineImageWithGeometry(
@@ -4101,7 +5069,13 @@ bool DocumentCanvas::insertInlineImageWithGeometry(
     }
 
     const auto imageId = core::NodeId::generate();
-    std::vector<core::Operation> operations;
+    auto formattingPlan = planReplacementFormatting(
+        snapshot.document, normalized.value(), typingFormat_,
+        typingOverrideMask_, defaultFontFamily_, defaultFontPointSize_);
+    const auto directTypingDelta = maskedCharacterFormatDelta(
+        formattingPlan.effective_typing_format,
+        formattingPlan.effective_typing_override_mask);
+    auto operations = std::move(formattingPlan.operations);
     if (!normalized.value().empty()) {
         operations.emplace_back(core::DeleteRange{selection_});
     }
@@ -4110,13 +5084,20 @@ bool DocumentCanvas::insertInlineImageWithGeometry(
         decoded.format == raster::Format::png ? core::ImageFormat::png
                                               : core::ImageFormat::jpeg,
         encodedName.toStdString(), widthEmu, heightEmu, imageId,
-        insertionFormatFor(snapshot.document, normalized.value(),
-                           typingFormat_), layout});
+        formattingPlan.insertion_format, layout});
     core::Position after = insertion;
     ++after.utf16_offset;
+    if (!directTypingDelta.empty()) {
+        operations.emplace_back(core::SetCharacterFormat{
+            {insertion, after}, directTypingDelta});
+    }
     const core::Range imageSelection{insertion, after};
-    if (!apply(std::move(operations), std::nullopt, std::nullopt, false,
-               imageSelection)) {
+    if (!apply(
+            std::move(operations), std::nullopt,
+            std::move(formattingPlan.resulting_typing_format), false,
+            imageSelection, false, false, std::nullopt, std::nullopt,
+            std::nullopt,
+            std::move(formattingPlan.resulting_typing_override_mask))) {
         return false;
     }
     const auto [cached, inserted] = decodedImages_.emplace(
@@ -4568,6 +5549,7 @@ bool DocumentCanvas::activateTableCell(core::NodeId tableId, std::size_t row,
     tableMouseSelectionAnchor_.reset();
     selectedTable_ = tableId;
     typingFormat_ = currentCharacterFormat();
+    typingOverrideMask_ = {};
     commitPendingSpellingWordIfCaretLeft();
     emit selectionChanged();
     emitCursorFormat();
@@ -4602,6 +5584,7 @@ bool DocumentCanvas::selectTableCells(core::NodeId tableId,
     tableMouseSelectionAnchor_.reset();
     selectedTable_ = tableId;
     typingFormat_ = selectedCharacterFormat();
+    typingOverrideMask_ = {};
     emit selectionChanged();
     emitCursorFormat();
     updateStatus();
@@ -4623,6 +5606,7 @@ bool DocumentCanvas::selectTable(core::NodeId tableId) {
     tableCellSelection_.reset();
     tableMouseSelectionAnchor_.reset();
     selectedTable_ = tableId;
+    typingOverrideMask_ = {};
     emit selectionChanged();
     emitCursorFormat();
     updateStatus();
@@ -5972,6 +6956,7 @@ void DocumentCanvas::selectAll() {
         tableSelectionAnchor_.reset();
         tableCellSelection_.reset();
         tableMouseSelectionAnchor_.reset();
+        typingOverrideMask_ = {};
         emit selectionChanged();
         emitCursorFormat();
         viewport()->update();
@@ -5987,6 +6972,7 @@ void DocumentCanvas::selectAll() {
     tableMouseSelectionAnchor_.reset();
     selectedTable_.reset();
     typingFormat_ = selectedCharacterFormat();
+    typingOverrideMask_ = selectedCharacterOverrideMask();
     emit selectionChanged();
     emitCursorFormat();
     viewport()->update();
@@ -6320,9 +7306,17 @@ void DocumentCanvas::keyPressEvent(QKeyEvent* event) {
     if (event->matches(QKeySequence::Bold)) { toggleBold(); return; }
     if (event->matches(QKeySequence::Italic)) { toggleItalic(); return; }
     if (event->matches(QKeySequence::Underline)) { toggleUnderline(); return; }
+    if (selectedExcalidrawScene() &&
+        (event->key() == Qt::Key_Return ||
+         event->key() == Qt::Key_Enter)) {
+        emit editExcalidrawFigureRequested();
+        return;
+    }
     if (selectedInlineImageId() && event->key() == Qt::Key_F2) {
         if (event->modifiers() & Qt::ShiftModifier) {
             showSelectedImageAltTextDialog();
+        } else if (selectedExcalidrawScene()) {
+            emit editExcalidrawFigureRequested();
         } else {
             showSelectedImageSizeDialog();
         }
@@ -6467,6 +7461,7 @@ void DocumentCanvas::keyPressEvent(QKeyEvent* event) {
                 tableCellSelection_.reset();
                 selectedTable_ = cursor.tableId;
                 typingFormat_ = selectedCharacterFormat();
+                typingOverrideMask_ = {};
                 commitPendingSpellingWordIfCaretLeft();
                 emit selectionChanged();
                 emitCursorFormat();
@@ -6720,7 +7715,7 @@ void DocumentCanvas::keyPressEvent(QKeyEvent* event) {
                 viewport()->update();
                 return;
             }
-            replaceSelection(QStringLiteral("\n"));
+            insertParagraphBreak();
             clearPendingSpellingWord();
             viewport()->update();
             return;
@@ -7080,6 +8075,7 @@ void DocumentCanvas::mousePressEvent(QMouseEvent* event) {
             if (lineAnchor) {
                 tableSelectionAnchor_ = *lineAnchor;
                 typingFormat_ = selectedCharacterFormat();
+                typingOverrideMask_ = {};
                 emit selectionChanged();
                 emitCursorFormat();
                 viewport()->update();
@@ -7136,7 +8132,11 @@ void DocumentCanvas::mouseDoubleClickEvent(QMouseEvent* event) {
     if (hit.image) {
         if (selectInlineImage(*hit.image)) {
             tripleClickArmed_ = false;
-            showSelectedImageSizeDialog();
+            if (selectedExcalidrawScene()) {
+                emit editExcalidrawFigureRequested();
+            } else {
+                showSelectedImageSizeDialog();
+            }
         }
     } else if (hit.tableCursor) {
         if (activateTableCell(
@@ -7167,6 +8167,7 @@ void DocumentCanvas::mouseDoubleClickEvent(QMouseEvent* event) {
                     tableSelectionAnchor_ = static_cast<std::size_t>(start);
                     tableCursor_->utf16Offset = static_cast<std::size_t>(end);
                     typingFormat_ = selectedCharacterFormat();
+                    typingOverrideMask_ = {};
                     emit selectionChanged();
                     emitCursorFormat();
                     viewport()->update();
@@ -7314,6 +8315,7 @@ void DocumentCanvas::mouseMoveEvent(QMouseEvent* event) {
                 focus.row, focus.column};
         }
         typingFormat_ = selectedCharacterFormat();
+        typingOverrideMask_ = {};
         commitPendingSpellingWordIfCaretLeft();
         emit selectionChanged();
         emitCursorFormat();
@@ -7439,6 +8441,14 @@ void DocumentCanvas::contextMenuEvent(QContextMenuEvent* event) {
     }
     QMenu menu(this);
     if (selectedInlineImageId()) {
+        if (selectedExcalidrawScene()) {
+            auto* editFigure = menu.addAction(tr("Edit Excalidraw Figure…"));
+            editFigure->setObjectName(
+                QStringLiteral("context.editExcalidrawFigure"));
+            connect(editFigure, &QAction::triggered, this,
+                    &DocumentCanvas::editExcalidrawFigureRequested);
+            menu.addSeparator();
+        }
         auto* size = menu.addAction(tr("Picture Size…"));
         size->setObjectName(QStringLiteral("context.pictureSize"));
         connect(size, &QAction::triggered, this,
@@ -7504,6 +8514,7 @@ void DocumentCanvas::contextMenuEvent(QContextMenuEvent* event) {
                         }
                         tableSelectionAnchor_ = range.first;
                         typingFormat_ = selectedCharacterFormat();
+                        typingOverrideMask_ = {};
                         static_cast<void>(replaceTableCellText(
                             suggestion, false));
                     });
@@ -7514,6 +8525,8 @@ void DocumentCanvas::contextMenuEvent(QContextMenuEvent* event) {
                         clearPendingSpellingWord();
                         selection_ = wordRange;
                         typingFormat_ = selectedCharacterFormat();
+                        typingOverrideMask_ =
+                            selectedCharacterOverrideMask();
                         replaceSelection(suggestion);
                     });
             }
@@ -7589,6 +8602,7 @@ void DocumentCanvas::setCursor(core::Position position, bool extend,
     typingFormat_ = selection_.anchor == selection_.focus
         ? currentCharacterFormat()
         : selectedCharacterFormat();
+    typingOverrideMask_ = selectedCharacterOverrideMask();
     emit selectionChanged();
     emitCursorFormat();
     updateStatus();
@@ -7613,6 +8627,7 @@ void DocumentCanvas::selectRange(core::Range range,
     tableDropBefore_.reset();
     selection_ = std::move(range);
     typingFormat_ = selectedCharacterFormat();
+    typingOverrideMask_ = selectedCharacterOverrideMask();
     emit selectionChanged();
     emitCursorFormat();
     updateStatus();
@@ -7716,6 +8731,35 @@ core::CharacterFormat DocumentCanvas::selectedCharacterFormat() const {
     return {};
 }
 
+core::CharacterFormatMask
+DocumentCanvas::selectedCharacterOverrideMask() const {
+    if (selectedTable_ || tableCursor_ || tableCellSelection_) return {};
+    const auto snap = session_->snapshot();
+    const auto normalized = snap.document.normalizeRange(selection_);
+    if (!normalized) return {};
+    const auto& range = normalized.value();
+    if (!range.empty()) {
+        for (std::size_t index = range.start_paragraph_index;
+             index <= range.end_paragraph_index; ++index) {
+            const auto& paragraph = snap.document.paragraphs()[index];
+            const std::size_t start = index == range.start_paragraph_index
+                ? range.start.utf16_offset
+                : 0;
+            const std::size_t end = index == range.end_paragraph_index
+                ? range.end.utf16_offset
+                : paragraph.text().size();
+            if (start < end) {
+                return paragraph.styleOverrideMaskAt(start + 1);
+            }
+        }
+    }
+    const auto* paragraph = snap.document.findParagraph(
+        selection_.focus.paragraph_id);
+    return paragraph
+        ? paragraph->styleOverrideMaskAt(selection_.focus.utf16_offset)
+        : core::CharacterFormatMask{};
+}
+
 core::CharacterFormat DocumentCanvas::activeCharacterFormat() const {
     if (tableCursor_) {
         const bool hasSelection = tableSelectionAnchor_ &&
@@ -7757,6 +8801,7 @@ void DocumentCanvas::applyCharacterFormatInternal(
             const auto end = std::max(anchor, focus);
             if (start == end && !cell->text.empty()) {
                 typingFormat_ = std::move(resultingTypingFormat);
+                typingOverrideMask_ = {};
                 emitCursorFormat();
                 return;
             }
@@ -7773,6 +8818,7 @@ void DocumentCanvas::applyCharacterFormatInternal(
         }
         if (operations.empty()) {
             typingFormat_ = std::move(resultingTypingFormat);
+            typingOverrideMask_ = {};
             emitCursorFormat();
             return;
         }
@@ -7784,31 +8830,120 @@ void DocumentCanvas::applyCharacterFormatInternal(
     // Formatting a selection also changes the active typing attributes. If it
     // is immediately replaced, the new text uses the color/font/style the
     // user just chose.
-    auto resultingTypingFormat = typingFormat_;
-    delta.applyTo(resultingTypingFormat);
+    auto resultingTypingOverrideMask = typingOverrideMask_;
+    resultingTypingOverrideMask.mark(delta);
     if (selection_.anchor == selection_.focus) {
         const auto snap = session_->snapshot();
         const auto* paragraph = snap.document.findParagraph(
             selection_.focus.paragraph_id);
         if (paragraph && paragraph->text().empty()) {
+            const std::array<core::NodeId, 1> paragraphIds{
+                paragraph->id()};
+            auto initialization =
+                planBuiltInStyleProvenanceInitialization(
+                    snap.document, paragraphIds, defaultFontFamily_,
+                    defaultFontPointSize_, typingFormat_, selection_.focus,
+                    typingOverrideMask_);
+            auto resultingTypingFormat =
+                initialization.resultingTypingFormat.value_or(typingFormat_);
+            resultingTypingOverrideMask =
+                initialization.resultingTypingOverrideMask.value_or(
+                    typingOverrideMask_);
+            resultingTypingOverrideMask.mark(delta);
+            delta.applyTo(resultingTypingFormat);
             // Empty lines have no character run to recover from after the
             // user clicks elsewhere, so keep their insertion format in the
             // semantic paragraph mark. A non-empty caret remains transient
             // until text is actually entered, matching normal editor
             // behavior and avoiding an invisible document mutation.
-            apply({core::SetParagraphMarkCharacterFormat{
-                       selection_.focus.paragraph_id, delta}},
-                  std::nullopt, std::move(resultingTypingFormat), false,
-                  selection_, coalesceWithPrevious);
+            initialization.operations.emplace_back(
+                core::SetParagraphMarkCharacterFormat{
+                    selection_.focus.paragraph_id, delta});
+            apply(std::move(initialization.operations), std::nullopt,
+                  std::move(resultingTypingFormat), false, selection_,
+                  coalesceWithPrevious, false, std::nullopt, std::nullopt,
+                  std::nullopt, resultingTypingOverrideMask);
         } else {
+            auto resultingTypingFormat = typingFormat_;
+            delta.applyTo(resultingTypingFormat);
             typingFormat_ = std::move(resultingTypingFormat);
+            typingOverrideMask_ = resultingTypingOverrideMask;
             emitCursorFormat();
         }
         return;
     }
-    apply({core::SetCharacterFormat{selection_, delta}}, std::nullopt,
+
+    const auto snap = session_->snapshot();
+    const auto normalized = snap.document.normalizeRange(selection_);
+    if (!normalized) {
+        emit operationFailed(errorText(normalized.error()));
+        return;
+    }
+    bool requiresMutation = false;
+    for (std::size_t index = normalized.value().start_paragraph_index;
+         index <= normalized.value().end_paragraph_index &&
+         !requiresMutation; ++index) {
+        const auto& paragraph = snap.document.paragraphs()[index];
+        const std::size_t start =
+            index == normalized.value().start_paragraph_index
+            ? normalized.value().start.utf16_offset
+            : 0;
+        const std::size_t end =
+            index == normalized.value().end_paragraph_index
+            ? normalized.value().end.utf16_offset
+            : paragraph.text().size();
+        if (start == end && paragraph.text().empty()) {
+            requiresMutation = characterDeltaRequiresMutation(
+                paragraph, 0, true, delta, defaultFontFamily_,
+                defaultFontPointSize_);
+            continue;
+        }
+        for (std::size_t offset = start; offset < end; ++offset) {
+            if (characterDeltaRequiresMutation(
+                    paragraph, offset + 1, false, delta,
+                    defaultFontFamily_, defaultFontPointSize_)) {
+                requiresMutation = true;
+                break;
+            }
+        }
+    }
+    if (!requiresMutation) {
+        emitCursorFormat();
+        return;
+    }
+    std::vector<core::NodeId> affectedParagraphs;
+    for (std::size_t index = normalized.value().start_paragraph_index;
+         index <= normalized.value().end_paragraph_index; ++index) {
+        const auto& paragraph = snap.document.paragraphs()[index];
+        const std::size_t start =
+            index == normalized.value().start_paragraph_index
+            ? normalized.value().start.utf16_offset
+            : 0;
+        const std::size_t end =
+            index == normalized.value().end_paragraph_index
+            ? normalized.value().end.utf16_offset
+            : paragraph.text().size();
+        if (start < end || paragraph.text().empty()) {
+            affectedParagraphs.push_back(paragraph.id());
+        }
+    }
+    auto initialization = planBuiltInStyleProvenanceInitialization(
+        snap.document, affectedParagraphs, defaultFontFamily_,
+        defaultFontPointSize_, typingFormat_, selection_.focus,
+        typingOverrideMask_);
+    auto resultingTypingFormat =
+        initialization.resultingTypingFormat.value_or(typingFormat_);
+    resultingTypingOverrideMask =
+        initialization.resultingTypingOverrideMask.value_or(
+            typingOverrideMask_);
+    resultingTypingOverrideMask.mark(delta);
+    delta.applyTo(resultingTypingFormat);
+    initialization.operations.emplace_back(
+        core::SetCharacterFormat{selection_, delta});
+    apply(std::move(initialization.operations), std::nullopt,
           std::move(resultingTypingFormat), false, std::nullopt,
-          coalesceWithPrevious);
+          coalesceWithPrevious, false, std::nullopt, std::nullopt,
+          std::nullopt, resultingTypingOverrideMask);
 }
 
 void DocumentCanvas::applyParagraphFormat(const core::ParagraphFormatDelta& delta) {
@@ -7825,7 +8960,116 @@ void DocumentCanvas::applyParagraphFormat(const core::ParagraphFormatDelta& delt
         if (!operations.empty()) apply(std::move(operations));
         return;
     }
-    apply({core::SetParagraphFormat{selectedParagraphIds(), delta}});
+    if (rejectLiveEditDuringPreview()) return;
+    const auto snap = session_->snapshot();
+    const auto normalized = snap.document.normalizeRange(selection_);
+    if (!normalized) {
+        emit operationFailed(errorText(normalized.error()));
+        return;
+    }
+    std::vector<core::NodeId> paragraphIds;
+    paragraphIds.reserve(
+        normalized.value().end_paragraph_index -
+        normalized.value().start_paragraph_index + 1);
+    for (std::size_t index = normalized.value().start_paragraph_index;
+         index <= normalized.value().end_paragraph_index; ++index) {
+        paragraphIds.push_back(snap.document.paragraphs()[index].id());
+    }
+    const bool requiresMutation = std::any_of(
+        paragraphIds.begin(), paragraphIds.end(),
+        [&snap, &delta](core::NodeId id) {
+            const auto* paragraph = snap.document.findParagraph(id);
+            return paragraph && paragraphDeltaRequiresMutation(
+                                    *paragraph, delta);
+        });
+    if (!requiresMutation) return;
+    auto initialization = planBuiltInStyleProvenanceInitialization(
+        snap.document, paragraphIds, defaultFontFamily_,
+        defaultFontPointSize_, typingFormat_, selection_.focus,
+        typingOverrideMask_);
+    initialization.operations.emplace_back(
+        core::SetParagraphFormat{std::move(paragraphIds), delta});
+    const auto resultingTypingOverrideMask =
+        initialization.resultingTypingOverrideMask.value_or(
+            typingOverrideMask_);
+    apply(std::move(initialization.operations), std::nullopt,
+          std::move(initialization.resultingTypingFormat), false,
+          std::nullopt, false, false, std::nullopt, std::nullopt,
+          std::nullopt, resultingTypingOverrideMask);
+}
+
+bool DocumentCanvas::paragraphStylesAvailable() const noexcept {
+    return !previewId_ && !selectedTable_ && !tableCursor_ &&
+           !tableCellSelection_;
+}
+
+QString DocumentCanvas::currentParagraphStyleId() const {
+    if (selectedTable_ || tableCursor_ || tableCellSelection_) return {};
+    const auto snap = visibleDocumentSnapshot();
+    const auto normalized = snap.document.normalizeRange(selection_);
+    if (!normalized) return {};
+
+    std::optional<std::string> common;
+    for (std::size_t index = normalized.value().start_paragraph_index;
+         index <= normalized.value().end_paragraph_index; ++index) {
+        const auto& paragraph = snap.document.paragraphs()[index];
+        const std::string id = paragraph.styleId().value_or("Normal");
+        if (!common) {
+            common = id;
+        } else if (*common != id) {
+            return {};
+        }
+    }
+    return common ? QString::fromUtf8(
+                        common->data(), static_cast<qsizetype>(common->size()))
+                  : QString{};
+}
+
+void DocumentCanvas::applyParagraphStyle(const QString& styleId) {
+    applyParagraphStyleInternal(styleId, false);
+}
+
+std::vector<core::Operation> DocumentCanvas::planParagraphStyleOperations(
+    const core::Document& document,
+    const std::vector<core::NodeId>& paragraphIds,
+    const core::ParagraphStyleDefinition& target,
+    bool ensureTargetProvenance) const {
+    auto plan = planParagraphStyleApplication(
+        document, paragraphIds, target, defaultFontFamily_,
+        defaultFontPointSize_, core::CharacterFormat{}, std::nullopt,
+        ensureTargetProvenance);
+    return std::move(plan.operations);
+}
+
+void DocumentCanvas::applyParagraphStyleInternal(
+    const QString& styleId, bool coalesceWithPrevious) {
+    if (selectedTable_ || tableCursor_ || tableCellSelection_) {
+        emit operationFailed(tr(
+            "Paragraph styles are not available inside or across table cells."));
+        return;
+    }
+    if (rejectLiveEditDuringPreview()) return;
+    const QByteArray encoded = styleId.toUtf8();
+    const std::string targetId(encoded.constData(),
+                               static_cast<std::size_t>(encoded.size()));
+    const auto* target = core::findBuiltInParagraphStyle(targetId);
+    if (!target) {
+        emit operationFailed(tr("Unknown paragraph style."));
+        return;
+    }
+
+    const auto snap = session_->snapshot();
+    const auto ids = selectedParagraphIds();
+    if (ids.empty()) return;
+    auto plan = planParagraphStyleApplication(
+        snap.document, ids, *target, defaultFontFamily_,
+        defaultFontPointSize_, typingFormat_, selection_.focus, false,
+        typingOverrideMask_);
+    if (plan.operations.empty()) return;
+    apply(std::move(plan.operations), std::nullopt,
+          std::move(plan.resultingTypingFormat), false, std::nullopt,
+          coalesceWithPrevious, false, std::nullopt, std::nullopt,
+          std::nullopt, std::move(plan.resultingTypingOverrideMask));
 }
 
 void DocumentCanvas::toggleBold() {
@@ -8239,6 +9483,7 @@ bool DocumentCanvas::activateSearchHit(const DocumentSearchHit& hit) {
     // accepted or discarded instead of resolving it against mismatched text.
     if (!previewId_) {
         typingFormat_ = selectedCharacterFormat();
+        typingOverrideMask_ = selectedCharacterOverrideMask();
     }
     emit selectionChanged();
     if (!previewId_) {
@@ -8818,27 +10063,60 @@ bool DocumentCanvas::createReplacementPreview(const QString& replacement,
     safeReplacement.replace(QLatin1Char('\r'), QLatin1Char('\n'));
     safeReplacement.replace(QLatin1Char('\n'), QChar::LineSeparator);
     const auto inserted = toUtf16(safeReplacement);
-    std::vector<core::Operation> operations;
-    core::Position cursor = selection_.anchor;
     const auto normalized = live.document.normalizeRange(selection_);
     if (!normalized) {
         error = errorText(normalized.error());
         return false;
     }
-    cursor = normalized.value().start;
-    const auto replacementFormat = insertionFormatFor(
-        live.document, normalized.value(), typingFormat_);
-    if (normalized.value().empty()) {
-        operations.push_back(core::InsertText{cursor, inserted, replacementFormat});
-    } else {
-        operations.push_back(core::ReplaceRange{selection_, inserted, replacementFormat});
-    }
-    cursor.utf16_offset += inserted.size();
     const auto before = selectedText();
     const QString label = tr("Replace %1 characters with %2 characters.\n\nBefore: %3\n\nAfter: %4")
                               .arg(before.size())
                               .arg(safeReplacement.size())
                               .arg(before.left(240), safeReplacement.left(240));
+    if (normalized.value().empty() && inserted.empty()) {
+        const std::vector<core::Operation> noOp{
+            core::InsertText{
+                normalized.value().start, {},
+                insertionFormatFor(live.document, normalized.value(),
+                                   typingFormat_)}};
+        return createOperationsPreview(
+            live.revision, noOp, label, summary, error);
+    }
+    auto formattingPlan = planReplacementFormatting(
+        live.document, normalized.value(), typingFormat_,
+        typingOverrideMask_, defaultFontFamily_, defaultFontPointSize_);
+    std::vector<core::Operation> operations =
+        std::move(formattingPlan.operations);
+    core::Position cursor = normalized.value().start;
+    const auto directTypingDelta = maskedCharacterFormatDelta(
+        formattingPlan.effective_typing_format,
+        formattingPlan.effective_typing_override_mask);
+    std::vector<core::NodeId> emptyTypingCandidates;
+    appendInitialReplacementOperations(
+        operations, normalized.value(), selection_, inserted,
+        formattingPlan.insertion_format, directTypingDelta, cursor,
+        emptyTypingCandidates);
+
+    // Replacing a list marker has the same semantic effect in a reviewed
+    // chat edit as it does during direct typing or paste: the surviving text
+    // is no longer attached to list metadata.
+    const auto* startParagraph = live.document.findParagraph(
+        normalized.value().start.paragraph_id);
+    const auto marker = startParagraph
+        ? plainTextListMarker(fromUtf16(startParagraph->text()))
+        : std::nullopt;
+    if (startParagraph && startParagraph->format().list_id && marker &&
+        normalized.value().start.utf16_offset <
+            static_cast<std::size_t>(marker->prefixLength)) {
+        operations.emplace_back(core::SetParagraphFormat{
+            {startParagraph->id()}, clearSemanticListDelta()});
+    }
+
+    if (!appendEmptyTypingOverrideOperations(
+            live.document, operations, std::move(emptyTypingCandidates),
+            directTypingDelta, error)) {
+        return false;
+    }
     if (!createOperationsPreview(live.revision, operations, label, summary, error)) {
         return false;
     }
@@ -8964,6 +10242,7 @@ bool DocumentCanvas::acceptPreview(QString& error) {
     typingFormat_ = selection_.anchor == selection_.focus
         ? currentCharacterFormat()
         : selectedCharacterFormat();
+    typingOverrideMask_ = selectedCharacterOverrideMask();
     previewId_.reset();
     previewRevision_ = {};
     previewCursor_.reset();
@@ -9090,6 +10369,7 @@ void DocumentCanvas::discardPreview() {
     typingFormat_ = selection_.anchor == selection_.focus
         ? currentCharacterFormat()
         : selectedCharacterFormat();
+    typingOverrideMask_ = selectedCharacterOverrideMask();
     emit selectionChanged();
     emitCursorFormat();
     updateStatus();
@@ -9229,6 +10509,7 @@ void DocumentCanvas::revealCursor() {
 
 void DocumentCanvas::emitCursorFormat() {
     const auto format = activeCharacterFormat();
+    emit cursorParagraphStyleChanged(currentParagraphStyleId());
     emit cursorFormatChanged(format.font_family
                                  ? QString::fromStdString(*format.font_family)
                                  : defaultFontFamily_,

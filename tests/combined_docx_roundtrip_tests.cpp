@@ -157,7 +157,9 @@ void testEmptyBodyParagraphFormattingSurvivesSaveAndReopen() {
           "formatted empty paragraph was not saved as a clean DOCX baseline");
 
     const QByteArray xml = zipMember(path, "word/document.xml");
-    check(xml.contains("<w:p><w:pPr><w:rPr>") &&
+    check(xml.contains("<w:p><w:pPr>") &&
+              xml.contains("<w:pStyle w:val=\"Normal\"/>") &&
+              xml.contains("<w:rPr>") &&
               xml.contains("<w:color w:val=\"284B63\"/>") &&
               xml.contains("<w:sz w:val=\"31\"/>") &&
               xml.contains("<w:i/>"),

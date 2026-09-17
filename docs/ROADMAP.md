@@ -21,12 +21,14 @@ complete only when the features below work together in normal keyboard- and
 mouse-driven workflows, survive save/reopen and recovery, and meet the stated
 performance and privacy gates.
 
-The 0.4.3 checkpoint adds the document-ingress and Recent Files lifecycle to
-the 0.4.2 modeless Navigation/Find-Replace slice. Startup, command-line,
-desktop-association, file-manager-drop, and recent-file opens now share
-multi-document behavior, equivalent-path deduplication, and focused workflow
-tests. Heading, page, and object browsing remain later Navigation-pane work.
-M1 as a whole remains active.
+The 0.4.4 checkpoint adds native built-in paragraph-style identity and
+provenance-aware transitions to the 0.4.3 document-ingress/Recent Files slice.
+Normal, No Spacing, Title, Subtitle, Quote, and Heading 1–9 are available from
+the Home ribbon; heading Enter continuation, undo, recovery, supported DOCX
+save/reopen, and previewed Codex changes use the same direct-override
+preservation rules. Custom style-definition editing, styles inside table
+cells, and heading/page/object browsing remain later work. M1 as a whole
+remains active.
 
 - Finish remaining recovery/session edge cases around the implemented
   multi-document ingress, printing, shared-layout PDF export, recent files,
@@ -39,9 +41,10 @@ M1 as a whole remains active.
 - Complete direct character and paragraph formatting, styles, tabs, borders,
   page breaks, sections, page geometry, columns, lists, and the daily-use table
   subset.
-- Expose native image insertion in the desktop editor, then add selection,
-  sizing, inline and floating placement, supported text-wrap modes, crop,
-  rotation, z-order, and move-with-text behavior without losing unsupported
+- Complete the image surface around the implemented native PNG/JPEG
+  insertion, selection, resizing, inline placement, and canonical
+  square/top-and-bottom anchors: add crop, rotation, z-order, arbitrary
+  positioning, and the remaining wrap modes without losing unsupported
   imported drawing data.
 - Add text boxes, captions, and the initial simple-shape subset.
 - Finish local English spelling behavior and personal-dictionary workflows.
@@ -63,6 +66,14 @@ M1 as a whole remains active.
 M2 adds document-owned, editable figures through a pinned and audited local
 Excalidraw build. Excalidraw is an optional authoring surface; the DOCX remains
 readable and visually useful when that surface is unavailable.
+
+Version 0.5.0 implements the first end-to-end slice. It bundles the figure
+editor in Owl Docs, supports insert/edit/cancel, one-transaction updates,
+ordinary picture layout, recovery, and native DOCX save/reopen. This checkpoint
+stores bounded inert scene JSON in a private PNG iTXt chunk so the preview and
+source share one byte-owned image atom. The private OPC index/relationship,
+hash-divergence workflow, and remaining acceptance automation below are still
+planned before M2 is declared complete.
 
 ### User experience
 
@@ -90,10 +101,12 @@ readable and visually useful when that surface is unavailable.
 - Where the validated export permits it, retain a sanitized vector preview for
   Owl Docs screen/PDF rendering while keeping the PNG fallback authoritative
   for broad interoperability.
-- Store the editable, size-bounded Excalidraw scene in a private optional OPC
+- Migrate the editable, size-bounded Excalidraw scene from the 0.5.0 private
+  PNG metadata checkpoint to a private optional OPC
   part related to the drawing by a stable figure identifier and versioned
   source/preview hashes. The custom part must never be required to render the
-  document, and it is never hidden inside the exported PNG.
+  document. Until that migration, Owl Docs recognizes its namespaced inert iTXt
+  chunk and treats a stripped chunk as a flattened ordinary picture.
 - Before embedding, remove deleted elements, unreferenced binary files, local
   history, and other hidden scene state that is unnecessary for future edits.
   Owl Docs undo history, not undisclosed content inside the scene, owns prior
@@ -117,7 +130,9 @@ readable and visually useful when that surface is unavailable.
 - Launch a dedicated figure-editor process only after a user creates or edits a
   figure. It receives that one scene through authenticated, document-scoped
   IPC and receives no arbitrary path or broad home-directory mount.
-- Use a permission-0600 Unix socket with a versioned framed protocol,
+- The 0.5.0 checkpoint uses atomic files inside a permission-0700 ephemeral
+  directory plus a 256-bit capability token and strict byte/schema limits.
+  Replace that bridge with a permission-0600 Unix socket and versioned protocol,
   per-session capability token, peer-process verification, and strict message
   limits. Do not expose an HTTP listener or launch the system browser.
 - Run with no network namespace, no telemetry, no collaboration/cloud UI, a

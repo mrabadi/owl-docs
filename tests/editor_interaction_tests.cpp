@@ -608,8 +608,8 @@ void testHighlightRemoval(docxstudio::app::SpellChecker& spelling) {
     auto entered = transientEnter.snapshot();
     check(entered.document.paragraphs().size() == 2 &&
               entered.document.paragraphs()[1].text().empty() &&
-              entered.document.paragraphs()[1]
-                  .paragraphMarkCharacterFormat().empty(),
+              !entered.document.paragraphs()[1]
+                   .paragraphMarkCharacterFormat().highlight_argb,
           "Enter after transient No Highlight reintroduced the adjacent highlight");
     transientEnter.insertText(QStringLiteral("p"));
     entered = transientEnter.snapshot();

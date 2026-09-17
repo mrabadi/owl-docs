@@ -267,10 +267,50 @@ struct Run {
     // formatting after the character/paragraph style cascade is resolved.
     std::optional<std::string> style_id;
     BasicRunFormat format;
+    // Supported properties contributed by a character style or direct rPr,
+    // excluding the paragraph-style baseline. Presence is significant even
+    // when the value is false or equals the inherited value.
+    BasicRunFormat paragraph_style_overrides;
     bool format_is_basic{true};
     bool has_unsupported_content{false};
 
     [[nodiscard]] std::string plainText() const;
+};
+
+struct ParagraphStyleProvenance {
+    BasicRunFormat inherited_character_format;
+    // Resolved paragraph-mark baseline before direct w:pPr/w:rPr is applied.
+    // It includes docDefaults, paragraph-style rPr, and style-chain pPr/rPr.
+    BasicRunFormat inherited_paragraph_mark_format;
+    std::optional<BasicParagraphAlignment> inherited_alignment;
+    std::optional<std::int32_t> inherited_left_indent_twips;
+    std::optional<std::int32_t> inherited_right_indent_twips;
+    std::optional<std::int32_t> inherited_first_line_indent_twips;
+    std::optional<std::uint32_t> inherited_space_before_twips;
+    std::optional<std::uint32_t> inherited_space_after_twips;
+    std::optional<std::uint32_t> inherited_line_spacing;
+    std::optional<BasicLineSpacingRule> inherited_line_spacing_rule;
+    std::optional<bool> inherited_keep_with_next;
+    std::optional<bool> inherited_keep_lines;
+    std::optional<bool> inherited_page_break_before;
+
+    // Direct pPr values are represented by presence, including explicit
+    // false. Numbering/list properties are deliberately excluded because the
+    // editor treats list identity and geometry independently from styles.
+    std::optional<BasicParagraphAlignment> direct_alignment;
+    std::optional<std::int32_t> direct_left_indent_twips;
+    std::optional<std::int32_t> direct_right_indent_twips;
+    std::optional<std::int32_t> direct_first_line_indent_twips;
+    std::optional<std::uint32_t> direct_space_before_twips;
+    std::optional<std::uint32_t> direct_space_after_twips;
+    std::optional<std::uint32_t> direct_line_spacing;
+    std::optional<BasicLineSpacingRule> direct_line_spacing_rule;
+    std::optional<bool> direct_keep_with_next;
+    std::optional<bool> direct_keep_lines;
+    std::optional<bool> direct_page_break_before;
+    BasicRunFormat direct_paragraph_mark_format;
+
+    auto operator<=>(const ParagraphStyleProvenance&) const = default;
 };
 
 struct Paragraph {
@@ -279,6 +319,10 @@ struct Paragraph {
     // supported values after docDefaults, basedOn, style, numbering-level,
     // and direct formatting have been cascaded in OOXML precedence order.
     std::optional<std::string> style_id;
+    // Present only for an explicit source pStyle whose supported cascade was
+    // resolved successfully. It lets the editor later change that style
+    // without confusing source inheritance with direct formatting.
+    std::optional<ParagraphStyleProvenance> style_provenance;
     std::optional<std::int32_t> numbering_id;
     std::optional<std::uint8_t> numbering_level;
     std::optional<ImportedNumbering> numbering;
@@ -501,6 +545,10 @@ struct NewParagraph {
         : runs(std::move(new_runs)), alignment(new_alignment) {}
 
     std::vector<NewRun> runs;
+    // WordprocessingML paragraph style ID (w:pPr/w:pStyle). New documents
+    // accept only Owl Docs' deterministic built-in paragraph styles; imported
+    // custom IDs remain visible on Paragraph but are never fabricated here.
+    std::optional<std::string> style_id;
     std::optional<BasicParagraphAlignment> alignment;
     std::optional<std::int32_t> left_indent_twips;
     std::optional<std::int32_t> right_indent_twips;
@@ -706,9 +754,9 @@ public:
     // by this writer when every package part and document structure is covered
     // by the current semantic regeneration path. This is stricter than
     // basic_body_text_patch: an extra/custom part, relationship, setting,
-    // style, section property, table, drawing, equation, or numbering part
-    // makes the answer false so callers never infer rewrite safety merely from
-    // a simple-looking body.
+    // unsupported or extra style definition, section property, table,
+    // drawing, equation, or numbering part makes the answer false so callers
+    // never infer rewrite safety merely from a simple-looking body.
     [[nodiscard]] bool isCanonicalRegeneratableSimplePackage(
         const DocumentDefaults& regeneration_defaults) const noexcept;
     [[nodiscard]] bool dirty() const noexcept;

@@ -10,9 +10,12 @@
 #include <QStringList>
 #include <QTextBoundaryFinder>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
+#include <limits>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -195,6 +198,750 @@ int main(int argc, char** argv) {
         {{"scope", "blocks"}, {"blockIds", {"not-a-node-id"}}},
         QStringLiteral("invalid stable ID"),
         "read silently ignored an invalid stable block ID");
+
+    const auto toolDefinitions =
+        docxstudio::codex::editorV1ToolDefinitions();
+    const auto previewDefinition = std::find_if(
+        toolDefinitions.begin(), toolDefinitions.end(), [](const auto& tool) {
+            return tool.name == docxstudio::codex::kEditorPreviewTool;
+        });
+    check(previewDefinition != toolDefinitions.end(),
+          "editor tool catalog omitted the preview tool");
+    const auto& styleIdSchema = previewDefinition->inputSchema
+                                    .at("$defs")
+                                    .at("paragraphStyle")
+                                    .at("properties")
+                                    .at("styleId");
+    check(styleIdSchema.at("oneOf").size() == 2 &&
+              styleIdSchema.at("oneOf").at(0).at("maxLength") == 1024 &&
+              styleIdSchema.at("oneOf").at(1).at("type") == "null" &&
+              docxstudio::codex::kEditorToolCatalogVersion ==
+                  "editor.v1.catalog.6",
+          "editor tool schema does not advertise bounded style set/clear");
+    check(previewDefinition->inputSchema.dump().find(
+              "insert_excalidraw_figure") != std::string::npos &&
+              previewDefinition->inputSchema.dump().find(
+              "replace_excalidraw_figure") != std::string::npos,
+          "editor tool schema omitted editable Excalidraw operations");
+    check(previewDefinition->inputSchema.dump().find("insert_image") ==
+              std::string::npos,
+          "editor tool schema advertises unavailable image insertion");
+
+    auto headingParagraph = docxstudio::core::Paragraph::restore(
+        u"Built-in heading", docxstudio::core::NodeId{701, 702}, {},
+        std::string("Heading2"));
+    auto customStyleParagraph = docxstudio::core::Paragraph::restore(
+        u"Imported custom", docxstudio::core::NodeId{703, 704}, {},
+        std::string("Firm.Custom-β"));
+    auto plainParagraph = docxstudio::core::Paragraph::restore(
+        u"Plain paragraph", docxstudio::core::NodeId{705, 706}, {});
+    check(headingParagraph && customStyleParagraph && plainParagraph,
+          "could not create editor style-read paragraphs");
+    auto styleReadDocument = docxstudio::core::Document::create(
+        {std::move(headingParagraph.value()),
+         std::move(customStyleParagraph.value()),
+         std::move(plainParagraph.value())});
+    check(static_cast<bool>(styleReadDocument),
+          "could not create editor style-read document");
+    docxstudio::app::DocumentCanvas styleReadCanvas(spelling);
+    styleReadCanvas.setDocument(std::move(styleReadDocument.value()));
+    const auto styleReadSnapshot = styleReadCanvas.snapshot();
+    const auto styleRead = docxstudio::app::invokeEditorTool(
+        styleReadCanvas, documentId, readTool,
+        {{"documentId", documentId.toStdString()},
+         {"expectedRevision", styleReadSnapshot.revision.value()},
+         {"scope", "document"},
+         {"includeFormatting", false}},
+        summary, error);
+    check(error.isEmpty() && styleRead.at("blocks").size() == 3,
+          "semantic style document read failed");
+    const auto& headingAttributes =
+        styleRead.at("blocks").at(0).at("attributes");
+    const auto& customAttributes =
+        styleRead.at("blocks").at(1).at("attributes");
+    const auto& plainAttributes =
+        styleRead.at("blocks").at(2).at("attributes");
+    check(headingAttributes.at("styleId") == "Heading2" &&
+              headingAttributes.at("styleDisplayName") == "Heading 2" &&
+              headingAttributes.at("outlineLevel") == 1,
+          "editor read omitted recognized paragraph-style metadata");
+    check(customAttributes.at("styleId") == "Firm.Custom-β" &&
+              !customAttributes.contains("styleDisplayName") &&
+              !customAttributes.contains("outlineLevel"),
+          "editor read remapped or embellished an unknown custom style ID");
+    check(!plainAttributes.contains("styleId") &&
+              !plainAttributes.contains("styleDisplayName") &&
+              !plainAttributes.contains("outlineLevel"),
+          "editor read invented style metadata for an unstyled paragraph");
+
+    const auto outlineStyleRead = docxstudio::app::invokeEditorTool(
+        styleReadCanvas, documentId, readTool,
+        {{"documentId", documentId.toStdString()},
+         {"expectedRevision", styleReadSnapshot.revision.value()},
+         {"scope", "outline"},
+         {"includeFormatting", false}},
+        summary, error);
+    check(error.isEmpty() &&
+              outlineStyleRead.at("blocks").at(0).at("attributes")
+                  .at("styleId") == "Heading2" &&
+              outlineStyleRead.at("blocks").at(0).at("attributes")
+                  .at("outlineLevel") == 1 &&
+              outlineStyleRead.at("blocks").at(1).at("attributes")
+                  .at("styleId") == "Firm.Custom-β",
+          "outline read omitted semantic paragraph-style metadata");
+
+    const QString previewTool = QString::fromLatin1(
+        docxstudio::codex::kEditorPreviewTool.data(),
+        static_cast<qsizetype>(
+            docxstudio::codex::kEditorPreviewTool.size()));
+    docxstudio::app::DocumentCanvas styleMutationCanvas(spelling);
+    styleMutationCanvas.insertText(QStringLiteral("Heading candidate"));
+    styleMutationCanvas.markSaved();
+    const auto styleBase = styleMutationCanvas.snapshot();
+    const auto styleBlockId =
+        styleBase.document.paragraphs().front().id().toString();
+    const auto headingPreview = docxstudio::app::invokeEditorTool(
+        styleMutationCanvas, documentId, previewTool,
+        {{"documentId", documentId.toStdString()},
+         {"baseRevision", styleBase.revision.value()},
+         {"summary", "Apply Heading 1"},
+         {"operations",
+          {{{"kind", "set_paragraph_style"},
+            {"target", {{"blockId", styleBlockId}, {"start", 0}}},
+            {"style",
+             {{"styleId", "Heading1"}, {"alignment", "right"}}}}}}},
+        summary, error);
+    check(error.isEmpty() && !headingPreview.empty() &&
+              styleMutationCanvas.hasPreview(),
+          "recognized paragraph style preview was rejected");
+    const auto beforeHeadingAccept = styleMutationCanvas.snapshot();
+    check(beforeHeadingAccept.revision == styleBase.revision &&
+              !beforeHeadingAccept.document.paragraphs().front().styleId() &&
+              beforeHeadingAccept.document.paragraphs().front()
+                  .format().empty(),
+          "paragraph style preview changed the authoritative document");
+    check(styleMutationCanvas.acceptPreview(error),
+          "recognized paragraph style preview could not be accepted");
+    const auto styledSnapshot = styleMutationCanvas.snapshot();
+    const auto& styledParagraph = styledSnapshot.document.paragraphs().front();
+    check(styledSnapshot.revision.value() == styleBase.revision.value() + 1 &&
+              styledParagraph.styleId() ==
+                  std::optional<std::string>("Heading1") &&
+              styledParagraph.format().alignment ==
+                  docxstudio::core::ParagraphAlignment::right &&
+              styledParagraph.format().space_before_emu == 152400 &&
+              styledParagraph.format().space_after_emu == 76200 &&
+              styledParagraph.characterFormatAt(1).bold == true &&
+              styledParagraph.characterFormatAt(1)
+                      .font_size_half_points == 32 &&
+              styledParagraph.paragraphMarkCharacterFormat().bold == true &&
+              styledParagraph.styleProvenance() &&
+              styledParagraph.styleProvenance()
+                  ->paragraph_overrides.alignment &&
+              styleMutationCanvas.hasNonTextChanges(),
+          "recognized paragraph style did not apply identity, baseline, and explicit override atomically");
+    styleMutationCanvas.undo();
+    const auto headingUndone = styleMutationCanvas.snapshot();
+    check(!headingUndone.document.paragraphs().front().styleId() &&
+              headingUndone.document.paragraphs().front().format().empty() &&
+              headingUndone.document.paragraphs().front()
+                  .characterFormats().empty() &&
+              headingUndone.document.paragraphs().front()
+                  .paragraphMarkCharacterFormat().empty(),
+          "paragraph style acceptance was not one undo transaction");
+
+    const auto formattingOnlyBase = styleMutationCanvas.snapshot();
+    const auto formattingOnlyPreview =
+        docxstudio::app::invokeEditorTool(
+            styleMutationCanvas, documentId, previewTool,
+            {{"documentId", documentId.toStdString()},
+             {"baseRevision", formattingOnlyBase.revision.value()},
+             {"summary", "Center the paragraph"},
+             {"operations",
+              {{{"kind", "set_paragraph_style"},
+                {"target", {{"blockId", styleBlockId}, {"start", 0}}},
+                {"style", {{"alignment", "center"}}}}}}},
+            summary, error);
+    check(error.isEmpty() && !formattingOnlyPreview.empty() &&
+              styleMutationCanvas.acceptPreview(error),
+          "legacy formatting-only paragraph-style operation regressed");
+    const auto formattingOnlyApplied = styleMutationCanvas.snapshot();
+    check(formattingOnlyApplied.document.paragraphs().front().styleId() ==
+                  std::optional<std::string>{"Normal"} &&
+              formattingOnlyApplied.document.paragraphs().front()
+                  .styleProvenance() &&
+              formattingOnlyApplied.document.paragraphs().front()
+                      .format().alignment ==
+                  docxstudio::core::ParagraphAlignment::center,
+          "formatting-only paragraph style did not atomically initialize Normal provenance");
+    styleMutationCanvas.undo();
+    check(!styleMutationCanvas.snapshot().document.paragraphs().front()
+                   .styleId() &&
+              !styleMutationCanvas.snapshot().document.paragraphs().front()
+                   .styleProvenance(),
+          "undo did not restore the implicit Normal paragraph identity");
+
+    const auto customBase = styleMutationCanvas.snapshot();
+    const auto customPreview = docxstudio::app::invokeEditorTool(
+        styleMutationCanvas, documentId, previewTool,
+        {{"documentId", documentId.toStdString()},
+         {"baseRevision", customBase.revision.value()},
+         {"summary", "Retain an imported custom style"},
+         {"operations",
+          {{{"kind", "set_paragraph_style"},
+            {"target", {{"blockId", styleBlockId}, {"start", 0}}},
+            {"style", {{"styleId", "Firm.Custom-β"}}}}}}},
+        summary, error);
+    check(error.isEmpty() && !customPreview.empty() &&
+              styleMutationCanvas.acceptPreview(error),
+          "unknown custom paragraph-style identity was rejected");
+    const auto customStyled = styleMutationCanvas.snapshot();
+    check(customStyled.document.paragraphs().front().styleId() ==
+              std::optional<std::string>("Firm.Custom-β") &&
+              customStyled.document.paragraphs().front().format().empty() &&
+              customStyled.document.paragraphs().front()
+                  .characterFormats().empty(),
+          "unknown custom style ID was remapped or given invented formatting");
+
+    const auto clearBase = styleMutationCanvas.snapshot();
+    const auto clearPreview = docxstudio::app::invokeEditorTool(
+        styleMutationCanvas, documentId, previewTool,
+        {{"documentId", documentId.toStdString()},
+         {"baseRevision", clearBase.revision.value()},
+         {"summary", "Clear the paragraph style identity"},
+         {"operations",
+          {{{"kind", "set_paragraph_style"},
+            {"target", {{"blockId", styleBlockId}, {"start", 0}}},
+            {"style", {{"styleId", nullptr}}}}}}},
+        summary, error);
+    check(error.isEmpty() && !clearPreview.empty() &&
+              styleMutationCanvas.snapshot().document.paragraphs().front()
+                      .styleId() ==
+                  std::optional<std::string>("Firm.Custom-β") &&
+              styleMutationCanvas.acceptPreview(error) &&
+              !styleMutationCanvas.snapshot().document.paragraphs().front()
+                   .styleId(),
+          "paragraph-style clear was not previewed and applied safely");
+    styleMutationCanvas.undo();
+    check(styleMutationCanvas.snapshot().document.paragraphs().front()
+              .styleId() ==
+              std::optional<std::string>("Firm.Custom-β"),
+          "paragraph-style clear was not one undo transaction");
+
+    const auto expectRejectedStyleId =
+        [&](const docxstudio::codex::Json& styleId,
+            const QString& expectedError, const char* failureMessage) {
+            const auto rejected = docxstudio::app::invokeEditorTool(
+                styleMutationCanvas, documentId, previewTool,
+                {{"documentId", documentId.toStdString()},
+                 {"baseRevision",
+                  styleMutationCanvas.snapshot().revision.value()},
+                 {"summary", "Reject malformed paragraph style"},
+                 {"operations",
+                  {{{"kind", "set_paragraph_style"},
+                    {"target",
+                     {{"blockId", styleBlockId}, {"start", 0}}},
+                    {"style", {{"styleId", styleId}}}}}}},
+                summary, error);
+            check(rejected.empty() && error.contains(expectedError),
+                  failureMessage);
+        };
+    expectRejectedStyleId(
+        "", QStringLiteral("cannot be empty"),
+        "editor preview accepted an empty paragraph-style ID");
+    expectRejectedStyleId(
+        "Heading\n1", QStringLiteral("valid visible UTF-8"),
+        "editor preview accepted a control character in a paragraph-style ID");
+    expectRejectedStyleId(
+        std::string(docxstudio::core::kMaximumParagraphStyleIdBytes + 1U,
+                    'x'),
+        QStringLiteral("size limit"),
+        "editor preview accepted an oversized paragraph-style ID");
+    expectRejectedStyleId(
+        42, QStringLiteral("string or null"),
+        "editor preview accepted a non-string paragraph-style ID");
+
+    const auto expectRejectedParagraphStyle =
+        [&](docxstudio::codex::Json style, const QString& expectedError,
+            const char* failureMessage) {
+            error.clear();
+            const auto beforeRejection = styleMutationCanvas.snapshot();
+            const auto rejected = docxstudio::app::invokeEditorTool(
+                styleMutationCanvas, documentId, previewTool,
+                {{"documentId", documentId.toStdString()},
+                 {"baseRevision", beforeRejection.revision.value()},
+                 {"summary", "Reject malformed paragraph formatting"},
+                 {"operations",
+                  {{{"kind", "set_paragraph_style"},
+                    {"target",
+                     {{"blockId", styleBlockId}, {"start", 0}}},
+                    {"style", std::move(style)}}}}},
+                summary, error);
+            check(rejected.empty() && error.contains(expectedError) &&
+                      !styleMutationCanvas.hasPreview() &&
+                      styleMutationCanvas.snapshot().revision ==
+                          beforeRejection.revision,
+                  failureMessage);
+        };
+    expectRejectedParagraphStyle(
+        {{"styleId", "Heading1"}, {"mysteryProperty", true}},
+        QStringLiteral("unsupported property"),
+        "editor preview accepted an unknown paragraph-style property");
+    expectRejectedParagraphStyle(
+        {{"styleId", "Heading1"}, {"alignment", 7}},
+        QStringLiteral("alignment must be a string"),
+        "editor preview accepted a non-string paragraph alignment");
+    expectRejectedParagraphStyle(
+        {{"styleId", "Heading1"}, {"alignment", "distributed"}},
+        QStringLiteral("left, center, right, or justify"),
+        "editor preview mapped an unknown paragraph alignment to left");
+    expectRejectedParagraphStyle(
+        {{"styleId", "Heading1"}, {"lineSpacing", "single"}},
+        QStringLiteral("lineSpacing must be a number"),
+        "editor preview ignored a non-number line spacing");
+    expectRejectedParagraphStyle(
+        {{"styleId", "Heading1"},
+         {"lineSpacing", std::numeric_limits<double>::quiet_NaN()}},
+        QStringLiteral("lineSpacing is outside"),
+        "editor preview accepted non-finite line spacing");
+    expectRejectedParagraphStyle(
+        {{"styleId", "Heading1"}, {"lineSpacing", 20.01}},
+        QStringLiteral("lineSpacing is outside"),
+        "editor preview accepted line spacing above its schema maximum");
+    expectRejectedParagraphStyle(
+        {{"styleId", "Heading1"}, {"spaceBeforePoints", -0.5}},
+        QStringLiteral("spaceBeforePoints is outside"),
+        "editor preview accepted negative space-before formatting");
+    expectRejectedParagraphStyle(
+        {{"styleId", "Heading1"}, {"spaceBeforePoints", 10000.01}},
+        QStringLiteral("spaceBeforePoints is outside"),
+        "editor preview accepted space-before above its schema maximum");
+    expectRejectedParagraphStyle(
+        {{"styleId", "Heading1"},
+         {"spaceAfterPoints", std::numeric_limits<double>::infinity()}},
+        QStringLiteral("spaceAfterPoints is outside"),
+        "editor preview accepted non-finite space-after formatting");
+    expectRejectedParagraphStyle(
+        {{"styleId", "Heading1"}, {"spaceAfterPoints", "12"}},
+        QStringLiteral("spaceAfterPoints must be a number"),
+        "editor preview ignored a non-number space-after value");
+    expectRejectedParagraphStyle(
+        {{"styleId", "Heading1"}, {"keepWithNext", 0}},
+        QStringLiteral("keepWithNext must be a boolean"),
+        "editor preview ignored a non-boolean keep-with-next value");
+
+    {
+        docxstudio::app::DocumentCanvas implicitNormalCanvas(spelling);
+        implicitNormalCanvas.insertText(QStringLiteral("Implicit Normal"));
+        const auto implicitBase = implicitNormalCanvas.snapshot();
+        const auto implicitBlockId =
+            implicitBase.document.paragraphs().front().id().toString();
+        check(!implicitBase.document.paragraphs().front().styleId() &&
+                  !implicitBase.document.paragraphs().front()
+                       .styleProvenance(),
+              "implicit-Normal Codex fixture unexpectedly had style provenance");
+
+        const auto explicitNormalPreview =
+            docxstudio::app::invokeEditorTool(
+                implicitNormalCanvas, documentId, previewTool,
+                {{"documentId", documentId.toStdString()},
+                 {"baseRevision", implicitBase.revision.value()},
+                 {"summary", "Assign explicit Normal identity"},
+                 {"operations",
+                  {{{"kind", "set_paragraph_style"},
+                    {"target",
+                     {{"blockId", implicitBlockId}, {"start", 0}}},
+                    {"style", {{"styleId", "Normal"}}}}}}},
+                summary, error);
+        check(error.isEmpty() && !explicitNormalPreview.empty() &&
+                  implicitNormalCanvas.acceptPreview(error),
+              "Codex could not assign explicit Normal identity");
+        const auto explicitNormalSnapshot = implicitNormalCanvas.snapshot();
+        check(explicitNormalSnapshot.document.paragraphs().front().styleId() ==
+                      std::optional<std::string>{"Normal"} &&
+                  !explicitNormalSnapshot.document.paragraphs().front()
+                       .styleProvenance(),
+              "identity-only Normal request created meaningless provenance");
+
+        const auto explicitClearPreview =
+            docxstudio::app::invokeEditorTool(
+                implicitNormalCanvas, documentId, previewTool,
+                {{"documentId", documentId.toStdString()},
+                 {"baseRevision", explicitNormalSnapshot.revision.value()},
+                 {"summary", "Keep body paragraph separate from the next"},
+                 {"operations",
+                  {{{"kind", "set_paragraph_style"},
+                    {"target",
+                     {{"blockId", implicitBlockId}, {"start", 0}}},
+                    {"style", {{"keepWithNext", false}}}}}}},
+                summary, error);
+        check(error.isEmpty() && !explicitClearPreview.empty() &&
+                  implicitNormalCanvas.acceptPreview(error),
+              "formatting-only Codex request did not initialize Normal provenance");
+        const auto implicitStyled = implicitNormalCanvas.snapshot();
+        const auto& explicitNormal =
+            implicitStyled.document.paragraphs().front();
+        check(explicitNormal.styleId() ==
+                      std::optional<std::string>{"Normal"} &&
+                  explicitNormal.styleProvenance() &&
+                  explicitNormal.styleProvenance()
+                      ->paragraph_overrides.keep_with_next &&
+                  explicitNormal.format().keep_with_next == false,
+              "equal-to-Normal explicit override was not recorded as direct");
+
+        const auto headingAfterClear =
+            docxstudio::app::invokeEditorTool(
+                implicitNormalCanvas, documentId, previewTool,
+                {{"documentId", documentId.toStdString()},
+                 {"baseRevision", implicitStyled.revision.value()},
+                 {"summary", "Apply Heading 1 without changing the override"},
+                 {"operations",
+                  {{{"kind", "set_paragraph_style"},
+                    {"target",
+                     {{"blockId", implicitBlockId}, {"start", 0}}},
+                    {"style", {{"styleId", "Heading1"}}}}}}},
+                summary, error);
+        check(error.isEmpty() && !headingAfterClear.empty() &&
+                  implicitNormalCanvas.acceptPreview(error),
+              "Codex could not transition provenance-initialized Normal to Heading 1");
+        const auto headingWithClearSnapshot = implicitNormalCanvas.snapshot();
+        const auto& headingWithClear =
+            headingWithClearSnapshot.document.paragraphs().front();
+        check(headingWithClear.styleId() ==
+                      std::optional<std::string>{"Heading1"} &&
+                  headingWithClear.format().keep_with_next == false &&
+                  headingWithClear.styleProvenance() &&
+                  headingWithClear.styleProvenance()
+                      ->paragraph_overrides.keep_with_next &&
+                  headingWithClear.format().space_before_emu == 152400 &&
+                  headingWithClear.characterFormatAt(1).bold == true,
+              "later style transition erased an equal-to-baseline Codex override");
+    }
+
+    {
+        docxstudio::app::DocumentCanvas directTextCanvas(spelling);
+        directTextCanvas.insertText(QStringLiteral("Plain text"));
+        const auto directTextBase = directTextCanvas.snapshot();
+        const auto directTextBlockId =
+            directTextBase.document.paragraphs().front().id().toString();
+        const auto directTextPreview = docxstudio::app::invokeEditorTool(
+            directTextCanvas, documentId, previewTool,
+            {{"documentId", documentId.toStdString()},
+             {"baseRevision", directTextBase.revision.value()},
+             {"summary", "Keep explicit body text formatting"},
+             {"operations",
+              {{{"kind", "set_text_style"},
+                {"target",
+                 {{"blockId", directTextBlockId},
+                  {"start", 0},
+                  {"end", 10}}},
+                {"style",
+                 {{"bold", false},
+                  {"foregroundColor", "#000000"}}}}}}},
+            summary, error);
+        check(error.isEmpty() && !directTextPreview.empty() &&
+                  directTextCanvas.acceptPreview(error),
+              "direct text formatting did not initialize implicit Normal provenance");
+        const auto directTextStyled = directTextCanvas.snapshot();
+        const auto& directNormal =
+            directTextStyled.document.paragraphs().front();
+        const auto directMask = directNormal.styleOverrideMaskAt(1);
+        check(directNormal.styleId() ==
+                      std::optional<std::string>{"Normal"} &&
+                  directNormal.styleProvenance() && directMask.bold &&
+                  directMask.foreground_argb &&
+                  directNormal.characterFormatAt(1).bold == false &&
+                  directNormal.characterFormatAt(1).foreground_argb ==
+                      0xff000000U,
+              "equal-to-Normal text properties were not recorded as direct");
+
+        const auto directHeadingPreview =
+            docxstudio::app::invokeEditorTool(
+                directTextCanvas, documentId, previewTool,
+                {{"documentId", documentId.toStdString()},
+                 {"baseRevision", directTextStyled.revision.value()},
+                 {"summary", "Apply Heading 1 around direct text formatting"},
+                 {"operations",
+                  {{{"kind", "set_paragraph_style"},
+                    {"target",
+                     {{"blockId", directTextBlockId}, {"start", 0}}},
+                    {"style", {{"styleId", "Heading1"}}}}}}},
+                summary, error);
+        check(error.isEmpty() && !directHeadingPreview.empty() &&
+                  directTextCanvas.acceptPreview(error),
+              "Codex could not style direct text after lazy provenance initialization");
+        const auto directHeadingSnapshot = directTextCanvas.snapshot();
+        const auto& directHeading =
+            directHeadingSnapshot.document.paragraphs().front();
+        check(directHeading.characterFormatAt(1).bold == false &&
+                  directHeading.characterFormatAt(1).foreground_argb ==
+                      0xff000000U &&
+                  directHeading.characterFormatAt(1)
+                          .font_size_half_points == 32,
+              "Heading transition erased explicit black/bold-off text formatting");
+    }
+
+    {
+        docxstudio::app::DocumentCanvas replacementDirectCanvas(spelling);
+        replacementDirectCanvas.insertText(QStringLiteral("AoldZ"));
+        const auto replacementDirectBase =
+            replacementDirectCanvas.snapshot();
+        const auto replacementDirectBlockId =
+            replacementDirectBase.document.paragraphs().front().id()
+                .toString();
+        const auto directSourcePreview =
+            docxstudio::app::invokeEditorTool(
+                replacementDirectCanvas, documentId, previewTool,
+                {{"documentId", documentId.toStdString()},
+                 {"baseRevision", replacementDirectBase.revision.value()},
+                 {"summary", "Keep replacement source explicitly plain"},
+                 {"operations",
+                  {{{"kind", "set_text_style"},
+                    {"target",
+                     {{"blockId", replacementDirectBlockId},
+                      {"start", 1},
+                      {"end", 4}}},
+                    {"style",
+                     {{"bold", false},
+                      {"foregroundColor", "#000000"}}}}}}},
+                summary, error);
+        check(error.isEmpty() && !directSourcePreview.empty() &&
+                  replacementDirectCanvas.acceptPreview(error),
+              "could not create an explicitly black/bold-off replacement source");
+        const auto directSourceSnapshot =
+            replacementDirectCanvas.snapshot();
+        const auto& directSource =
+            directSourceSnapshot.document.paragraphs().front();
+        check(directSource.styleOverrideMaskAt(1).empty() &&
+                  directSource.styleOverrideMaskAt(2).bold &&
+                  directSource.styleOverrideMaskAt(2).foreground_argb &&
+                  directSource.styleOverrideMaskAt(5).empty(),
+              "replacement fixture did not isolate direct source provenance");
+
+        const auto directReplacementPreview =
+            docxstudio::app::invokeEditorTool(
+                replacementDirectCanvas, documentId, previewTool,
+                {{"documentId", documentId.toStdString()},
+                 {"baseRevision", directSourceSnapshot.revision.value()},
+                 {"summary", "Replace only the explicitly plain span"},
+                 {"operations",
+                  {{{"kind", "replace_text"},
+                    {"target",
+                     {{"blockId", replacementDirectBlockId},
+                      {"start", 1},
+                      {"end", 4}}},
+                    {"text", "new"}}}}},
+                summary, error);
+        check(error.isEmpty() && !directReplacementPreview.empty() &&
+                  replacementDirectCanvas.acceptPreview(error),
+              "Codex could not replace a partial direct-format span");
+        const auto replacedDirectSnapshot =
+            replacementDirectCanvas.snapshot();
+        const auto& replacedDirect =
+            replacedDirectSnapshot.document.paragraphs().front();
+        check(paragraphText(replacementDirectCanvas) ==
+                      QStringLiteral("AnewZ") &&
+                  replacedDirect.styleOverrideMaskAt(1).empty() &&
+                  replacedDirect.styleOverrideMaskAt(2).bold &&
+                  replacedDirect.styleOverrideMaskAt(2).foreground_argb &&
+                  replacedDirect.styleOverrideMaskAt(4).bold &&
+                  replacedDirect.styleOverrideMaskAt(4).foreground_argb &&
+                  replacedDirect.styleOverrideMaskAt(5).empty(),
+              "Codex partial replacement lost or spread source directness");
+
+        const auto replacementHeadingPreview =
+            docxstudio::app::invokeEditorTool(
+                replacementDirectCanvas, documentId, previewTool,
+                {{"documentId", documentId.toStdString()},
+                 {"baseRevision", replacedDirectSnapshot.revision.value()},
+                 {"summary", "Apply Heading 1 after the partial replacement"},
+                 {"operations",
+                  {{{"kind", "set_paragraph_style"},
+                    {"target",
+                     {{"blockId", replacementDirectBlockId},
+                      {"start", 0}}},
+                    {"style", {{"styleId", "Heading1"}}}}}}},
+                summary, error);
+        check(error.isEmpty() && !replacementHeadingPreview.empty() &&
+                  replacementDirectCanvas.acceptPreview(error),
+              "Codex could not style the paragraph after a partial replacement");
+        const auto replacementHeadingSnapshot =
+            replacementDirectCanvas.snapshot();
+        const auto& replacementHeading =
+            replacementHeadingSnapshot.document.paragraphs().front();
+        check(replacementHeading.characterFormatAt(1).bold == true &&
+                  replacementHeading.characterFormatAt(1).foreground_argb ==
+                      0xffe95420U &&
+                  replacementHeading.characterFormatAt(2).bold == false &&
+                  replacementHeading.characterFormatAt(2).foreground_argb ==
+                      0xff000000U &&
+                  replacementHeading.characterFormatAt(5).bold == true &&
+                  replacementHeading.characterFormatAt(5).foreground_argb ==
+                      0xffe95420U,
+              "style transition erased replacement directness or changed adjacent inheritance");
+    }
+
+    {
+        auto customParagraph = docxstudio::core::Paragraph::restore(
+            u"Custom", docxstudio::core::NodeId::generate(), {},
+            std::string{"Firm.Custom"});
+        check(static_cast<bool>(customParagraph),
+              "could not create provenance-free custom style fixture");
+        auto customDocument = docxstudio::core::Document::create(
+            {std::move(customParagraph.value())});
+        check(static_cast<bool>(customDocument),
+              "could not create custom style document");
+        docxstudio::app::DocumentCanvas customDirectCanvas(spelling);
+        customDirectCanvas.setDocument(std::move(customDocument.value()));
+        const auto customDirectBase = customDirectCanvas.snapshot();
+        const auto customDirectBlockId =
+            customDirectBase.document.paragraphs().front().id().toString();
+        const auto customDirectPreview = docxstudio::app::invokeEditorTool(
+            customDirectCanvas, documentId, previewTool,
+            {{"documentId", documentId.toStdString()},
+             {"baseRevision", customDirectBase.revision.value()},
+             {"summary", "Format custom-style text"},
+             {"operations",
+              {{{"kind", "set_text_style"},
+                {"target",
+                 {{"blockId", customDirectBlockId},
+                  {"start", 0},
+                  {"end", 6}}},
+                {"style", {{"bold", false}}}}}}},
+            summary, error);
+        check(error.isEmpty() && !customDirectPreview.empty() &&
+                  customDirectCanvas.acceptPreview(error) &&
+                  customDirectCanvas.snapshot().document.paragraphs().front()
+                          .styleId() ==
+                      std::optional<std::string>{"Firm.Custom"} &&
+                  !customDirectCanvas.snapshot().document.paragraphs().front()
+                       .styleProvenance(),
+              "direct formatting invented provenance for an unknown custom style");
+    }
+
+    const auto staleStyle = docxstudio::app::invokeEditorTool(
+        styleMutationCanvas, documentId, previewTool,
+        {{"documentId", documentId.toStdString()},
+         {"baseRevision", customBase.revision.value()},
+         {"summary", "Reject stale style change"},
+         {"operations",
+          {{{"kind", "set_paragraph_style"},
+            {"target", {{"blockId", styleBlockId}, {"start", 0}}},
+            {"style", {{"styleId", "Heading3"}}}}}}},
+        summary, error);
+    check(staleStyle.empty() &&
+              error.contains(QStringLiteral("REVISION_CONFLICT")),
+          "stale paragraph-style preview did not report a revision conflict");
+
+    auto preservedStyleParagraph = docxstudio::core::Paragraph::create(
+        u"Red inherited");
+    check(static_cast<bool>(preservedStyleParagraph),
+          "could not create Codex style-preservation paragraph");
+    auto preservedStyleDocument = docxstudio::core::Document::create(
+        {std::move(preservedStyleParagraph.value())});
+    check(static_cast<bool>(preservedStyleDocument),
+          "could not create Codex style-preservation document");
+    const auto preservedStyleId =
+        preservedStyleDocument.value().paragraphs().front().id();
+    docxstudio::core::CharacterFormatDelta directRed;
+    directRed.foreground_argb =
+        docxstudio::core::PropertyDelta<std::uint32_t>::set(0xffcc0000U);
+    check(static_cast<bool>(preservedStyleDocument.value().applyCharacterFormat(
+              {{preservedStyleId, 0}, {preservedStyleId, 3}}, directRed)),
+          "could not create a direct red span for Codex style testing");
+
+    docxstudio::app::DocumentCanvas preservedStyleCanvas(spelling);
+    preservedStyleCanvas.setEditorDefaults(
+        QStringLiteral("DejaVu Sans"), 13.5, 4);
+    preservedStyleCanvas.setDocument(
+        std::move(preservedStyleDocument.value()));
+    const auto preservedStyleBlockId = preservedStyleId.toString();
+    const auto invokeAndAcceptStyle =
+        [&](const std::string& styleId,
+            const char* failureMessage) {
+            error.clear();
+            const auto beforeStylePreview = preservedStyleCanvas.snapshot();
+            const auto preview = docxstudio::app::invokeEditorTool(
+                preservedStyleCanvas, documentId, previewTool,
+                {{"documentId", documentId.toStdString()},
+                 {"baseRevision", beforeStylePreview.revision.value()},
+                 {"summary", "Apply a native paragraph style"},
+                 {"operations",
+                  {{{"kind", "set_paragraph_style"},
+                    {"target",
+                     {{"blockId", preservedStyleBlockId}, {"start", 0}}},
+                    {"style", {{"styleId", styleId}}}}}}},
+                summary, error);
+            check(error.isEmpty() && !preview.empty() &&
+                      preservedStyleCanvas.acceptPreview(error),
+                  failureMessage);
+        };
+
+    invokeAndAcceptStyle(
+        "Heading1",
+        "Codex could not apply a provenance-aware Heading 1 style");
+    const auto headingThroughCodex = preservedStyleCanvas.snapshot();
+    const auto& headingThroughCodexParagraph =
+        headingThroughCodex.document.paragraphs().front();
+    check(headingThroughCodexParagraph.styleId() ==
+                  std::optional<std::string>{"Heading1"} &&
+              headingThroughCodexParagraph.characterFormatAt(1)
+                      .foreground_argb == 0xffcc0000U &&
+              headingThroughCodexParagraph.characterFormatAt(1).bold == true &&
+              headingThroughCodexParagraph.characterFormatAt(5)
+                      .foreground_argb == 0xffe95420U &&
+              headingThroughCodexParagraph.characterFormatAt(5).bold == true &&
+              headingThroughCodexParagraph.characterFormatAt(5)
+                      .font_size_half_points == 32,
+          "Codex style application clobbered a direct span or skipped inherited Heading 1 properties");
+
+    invokeAndAcceptStyle(
+        "Normal",
+        "Codex could not return a styled paragraph to configured Normal defaults");
+    const auto normalThroughCodex = preservedStyleCanvas.snapshot();
+    const auto& normalThroughCodexParagraph =
+        normalThroughCodex.document.paragraphs().front();
+    check(normalThroughCodexParagraph.styleId() ==
+                  std::optional<std::string>{"Normal"} &&
+              normalThroughCodexParagraph.characterFormatAt(1)
+                      .foreground_argb == 0xffcc0000U &&
+              normalThroughCodexParagraph.characterFormatAt(1).font_family ==
+                  std::optional<std::string>{"DejaVu Sans"} &&
+              normalThroughCodexParagraph.characterFormatAt(1)
+                      .font_size_half_points == 27 &&
+              normalThroughCodexParagraph.characterFormatAt(1).bold == false &&
+              normalThroughCodexParagraph.characterFormatAt(5)
+                      .foreground_argb == 0xff000000U &&
+              normalThroughCodexParagraph.characterFormatAt(5).font_family ==
+                  std::optional<std::string>{"DejaVu Sans"} &&
+              normalThroughCodexParagraph.characterFormatAt(5)
+                      .font_size_half_points == 27 &&
+              normalThroughCodexParagraph.characterFormatAt(5).bold == false,
+          "Codex Normal style lost a direct color or ignored configured font defaults");
+
+    invokeAndAcceptStyle(
+        "NoSpacing",
+        "Codex could not apply No Spacing with configured defaults");
+    const auto noSpacingThroughCodex = preservedStyleCanvas.snapshot();
+    const auto& noSpacingThroughCodexParagraph =
+        noSpacingThroughCodex.document.paragraphs().front();
+    check(noSpacingThroughCodexParagraph.styleId() ==
+                  std::optional<std::string>{"NoSpacing"} &&
+              noSpacingThroughCodexParagraph.characterFormatAt(1)
+                      .foreground_argb == 0xffcc0000U &&
+              noSpacingThroughCodexParagraph.characterFormatAt(1)
+                      .font_family ==
+                  std::optional<std::string>{"DejaVu Sans"} &&
+              noSpacingThroughCodexParagraph.characterFormatAt(1)
+                      .font_size_half_points == 27 &&
+              noSpacingThroughCodexParagraph.characterFormatAt(5)
+                      .foreground_argb == 0xff000000U &&
+              noSpacingThroughCodexParagraph.characterFormatAt(5)
+                      .font_family ==
+                  std::optional<std::string>{"DejaVu Sans"} &&
+              noSpacingThroughCodexParagraph.characterFormatAt(5)
+                      .font_size_half_points == 27,
+          "Codex No Spacing lost direct formatting or configured defaults");
 
     docxstudio::app::DocumentCanvas imageCanvas(spelling);
     imageCanvas.insertText(QStringLiteral("A"));

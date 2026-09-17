@@ -680,7 +680,8 @@ void testStylesThemesAndNativeNumberingImport(
         "<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">"
         "<w:body>"
         "<w:p><w:pPr><w:pStyle w:val=\"HeadingSample\"/>"
-        "<w:spacing w:after=\"40\"/></w:pPr>"
+        "<w:spacing w:after=\"40\"/><w:rPr><w:i w:val=\"0\"/>"
+        "</w:rPr></w:pPr>"
         "<w:r><w:rPr><w:rStyle w:val=\"EmphasisSample\"/></w:rPr>"
         "<w:t>Styled</w:t></w:r></w:p>"
         "<w:p><w:pPr><w:numPr><w:ilvl w:val=\"0\"/>"
@@ -719,7 +720,8 @@ void testStylesThemesAndNativeNumberingImport(
         "</w:style>"
         "<w:style w:type=\"paragraph\" w:styleId=\"HeadingSample\">"
         "<w:name w:val=\"Heading Sample\"/><w:basedOn w:val=\"Normal\"/>"
-        "<w:pPr><w:jc w:val=\"center\"/><w:keepNext/></w:pPr>"
+        "<w:pPr><w:jc w:val=\"center\"/><w:keepNext/>"
+        "<w:rPr><w:i/></w:rPr></w:pPr>"
         "<w:rPr><w:rFonts w:ascii=\"Fallback Serif\" "
         "w:hAnsi=\"Fallback Serif\" w:asciiTheme=\"majorHAnsi\" "
         "w:hAnsiTheme=\"majorHAnsi\"/><w:b/>"
@@ -792,6 +794,22 @@ void testStylesThemesAndNativeNumberingImport(
           "character style italic did not cascade into styled run");
     check(styled.runs[0].format.foreground_rgb == 0x00336699U,
           "theme color did not override its fallback value");
+    check(styled.style_provenance &&
+              styled.style_provenance->inherited_character_format
+                      .foreground_rgb == 0x00336699U &&
+              styled.style_provenance->inherited_character_format.italic ==
+                  std::nullopt &&
+              styled.style_provenance->inherited_paragraph_mark_format
+                      .italic == true &&
+              styled.style_provenance->inherited_alignment ==
+                  BasicParagraphAlignment::center &&
+              styled.style_provenance->direct_space_after_twips == 40 &&
+              styled.style_provenance->direct_paragraph_mark_format.italic ==
+                  false &&
+              styled.paragraph_mark_format &&
+              styled.paragraph_mark_format->italic == false &&
+              styled.runs[0].paragraph_style_overrides.italic == true,
+          "style import did not separate the resolved baseline from direct/character-style overrides");
 
     const auto& first = document->paragraphs()[1];
     const auto& second = document->paragraphs()[2];
@@ -811,6 +829,127 @@ void testStylesThemesAndNativeNumberingImport(
               first.runs[0].format.font_size_half_points == 20 &&
               first.runs[0].format.bold == false,
           "document defaults and explicit false style values were not inherited");
+
+    const auto cyclic_path = temporary.file("cyclic-style.docx");
+    const std::string cyclic_document =
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+        "<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">"
+        "<w:body><w:p><w:pPr><w:pStyle w:val=\"CycleA\"/></w:pPr>"
+        "<w:r><w:t>Cycle</w:t></w:r></w:p><w:sectPr/></w:body></w:document>";
+    createPackage(cyclic_path, cyclic_document);
+    const std::string cyclic_styles =
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+        "<w:styles xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">"
+        "<w:style w:type=\"paragraph\" w:styleId=\"CycleA\">"
+        "<w:basedOn w:val=\"CycleB\"/><w:rPr><w:color w:val=\"336699\"/>"
+        "</w:rPr></w:style>"
+        "<w:style w:type=\"paragraph\" w:styleId=\"CycleB\">"
+        "<w:basedOn w:val=\"CycleA\"/></w:style></w:styles>";
+    appendMembers(
+        cyclic_path,
+        {{"word/_rels/document.xml.rels", document_relationships},
+         {"word/styles-main.xml", cyclic_styles}});
+    auto cyclic = DocxDocument::open(cyclic_path, &error);
+    check(cyclic && cyclic->paragraphs().size() == 1 &&
+              cyclic->paragraphs()[0].style_id == "CycleA" &&
+              !cyclic->paragraphs()[0].style_provenance &&
+              !cyclic->paragraphs()[0].format_is_basic,
+          "cyclic paragraph style produced unsafe partial provenance");
+
+    const auto deep_path = temporary.file("deep-style-chain.docx");
+    const std::string deep_document =
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+        "<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">"
+        "<w:body>"
+        "<w:p><w:pPr><w:pStyle w:val=\"P69\"/></w:pPr>"
+        "<w:r><w:t>Deep paragraph</w:t></w:r></w:p>"
+        "<w:p><w:pPr><w:pStyle w:val=\"Normal\"/></w:pPr>"
+        "<w:r><w:rPr><w:rStyle w:val=\"C69\"/></w:rPr>"
+        "<w:t>Deep character</w:t></w:r></w:p>"
+        "<w:p><w:pPr><w:pStyle w:val=\"P62\"/></w:pPr>"
+        "<w:r><w:t>Bounded paragraph</w:t></w:r></w:p>"
+        "<w:p><w:pPr><w:pStyle w:val=\"Normal\"/></w:pPr>"
+        "<w:r><w:rPr><w:rStyle w:val=\"C63\"/></w:rPr>"
+        "<w:t>Bounded character</w:t></w:r></w:p>"
+        "<w:p><w:pPr><w:pStyle w:val=\"MissingP\"/></w:pPr>"
+        "<w:r><w:t>Missing paragraph</w:t></w:r></w:p>"
+        "<w:p><w:pPr><w:pStyle w:val=\"Normal\"/></w:pPr>"
+        "<w:r><w:rPr><w:rStyle w:val=\"MissingC\"/></w:rPr>"
+        "<w:t>Missing character</w:t></w:r></w:p>"
+        "<w:p><w:pPr><w:pStyle w:val=\"Normal\"/></w:pPr>"
+        "<w:r><w:rPr><w:rStyle w:val=\"CycleC1\"/></w:rPr>"
+        "<w:t>Cyclic character</w:t></w:r></w:p>"
+        "<w:sectPr/></w:body></w:document>";
+    createPackage(deep_path, deep_document);
+
+    std::string deep_styles =
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+        "<w:styles xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">"
+        "<w:style w:type=\"paragraph\" w:default=\"1\" w:styleId=\"Normal\">"
+        "<w:rPr><w:sz w:val=\"22\"/></w:rPr></w:style>";
+    for (std::size_t index = 0; index < 70; ++index) {
+        deep_styles +=
+            "<w:style w:type=\"paragraph\" w:styleId=\"P" +
+            std::to_string(index) + "\"><w:basedOn w:val=\"" +
+            (index == 0 ? std::string{"Normal"}
+                        : "P" + std::to_string(index - 1)) +
+            "\"/><w:rPr><w:b/></w:rPr></w:style>";
+    }
+    for (std::size_t index = 0; index < 70; ++index) {
+        deep_styles +=
+            "<w:style w:type=\"character\" w:styleId=\"C" +
+            std::to_string(index) + "\">" +
+            (index == 0
+                 ? std::string{}
+                 : "<w:basedOn w:val=\"C" +
+                       std::to_string(index - 1) + "\"/>") +
+            "<w:rPr><w:i/></w:rPr></w:style>";
+    }
+    deep_styles +=
+        "<w:style w:type=\"character\" w:styleId=\"CycleC1\">"
+        "<w:basedOn w:val=\"CycleC2\"/></w:style>"
+        "<w:style w:type=\"character\" w:styleId=\"CycleC2\">"
+        "<w:basedOn w:val=\"CycleC1\"/></w:style></w:styles>";
+    appendMembers(
+        deep_path,
+        {{"word/_rels/document.xml.rels", document_relationships},
+         {"word/styles-main.xml", deep_styles}});
+
+    auto deep = DocxDocument::open(deep_path, &error);
+    check(deep && deep->paragraphs().size() == 7,
+          "bounded style-chain fixture did not open");
+    check(deep->paragraphs()[0].style_id == "P69" &&
+              !deep->paragraphs()[0].style_provenance &&
+              !deep->paragraphs()[0].format_is_basic,
+          "over-depth paragraph basedOn chain produced supported provenance");
+    check(deep->paragraphs()[1].runs.size() == 1 &&
+              deep->paragraphs()[1].runs[0].style_id == "C69" &&
+              !deep->paragraphs()[1].runs[0].format_is_basic,
+          "over-depth character basedOn chain was treated as supported");
+    check(deep->paragraphs()[2].style_id == "P62" &&
+              deep->paragraphs()[2].style_provenance &&
+              deep->paragraphs()[2].format_is_basic &&
+              deep->paragraphs()[3].runs[0].style_id == "C63" &&
+              deep->paragraphs()[3].runs[0].format_is_basic,
+          "a style chain within the explicit depth bound was rejected");
+    check(deep->paragraphs()[4].style_id == "MissingP" &&
+              !deep->paragraphs()[4].style_provenance &&
+              !deep->paragraphs()[4].format_is_basic &&
+              deep->paragraphs()[5].runs[0].style_id == "MissingC" &&
+              !deep->paragraphs()[5].runs[0].format_is_basic &&
+              deep->paragraphs()[6].runs[0].style_id == "CycleC1" &&
+              !deep->paragraphs()[6].runs[0].format_is_basic,
+          "missing or cyclic basedOn targets were treated as supported");
+    check(deep->compatibility().classification ==
+              CompatibilityClass::safe_text_patch,
+          "unsupported style chains did not conservatively block structural rewrite");
+    check(std::any_of(
+              deep->compatibility().issues.begin(),
+              deep->compatibility().issues.end(),
+              [](const auto& issue) {
+                  return issue.code == IssueCode::unsupported_formatting;
+              }),
+          "bounded/missing/cyclic style failures lacked a compatibility warning");
 }
 
 void testNumberingLevelJustificationIsConservative(
@@ -1205,6 +1344,24 @@ void testNewDocumentDefaultStyle(const TemporaryDirectory& temporary) {
         "document-to-settings relationship is missing or incorrect");
 
     const std::string styles = readMember(path, "word/styles.xml");
+    const std::string legacy_styles =
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+        "<w:styles xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">"
+        "<w:docDefaults><w:rPrDefault><w:rPr>"
+        "<w:rFonts w:ascii=\"Carlito\" w:hAnsi=\"Carlito\" w:cs=\"Carlito\"/>"
+        "<w:sz w:val=\"22\"/><w:szCs w:val=\"22\"/>"
+        "</w:rPr></w:rPrDefault><w:pPrDefault><w:pPr>"
+        "<w:spacing w:after=\"0\" w:line=\"240\" w:lineRule=\"auto\"/>"
+        "</w:pPr></w:pPrDefault></w:docDefaults>"
+        "<w:style w:type=\"paragraph\" w:default=\"1\" w:styleId=\"Normal\">"
+        "<w:name w:val=\"Normal\"/><w:qFormat/><w:pPr>"
+        "<w:spacing w:after=\"0\" w:line=\"240\" w:lineRule=\"auto\"/>"
+        "</w:pPr><w:rPr>"
+        "<w:rFonts w:ascii=\"Carlito\" w:hAnsi=\"Carlito\" w:cs=\"Carlito\"/>"
+        "<w:sz w:val=\"22\"/><w:szCs w:val=\"22\"/>"
+        "</w:rPr></w:style></w:styles>";
+    check(styles == legacy_styles,
+          "unstyled authoring changed the legacy Normal-only styles.xml bytes");
     const std::string run_defaults =
         "<w:rPrDefault><w:rPr>"
         "<w:rFonts w:ascii=\"Carlito\" w:hAnsi=\"Carlito\" w:cs=\"Carlito\"/>"
@@ -1240,6 +1397,259 @@ void testNewDocumentDefaultStyle(const TemporaryDirectory& temporary) {
           "plain DOCX did not reopen with its body text intact");
     check(reopened->packageMembers().size() == 6,
           "reopened plain DOCX did not retain its style/settings parts");
+}
+
+void testNativeParagraphStyleWriting(const TemporaryDirectory& temporary) {
+    const auto path = temporary.file("native-paragraph-styles.docx");
+    NewParagraph title{{NewRun{"A styled title", {}}}};
+    title.style_id = "Title";
+    NewParagraph heading{{NewRun{"A second-level heading", {}}}};
+    heading.style_id = "Heading2";
+    heading.space_after_twips = 77;
+    NewParagraph deep_heading{{NewRun{"A deep heading", {}}}};
+    deep_heading.style_id = "Heading9";
+    NewParagraph no_spacing{{NewRun{"Compact body", {}}}};
+    no_spacing.style_id = "NoSpacing";
+    NewParagraph explicit_normal{{NewRun{"Normal body", {}}}};
+    explicit_normal.style_id = "Normal";
+
+    const auto save = DocxDocument::writeNew(
+        path, {title, heading, deep_heading, no_spacing, explicit_normal});
+    check(save.saved,
+          save.error ? save.error->message
+                     : "native paragraph-style DOCX was not saved");
+
+    const std::string document_xml =
+        readMember(path, "word/document.xml");
+    check(document_xml.find(
+              "<w:pPr><w:pStyle w:val=\"Heading2\"/>"
+              "<w:spacing w:after=\"77\"/>") != std::string::npos,
+          "w:pStyle was not emitted first in CT_PPr schema order");
+    check(countOccurrences(document_xml, "<w:pStyle ") == 5,
+          "authored paragraph style references were omitted or duplicated");
+
+    const std::string styles_xml = readMember(path, "word/styles.xml");
+    check(countOccurrences(styles_xml, "<w:style ") == 5,
+          "styles.xml did not contain exactly Normal plus the used styles");
+    check(styles_xml.find(
+              "<w:style w:type=\"paragraph\" w:styleId=\"Heading2\">"
+              "<w:name w:val=\"Heading 2\"/>"
+              "<w:basedOn w:val=\"Normal\"/>"
+              "<w:next w:val=\"Normal\"/>"
+              "<w:uiPriority w:val=\"9\"/><w:qFormat/><w:pPr>"
+              "<w:keepNext/><w:keepLines/>"
+              "<w:spacing w:before=\"200\" w:after=\"80\" "
+              "w:line=\"240\" w:lineRule=\"auto\"/>"
+              "<w:jc w:val=\"left\"/>"
+              "<w:outlineLvl w:val=\"1\"/></w:pPr><w:rPr>"
+              "<w:b/><w:color w:val=\"77216F\"/>"
+              "<w:sz w:val=\"26\"/><w:szCs w:val=\"26\"/>"
+              "</w:rPr></w:style>") != std::string::npos,
+          "Heading2 definition lost metadata, outline, or formatting");
+    check(styles_xml.find("<w:outlineLvl w:val=\"8\"/>") !=
+              std::string::npos,
+          "Heading9 definition did not carry its outline level");
+    check(styles_xml.find("w:styleId=\"Title\"") != std::string::npos &&
+              styles_xml.find("w:styleId=\"NoSpacing\"") !=
+                  std::string::npos &&
+              styles_xml.find("w:styleId=\"Subtitle\"") ==
+                  std::string::npos &&
+              styles_xml.find("w:styleId=\"Quote\"") ==
+                  std::string::npos &&
+              styles_xml.find("w:styleId=\"Heading1\"") ==
+                  std::string::npos &&
+              styles_xml.find("w:styleId=\"Heading3\"") ==
+                  std::string::npos,
+          "styles.xml omitted a used style or fabricated an unused one");
+
+    Error error;
+    auto reopened = DocxDocument::open(path, &error);
+    check(reopened != nullptr, error.message);
+    check(reopened->paragraphs().size() == 5 &&
+              reopened->paragraphs()[0].style_id == "Title" &&
+              reopened->paragraphs()[1].style_id == "Heading2" &&
+              reopened->paragraphs()[2].style_id == "Heading9" &&
+              reopened->paragraphs()[3].style_id == "NoSpacing" &&
+              reopened->paragraphs()[4].style_id == "Normal",
+          "native paragraph style IDs did not survive write/reopen");
+    check(reopened->paragraphs()[0].alignment ==
+                  BasicParagraphAlignment::left &&
+              reopened->paragraphs()[0].keep_with_next == true &&
+              reopened->paragraphs()[0].runs[0].format.bold == true &&
+              reopened->paragraphs()[0].runs[0].format.font_size_half_points ==
+                  56 &&
+              reopened->paragraphs()[1].space_after_twips == 77 &&
+              reopened->paragraphs()[1].runs[0].format.foreground_rgb ==
+                  0x0077216fU,
+          "built-in style formatting or direct-format precedence changed on reopen");
+    check(reopened->compatibility().classification ==
+                  CompatibilityClass::basic_body_text_patch &&
+              reopened->compatibility().issues.empty() &&
+              reopened->isCanonicalRegeneratableSimplePackage(
+                  DocumentDefaults{}),
+          "styled current-writer package was not safely regeneratable");
+
+    const auto reordered_path =
+        temporary.file("native-paragraph-style-reordered.docx");
+    check(std::filesystem::copy_file(path, reordered_path),
+          "could not copy styled canonical fixture");
+    std::string reordered_xml =
+        readMember(reordered_path, "word/document.xml");
+    const std::string canonical_properties =
+        "<w:pStyle w:val=\"Heading2\"/>"
+        "<w:spacing w:after=\"77\"/>";
+    const auto property_position = reordered_xml.find(canonical_properties);
+    check(property_position != std::string::npos,
+          "styled canonical fixture properties are missing");
+    reordered_xml.replace(
+        property_position, canonical_properties.size(),
+        "<w:spacing w:after=\"77\"/>"
+        "<w:pStyle w:val=\"Heading2\"/>");
+    replaceMember(reordered_path, "word/document.xml", reordered_xml);
+    error = {};
+    auto reordered = DocxDocument::open(reordered_path, &error);
+    check(reordered != nullptr, error.message);
+    check(!reordered->isCanonicalRegeneratableSimplePackage(
+              DocumentDefaults{}),
+          "out-of-order pStyle grammar was declared canonical");
+
+    const auto custom_path = temporary.file("imported-custom-style.docx");
+    check(std::filesystem::copy_file(path, custom_path),
+          "could not copy custom paragraph-style fixture");
+    std::string custom_document_xml =
+        readMember(custom_path, "word/document.xml");
+    const auto title_reference = custom_document_xml.find(
+        "w:pStyle w:val=\"Title\"");
+    check(title_reference != std::string::npos,
+          "custom style fixture Title reference is missing");
+    custom_document_xml.replace(
+        title_reference, std::string_view("w:pStyle w:val=\"Title\"").size(),
+        "w:pStyle w:val=\"FirmLegalBody\"");
+    replaceMember(custom_path, "word/document.xml", custom_document_xml);
+    std::string custom_styles_xml =
+        readMember(custom_path, "word/styles.xml");
+    const auto title_definition = custom_styles_xml.find(
+        "w:styleId=\"Title\"");
+    check(title_definition != std::string::npos,
+          "custom style fixture Title definition is missing");
+    custom_styles_xml.replace(
+        title_definition, std::string_view("w:styleId=\"Title\"").size(),
+        "w:styleId=\"FirmLegalBody\"");
+    replaceMember(custom_path, "word/styles.xml", custom_styles_xml);
+    error = {};
+    auto custom = DocxDocument::open(custom_path, &error);
+    check(custom != nullptr &&
+              custom->paragraphs()[0].style_id == "FirmLegalBody",
+          error.message.empty()
+              ? "imported custom paragraph style ID was not retained"
+              : error.message);
+    check(!custom->isCanonicalRegeneratableSimplePackage(
+              DocumentDefaults{}),
+          "imported custom paragraph style was declared canonical");
+
+    NewParagraph regenerate_custom{{NewRun{"Do not fabricate", {}}}};
+    regenerate_custom.style_id = custom->paragraphs()[0].style_id;
+    const auto custom_save = DocxDocument::writeNew(
+        temporary.file("regenerated-custom-style.docx"),
+        {regenerate_custom});
+    check(!custom_save.saved && custom_save.error &&
+              custom_save.error->code ==
+                  docxstudio::ooxml::ErrorCode::unsafe_edit &&
+              custom_save.loss_report.hasBlockers() &&
+              custom_save.loss_report.issues.front().code ==
+                  IssueCode::unsupported_formatting,
+          "unknown custom paragraph style was fabricated during regeneration");
+
+    const std::vector<std::string> built_in_ids{
+        "Normal", "NoSpacing", "Title", "Subtitle", "Quote",
+        "Heading1", "Heading2", "Heading3", "Heading4", "Heading5",
+        "Heading6", "Heading7", "Heading8", "Heading9"};
+    std::vector<NewParagraph> every_built_in;
+    every_built_in.reserve(built_in_ids.size());
+    for (const auto& id : built_in_ids) {
+        NewParagraph paragraph{{NewRun{id, {}}}};
+        paragraph.style_id = id;
+        every_built_in.push_back(std::move(paragraph));
+    }
+    const auto every_style_path =
+        temporary.file("every-built-in-paragraph-style.docx");
+    const auto every_style_save = DocxDocument::writeNew(
+        every_style_path, every_built_in);
+    error = {};
+    auto every_style = every_style_save.saved
+        ? DocxDocument::open(every_style_path, &error)
+        : nullptr;
+    check(every_style_save.saved && every_style != nullptr &&
+              every_style->paragraphs().size() == built_in_ids.size() &&
+              countOccurrences(
+                  readMember(every_style_path, "word/styles.xml"),
+                  "<w:style ") == built_in_ids.size() &&
+              every_style->isCanonicalRegeneratableSimplePackage(
+                  DocumentDefaults{}),
+          every_style_save.error
+              ? every_style_save.error->message
+              : (error.message.empty()
+                     ? "full built-in paragraph style catalog did not round-trip"
+                     : error.message));
+
+    const std::vector<std::string> invalid_ids{
+        "", "Heading 1", "1Heading", std::string(254, 'A'),
+        std::string("\xc3\x28", 2)};
+    for (std::size_t index = 0; index < invalid_ids.size(); ++index) {
+        NewParagraph invalid{{NewRun{"Rejected style", {}}}};
+        invalid.style_id = invalid_ids[index];
+        const auto invalid_path = temporary.file(
+            "invalid-paragraph-style-" + std::to_string(index) + ".docx");
+        const auto invalid_save = DocxDocument::writeNew(
+            invalid_path, {invalid});
+        check(!invalid_save.saved && invalid_save.error &&
+                  invalid_save.error->code ==
+                      docxstudio::ooxml::ErrorCode::unsafe_edit &&
+                  invalid_save.loss_report.hasBlockers() &&
+                  !std::filesystem::exists(invalid_path),
+              "invalid paragraph style ID was accepted or left an output file");
+    }
+
+    NewTable table;
+    table.rows = 1;
+    table.columns = 1;
+    NewParagraph quote{{NewRun{"Styled cell", {}}}};
+    quote.style_id = "Quote";
+    table.cell_paragraphs = {quote};
+    const auto table_path = temporary.file("table-cell-paragraph-style.docx");
+    const auto table_save = DocxDocument::writeNew(
+        table_path, NewDocumentBody{{table}});
+    check(table_save.saved &&
+              readMember(table_path, "word/styles.xml")
+                      .find("w:styleId=\"Quote\"") != std::string::npos,
+          table_save.error ? table_save.error->message
+                           : "table-cell paragraph style was not catalogued");
+
+    docxstudio::ooxml::NewSection first_section;
+    NewParagraph subtitle{{NewRun{"Section one", {}}}};
+    subtitle.style_id = "Subtitle";
+    first_section.body.blocks = {subtitle};
+    docxstudio::ooxml::NewSection second_section;
+    NewParagraph heading_three{{NewRun{"Section two", {}}}};
+    heading_three.style_id = "Heading3";
+    second_section.body.blocks = {heading_three};
+    docxstudio::ooxml::NewSectionedDocumentBody sections{
+        {first_section, second_section}};
+    const auto sectioned_path =
+        temporary.file("sectioned-paragraph-styles.docx");
+    const auto sectioned_save = DocxDocument::writeNew(
+        sectioned_path, sections);
+    const std::string sectioned_styles = sectioned_save.saved
+        ? readMember(sectioned_path, "word/styles.xml")
+        : std::string{};
+    check(sectioned_save.saved &&
+              sectioned_styles.find("w:styleId=\"Subtitle\"") !=
+                  std::string::npos &&
+              sectioned_styles.find("w:styleId=\"Heading3\"") !=
+                  std::string::npos,
+          sectioned_save.error
+              ? sectioned_save.error->message
+              : "sectioned paragraph styles were not catalogued");
 }
 
 void testCustomDocumentDefaults(const TemporaryDirectory& temporary) {
@@ -1862,11 +2272,15 @@ void testNativeOfficeMathRoundTrip(const TemporaryDirectory& temporary) {
         canonicalLatex(R"(\begin{Vmatrix}a & b \\ c & d\end{Vmatrix})"),
     };
     const std::string displayed = canonicalLatex(R"(\frac{1}{2})");
+    docxstudio::ooxml::BasicRunFormat equation_format;
+    equation_format.font_size_half_points = 30;
+    equation_format.bold = false;
+    equation_format.foreground_rgb = 0x00cc0000U;
 
     NewParagraph inline_paragraph;
     inline_paragraph.runs.emplace_back("Before ", docxstudio::ooxml::BasicRunFormat{});
     inline_paragraph.runs.emplace_back(
-        "", docxstudio::ooxml::BasicRunFormat{}, EquationPayload{composite, false});
+        "", equation_format, EquationPayload{composite, false});
     inline_paragraph.runs.emplace_back(" between ", docxstudio::ooxml::BasicRunFormat{});
     for (const auto& matrix : matrices) {
         inline_paragraph.runs.emplace_back(
@@ -1920,6 +2334,11 @@ void testNativeOfficeMathRoundTrip(const TemporaryDirectory& temporary) {
               inline_runs[1].fragments[0].equation->canonical_latex == composite &&
               !inline_runs[1].fragments[0].equation->display,
           "composite inline equation did not round-trip as a structured fragment");
+    check(inline_runs[1].format.font_size_half_points == 30 &&
+              inline_runs[1].format.bold == false &&
+              inline_runs[1].format.foreground_rgb == 0x00cc0000U &&
+              inline_runs[1].paragraph_style_overrides == equation_format,
+          "uniform nested Office Math w:rPr formatting did not round-trip as direct formatting");
     for (std::size_t index = 0; index < matrices.size(); ++index) {
         const auto& fragment = inline_runs[index + 3].fragments.at(0);
         check(fragment.kind == FragmentKind::equation && fragment.equation.has_value() &&
@@ -1981,6 +2400,67 @@ void testUnsupportedOfficeMathIsPreserved(const TemporaryDirectory& temporary) {
           "unsupported Office Math subtree was modified or flattened");
     check(saved_xml.find("<w:t>Changed</w:t>") != std::string::npos,
           "safe text edit next to preserved Office Math was lost");
+
+    const auto mixed_source = temporary.file(
+        "mixed-office-math-formatting.docx");
+    const auto mixed_output = temporary.file(
+        "mixed-office-math-formatting-edited.docx");
+    const std::string mixed =
+        "<m:oMath><m:f><m:num><m:r><w:rPr><w:color w:val=\"CC0000\"/>"
+        "</w:rPr><m:t>x</m:t></m:r></m:num><m:den><m:r><w:rPr>"
+        "<w:color w:val=\"0000CC\"/></w:rPr><m:t>y</m:t></m:r>"
+        "</m:den></m:f></m:oMath>";
+    const std::string mixed_xml =
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+        "<w:document xmlns:w=\"" + std::string(kWordNamespace) +
+        "\" xmlns:m=\"http://schemas.openxmlformats.org/officeDocument/2006/math\">"
+        "<w:body><w:p><w:r><w:t>Before</w:t></w:r>" + mixed +
+        "<w:r><w:t>After</w:t></w:r></w:p><w:sectPr/></w:body></w:document>";
+    createPackage(mixed_source, mixed_xml);
+
+    auto mixed_document = DocxDocument::open(mixed_source, &error);
+    check(mixed_document &&
+              mixed_document->compatibility().classification ==
+                  CompatibilityClass::safe_text_patch &&
+              std::any_of(
+                  mixed_document->compatibility().issues.begin(),
+                  mixed_document->compatibility().issues.end(),
+                  [](const auto& issue) {
+                      return issue.code ==
+                                 IssueCode::unsupported_body_content &&
+                             issue.detail.find("Office Math") !=
+                                 std::string::npos;
+                  }) &&
+              std::none_of(
+                  mixed_document->paragraphs()[0].runs.begin(),
+                  mixed_document->paragraphs()[0].runs.end(),
+                  [](const auto& run) {
+                      return std::any_of(
+                          run.fragments.begin(), run.fragments.end(),
+                          [](const auto& fragment) {
+                              return fragment.kind == FragmentKind::equation;
+                          });
+                  }),
+          "mixed Office Math w:rPr was silently flattened into one editable equation atom");
+    const auto& mixed_before =
+        mixed_document->paragraphs()[0].runs[0].fragments[0];
+    check(mixed_before.text_span_id.has_value(),
+          "text next to mixed-format Office Math is not editable");
+    const auto mixed_edit = mixed_document->replaceText(
+        *mixed_before.text_span_id, "Retained");
+    check(mixed_edit.accepted,
+          mixed_edit.error ? mixed_edit.error->message
+                           : "safe mixed-equation adjacent edit was refused");
+    const auto mixed_save = mixed_document->saveAs(mixed_output);
+    check(mixed_save.saved,
+          mixed_save.error ? mixed_save.error->message
+                           : "mixed equation preservation save failed");
+    const std::string mixed_saved_xml = readMember(
+        mixed_output, "word/document.xml");
+    check(mixed_saved_xml.find(mixed) != std::string::npos &&
+              mixed_saved_xml.find("<w:t>Retained</w:t>") !=
+                  std::string::npos,
+          "mixed Office Math formatting was flattened or blocked an adjacent safe text patch");
 }
 
 void testExactUnchangedSave(const TemporaryDirectory& temporary) {
@@ -2363,6 +2843,7 @@ int main() {
         testNativeNumberingWriting(temporary);
         testUnsafeImageRelationshipsAreNotLoaded(temporary);
         testNewDocumentCreation(temporary);
+        testNativeParagraphStyleWriting(temporary);
         testSemanticTableWriting(temporary);
         testFormattedTableCellsAndStyles(temporary);
         testBodyParagraphMarkFormattingRoundTrip(temporary);

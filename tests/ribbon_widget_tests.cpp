@@ -5,9 +5,11 @@
 #include "docxstudio/app/RibbonWidget.h"
 
 #include <QAction>
+#include <QAbstractItemModel>
 #include <QAbstractItemView>
 #include <QApplication>
 #include <QColor>
+#include <QComboBox>
 #include <QFontComboBox>
 #include <QFontDatabase>
 #include <QFontMetrics>
@@ -95,6 +97,77 @@ int main(int argc, char** argv) {
     }
 
     docxstudio::app::RibbonWidget ribbon(commands);
+    auto* stylePicker = ribbon.findChild<QComboBox*>(
+        QStringLiteral("ribbon.paragraphStyle"));
+    check(stylePicker && stylePicker->count() == 14 &&
+              stylePicker->currentData().toString() == QStringLiteral("Normal"),
+          "paragraph-style picker does not expose the complete built-in catalog");
+    const int headingOne = stylePicker
+        ? stylePicker->findData(QStringLiteral("Heading1"))
+        : -1;
+    check(headingOne >= 0 &&
+              stylePicker->itemText(headingOne) == QStringLiteral("Heading 1") &&
+              stylePicker->itemData(headingOne, Qt::FontRole).value<QFont>().bold(),
+          "Heading 1 is missing its stable ID or visual preview");
+    check(!stylePicker->itemData(0, Qt::ForegroundRole).isValid() &&
+              !stylePicker->itemData(headingOne, Qt::ForegroundRole).isValid(),
+          "paragraph-style rows force document colors instead of the active theme palette");
+    QString requestedStyle;
+    QObject::connect(&ribbon,
+                     &docxstudio::app::RibbonWidget::paragraphStyleRequested,
+                     [&requestedStyle](const QString& id) {
+        requestedStyle = id;
+    });
+    check(QMetaObject::invokeMethod(
+              stylePicker, "activated", Qt::DirectConnection,
+              Q_ARG(int, headingOne)) &&
+              requestedStyle == QStringLiteral("Heading1"),
+          "activating a style row did not request its stable style ID");
+    ribbon.setParagraphStyle(QStringLiteral("FirmLegalHeading"));
+    check(stylePicker->count() == 15 &&
+              stylePicker->currentData().toString() ==
+                  QStringLiteral("FirmLegalHeading") &&
+              stylePicker->currentText().startsWith(QStringLiteral("Custom:")),
+          "an imported custom style was not represented without relabeling it");
+    int styleModelMutations = 0;
+    QObject::connect(stylePicker->model(), &QAbstractItemModel::rowsInserted,
+                     [&styleModelMutations] { ++styleModelMutations; });
+    QObject::connect(stylePicker->model(), &QAbstractItemModel::rowsRemoved,
+                     [&styleModelMutations] { ++styleModelMutations; });
+    ribbon.setParagraphStyle(QStringLiteral("FirmLegalHeading"));
+    check(styleModelMutations == 0 && stylePicker->count() == 15,
+          "an unchanged custom style rebuilt the picker model");
+    requestedStyle.clear();
+    check(QMetaObject::invokeMethod(
+              stylePicker, "activated", Qt::DirectConnection,
+              Q_ARG(int, stylePicker->currentIndex())) &&
+              requestedStyle.isEmpty(),
+          "the read-only custom-style context was incorrectly made actionable");
+    ribbon.setParagraphStyle(QStringLiteral("Normal"));
+    check(stylePicker->count() == 14 &&
+              stylePicker->currentData().toString() == QStringLiteral("Normal"),
+          "returning to a built-in style retained a stale custom row");
+    ribbon.setParagraphStyle({});
+    check(stylePicker->count() == 15 &&
+              stylePicker->isEnabled() &&
+              stylePicker->currentText() == QStringLiteral("Multiple styles"),
+          "mixed paragraph styles are not communicated by the ribbon");
+    ribbon.setParagraphStyleAvailable(
+        false, QStringLiteral("Paragraph styles unavailable in tables"));
+    check(!stylePicker->isEnabled() && stylePicker->count() == 15 &&
+              stylePicker->currentText() ==
+                  QStringLiteral("Paragraph styles unavailable in tables"),
+          "an unavailable table context is still presented as mixed or actionable");
+    styleModelMutations = 0;
+    ribbon.setParagraphStyleAvailable(
+        false, QStringLiteral("Paragraph styles unavailable in tables"));
+    check(styleModelMutations == 0,
+          "an unchanged unavailable style context rebuilt the picker model");
+    ribbon.setParagraphStyleAvailable(true);
+    check(stylePicker->isEnabled() && stylePicker->count() == 15 &&
+              stylePicker->currentText() == QStringLiteral("Multiple styles"),
+          "leaving an unavailable context did not restore the mixed style state");
+
     auto* fontPicker = ribbon.findChild<QFontComboBox*>(
         QStringLiteral("ribbon.fontFamily"));
     check(fontPicker != nullptr &&
