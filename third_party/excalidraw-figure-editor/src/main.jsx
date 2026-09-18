@@ -137,9 +137,10 @@ function App() {
   useEffect(() => {
     if (!apiReady || !request?.renderOnly || renderStartedRef.current) return;
     renderStartedRef.current = true;
-    // Let Excalidraw finish its first scene commit before exporting the local
-    // PNG and native scene for the Owl Docs preview branch.
-    requestAnimationFrame(() => requestAnimationFrame(() => save()));
+    // Hidden render-only windows do not have a reliably ticking animation
+    // frame clock. Yield one task so Excalidraw can commit the initial scene,
+    // then export through the same path as an interactive save.
+    setTimeout(() => save(), 0);
   }, [apiReady, request, save]);
 
   return <div className="owl-figure-shell">

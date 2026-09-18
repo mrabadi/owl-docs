@@ -90,6 +90,7 @@ function createWindow() {
       sandbox: true,
       contextIsolation: true,
       nodeIntegration: false,
+      backgroundThrottling: false,
       webSecurity: true,
       allowRunningInsecureContent: false
     }

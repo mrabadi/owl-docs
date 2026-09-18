@@ -143,13 +143,17 @@ bool parseTarget(const codex::Json& operation, Target& target, QString& error,
         error = QObject::tr("An editor operation has no valid target.");
         return false;
     }
-    const auto id = found->find("blockId");
+    auto id = found->find("blockId");
+    if (id == found->end()) id = found->find("paragraphId");
     if (id == found->end() || !id->is_string()) {
         error = QObject::tr("An editor target has no blockId.");
         return false;
     }
     const auto parsed = core::NodeId::parse(id->get<std::string>());
-    const auto start = unsignedValue(*found, "start");
+    auto start = unsignedValue(*found, "start");
+    if (!start) start = unsignedValue(*found, "offset");
+    if (!start) start = unsignedValue(*found, "utf16Offset");
+    if (!start) start = unsignedValue(*found, "startOffset");
     if (!parsed || !start ||
         *start > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
         error = QObject::tr("An editor target has an invalid blockId or UTF-16 offset.");
@@ -174,6 +178,172 @@ bool parseTarget(const codex::Json& operation, Target& target, QString& error,
         return false;
     }
     return true;
+}
+
+std::string operationKind(const codex::Json& operation) {
+    for (const char* key : {"kind", "type", "operation"}) {
+        const auto value = operation.find(key);
+        if (value != operation.end() && value->is_string()) {
+            std::string kind = value->get<std::string>();
+            if (kind == "insertExcalidrawFigure")
+                return "insert_excalidraw_figure";
+            if (kind == "replaceExcalidrawFigure")
+                return "replace_excalidraw_figure";
+            return kind;
+        }
+    }
+    return {};
+}
+
+bool validExcalidrawColor(const std::string& value) {
+    if (value.size() != 7 || value.front() != '#') return false;
+    return std::all_of(value.begin() + 1, value.end(), [](const char ch) {
+        return (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') ||
+               (ch >= 'A' && ch <= 'F');
+    });
+}
+
+std::optional<double> finiteNumber(const codex::Json& object,
+                                   const char* key) {
+    const auto value = object.find(key);
+    if (value == object.end() || !value->is_number()) return std::nullopt;
+    const double number = value->get<double>();
+    return std::isfinite(number) ? std::optional{number} : std::nullopt;
+}
+
+std::optional<codex::Json> normalizeExcalidrawElements(
+    const codex::Json& source, QString& error) {
+    if (!source.is_array() || source.empty() || source.size() > 128) {
+        error = QObject::tr(
+            "An Excalidraw figure requires between 1 and 128 elements.");
+        return std::nullopt;
+    }
+    codex::Json result = codex::Json::array();
+    std::set<std::string> ids;
+    std::size_t generatedId = 0;
+    for (const auto& input : source) {
+        if (!input.is_object()) {
+            error = QObject::tr("Every Excalidraw element must be an object.");
+            return std::nullopt;
+        }
+        const auto typeValue = input.find("type");
+        if (typeValue == input.end() || !typeValue->is_string()) {
+            error = QObject::tr("Every Excalidraw element requires a type.");
+            return std::nullopt;
+        }
+        const std::string type = typeValue->get<std::string>();
+        if (type != "rectangle" && type != "ellipse" && type != "diamond" &&
+            type != "text" && type != "line" && type != "arrow") {
+            error = QObject::tr("Unsupported Excalidraw element type: %1")
+                        .arg(QString::fromStdString(type));
+            return std::nullopt;
+        }
+        auto x = finiteNumber(input, "x");
+        auto y = finiteNumber(input, "y");
+        if (!x || !y || std::abs(*x) > 10000.0 ||
+            std::abs(*y) > 10000.0) {
+            error = QObject::tr("An Excalidraw element has invalid coordinates.");
+            return std::nullopt;
+        }
+        std::string id;
+        if (const auto idValue = input.find("id");
+            idValue != input.end() && idValue->is_string()) {
+            id = idValue->get<std::string>();
+        }
+        if (id.empty() || id.size() > 64 || ids.contains(id)) {
+            do {
+                id = "codex-element-" + std::to_string(++generatedId);
+            } while (ids.contains(id));
+        }
+        ids.insert(id);
+        codex::Json element{{"id", id}, {"type", type}, {"x", *x}, {"y", *y}};
+        for (const char* colorKey : {"strokeColor", "backgroundColor"}) {
+            const auto color = input.find(colorKey);
+            if (color != input.end() && color->is_string() &&
+                validExcalidrawColor(color->get<std::string>())) {
+                element[colorKey] = *color;
+            }
+        }
+        if (const auto stroke = finiteNumber(input, "strokeWidth"))
+            element["strokeWidth"] = std::clamp(*stroke, 1.0, 4.0);
+        if (const auto opacity = finiteNumber(input, "opacity"))
+            element["opacity"] = static_cast<int>(
+                std::llround(std::clamp(*opacity, 0.0, 100.0)));
+
+        if (type == "rectangle" || type == "ellipse" || type == "diamond") {
+            const auto width = finiteNumber(input, "width");
+            const auto height = finiteNumber(input, "height");
+            if (!width || !height || *width <= 0.0 || *height <= 0.0 ||
+                *width > 10000.0 || *height > 10000.0) {
+                error = QObject::tr("An Excalidraw shape has invalid dimensions.");
+                return std::nullopt;
+            }
+            element["width"] = *width;
+            element["height"] = *height;
+            if (const auto label = input.find("label");
+                label != input.end() && label->is_object()) {
+                const auto text = label->find("text");
+                if (text != label->end() && text->is_string() &&
+                    !text->get<std::string>().empty()) {
+                    element["label"] = {{"text", text->get<std::string>()}};
+                    if (const auto size = finiteNumber(*label, "fontSize"))
+                        element["label"]["fontSize"] =
+                            std::clamp(*size, 8.0, 96.0);
+                }
+            }
+        } else if (type == "text") {
+            const auto text = input.find("text");
+            if (text == input.end() || !text->is_string() ||
+                text->get<std::string>().empty()) {
+                error = QObject::tr("An Excalidraw text element has no text.");
+                return std::nullopt;
+            }
+            element["text"] = text->get<std::string>();
+            if (const auto size = finiteNumber(input, "fontSize"))
+                element["fontSize"] = std::clamp(*size, 8.0, 96.0);
+        } else {
+            codex::Json points;
+            if (const auto supplied = input.find("points");
+                supplied != input.end() && supplied->is_array() &&
+                supplied->size() >= 2 && supplied->size() <= 16) {
+                points = codex::Json::array();
+                for (const auto& point : *supplied) {
+                    if (!point.is_array() || point.size() != 2 ||
+                        !point.at(0).is_number() ||
+                        !point.at(1).is_number()) {
+                        error = QObject::tr(
+                            "An Excalidraw line or arrow contains an invalid point.");
+                        return std::nullopt;
+                    }
+                    const double pointX = point.at(0).get<double>();
+                    const double pointY = point.at(1).get<double>();
+                    if (!std::isfinite(pointX) || !std::isfinite(pointY) ||
+                        std::abs(pointX) > 10000.0 ||
+                        std::abs(pointY) > 10000.0) {
+                        error = QObject::tr(
+                            "An Excalidraw line or arrow contains an invalid point.");
+                        return std::nullopt;
+                    }
+                    points.push_back(codex::Json::array({pointX, pointY}));
+                }
+            } else {
+                const auto width = finiteNumber(input, "width");
+                const auto height = finiteNumber(input, "height");
+                if (!width || !height || std::abs(*width) > 10000.0 ||
+                    std::abs(*height) > 10000.0) {
+                    error = QObject::tr(
+                        "An Excalidraw line or arrow requires points or width and height.");
+                    return std::nullopt;
+                }
+                points = codex::Json::array(
+                    {codex::Json::array({0.0, 0.0}),
+                     codex::Json::array({*width, *height})});
+            }
+            element["points"] = std::move(points);
+        }
+        result.push_back(std::move(element));
+    }
+    return std::optional<codex::Json>(std::move(result));
 }
 
 std::optional<std::uint32_t> parseRgb(const codex::Json& style,
@@ -1228,43 +1398,78 @@ std::optional<core::NodeId> paragraphContainingImage(
 }
 
 std::optional<ExcalidrawFigureEditor::Result> renderFigure(
-    const codex::Json& source, QString& accessibleName,
+    const codex::Json& source, const QString& defaultAccessibleName,
+    QString& accessibleName,
     std::optional<double>& widthPoints, std::optional<double>& heightPoints,
     QString& error) {
-    const auto figure = source.find("figure");
-    if (figure == source.end() || !figure->is_object()) {
-        error = QObject::tr("An Excalidraw operation requires a figure object.");
+    codex::Json figure = codex::Json::object();
+    if (const auto nested = source.find("figure");
+        nested != source.end() && nested->is_object()) {
+        figure = *nested;
+    }
+    const codex::Json* elements = nullptr;
+    if (const auto nestedElements = figure.find("elements");
+        nestedElements != figure.end()) {
+        elements = &*nestedElements;
+    } else if (const auto topLevelElements = source.find("elements");
+               topLevelElements != source.end()) {
+        elements = &*topLevelElements;
+    }
+    if (!elements) {
+        error = QObject::tr("An Excalidraw operation requires an elements array.");
         return std::nullopt;
     }
-    const auto elements = figure->find("elements");
-    const auto name = figure->find("accessibleName");
-    if (elements == figure->end() || !elements->is_array() ||
-        elements->empty() || elements->size() > 128 ||
-        name == figure->end() || !name->is_string()) {
-        error = QObject::tr(
-            "An Excalidraw figure requires 1–128 elements and an accessible name.");
-        return std::nullopt;
+    const auto normalizedElements = normalizeExcalidrawElements(*elements, error);
+    if (!normalizedElements) return std::nullopt;
+
+    const auto assignName = [&](const codex::Json& object) {
+        const auto name = object.find("accessibleName");
+        if (name == object.end() || !name->is_string()) return false;
+        const std::string encoded = name->get<std::string>();
+        accessibleName = QString::fromUtf8(
+            encoded.data(), static_cast<qsizetype>(encoded.size())).left(500);
+        return !accessibleName.trimmed().isEmpty();
+    };
+    if (!assignName(figure) && !assignName(source)) {
+        accessibleName = defaultAccessibleName.trimmed().left(500);
+        if (accessibleName.isEmpty())
+            accessibleName = QObject::tr("Editable Excalidraw figure");
     }
-    const std::string nameUtf8 = name->get<std::string>();
-    accessibleName = QString::fromUtf8(
-        nameUtf8.data(), static_cast<qsizetype>(nameUtf8.size())).left(500);
-    const auto dimension = [&](const char* key,
+    const auto dimension = [&](const char* canonicalKey,
+                               const char* pixelAlias,
                                std::optional<double>& output) -> bool {
-        const auto value = figure->find(key);
-        if (value == figure->end()) return true;
+        const codex::Json* value = nullptr;
+        bool pixels = false;
+        const auto findValue = [&](const codex::Json& object,
+                                   const char* key) -> const codex::Json* {
+            const auto found = object.find(key);
+            return found == object.end() ? nullptr : &*found;
+        };
+        value = findValue(figure, canonicalKey);
+        if (!value) value = findValue(source, canonicalKey);
+        if (!value) {
+            value = findValue(figure, pixelAlias);
+            pixels = value != nullptr;
+        }
+        if (!value) {
+            value = findValue(source, pixelAlias);
+            pixels = value != nullptr;
+        }
+        if (!value) return true;
         if (!value->is_number()) return false;
-        const double points = value->get<double>();
+        double points = value->get<double>();
+        if (pixels) points *= 0.75;
         if (!std::isfinite(points) || points < 36.0 || points > 936.0)
             return false;
         output = points;
         return true;
     };
-    if (!dimension("widthPoints", widthPoints) ||
-        !dimension("heightPoints", heightPoints)) {
+    if (!dimension("widthPoints", "width", widthPoints) ||
+        !dimension("heightPoints", "height", heightPoints)) {
         error = QObject::tr("Excalidraw figure dimensions are outside the supported range.");
         return std::nullopt;
     }
-    const std::string serialized = elements->dump();
+    const std::string serialized = normalizedElements->dump();
     if (serialized.size() > 256U * 1024U) {
         error = QObject::tr("The Excalidraw element request is too large.");
         return std::nullopt;
@@ -1342,12 +1547,44 @@ codex::Json createPreview(DocumentCanvas& canvas,
     std::set<std::string> affected;
     std::vector<std::string> warnings;
     std::size_t figureOperationCount = 0;
-    for (const auto& source : *sourceOperations) {
-        if (!source.is_object()) {
+    for (const auto& rawSource : *sourceOperations) {
+        if (!rawSource.is_object()) {
             error = QObject::tr("Every preview operation must be an object.");
             return {};
         }
-        const std::string kind = source.value("kind", std::string());
+        codex::Json source = rawSource;
+        const std::string kind = operationKind(source);
+        source["kind"] = kind;
+        if (kind == "insert_excalidraw_figure") {
+            codex::Json target = codex::Json::object();
+            if (const auto supplied = source.find("target");
+                supplied != source.end() && supplied->is_object()) {
+                target = *supplied;
+            }
+            if (!target.contains("blockId") && target.contains("paragraphId"))
+                target["blockId"] = target["paragraphId"];
+            if (!target.contains("start")) {
+                for (const char* alias : {"offset", "utf16Offset", "startOffset"}) {
+                    if (target.contains(alias)) {
+                        target["start"] = target[alias];
+                        break;
+                    }
+                }
+            }
+            const auto cursor = canvas.selection().focus;
+            if (!target.contains("blockId"))
+                target["blockId"] = cursor.paragraph_id.toString();
+            if (!target.contains("start")) {
+                const auto targetId = target.find("blockId");
+                const auto parsed = targetId != target.end() && targetId->is_string()
+                    ? core::NodeId::parse(targetId->get<std::string>())
+                    : std::nullopt;
+                target["start"] = parsed && *parsed == cursor.paragraph_id
+                    ? cursor.utf16_offset
+                    : 0;
+            }
+            source["target"] = std::move(target);
+        }
         const bool needsEnd = kind == "replace_text" || kind == "delete_range" ||
                               kind == "set_text_style";
         Target target;
@@ -1493,7 +1730,8 @@ codex::Json createPreview(DocumentCanvas& canvas,
             std::optional<double> widthPoints;
             std::optional<double> heightPoints;
             const auto rendered = renderFigure(
-                source, accessibleName, widthPoints, heightPoints, error);
+                source, QString::fromStdString(labelValue->get<std::string>()),
+                accessibleName, widthPoints, heightPoints, error);
             if (!rendered) {
                 if (error.isEmpty())
                     error = QObject::tr("The local Excalidraw renderer did not return a figure.");

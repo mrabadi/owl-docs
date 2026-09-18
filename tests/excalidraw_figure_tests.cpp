@@ -92,6 +92,31 @@ int main(int argc, char** argv) {
               png(Qt::black, 4, 4), QByteArrayLiteral("{}"), error).isEmpty(),
           "invalid figure scene was accepted");
 
+    docxstudio::app::SpellChecker anchorSpelling;
+    docxstudio::app::DocumentCanvas anchorCanvas(anchorSpelling);
+    const auto anchorSnapshot = anchorCanvas.snapshot();
+    const auto anchorParagraph =
+        anchorSnapshot.document.paragraphs().front().id().toString();
+    QString anchorSummary;
+    const auto anchorResult = docxstudio::app::invokeEditorTool(
+        anchorCanvas, QStringLiteral("document:anchor-regression"),
+        QString::fromLatin1(
+            docxstudio::codex::kEditorPreviewTool.data(),
+            static_cast<qsizetype>(
+                docxstudio::codex::kEditorPreviewTool.size())),
+        {{"documentId", "document:anchor-regression"},
+         {"baseRevision", anchorSnapshot.revision.value()},
+         {"summary", "Anchor regression"},
+         {"operations",
+          {{{"type", "insert_excalidraw_figure"},
+            {"target", {{"blockId", anchorParagraph}, {"offset", 0}}},
+            {"elements", docxstudio::codex::Json::array()}}}}},
+        anchorSummary, error);
+    check(anchorResult.empty() &&
+              error.contains(QStringLiteral("between 1 and 128")),
+          "figure shorthand did not accept an empty paragraph offset anchor");
+    error.clear();
+
     // The end-to-end renderer needs permission to create its own bubblewrap
     // network namespace. Managed CI/sandbox runners can opt in when that
     // kernel facility is available; ordinary unit runs still cover PNG scene
@@ -133,8 +158,6 @@ int main(int argc, char** argv) {
         docxstudio::app::SpellChecker bridgeSpelling;
         docxstudio::app::DocumentCanvas bridgeCanvas(bridgeSpelling);
         const auto bridgeBefore = bridgeCanvas.snapshot();
-        const auto bridgeParagraph =
-            bridgeBefore.document.paragraphs().front().id().toString();
         const QString bridgeDocumentId =
             QStringLiteral("document:excalidraw-tool-test");
         QString previewSummary;
@@ -148,17 +171,19 @@ int main(int argc, char** argv) {
              {"baseRevision", bridgeBefore.revision.value()},
              {"summary", "Insert an editable process figure"},
              {"operations",
-              {{{"kind", "insert_excalidraw_figure"},
-                {"target", {{"blockId", bridgeParagraph}, {"start", 0}}},
-                {"figure",
-                 {{"accessibleName", "Codex process figure"},
-                  {"widthPoints", 300},
-                  {"elements",
-                   {{{"id", "tool-box"},
-                     {"type", "rectangle"},
-                     {"x", 10}, {"y", 10},
-                     {"width", 180}, {"height", 80},
-                     {"label", {{"text", "Professional"}}}}}}}}}}}},
+              {{{"type", "insert_excalidraw_figure"},
+                {"elements",
+                 {{{"type", "rectangle"},
+                   {"x", 10}, {"y", 10},
+                   {"width", 180}, {"height", 80},
+                   {"backgroundColor", "#E7F5FF"},
+                   {"label", {{"text", "Professional"}}}},
+                  {{"type", "arrow"},
+                   {"x", 190}, {"y", 50},
+                   {"width", 80}, {"height", 0}}}},
+                {"width", 400},
+                {"height", 180},
+                {"accessibleName", "Codex process figure"}}}}},
             previewSummary, error);
         check(error.isEmpty() && toolResult.value("committed", true) == false &&
                   bridgeCanvas.hasPreview(),

@@ -27,7 +27,10 @@ constexpr auto kDocumentModeInstructions =
     "insert_excalidraw_figure and revise them by image ID with replace_excalidraw_figure. "
     "Use editor_v1_read to inspect existing figure IDs and editable elements. These tools "
     "always render in Professional mode: crisp non-sketch strokes, Architect sans text, solid "
-    "fills, a white canvas, and the professional palette. All writes "
+    "fills, a white canvas, and the professional palette. For insertion, use the exact "
+    "editor.v1 shape: kind=insert_excalidraw_figure, target={blockId,start}, and "
+    "figure={accessibleName,elements,widthPoints,heightPoints}; element IDs are stable strings "
+    "and arrows use points such as [[0,0],[120,0]]. All writes "
     "must remain in editor_v1_preview until the user "
     "accepts them. A preview is not committed, so never claim that a proposed edit is already "
     "applied.";
