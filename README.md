@@ -2,7 +2,7 @@
 
 Owl Docs is a Linux-first, offline word-processor prototype with an optional Codex chat panel. New documents are written directly as Office Open XML (`.docx`), and imported DOCX packages are handled without an HTML or ODF conversion step.
 
-Version 0.5.6 is an M1 development checkpoint plus the first complete M2
+Version 0.5.7 is an M1 development checkpoint plus the first complete M2
 vertical slice: Owl Docs ships its own pinned, offline Excalidraw figure editor.
 Insert > Excalidraw Figure creates a PNG-backed editable figure; double-click,
 F2, the context menu, or the Picture ribbon reopens it. Creation and updates are
@@ -90,8 +90,8 @@ cmake -S . -B build-release -G Ninja \
 cmake --build build-release
 ctest --test-dir build-release --output-on-failure
 cpack --config build-release/CPackConfig.cmake -G DEB -B dist
-install -m 0644 dist/owl-docs_0.5.6_amd64.deb /tmp/owl-docs_0.5.6_amd64.deb
-sudo apt install /tmp/owl-docs_0.5.6_amd64.deb
+install -m 0644 dist/owl-docs_0.5.7_amd64.deb /tmp/owl-docs_0.5.7_amd64.deb
+sudo apt install /tmp/owl-docs_0.5.7_amd64.deb
 owl-docs
 ```
 

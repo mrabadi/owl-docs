@@ -92,6 +92,21 @@ int main(int argc, char** argv) {
               png(Qt::black, 4, 4), QByteArrayLiteral("{}"), error).isEmpty(),
           "invalid figure scene was accepted");
 
+    const auto boundedDisplay =
+        docxstudio::app::fitExcalidrawFigureDisplaySize(
+            QSize(1000, 200), 300.0, 300.0);
+    check(boundedDisplay &&
+              std::abs(boundedDisplay->width() - 300.0) < 0.001 &&
+              std::abs(boundedDisplay->height() - 60.0) < 0.001,
+          "Codex figure dimensions did not preserve the exported raster aspect ratio");
+    const auto heightOnlyDisplay =
+        docxstudio::app::fitExcalidrawFigureDisplaySize(
+            QSize(100, 200), std::nullopt, 180.0);
+    check(heightOnlyDisplay &&
+              std::abs(heightOnlyDisplay->width() - 90.0) < 0.001 &&
+              std::abs(heightOnlyDisplay->height() - 180.0) < 0.001,
+          "height-only Codex figure sizing did not preserve aspect ratio");
+
     docxstudio::app::SpellChecker anchorSpelling;
     docxstudio::app::DocumentCanvas anchorCanvas(anchorSpelling);
     const auto anchorSnapshot = anchorCanvas.snapshot();
@@ -197,6 +212,16 @@ int main(int argc, char** argv) {
                       atomBytes(bridgeImages.front()))
                       .has_value(),
               "accepted Codex preview was not a native editable figure");
+        const QImage insertedPreview =
+            QImage::fromData(atomBytes(bridgeImages.front()), "PNG");
+        const double rasterAspect =
+            static_cast<double>(insertedPreview.width()) /
+            static_cast<double>(insertedPreview.height());
+        const double displayAspect =
+            static_cast<double>(bridgeImages.front().width_emu) /
+            static_cast<double>(bridgeImages.front().height_emu);
+        check(std::abs(rasterAspect - displayAspect) < 0.001,
+              "first Codex figure preview was stretched instead of preserving its aspect ratio");
     }
 
     docxstudio::app::SpellChecker spelling;

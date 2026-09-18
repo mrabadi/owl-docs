@@ -216,7 +216,7 @@ int main(int argc, char** argv) {
               styleIdSchema.at("oneOf").at(0).at("maxLength") == 1024 &&
               styleIdSchema.at("oneOf").at(1).at("type") == "null" &&
               docxstudio::codex::kEditorToolCatalogVersion ==
-                  "editor.v1.catalog.7",
+                  "editor.v1.catalog.8",
           "editor tool schema does not advertise bounded style set/clear");
     check(previewDefinition->inputSchema.dump().find(
               "insert_excalidraw_figure") != std::string::npos &&

@@ -3,6 +3,8 @@
 #include <QByteArray>
 #include <QJsonArray>
 #include <QObject>
+#include <QSize>
+#include <QSizeF>
 #include <QString>
 
 #include <functional>
@@ -21,6 +23,12 @@ inline constexpr qsizetype kMaximumExcalidrawSceneBytes =
     const QByteArray& png);
 [[nodiscard]] QByteArray pngWithExcalidrawScene(
     const QByteArray& png, const QByteArray& scene, QString& error);
+
+// Resolves optional agent-requested dimensions without ever stretching the
+// exported scene. When both dimensions are present they form a bounding box.
+[[nodiscard]] std::optional<QSizeF> fitExcalidrawFigureDisplaySize(
+    QSize rasterSize, std::optional<double> widthPoints,
+    std::optional<double> heightPoints);
 
 class ExcalidrawFigureEditor final : public QObject {
 public:

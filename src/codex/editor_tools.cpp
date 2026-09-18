@@ -215,8 +215,8 @@ Json previewSchema() {
           "items": {"$ref": "#/$defs/excalidrawElement"}
         },
         "accessibleName": {"type": "string", "minLength": 1, "maxLength": 500},
-        "widthPoints": {"type": "number", "minimum": 36, "maximum": 936},
-        "heightPoints": {"type": "number", "minimum": 36, "maximum": 936}
+        "widthPoints": {"type": "number", "minimum": 36, "maximum": 936, "description": "Optional display width, or bounding-box width when heightPoints is also supplied. The rendered figure always keeps its aspect ratio."},
+        "heightPoints": {"type": "number", "minimum": 36, "maximum": 936, "description": "Optional display height, or bounding-box height when widthPoints is also supplied. The rendered figure always keeps its aspect ratio."}
       },
       "required": ["elements", "accessibleName"]
     },

@@ -1743,19 +1743,22 @@ codex::Json createPreview(DocumentCanvas& canvas,
                 error = QObject::tr("The local Excalidraw renderer returned an invalid PNG.");
                 return {};
             }
-            const double aspect = static_cast<double>(previewImage.height()) /
-                                  static_cast<double>(previewImage.width());
             if (kind == "insert_excalidraw_figure") {
-                const double width = widthPoints.value_or(432.0);
-                const double height = heightPoints.value_or(
-                    std::clamp(width * aspect, 36.0, 936.0));
+                const auto displaySize = fitExcalidrawFigureDisplaySize(
+                    previewImage.size(), widthPoints, heightPoints);
+                if (!displaySize) {
+                    error = QObject::tr(
+                        "The rendered Excalidraw figure has invalid display dimensions.");
+                    return {};
+                }
                 if (!appendWorkingOperation(
                         working, operations,
                         core::InsertImage{
                             {target.block, target.start},
                             imagePayload(rendered->png), core::ImageFormat::png,
-                            toUtf8(accessibleName), pointsToEmu(width),
-                            pointsToEmu(height)},
+                            toUtf8(accessibleName),
+                            pointsToEmu(displaySize->width()),
+                            pointsToEmu(displaySize->height())},
                         error)) {
                     return {};
                 }
@@ -1787,17 +1790,22 @@ codex::Json createPreview(DocumentCanvas& canvas,
                 std::int64_t height = current->height_emu;
                 const std::string previousAccessibleName =
                     current->accessible_name;
-                if (widthPoints && heightPoints) {
-                    width = pointsToEmu(*widthPoints);
-                    height = pointsToEmu(*heightPoints);
-                } else if (widthPoints) {
-                    width = pointsToEmu(*widthPoints);
+                if (widthPoints || heightPoints) {
+                    const auto displaySize = fitExcalidrawFigureDisplaySize(
+                        previewImage.size(), widthPoints, heightPoints);
+                    if (!displaySize) {
+                        error = QObject::tr(
+                            "The rendered Excalidraw figure has invalid display dimensions.");
+                        return {};
+                    }
+                    width = pointsToEmu(displaySize->width());
+                    height = pointsToEmu(displaySize->height());
+                } else {
+                    const double aspect =
+                        static_cast<double>(previewImage.height()) /
+                        static_cast<double>(previewImage.width());
                     height = pointsToEmu(
-                        std::clamp(*widthPoints * aspect, 36.0, 936.0));
-                } else if (heightPoints) {
-                    height = pointsToEmu(*heightPoints);
-                    width = pointsToEmu(
-                        std::clamp(*heightPoints / aspect, 36.0, 936.0));
+                        static_cast<double>(width) / 12700.0 * aspect);
                 }
                 if (const auto owner = paragraphContainingImage(working, *imageId))
                     affected.insert(owner->toString());

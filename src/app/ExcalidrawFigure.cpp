@@ -20,6 +20,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <utility>
 
@@ -191,6 +192,46 @@ QByteArray pngWithExcalidrawScene(
         return {};
     }
     return output;
+}
+
+std::optional<QSizeF> fitExcalidrawFigureDisplaySize(
+    const QSize rasterSize, const std::optional<double> widthPoints,
+    const std::optional<double> heightPoints) {
+    if (rasterSize.width() <= 0 || rasterSize.height() <= 0) {
+        return std::nullopt;
+    }
+    const auto validRequestedDimension = [](const std::optional<double> value) {
+        return !value || (std::isfinite(*value) && *value > 0.0);
+    };
+    if (!validRequestedDimension(widthPoints) ||
+        !validRequestedDimension(heightPoints)) {
+        return std::nullopt;
+    }
+    const double aspect = static_cast<double>(rasterSize.height()) /
+                          static_cast<double>(rasterSize.width());
+    double width = widthPoints.value_or(432.0);
+    double height = width * aspect;
+    if (!widthPoints && heightPoints) {
+        height = *heightPoints;
+        width = height / aspect;
+    } else if (widthPoints && heightPoints) {
+        const double scale = std::min(
+            *widthPoints / static_cast<double>(rasterSize.width()),
+            *heightPoints / static_cast<double>(rasterSize.height()));
+        width = static_cast<double>(rasterSize.width()) * scale;
+        height = static_cast<double>(rasterSize.height()) * scale;
+    }
+
+    const double maximumScale = std::min(936.0 / width, 936.0 / height);
+    if (maximumScale < 1.0) {
+        width *= maximumScale;
+        height *= maximumScale;
+    }
+    if (!std::isfinite(width) || !std::isfinite(height) || width <= 0.0 ||
+        height <= 0.0) {
+        return std::nullopt;
+    }
+    return QSizeF(width, height);
 }
 
 struct ExcalidrawFigureEditor::Session {
