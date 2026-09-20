@@ -70,7 +70,7 @@ sequence, including local editable Excalidraw figures as M2, is maintained in
 
 ## Release interpretation
 
-Version 0.5.7 is an M1 development checkpoint with the first self-contained M2
+Version 0.5.8 is an M1 development checkpoint with the first self-contained M2
 Excalidraw vertical slice. It retains the tested 0.4.4 paragraph-style,
 multi-document, navigation, zoom, text-only paste, conservative-save, and Codex
 isolation work. The gates remain narrower than production acceptance: they do

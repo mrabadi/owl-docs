@@ -197,6 +197,26 @@ int main(int argc, char** argv) {
     check(!figureEditor.contains(
               QStringLiteral("api.updateScene(request.scene)")),
           "changing figure mode can restore the opening scene over unsaved work");
+    check(figureEditor.contains(
+              QStringLiteral("setLocalProfessionalPalette")) &&
+              figureEditor.contains(
+                  QStringLiteral("currentItemEndArrowhead: \"triangle\"")),
+          "Owl Docs is not using the current Excalidraw Local Professional-mode API");
+    const QString vendoredProperties = readFile(
+        root + QStringLiteral(
+                   "/third_party/excalidraw-figure-editor/vendor/excalidraw-workspace/packages/excalidraw/actions/actionProperties.tsx"));
+    check(vendoredProperties.contains(
+              QStringLiteral("excalidraw-local-text-style")) &&
+              vendoredProperties.contains(QStringLiteral("fontWeight")) &&
+              vendoredProperties.contains(QStringLiteral("fontStyle")),
+          "vendored Excalidraw Local text-style controls are missing");
+    const QString assetPreparation = readFile(
+        root + QStringLiteral(
+                   "/third_party/excalidraw-figure-editor/scripts/prepare-assets.mjs"));
+    check(assetPreparation.contains(QStringLiteral("Ubuntu-B.ttf")) &&
+              assetPreparation.contains(QStringLiteral("Ubuntu-RI.ttf")) &&
+              assetPreparation.contains(QStringLiteral("Ubuntu-BI.ttf")),
+          "the integrated figure editor does not bundle all Ubuntu text faces");
 
     constexpr std::array<int, 8> iconSizes{16, 24, 32, 48, 64, 128, 256, 512};
     const QIcon applicationIcon = docxstudio::app::owlDocsApplicationIcon();

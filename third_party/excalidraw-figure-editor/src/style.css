@@ -4,6 +4,61 @@ html, body, #root {
   overflow: hidden;
 }
 
+/* Ubuntu is OFL-licensed and bundled with all four genuine faces. */
+@font-face {
+  font-family: "Ubuntu";
+  font-style: normal;
+  font-weight: 400;
+  src: url("/fonts/Ubuntu/Ubuntu-R.ttf") format("truetype");
+}
+
+@font-face {
+  font-family: "Ubuntu";
+  font-style: normal;
+  font-weight: 700;
+  src: url("/fonts/Ubuntu/Ubuntu-B.ttf") format("truetype");
+}
+
+@font-face {
+  font-family: "Ubuntu";
+  font-style: italic;
+  font-weight: 400;
+  src: url("/fonts/Ubuntu/Ubuntu-RI.ttf") format("truetype");
+}
+
+@font-face {
+  font-family: "Ubuntu";
+  font-style: italic;
+  font-weight: 700;
+  src: url("/fonts/Ubuntu/Ubuntu-BI.ttf") format("truetype");
+}
+
+.excalidraw-local-text-style {
+  display: flex;
+  gap: 4px;
+  margin-top: 6px;
+}
+
+.excalidraw-local-text-style button {
+  width: 32px;
+  height: 28px;
+  border: 1px solid var(--default-border-color);
+  border-radius: 4px;
+  background: var(--island-bg-color);
+  color: var(--text-primary-color);
+  cursor: pointer;
+}
+
+.excalidraw-local-text-style button.is-active {
+  background: var(--color-primary-light);
+  border-color: var(--color-primary);
+}
+
+.excalidraw-local-text-style button:disabled {
+  cursor: not-allowed;
+  opacity: 0.4;
+}
+
 .owl-figure-shell { height: 100%; display: flex; flex-direction: column; background: #fff; }
 .owl-figure-toolbar { min-height: 54px; padding: 8px 14px; box-sizing: border-box; display: flex; align-items: center; gap: 10px; border-bottom: 1px solid #d7d7d7; background: #f7f7f7; font: 14px Ubuntu, sans-serif; }
 .owl-figure-title { font-weight: 700; margin-right: auto; }

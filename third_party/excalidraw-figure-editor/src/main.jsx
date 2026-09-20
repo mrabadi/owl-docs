@@ -1,7 +1,8 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { Excalidraw, convertToExcalidrawElements, exportToBlob, serializeAsJSON } from "@excalidraw/excalidraw";
-import "@excalidraw/excalidraw/index.css";
+import { setLocalProfessionalPalette } from "@excalidraw/excalidraw/colors";
+import "../node_modules/@excalidraw/excalidraw/dist/prod/index.css";
 import "./style.css";
 
 window.EXCALIDRAW_ASSET_PATH = new URL("./", window.location.href).href;
@@ -10,6 +11,7 @@ const PROFESSIONAL_APP_STATE = {
   currentItemRoughness: 0,
   currentItemFontFamily: 10,
   currentItemArrowType: "elbow",
+  currentItemEndArrowhead: "triangle",
   currentItemStrokeColor: "#222624",
   currentItemBackgroundColor: "transparent",
   currentItemFillStyle: "solid",
@@ -19,6 +21,7 @@ const SKETCH_APP_STATE = {
   currentItemRoughness: 1,
   currentItemFontFamily: 5,
   currentItemArrowType: "round",
+  currentItemEndArrowhead: "arrow",
   currentItemStrokeColor: "#1e1e1e",
   currentItemBackgroundColor: "transparent",
   currentItemFillStyle: "hachure",
@@ -77,7 +80,7 @@ function App() {
   useEffect(() => {
     window.owlDocsFigure.request().then((value) => {
       const initialMode = value.mode === "sketch" ? "sketch" : "professional";
-      window.EXCALIDRAW_LOCAL_SET_PALETTE?.(initialMode === "professional");
+      setLocalProfessionalPalette(initialMode === "professional");
       setMode(initialMode);
       setRequest(value);
     }).catch((value) => setError(String(value)));
@@ -96,7 +99,7 @@ function App() {
 
   const selectMode = useCallback(async (nextMode) => {
     const resolvedMode = nextMode === "sketch" ? "sketch" : "professional";
-    window.EXCALIDRAW_LOCAL_SET_PALETTE?.(resolvedMode === "professional");
+    setLocalProfessionalPalette(resolvedMode === "professional");
     setMode(resolvedMode);
     apiRef.current?.updateScene({ appState: appStateForMode(resolvedMode) });
     await window.owlDocsFigure.setMode(resolvedMode);

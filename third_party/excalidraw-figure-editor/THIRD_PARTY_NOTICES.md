@@ -1,7 +1,12 @@
 # Third-party notices
 
 The Owl Docs figure editor is derived from the local Excalidraw fork at commit
-`d2f65b9b930d9d727cfaec11c8b7123c771452b2`.
+`6609200dd9a756410a4199fe6c06ab3ce9fbcab0`.
+
+The fork's reviewed Excalidraw 0.18 source snapshot is vendored under
+`vendor/excalidraw-workspace` so local font families, bold/italic text styles,
+and the Professional palette are compiled from source rather than injected
+into a minified dependency bundle.
 
 The locked build currently resolves these primary components:
 
