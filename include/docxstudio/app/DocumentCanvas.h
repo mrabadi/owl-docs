@@ -567,7 +567,7 @@ private:
     double marginRightPoints_{72.0};
     double marginBottomPoints_{72.0};
     double marginLeftPoints_{72.0};
-    QString defaultFontFamily_{QStringLiteral("Carlito")};
+    QString defaultFontFamily_{QStringLiteral("Helvetica")};
     double defaultFontPointSize_{11.0};
     int tabWidthSpaces_{4};
     core::ListLayout defaultListLayout_;

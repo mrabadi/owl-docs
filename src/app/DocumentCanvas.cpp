@@ -603,7 +603,7 @@ QString visibleParagraphText(const core::Paragraph& paragraph,
 }
 
 QFont fontFrom(const core::CharacterFormat& format,
-               const QString& defaultFamily = QStringLiteral("Carlito"),
+               const QString& defaultFamily = QStringLiteral("Helvetica"),
                double defaultPointSize = 11.0) {
     QFont font(format.font_family
                    ? QString::fromStdString(*format.font_family)
@@ -646,7 +646,7 @@ double requestedPointSize(const core::CharacterFormat& format,
 
 double unroundedLineAdvance(
     const core::CharacterFormat& format,
-    const QString& defaultFamily = QStringLiteral("Carlito"),
+    const QString& defaultFamily = QStringLiteral("Helvetica"),
     double defaultPointSize = 11.0) {
     const double requestedPoints = requestedPointSize(format, defaultPointSize);
     const QFont font = fontFrom(format, defaultFamily, defaultPointSize);
@@ -668,7 +668,7 @@ double unroundedLineAdvance(
 }
 
 QTextCharFormat qtFormat(const core::CharacterFormat& format,
-                         const QString& defaultFamily = QStringLiteral("Carlito"),
+                         const QString& defaultFamily = QStringLiteral("Helvetica"),
                          double defaultPointSize = 11.0) {
     QTextCharFormat result;
     result.setFont(fontFrom(format, defaultFamily, defaultPointSize));

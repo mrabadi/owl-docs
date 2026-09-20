@@ -497,7 +497,7 @@ RibbonWidget::RibbonWidget(CommandRegistry& commands, QWidget* parent) : QWidget
     refreshParagraphStyle();
     setTableContext(false);
     setPictureContext(false);
-    setFontFamily(QStringLiteral("Carlito"));
+    setFontFamily(QStringLiteral("Helvetica"));
     setFontPointSize(11.0);
     setTextColor(Qt::black);
 }
@@ -911,7 +911,7 @@ QWidget* RibbonWidget::makePictureTab(CommandRegistry& commands) {
 
 void RibbonWidget::setFontFamily(const QString& family) {
     const QSignalBlocker blocker(fontFamily_);
-    fontFamily_->setCurrentFont(QFont(family));
+    fontFamily_->setCurrentText(family);
 }
 
 void RibbonWidget::setParagraphStyle(const QString& styleId) {

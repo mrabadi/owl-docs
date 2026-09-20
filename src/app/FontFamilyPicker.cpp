@@ -57,6 +57,15 @@ FontFamilyPicker::FontFamilyPicker(QWidget* parent) : QFontComboBox(parent) {
     auto* delegate = new FontFamilyNameDelegate(this);
     delegate->setObjectName(QStringLiteral("fontFamilyNameOnlyDelegate"));
     setItemDelegate(delegate);
+
+    // DOCX names are not limited to locally installed font-family records.
+    // In particular, Linux Fontconfig resolves Helvetica to a metric-compatible
+    // substitute even though QFontDatabase commonly exposes only the resolved
+    // family. Keep the requested document name visible and editable so a
+    // Helvetica document does not misleadingly turn into "Nimbus Sans" merely
+    // because that is the local rendering face.
+    setEditable(true);
+    setInsertPolicy(QComboBox::NoInsert);
 }
 
 }  // namespace docxstudio::app

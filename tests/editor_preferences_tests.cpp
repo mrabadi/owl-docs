@@ -27,8 +27,8 @@ QSettings settingsFor(const QTemporaryDir& temporary, const QString& name) {
 void testBuiltInDefaults(const QTemporaryDir& temporary) {
     auto settings = settingsFor(temporary, QStringLiteral("empty.ini"));
     const auto preferences = EditorPreferences::load(settings);
-    check(preferences.defaultFontFamily() == QStringLiteral("Carlito"),
-          "the built-in font family is not Carlito");
+    check(preferences.defaultFontFamily() == QStringLiteral("Helvetica"),
+          "the built-in font family is not Helvetica");
     check(preferences.defaultFontPointSize() == 11.0,
           "the built-in font size is not 11 points");
     check(preferences.tabWidthSpaces() == 4,

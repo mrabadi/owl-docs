@@ -32,7 +32,7 @@ EditorPreferences::EditorPreferences()
     : defaultFontFamily_(builtInFontFamily()) {}
 
 QString EditorPreferences::builtInFontFamily() {
-    return QStringLiteral("Carlito");
+    return QStringLiteral("Helvetica");
 }
 
 bool EditorPreferences::isValidFontFamily(const QString& family) noexcept {

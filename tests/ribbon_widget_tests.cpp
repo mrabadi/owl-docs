@@ -177,6 +177,9 @@ int main(int argc, char** argv) {
               fontPicker->itemDelegate()->objectName() ==
                   QStringLiteral("fontFamilyNameOnlyDelegate"),
           "font picker still uses Qt's writing-system sample delegate");
+    check(fontPicker->isEditable() &&
+              fontPicker->currentText() == QStringLiteral("Helvetica"),
+          "ribbon does not retain the Helvetica document-family name");
 
     // Replacing Qt's noisy delegate must not filter multilingual fonts out of
     // the model: editing imported Arabic/CJK/Indic text still needs every

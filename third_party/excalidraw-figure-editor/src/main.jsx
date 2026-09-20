@@ -7,9 +7,11 @@ import "./style.css";
 
 window.EXCALIDRAW_ASSET_PATH = new URL("./", window.location.href).href;
 
+const HELVETICA_FONT_FAMILY = 2;
+
 const PROFESSIONAL_APP_STATE = {
   currentItemRoughness: 0,
-  currentItemFontFamily: 10,
+  currentItemFontFamily: HELVETICA_FONT_FAMILY,
   currentItemArrowType: "elbow",
   currentItemEndArrowhead: "triangle",
   currentItemStrokeColor: "#222624",
@@ -39,8 +41,8 @@ function professionalSkeleton(elements) {
     fillStyle: "solid",
     strokeColor: element.strokeColor || "#222624",
     backgroundColor: element.backgroundColor || "transparent",
-    ...(element.type === "text" ? { fontFamily: 10 } : {}),
-    ...(element.label ? { label: { ...element.label, fontFamily: 10 } } : {})
+    ...(element.type === "text" ? { fontFamily: HELVETICA_FONT_FAMILY } : {}),
+    ...(element.label ? { label: { ...element.label, fontFamily: HELVETICA_FONT_FAMILY } } : {})
   }));
 }
 

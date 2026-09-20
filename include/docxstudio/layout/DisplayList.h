@@ -22,7 +22,7 @@ struct Rect {
 };
 
 struct TextStyle {
-    std::string family{"Carlito"};
+    std::string family{"Helvetica"};
     double point_size{11.0};
     int weight{400};
     bool italic{false};

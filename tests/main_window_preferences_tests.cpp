@@ -65,7 +65,7 @@ void testOptionsDialogAndPropagation(QString& selectedFamily) {
     auto canvases = window.findChildren<DocumentCanvas*>();
     check(options && newDocument && canvases.size() == 1,
           "File Options or the initial document is missing");
-    checkCanvasDefaults(*canvases.front(), QStringLiteral("Carlito"), 11.0, 4);
+    checkCanvasDefaults(*canvases.front(), QStringLiteral("Helvetica"), 11.0, 4);
 
     auto* zoomSlider = window.findChild<QSlider*>(
         QStringLiteral("status.zoomSlider"));
@@ -131,6 +131,9 @@ void testOptionsDialogAndPropagation(QString& selectedFamily) {
                   font->itemDelegate()->objectName() ==
                       QStringLiteral("fontFamilyNameOnlyDelegate"),
               "Options font picker still appends writing-system samples");
+        check(font->isEditable() &&
+                  font->currentText() == QStringLiteral("Helvetica"),
+              "Options does not expose the Helvetica document default");
         check(near(size->value(), 11.0) && tab->value() == 4 &&
                   tab->minimum() == EditorPreferences::kMinimumTabWidthSpaces &&
                   tab->maximum() == EditorPreferences::kMaximumTabWidthSpaces,
@@ -142,7 +145,7 @@ void testOptionsDialogAndPropagation(QString& selectedFamily) {
     });
     options->trigger();
     check(cancelled, "Options cancel path was not exercised");
-    checkCanvasDefaults(*canvases.front(), QStringLiteral("Carlito"), 11.0, 4);
+    checkCanvasDefaults(*canvases.front(), QStringLiteral("Helvetica"), 11.0, 4);
 
     bool accepted = false;
     QTimer::singleShot(0, &window, [&] {

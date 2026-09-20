@@ -202,6 +202,15 @@ int main(int argc, char** argv) {
               figureEditor.contains(
                   QStringLiteral("currentItemEndArrowhead: \"triangle\"")),
           "Owl Docs is not using the current Excalidraw Local Professional-mode API");
+    check(figureEditor.contains(
+              QStringLiteral("const HELVETICA_FONT_FAMILY = 2")) &&
+              figureEditor.contains(QStringLiteral(
+                  "currentItemFontFamily: HELVETICA_FONT_FAMILY")) &&
+              figureEditor.contains(QStringLiteral(
+                  "element.type === \"text\" ? { fontFamily: HELVETICA_FONT_FAMILY }")) &&
+              figureEditor.contains(QStringLiteral(
+                  "currentItemFontFamily: 5")),
+          "Professional figures do not default to Helvetica or Sketch mode was changed");
     const QString vendoredProperties = readFile(
         root + QStringLiteral(
                    "/third_party/excalidraw-figure-editor/vendor/excalidraw-workspace/packages/excalidraw/actions/actionProperties.tsx"));
@@ -344,9 +353,9 @@ int main(int argc, char** argv) {
         QStringLiteral("ribbon.fontFamily"));
     auto* fontSize = window.findChild<QComboBox*>(
         QStringLiteral("ribbon.fontSize"));
-    check(fontFamily && fontFamily->currentFont().family() ==
-              QStringLiteral("Carlito"),
-          "new-document ribbon does not show the Carlito default font");
+    check(fontFamily && fontFamily->currentText() ==
+              QStringLiteral("Helvetica"),
+          "new-document ribbon does not show the Helvetica default font");
     check(fontSize && fontSize->currentText() == QStringLiteral("11"),
           "new-document ribbon does not show the 11 point default size");
     window.resize(1280, 860);

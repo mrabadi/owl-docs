@@ -1565,7 +1565,7 @@ ooxml::BasicRunFormat toOoxmlSparseFormat(
 
 ooxml::BasicRunFormat toOoxmlFormat(
     const core::CharacterFormat& format,
-    const QString& defaultFontFamily = QStringLiteral("Carlito"),
+    const QString& defaultFontFamily = QStringLiteral("Helvetica"),
     double defaultFontPointSize = 11.0) {
     auto result = toOoxmlSparseFormat(format);
     if (!result.font_family) {
@@ -2568,7 +2568,7 @@ std::optional<EditorPreferences> requestEditorPreferences(
     auto* fontFamily = new FontFamilyPicker(&dialog);
     fontFamily->setObjectName(QStringLiteral("editorOptions.fontFamily"));
     fontFamily->setAccessibleName(QObject::tr("Default font"));
-    fontFamily->setCurrentFont(QFont(current.defaultFontFamily()));
+    fontFamily->setCurrentText(current.defaultFontFamily());
     form->addRow(QObject::tr("Default font:"), fontFamily);
 
     auto* fontSize = new QDoubleSpinBox(&dialog);
@@ -2604,7 +2604,7 @@ std::optional<EditorPreferences> requestEditorPreferences(
     if (dialog.exec() != QDialog::Accepted) return std::nullopt;
 
     EditorPreferences result = current;
-    if (!result.setDefaultFontFamily(fontFamily->currentFont().family()) ||
+    if (!result.setDefaultFontFamily(fontFamily->currentText()) ||
         !result.setDefaultFontPointSize(fontSize->value()) ||
         !result.setTabWidthSpaces(tabWidth->value())) {
         return std::nullopt;
