@@ -89,7 +89,6 @@ export const FONT_METADATA: Record<number, FontMetadata> = {
       lineHeight: 1.15,
     },
     icon: FontFamilyNormalIcon,
-    deprecated: true,
     local: true,
   },
   [FONT_FAMILY.Cascadia]: {

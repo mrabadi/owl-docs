@@ -210,6 +210,18 @@ int main(int argc, char** argv) {
               vendoredProperties.contains(QStringLiteral("fontWeight")) &&
               vendoredProperties.contains(QStringLiteral("fontStyle")),
           "vendored Excalidraw Local text-style controls are missing");
+    const QString fontMetadata = readFile(
+        root + QStringLiteral(
+                   "/third_party/excalidraw-figure-editor/vendor/excalidraw-workspace/packages/excalidraw/fonts/FontMetadata.ts"));
+    const qsizetype helveticaStart = fontMetadata.indexOf(
+        QStringLiteral("[FONT_FAMILY.Helvetica]"));
+    const qsizetype cascadiaStart = fontMetadata.indexOf(
+        QStringLiteral("[FONT_FAMILY.Cascadia]"), helveticaStart);
+    check(helveticaStart >= 0 && cascadiaStart > helveticaStart &&
+              !fontMetadata.sliced(
+                  helveticaStart, cascadiaStart - helveticaStart)
+                   .contains(QStringLiteral("deprecated: true")),
+          "Helvetica is still hidden as a deprecated Excalidraw font");
     const QString assetPreparation = readFile(
         root + QStringLiteral(
                    "/third_party/excalidraw-figure-editor/scripts/prepare-assets.mjs"));
