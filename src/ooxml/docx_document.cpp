@@ -325,6 +325,10 @@ struct ParsedPackage {
     std::vector<ImportedBodyBlock> body_blocks;
     std::optional<PageSettings> page_settings;
     std::vector<ImportedSection> sections;
+    std::optional<std::string> header_text;
+    std::optional<std::string> footer_text;
+    std::string header_xml;
+    std::string footer_xml;
     std::vector<SpanLocation> spans;
     CompatibilityReport compatibility;
     std::optional<DocumentDefaults> canonical_simple_regeneration_defaults;
@@ -334,6 +338,7 @@ std::string buildNewStylesXml(
     const DocumentDefaults& defaults,
     const NewParagraphStyleCatalog& paragraph_styles);
 std::string buildNewSettingsXml(const DocumentDefaults& defaults);
+std::string buildStoryXml(std::string_view text, bool header);
 
 void setError(Error* error, ErrorCode code, std::string message) {
     if (error != nullptr) {
@@ -4176,6 +4181,8 @@ struct AuxiliaryPartTargets {
     std::optional<std::string> styles;
     std::optional<std::string> numbering;
     std::optional<std::string> theme;
+    std::optional<std::string> header;
+    std::optional<std::string> footer;
 };
 
 AuxiliaryPartTargets auxiliaryPartTargets(
@@ -4223,9 +4230,66 @@ AuxiliaryPartTargets auxiliaryPartTargets(
             targets.numbering = *target;
         } else if (type.ends_with("/theme")) {
             targets.theme = *target;
+        } else if (type.ends_with("/header") && !targets.header) {
+            targets.header = *target;
+        } else if (type.ends_with("/footer") && !targets.footer) {
+            targets.footer = *target;
         }
     }
     return targets;
+}
+
+std::optional<std::string> parseSimpleStoryText(
+    std::string_view xml, const OpenOptions& options) {
+    if (xml.empty()) return std::nullopt;
+    pugi::xml_document story;
+    if (!story.load_buffer(xml.data(), xml.size(), pugi::parse_default,
+                           pugi::encoding_auto) ||
+        !::docxstudio::xml::inspectComplexity(
+             story, options.max_xml_depth, options.max_xml_nodes)
+             .accepted()) {
+        return std::nullopt;
+    }
+    std::string result;
+    const auto appendNode = [&](const auto& self,
+                                const pugi::xml_node& node) -> void {
+        if (isWordElement(node, "t")) {
+            result += node.child_value();
+            return;
+        }
+        if (isWordElement(node, "tab")) {
+            result.push_back('\t');
+            return;
+        }
+        if (isWordElement(node, "br") || isWordElement(node, "cr")) {
+            result.push_back('\n');
+            return;
+        }
+        if (isWordElement(node, "fldSimple")) {
+            std::string instruction = wordAttribute(node, "instr").value_or("");
+            instruction.erase(std::remove_if(
+                instruction.begin(), instruction.end(),
+                [](unsigned char value) { return std::isspace(value); }),
+                instruction.end());
+            std::transform(instruction.begin(), instruction.end(),
+                           instruction.begin(), [](unsigned char value) {
+                               return static_cast<char>(std::toupper(value));
+                           });
+            if (instruction == "PAGE") result += "{PAGE}";
+            else if (instruction == "NUMPAGES") result += "{PAGES}";
+            else for (const auto child : node.children()) self(self, child);
+            return;
+        }
+        for (const auto child : node.children()) self(self, child);
+    };
+    bool firstParagraph = true;
+    for (const auto node : story.document_element().children()) {
+        if (!isWordElement(node, "p")) continue;
+        if (!firstParagraph) result.push_back('\n');
+        firstParagraph = false;
+        appendNode(appendNode, node);
+    }
+    return result;
 }
 
 std::string imageContentTypeForMember(std::string_view member) {
@@ -4833,10 +4897,18 @@ bool canonicalSimpleDocumentEnvelope(
         return false;
     }
 
+    pugi::xml_node header_reference;
+    pugi::xml_node footer_reference;
     pugi::xml_node page_size;
     pugi::xml_node page_margins;
     for (const pugi::xml_node child : section.children()) {
-        if (isCanonicalWriterWordElement(child, "pgSz") && !page_size &&
+        if (isCanonicalWriterWordElement(child, "headerReference") &&
+            !header_reference && !footer_reference && !page_size) {
+            header_reference = child;
+        } else if (isCanonicalWriterWordElement(child, "footerReference") &&
+                   !footer_reference && !page_size) {
+            footer_reference = child;
+        } else if (isCanonicalWriterWordElement(child, "pgSz") && !page_size &&
             !page_margins) {
             page_size = child;
         } else if (isCanonicalWriterWordElement(child, "pgMar") &&
@@ -4845,6 +4917,35 @@ bool canonicalSimpleDocumentEnvelope(
         } else {
             return false;
         }
+    }
+    const auto canonical_story_reference = [](
+        const pugi::xml_node& node, std::string_view expected_id) {
+        if (!node || node.first_child()) return false;
+        std::size_t attributes = 0;
+        bool type = false;
+        bool id = false;
+        for (const pugi::xml_attribute attribute : node.attributes()) {
+            ++attributes;
+            const std::string_view name(attribute.name());
+            if (name == "w:type" &&
+                std::string_view(attribute.value()) == "default") {
+                type = true;
+            } else if (name == "r:id" &&
+                       std::string_view(attribute.value()) == expected_id) {
+                id = true;
+            } else {
+                return false;
+            }
+        }
+        return attributes == 2U && type && id;
+    };
+    if (static_cast<bool>(header_reference) != parsed.header_text.has_value() ||
+        static_cast<bool>(footer_reference) != parsed.footer_text.has_value() ||
+        (header_reference && !canonical_story_reference(
+             header_reference, "rIdHeader1")) ||
+        (footer_reference && !canonical_story_reference(
+             footer_reference, "rIdFooter1"))) {
+        return false;
     }
     if (!page_size || !page_margins ||
         page_size.first_child() || page_margins.first_child() ||
@@ -4918,7 +5019,7 @@ std::optional<DocumentDefaults> canonicalSimpleRegenerationDefaults(
     std::string_view document_relationships_xml,
     std::string_view styles_xml, std::string_view settings_xml,
     const ImportContext& context) {
-    static constexpr std::array<std::string_view, 6> expected_members{
+    static constexpr std::array<std::string_view, 6> base_members{
         kContentTypesPart,
         kRootRelationshipsPart,
         kDocumentPart,
@@ -4926,13 +5027,43 @@ std::optional<DocumentDefaults> canonicalSimpleRegenerationDefaults(
         "word/styles.xml",
         "word/settings.xml",
     };
+    std::vector<std::string_view> expected_members(
+        base_members.begin(), base_members.end());
+    if (parsed.header_text) expected_members.push_back("word/header1.xml");
+    if (parsed.footer_text) expected_members.push_back("word/footer1.xml");
+
+    std::string expected_content_types(kNewContentTypes);
+    std::string expected_relationships(kNewDocumentRelationships);
+    constexpr std::string_view content_types_end = "</Types>";
+    constexpr std::string_view relationships_end = "</Relationships>";
+    const auto append_before = [](std::string& target, std::string_view ending,
+                                  std::string_view addition) {
+        const auto position = target.rfind(ending);
+        if (position != std::string::npos) target.insert(position, addition);
+    };
+    if (parsed.header_text) {
+        append_before(expected_content_types, content_types_end,
+                      "<Override PartName=\"/word/header1.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml\"/>");
+        append_before(expected_relationships, relationships_end,
+                      "<Relationship Id=\"rIdHeader1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/header\" Target=\"header1.xml\"/>");
+    }
+    if (parsed.footer_text) {
+        append_before(expected_content_types, content_types_end,
+                      "<Override PartName=\"/word/footer1.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.footer+xml\"/>");
+        append_before(expected_relationships, relationships_end,
+                      "<Relationship Id=\"rIdFooter1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/footer\" Target=\"footer1.xml\"/>");
+    }
     if (parsed.entries.size() != expected_members.size() ||
         parsed.compatibility.classification !=
             CompatibilityClass::basic_body_text_patch ||
         !parsed.compatibility.issues.empty() ||
-        content_types_xml != kNewContentTypes ||
+        content_types_xml != expected_content_types ||
         root_relationships_xml != kNewRootRelationships ||
-        document_relationships_xml != kNewDocumentRelationships) {
+        document_relationships_xml != expected_relationships ||
+        (parsed.header_text &&
+         parsed.header_xml != buildStoryXml(*parsed.header_text, true)) ||
+        (parsed.footer_text &&
+         parsed.footer_xml != buildStoryXml(*parsed.footer_text, false))) {
         return std::nullopt;
     }
     for (const auto name : expected_members) {
@@ -5179,10 +5310,14 @@ bool inspectPackage(
     if (const auto related = related_index(related_parts.theme)) {
         theme_index = related;
     }
+    const auto header_index = related_index(related_parts.header);
+    const auto footer_index = related_index(related_parts.footer);
     std::string styles_xml;
     std::string settings_xml;
     std::string numbering_xml;
     std::string theme_xml;
+    std::string header_xml;
+    std::string footer_xml;
     const auto read_optional = [&](const std::optional<std::size_t>& index,
                                    std::string& destination) {
         return !index || readEntry(
@@ -5192,7 +5327,9 @@ bool inspectPackage(
     if (!read_optional(styles_index, styles_xml) ||
         !read_optional(settings_index, settings_xml) ||
         !read_optional(numbering_index, numbering_xml) ||
-        !read_optional(theme_index, theme_xml)) {
+        !read_optional(theme_index, theme_xml) ||
+        !read_optional(header_index, header_xml) ||
+        !read_optional(footer_index, footer_xml)) {
         zip_discard(archive);
         return false;
     }
@@ -5256,6 +5393,10 @@ bool inspectPackage(
     resolveInlineImages(parsed, options);
     parsed.sections = parseBodySections(parsed.document_xml);
     parsed.page_settings = parseBodyPageSettings(parsed.document_xml);
+    parsed.header_xml = header_xml;
+    parsed.footer_xml = footer_xml;
+    parsed.header_text = parseSimpleStoryText(header_xml, options);
+    parsed.footer_text = parseSimpleStoryText(footer_xml, options);
     parsed.canonical_simple_regeneration_defaults =
         canonicalSimpleRegenerationDefaults(
             parsed, content_types_xml, relationships_xml,
@@ -6130,6 +6271,8 @@ bool writeNewArchive(
     std::string_view settings_xml,
     std::string_view numbering_xml,
     std::string_view document_xml,
+    std::string_view header_xml,
+    std::string_view footer_xml,
     const std::vector<AuthoredImagePart>& images,
     Error* error) {
     int open_error = 0;
@@ -6146,6 +6289,10 @@ bool writeNewArchive(
             archive, "word/_rels/document.xml.rels", document_relationships, error) ||
         !addBufferMember(archive, "word/styles.xml", styles_xml, error) ||
         !addBufferMember(archive, "word/settings.xml", settings_xml, error) ||
+        (!header_xml.empty() &&
+         !addBufferMember(archive, "word/header1.xml", header_xml, error)) ||
+        (!footer_xml.empty() &&
+         !addBufferMember(archive, "word/footer1.xml", footer_xml, error)) ||
         (!numbering_xml.empty() &&
          !addBufferMember(
              archive, "word/numbering.xml", numbering_xml, error))) {
@@ -7092,7 +7239,14 @@ bool buildNewDocumentXml(
         document << "</w:tbl>";
     }
 
-    document << "<w:sectPr><w:pgSz w:w=\"" << page.width_twips
+    document << "<w:sectPr>";
+    if (body.header_text && !body.header_text->empty()) {
+        document << "<w:headerReference w:type=\"default\" r:id=\"rIdHeader1\"/>";
+    }
+    if (body.footer_text && !body.footer_text->empty()) {
+        document << "<w:footerReference w:type=\"default\" r:id=\"rIdFooter1\"/>";
+    }
+    document << "<w:pgSz w:w=\"" << page.width_twips
              << "\" w:h=\"" << page.height_twips << "\"";
     if (page.width_twips > page.height_twips) {
         document << " w:orient=\"landscape\"";
@@ -7105,6 +7259,46 @@ bool buildNewDocumentXml(
              << "</w:sectPr></w:body></w:document>";
     xml = document.str();
     return true;
+}
+
+void appendStoryRunContents(std::ostringstream& output,
+                            std::string_view text) {
+    std::size_t cursor = 0;
+    while (cursor < text.size()) {
+        const auto page = text.find("{PAGE}", cursor);
+        const auto pages = text.find("{PAGES}", cursor);
+        std::size_t token = std::min(page, pages);
+        if (page == std::string_view::npos) token = pages;
+        if (pages == std::string_view::npos) token = page;
+        if (token == std::string_view::npos) {
+            if (cursor < text.size()) {
+                output << "<w:r>";
+                appendWordRunContents(output, text.substr(cursor));
+                output << "</w:r>";
+            }
+            break;
+        }
+        if (token > cursor) {
+            output << "<w:r>";
+            appendWordRunContents(output, text.substr(cursor, token - cursor));
+            output << "</w:r>";
+        }
+        const bool total = token == pages;
+        output << "<w:fldSimple w:instr=\" "
+               << (total ? "NUMPAGES" : "PAGE")
+               << " \"><w:r><w:t>1</w:t></w:r></w:fldSimple>";
+        cursor = token + (total ? 7U : 6U);
+    }
+}
+
+std::string buildStoryXml(std::string_view text, bool header) {
+    std::ostringstream output;
+    output << "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+           << (header ? "<w:hdr" : "<w:ftr")
+           << " xmlns:w=\"" << kWordNamespace << "\"><w:p>";
+    appendStoryRunContents(output, text);
+    output << "</w:p>" << (header ? "</w:hdr>" : "</w:ftr>");
+    return output.str();
 }
 
 bool validPageSettings(const PageSettings& page) {
@@ -7472,7 +7666,8 @@ bool buildNewNumberingXml(
 }
 
 std::string newContentTypes(
-    bool has_numbering, const std::vector<AuthoredImagePart>& images) {
+    bool has_numbering, bool has_header, bool has_footer,
+    const std::vector<AuthoredImagePart>& images) {
     std::string result(kNewContentTypes);
     constexpr std::string_view closing = "</Types>";
     const auto position = result.rfind(closing);
@@ -7481,6 +7676,16 @@ std::string newContentTypes(
             position,
             "<Override PartName=\"/word/numbering.xml\" "
             "ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml\"/>");
+    }
+    if (const auto header_position = result.rfind(closing);
+        header_position != std::string::npos && has_header) {
+        result.insert(header_position,
+                      "<Override PartName=\"/word/header1.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml\"/>");
+    }
+    if (const auto footer_position = result.rfind(closing);
+        footer_position != std::string::npos && has_footer) {
+        result.insert(footer_position,
+                      "<Override PartName=\"/word/footer1.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.footer+xml\"/>");
     }
     const bool has_png = std::any_of(
         images.begin(), images.end(), [](const auto& image) {
@@ -7504,7 +7709,8 @@ std::string newContentTypes(
 }
 
 std::string newDocumentRelationships(
-    bool has_numbering, const std::vector<AuthoredImagePart>& images) {
+    bool has_numbering, bool has_header, bool has_footer,
+    const std::vector<AuthoredImagePart>& images) {
     std::string result(kNewDocumentRelationships);
     constexpr std::string_view closing = "</Relationships>";
     const auto position = result.rfind(closing);
@@ -7514,6 +7720,16 @@ std::string newDocumentRelationships(
             "<Relationship Id=\"rId3\" "
             "Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/numbering\" "
             "Target=\"numbering.xml\"/>");
+    }
+    if (const auto header_position = result.rfind(closing);
+        header_position != std::string::npos && has_header) {
+        result.insert(header_position,
+                      "<Relationship Id=\"rIdHeader1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/header\" Target=\"header1.xml\"/>");
+    }
+    if (const auto footer_position = result.rfind(closing);
+        footer_position != std::string::npos && has_footer) {
+        result.insert(footer_position,
+                      "<Relationship Id=\"rIdFooter1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/footer\" Target=\"footer1.xml\"/>");
     }
     for (const auto& image : images) {
         const auto image_position = result.rfind(closing);
@@ -7763,6 +7979,14 @@ const std::optional<PageSettings>& DocxDocument::bodyPageSettings() const noexce
 
 const std::vector<ImportedSection>& DocxDocument::sections() const noexcept {
     return impl_->package.sections;
+}
+
+const std::optional<std::string>& DocxDocument::headerText() const noexcept {
+    return impl_->package.header_text;
+}
+
+const std::optional<std::string>& DocxDocument::footerText() const noexcept {
+    return impl_->package.footer_text;
 }
 
 const CompatibilityReport& DocxDocument::compatibility() const noexcept {
@@ -8057,9 +8281,30 @@ SaveResult DocxDocument::writeNew(
         return result;
     }
     const bool has_numbering = !numbering_xml.empty();
-    const std::string content_types = newContentTypes(has_numbering, images);
+    const bool has_header = body.header_text && !body.header_text->empty();
+    const bool has_footer = body.footer_text && !body.footer_text->empty();
+    for (const auto* story : {body.header_text ? &*body.header_text : nullptr,
+                              body.footer_text ? &*body.footer_text : nullptr}) {
+        if (!story) continue;
+        IssueCode issue = IssueCode::invalid_utf8;
+        std::string detail;
+        if (story->size() > 65536U ||
+            !isValidUtf8XmlText(*story, issue, detail)) {
+            const std::string message = detail.empty()
+                ? "Header or footer text exceeds the size limit" : detail;
+            result.loss_report.issues.push_back(blockingIssue(issue, message));
+            result.error = Error{ErrorCode::unsafe_edit, message};
+            return result;
+        }
+    }
+    const std::string header_xml = has_header
+        ? buildStoryXml(*body.header_text, true) : std::string{};
+    const std::string footer_xml = has_footer
+        ? buildStoryXml(*body.footer_text, false) : std::string{};
+    const std::string content_types = newContentTypes(
+        has_numbering, has_header, has_footer, images);
     const std::string document_relationships =
-        newDocumentRelationships(has_numbering, images);
+        newDocumentRelationships(has_numbering, has_header, has_footer, images);
 
     auto temporary = AtomicTempFile::create(target, 0600U, &save_error);
     if (!temporary.has_value()) {
@@ -8076,6 +8321,8 @@ SaveResult DocxDocument::writeNew(
             buildNewSettingsXml(defaults),
             numbering_xml,
             document_xml,
+            header_xml,
+            footer_xml,
             images,
             &save_error) ||
         !temporary->syncClosedFile(&save_error) ||
@@ -8151,9 +8398,9 @@ SaveResult DocxDocument::writeNew(
     }
     const bool has_numbering = !numbering_xml.empty();
     const std::string content_types =
-        newContentTypes(has_numbering, images);
+        newContentTypes(has_numbering, false, false, images);
     const std::string document_relationships =
-        newDocumentRelationships(has_numbering, images);
+        newDocumentRelationships(has_numbering, false, false, images);
 
     auto temporary = AtomicTempFile::create(target, 0600U, &save_error);
     if (!temporary.has_value()) {
@@ -8166,7 +8413,7 @@ SaveResult DocxDocument::writeNew(
             document_relationships,
             buildNewStylesXml(defaults, paragraph_styles),
             buildNewSettingsXml(defaults), numbering_xml, document_xml,
-            images, &save_error) ||
+            {}, {}, images, &save_error) ||
         !temporary->syncClosedFile(&save_error) ||
         !validateSavedPackage(
             temporary->path(), nullptr, document_xml, nullptr,

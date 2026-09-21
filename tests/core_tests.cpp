@@ -2412,6 +2412,35 @@ void testEquationStructureAndSessionHistory() {
     CHECK(atomic.snapshot().document == before.document);
 }
 
+void testHeaderFooterOperationsAndHistory() {
+    DocumentSession session(documentWithText(u"Body"));
+    auto snapshot = session.snapshot();
+    const std::vector<Operation> story_operations{
+        SetHeaderText{u"Owl Docs"},
+        SetFooterText{u"Page {PAGE} of {PAGES}"},
+    };
+    CHECK(session.applyBatch(snapshot.revision, story_operations));
+    snapshot = session.snapshot();
+    CHECK(snapshot.document.headerText() == u"Owl Docs");
+    CHECK(snapshot.document.footerText() == u"Page {PAGE} of {PAGES}");
+    CHECK(session.undo(snapshot.revision));
+    snapshot = session.snapshot();
+    CHECK(snapshot.document.headerText().empty());
+    CHECK(snapshot.document.footerText().empty());
+    CHECK(session.redo(snapshot.revision));
+    snapshot = session.snapshot();
+    CHECK(snapshot.document.headerText() == u"Owl Docs");
+    CHECK(snapshot.document.footerText() == u"Page {PAGE} of {PAGES}");
+
+    std::u16string oversized(
+        Document::maximum_header_footer_code_units + 1U, u'x');
+    const std::vector<Operation> oversized_operation{
+        SetHeaderText{std::move(oversized)},
+    };
+    CHECK(!session.applyBatch(snapshot.revision, oversized_operation));
+    CHECK(session.snapshot().revision == snapshot.revision);
+}
+
 void testSemanticTableOperationsAndHistory() {
     CHECK(!Table::create(0, 2, false));
     CHECK(!Table::create(Table::maximum_rows + 1, 1, false));
@@ -2939,6 +2968,7 @@ int main() {
     testBoundedSessionHistoryAndPreviews();
     testSemanticEquationAtomEditing();
     testEquationStructureAndSessionHistory();
+    testHeaderFooterOperationsAndHistory();
     testSemanticTableOperationsAndHistory();
     testTableFormattingStructureAndStyles();
     testInsertedTableCellsInheritFormatting();

@@ -606,7 +606,13 @@ struct NewTable {
 using NewBodyBlock = std::variant<NewParagraph, NewTable>;
 
 struct NewDocumentBody {
+    NewDocumentBody() = default;
+    NewDocumentBody(std::vector<NewBodyBlock> new_blocks)
+        : blocks(std::move(new_blocks)) {}
+
     std::vector<NewBodyBlock> blocks;
+    std::optional<std::string> header_text;
+    std::optional<std::string> footer_text;
 };
 
 struct PageSettings {
@@ -749,6 +755,8 @@ public:
     [[nodiscard]] const std::vector<ImportedBodyBlock>& bodyBlocks() const noexcept;
     [[nodiscard]] const std::optional<PageSettings>& bodyPageSettings() const noexcept;
     [[nodiscard]] const std::vector<ImportedSection>& sections() const noexcept;
+    [[nodiscard]] const std::optional<std::string>& headerText() const noexcept;
+    [[nodiscard]] const std::optional<std::string>& footerText() const noexcept;
     [[nodiscard]] const CompatibilityReport& compatibility() const noexcept;
     // True only for the deliberately narrow, text-only package shape emitted
     // by this writer when every package part and document structure is covered

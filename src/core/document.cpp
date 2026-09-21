@@ -2618,4 +2618,37 @@ Result<void> Document::deleteTable(NodeId table_id) {
     return {};
 }
 
+namespace {
+
+Result<void> validateHeaderFooterText(const std::u16string& text) {
+    if (text.size() > Document::maximum_header_footer_code_units) {
+        return Error{ErrorCode::invalid_operation,
+                     "Header or footer text exceeds the size limit"};
+    }
+    if (!isValidUtf16(text) ||
+        std::find(text.begin(), text.end(), u'\0') != text.end() ||
+        std::find(text.begin(), text.end(),
+                  kInlineObjectReplacementCharacter) != text.end()) {
+        return Error{ErrorCode::invalid_operation,
+                     "Header or footer text contains invalid characters"};
+    }
+    return {};
+}
+
+}  // namespace
+
+Result<void> Document::setHeaderText(std::u16string text) {
+    const auto validation = validateHeaderFooterText(text);
+    if (!validation) return validation.error();
+    header_text_ = std::move(text);
+    return {};
+}
+
+Result<void> Document::setFooterText(std::u16string text) {
+    const auto validation = validateHeaderFooterText(text);
+    if (!validation) return validation.error();
+    footer_text_ = std::move(text);
+    return {};
+}
+
 }  // namespace docxstudio::core

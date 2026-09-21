@@ -299,6 +299,16 @@ QIcon paintedCommandIcon(const QString& id, const QWidget* widget,
         painter.drawLine(8, 18, 12, 18);
         painter.drawLine(7, 9, 17, 9);
         painter.drawLine(7, 13, 14, 13);
+    } else if (id == QStringLiteral("insert.headerFooter")) {
+        painter.drawRect(QRect(5, 2, 14, 20));
+        painter.setBrush(QColor(QStringLiteral("#e95420")));
+        painter.setPen(Qt::NoPen);
+        painter.drawRect(QRect(7, 4, 10, 3));
+        painter.drawRect(QRect(7, 17, 10, 3));
+        painter.setBrush(Qt::NoBrush);
+        painter.setPen(QPen(foreground, 1.3));
+        painter.drawLine(8, 10, 16, 10);
+        painter.drawLine(8, 13, 14, 13);
     } else if (id == QStringLiteral("insert.pageBreak")) {
         painter.drawRect(QRect(5, 2, 14, 7));
         painter.drawRect(QRect(5, 15, 14, 7));
@@ -696,6 +706,7 @@ QWidget* RibbonWidget::makeInsertTab(CommandRegistry& commands) {
     addButtons(layout, commands, page,
                {"insert.pageBreak", "insert.table", "insert.image",
                 "insert.excalidraw", "insert.equation",
+                "insert.headerFooter",
                 "insert.textBox", "insert.comment"});
     layout->addStretch(1);
     return page;

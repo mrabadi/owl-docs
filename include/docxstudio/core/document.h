@@ -389,6 +389,7 @@ private:
 
 class Document {
 public:
+    static constexpr std::size_t maximum_header_footer_code_units = 32768;
     Document();
 
     [[nodiscard]] static Result<Document> create(std::vector<Paragraph> paragraphs);
@@ -397,6 +398,12 @@ public:
     [[nodiscard]] const std::vector<Table>& tables() const noexcept { return tables_; }
     [[nodiscard]] const std::vector<BodyBlockRef>& bodyBlocks() const noexcept {
         return body_blocks_;
+    }
+    [[nodiscard]] const std::u16string& headerText() const noexcept {
+        return header_text_;
+    }
+    [[nodiscard]] const std::u16string& footerText() const noexcept {
+        return footer_text_;
     }
     [[nodiscard]] const Paragraph* findParagraph(NodeId id) const noexcept;
     [[nodiscard]] const Table* findTable(NodeId id) const noexcept;
@@ -494,6 +501,8 @@ public:
     [[nodiscard]] Result<void> moveTable(NodeId table_id,
                                          std::optional<NodeId> before_block_id);
     [[nodiscard]] Result<void> deleteTable(NodeId table_id);
+    [[nodiscard]] Result<void> setHeaderText(std::u16string text);
+    [[nodiscard]] Result<void> setFooterText(std::u16string text);
 
     auto operator<=>(const Document&) const = default;
 
@@ -507,6 +516,8 @@ private:
     std::vector<Paragraph> paragraphs_;
     std::vector<Table> tables_;
     std::vector<BodyBlockRef> body_blocks_;
+    std::u16string header_text_;
+    std::u16string footer_text_;
 };
 
 [[nodiscard]] bool isValidUtf16(const std::u16string& text) noexcept;

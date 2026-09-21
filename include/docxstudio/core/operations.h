@@ -246,6 +246,14 @@ struct DeleteTable {
     NodeId table_id;
 };
 
+struct SetHeaderText {
+    std::u16string text;
+};
+
+struct SetFooterText {
+    std::u16string text;
+};
+
 using Operation = std::variant<InsertText, InsertEquation, InsertImage,
                                ResizeImage, ReplaceImagePayload, SetImageLayout,
                                SetImageAccessibleName, DeleteRange, ReplaceRange,
@@ -260,6 +268,7 @@ using Operation = std::variant<InsertText, InsertEquation, InsertImage,
                                SetTableCellParagraphFormat, AppendTableRow,
                                InsertTableRow, DeleteTableRows,
                                InsertTableColumn, DeleteTableColumns,
-                               SetTableStyle, MoveTable, DeleteTable>;
+                               SetTableStyle, MoveTable, DeleteTable,
+                               SetHeaderText, SetFooterText>;
 
 }  // namespace docxstudio::core

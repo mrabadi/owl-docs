@@ -1183,6 +1183,8 @@ std::optional<std::string> RecoveryCodec::encode(const RecoveryDocument& recover
                            ? "paragraph" : "table"},
              {"id", block.id.toString()}});
     }
+    root["header_text_utf16"] = encodeUtf16(recovery.document.headerText());
+    root["footer_text_utf16"] = encodeUtf16(recovery.document.footerText());
     try {
         std::string payload = root.dump();
         if (payload.size() > kMaximumPayloadBytes) {
@@ -2105,6 +2107,25 @@ std::optional<RecoveryDocument> RecoveryCodec::decode(std::string_view payload,
                     error = moved.error().message;
                     return std::nullopt;
                 }
+            }
+        }
+        if (version >= 12) {
+            std::u16string header;
+            std::u16string footer;
+            if (!decodeUtf16(root.at("header_text_utf16"), header,
+                             totalCodeUnits, error) ||
+                !decodeUtf16(root.at("footer_text_utf16"), footer,
+                             totalCodeUnits, error)) {
+                return std::nullopt;
+            }
+            const auto headerResult = document.value().setHeaderText(
+                std::move(header));
+            const auto footerResult = document.value().setFooterText(
+                std::move(footer));
+            if (!headerResult || !footerResult) {
+                error = !headerResult ? headerResult.error().message
+                                      : footerResult.error().message;
+                return std::nullopt;
             }
         }
         return RecoveryDocument{std::move(document.value()), page};

@@ -20,6 +20,7 @@
 #include <QMenu>
 #include <QMouseEvent>
 #include <QProcess>
+#include <QPlainTextEdit>
 #include <QPushButton>
 #include <QRawFont>
 #include <QSpinBox>
@@ -1731,14 +1732,40 @@ void testSingleDialogAndNativeSave() {
     auto* canvas = window.findChild<DocumentCanvas*>();
     auto* insertAction = window.findChild<QAction*>(
         QStringLiteral("insert.table"));
+    auto* headerFooterAction = window.findChild<QAction*>(
+        QStringLiteral("insert.headerFooter"));
     auto* pasteTextOnlyAction = window.findChild<QAction*>(
         QStringLiteral("edit.pasteTextOnly"));
-    check(canvas && insertAction && pasteTextOnlyAction &&
+    check(canvas && insertAction && headerFooterAction && pasteTextOnlyAction &&
               pasteTextOnlyAction->text() ==
                   QStringLiteral("Paste as Text Only") &&
               pasteTextOnlyAction->shortcut() ==
                   QKeySequence(QStringLiteral("Ctrl+Shift+V")),
           "could not reach the Paste as Text Only command and shortcut");
+
+    bool inspectedHeaderFooterDialog = false;
+    QTimer::singleShot(0, &window, [&] {
+        auto* dialog = window.findChild<QDialog*>(
+            QStringLiteral("headerFooterDialog"));
+        auto* header = dialog ? dialog->findChild<QPlainTextEdit*>(
+            QStringLiteral("headerFooter.header")) : nullptr;
+        auto* footer = dialog ? dialog->findChild<QPlainTextEdit*>(
+            QStringLiteral("headerFooter.footer")) : nullptr;
+        auto* buttons = dialog ? dialog->findChild<QDialogButtonBox*>(
+            QStringLiteral("headerFooter.buttons")) : nullptr;
+        check(dialog && dialog->isModal() && header && footer && buttons,
+              "Header & Footer did not open its complete modal editor");
+        header->setPlainText(QStringLiteral("Owl Docs"));
+        footer->setPlainText(QStringLiteral("Page {PAGE} of {PAGES}"));
+        inspectedHeaderFooterDialog = true;
+        buttons->button(QDialogButtonBox::Ok)->click();
+    });
+    headerFooterAction->trigger();
+    check(inspectedHeaderFooterDialog &&
+              canvas->headerText() == QStringLiteral("Owl Docs") &&
+              canvas->footerText() ==
+                  QStringLiteral("Page {PAGE} of {PAGES}"),
+          "Header & Footer dialog did not apply both stories");
 
     bool inspectedDialog = false;
     QTimer::singleShot(0, &window, [&] {
@@ -1798,6 +1825,9 @@ void testSingleDialogAndNativeSave() {
           "new document save did not emit a native WordprocessingML table");
     check(!xml.contains("Saved cell\t"),
           "new document save flattened the semantic table to tabbed text");
+    check(zipMember(path, "word/header1.xml").contains("Owl Docs") &&
+              zipMember(path, "word/footer1.xml").contains("NUMPAGES"),
+          "new document save omitted native header/footer parts");
 }
 
 }  // namespace

@@ -109,6 +109,10 @@ Result<void> applyOne(Document& document, const Operation& operation) {
                 return document.moveTable(typed.table_id, typed.before_block_id);
             } else if constexpr (std::is_same_v<Type, DeleteTable>) {
                 return document.deleteTable(typed.table_id);
+            } else if constexpr (std::is_same_v<Type, SetHeaderText>) {
+                return document.setHeaderText(typed.text);
+            } else if constexpr (std::is_same_v<Type, SetFooterText>) {
+                return document.setFooterText(typed.text);
             }
         },
         operation);

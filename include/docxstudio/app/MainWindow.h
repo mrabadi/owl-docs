@@ -95,6 +95,7 @@ private:
     void insertEquation();
     void insertImage();
     void insertExcalidrawFigure();
+    void showHeaderFooterEditor();
     void editSelectedExcalidrawFigure(DocumentCanvas* canvas);
     void showCompatibilityReport();
     void updateWindowTitle();

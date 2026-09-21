@@ -52,6 +52,7 @@
 #include <QMimeData>
 #include <QPrintDialog>
 #include <QPrintPreviewDialog>
+#include <QPlainTextEdit>
 #include <QPushButton>
 #include <QRegularExpression>
 #include <QSettings>
@@ -1520,6 +1521,21 @@ core::Result<ImportedSemanticDocument> documentFromOoxml(
         tablePresentations.push_back(std::move(tablePresentation));
     }
 
+    if (package.headerText()) {
+        const auto applied = document.setHeaderText(
+            QString::fromUtf8(package.headerText()->data(),
+                              static_cast<qsizetype>(package.headerText()->size()))
+                .toStdU16String());
+        if (!applied) return applied.error();
+    }
+    if (package.footerText()) {
+        const auto applied = document.setFooterText(
+            QString::fromUtf8(package.footerText()->data(),
+                              static_cast<qsizetype>(package.footerText()->size()))
+                .toStdU16String());
+        if (!applied) return applied.error();
+    }
+
     return ImportedSemanticDocument{std::move(document),
                                     std::move(sourceIndices),
                                     std::move(sourceTextPrefixes),
@@ -2434,6 +2450,18 @@ ooxml::NewDocumentBody toOoxmlBody(
     auto paragraphs = toOoxmlParagraphs(
         snapshot, losses, defaultFontFamily, defaultFontPointSize);
     ooxml::NewDocumentBody output;
+    if (!snapshot.document.headerText().empty()) {
+        output.header_text = QString::fromUtf16(
+            snapshot.document.headerText().data(),
+            static_cast<qsizetype>(snapshot.document.headerText().size()))
+                                 .toUtf8().toStdString();
+    }
+    if (!snapshot.document.footerText().empty()) {
+        output.footer_text = QString::fromUtf16(
+            snapshot.document.footerText().data(),
+            static_cast<qsizetype>(snapshot.document.footerText().size()))
+                                 .toUtf8().toStdString();
+    }
     output.blocks.reserve(snapshot.document.bodyBlocks().size());
     for (const auto& block : snapshot.document.bodyBlocks()) {
         if (block.kind == core::BodyBlockKind::paragraph) {
@@ -3176,6 +3204,8 @@ void MainWindow::registerCommands() {
     });
     add("insert.pageBreak", tr("Page Break"), QKeySequence(QStringLiteral("Ctrl+Return")),
         [this] { if (activeCanvas()) activeCanvas()->insertPageBreak(); });
+    add("insert.headerFooter", tr("Header & Footer"), QKeySequence(),
+        [this] { showHeaderFooterEditor(); });
     add("insert.table", tr("Table"), QKeySequence(), [this] { insertTable(); });
     add("table.insertRowAbove", tr("Insert Row Above"), QKeySequence(), [this] {
         if (auto* canvas = activeCanvas()) {
@@ -3325,7 +3355,7 @@ void MainWindow::registerCommands() {
              "paragraph.alignLeft", "paragraph.alignCenter",
              "paragraph.alignRight", "paragraph.justify", "paragraph.bullets",
              "paragraph.listProperties",
-             "insert.pageBreak", "insert.equation"}) {
+             "insert.pageBreak", "insert.headerFooter", "insert.equation"}) {
         if (auto* action = commands_.action(QString::fromLatin1(id))) {
             action->setShortcutContext(Qt::WidgetWithChildrenShortcut);
         }
@@ -3370,6 +3400,7 @@ void MainWindow::registerCommands() {
              "paragraph.alignRight", "paragraph.justify",
              "paragraph.decreaseIndent", "paragraph.increaseIndent",
              "insert.pageBreak", "insert.table", "insert.image",
+             "insert.headerFooter",
              "insert.excalidraw",
              "insert.equation", "insert.textBox", "insert.comment",
              "table.insertRowAbove", "table.insertRowBelow",
@@ -3423,7 +3454,7 @@ void MainWindow::buildMenus() {
     auto* insert = menuBar()->addMenu(tr("&Insert"));
     for (const auto* id : {"insert.table", "insert.image",
                            "insert.excalidraw", "insert.equation",
-                           "insert.pageBreak"})
+                           "insert.pageBreak", "insert.headerFooter"})
         insert->addAction(commands_.action(QString::fromLatin1(id)));
     auto* review = menuBar()->addMenu(tr("&Review"));
     review->addAction(commands_.action("review.spelling"));
@@ -4047,7 +4078,7 @@ bool MainWindow::saveCanvas(DocumentCanvas* canvas, bool saveAs) {
             cancel->setText(tr("Cancel"));
         }
         QString details = tr(
-            "Potential losses include headers/footers, comments, tracked revisions, "
+            "Potential losses include advanced headers/footers, comments, tracked revisions, "
             "fields, charts, SmartArt, text boxes, floating drawings, and custom XML. "
             "Editable body text and supported formatting will be retained.");
         details += QLatin1Char('\n');
@@ -4617,6 +4648,69 @@ void MainWindow::insertTable() {
             static_cast<std::size_t>(rows->value()),
             static_cast<std::size_t>(columns->value()),
             header->isChecked()));
+    }
+    canvas->setFocus();
+}
+
+void MainWindow::showHeaderFooterEditor() {
+    auto* canvas = activeCanvas();
+    if (!canvas) return;
+
+    QDialog dialog(this);
+    dialog.setObjectName(QStringLiteral("headerFooterDialog"));
+    dialog.setWindowTitle(tr("Header and Footer"));
+    dialog.setModal(true);
+    auto* outer = new QVBoxLayout(&dialog);
+    auto* explanation = new QLabel(
+        tr("Enter text shown on every page. Use {PAGE} for the current page "
+           "and {PAGES} for the total page count."), &dialog);
+    explanation->setWordWrap(true);
+    outer->addWidget(explanation);
+
+    auto* form = new QFormLayout;
+    auto* header = new QPlainTextEdit(canvas->headerText(), &dialog);
+    header->setObjectName(QStringLiteral("headerFooter.header"));
+    header->setAccessibleName(tr("Header text"));
+    header->setMaximumHeight(90);
+    form->addRow(tr("Header:"), header);
+    auto* footer = new QPlainTextEdit(canvas->footerText(), &dialog);
+    footer->setObjectName(QStringLiteral("headerFooter.footer"));
+    footer->setAccessibleName(tr("Footer text"));
+    footer->setMaximumHeight(90);
+    form->addRow(tr("Footer:"), footer);
+    outer->addLayout(form);
+
+    auto* tokenRow = new QHBoxLayout;
+    auto* page = new QPushButton(tr("Insert Page Number"), &dialog);
+    page->setObjectName(QStringLiteral("headerFooter.insertPage"));
+    auto* pages = new QPushButton(tr("Insert Total Pages"), &dialog);
+    pages->setObjectName(QStringLiteral("headerFooter.insertPages"));
+    tokenRow->addWidget(page);
+    tokenRow->addWidget(pages);
+    tokenRow->addStretch(1);
+    outer->addLayout(tokenRow);
+    const auto insertToken = [&dialog, header, footer](const QString& token) {
+        auto* target = qobject_cast<QPlainTextEdit*>(dialog.focusWidget());
+        if (target != header && target != footer) target = footer;
+        target->insertPlainText(token);
+        target->setFocus();
+    };
+    connect(page, &QPushButton::clicked, &dialog,
+            [insertToken] { insertToken(QStringLiteral("{PAGE}")); });
+    connect(pages, &QPushButton::clicked, &dialog,
+            [insertToken] { insertToken(QStringLiteral("{PAGES}")); });
+
+    auto* buttons = new QDialogButtonBox(
+        QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
+    buttons->setObjectName(QStringLiteral("headerFooter.buttons"));
+    connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+    outer->addWidget(buttons);
+    header->setFocus();
+
+    if (dialog.exec() == QDialog::Accepted) {
+        static_cast<void>(canvas->setHeaderFooterText(
+            header->toPlainText(), footer->toPlainText()));
     }
     canvas->setFocus();
 }

@@ -177,6 +177,10 @@ docxstudio::core::Document formattedDocument() {
               static_cast<bool>(document.value().moveTable(
                   NodeId{17, 18}, NodeId{7, 8})),
           "could not arrange recovery fixture tables");
+    check(static_cast<bool>(document.value().setHeaderText(u"Owl Docs")) &&
+              static_cast<bool>(document.value().setFooterText(
+                  u"Page {PAGE} of {PAGES}")),
+          "could not set recovery fixture header and footer");
     return std::move(document.value());
 }
 
@@ -272,10 +276,10 @@ void codecRoundTrip() {
     check(!RecoveryCodec::decode(invalidIndent, error),
           "recovery codec accepted an out-of-range bullet indentation");
 
-    const auto version = futureVersion.find("\"version\":11");
+    const auto version = futureVersion.find("\"version\":12");
     check(version != std::string::npos, "encoded recovery version was absent");
-    futureVersion.replace(version, std::string("\"version\":11").size(),
-                          "\"version\":12");
+    futureVersion.replace(version, std::string("\"version\":12").size(),
+                          "\"version\":13");
     check(!RecoveryCodec::decode(futureVersion, error),
           "recovery codec accepted an unsupported future version");
     check(!RecoveryCodec::decode("{not-json", error),
@@ -778,8 +782,8 @@ void semanticImageAdversarialLimits() {
     using namespace docxstudio::app;
     using namespace docxstudio::core;
 
-    check(RecoveryCodec::currentVersion == 11,
-          "recovery schema version was not bumped for paragraph-mark style provenance");
+    check(RecoveryCodec::currentVersion == 12,
+          "recovery schema version was not bumped for header/footer stories");
     check(kMaximumInlineImagesPerDocument == 512 &&
               kMaximumEncodedImageBytes == 16U * 1024U * 1024U &&
               kMaximumDocumentEncodedImageBytes == 32U * 1024U * 1024U &&

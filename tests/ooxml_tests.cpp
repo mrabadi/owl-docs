@@ -2514,6 +2514,43 @@ void testNewRunTabsAndBreaks(const TemporaryDirectory& temporary) {
           "run formatting did not cover serialized tabs and breaks");
 }
 
+void testHeaderFooterRoundTrip(const TemporaryDirectory& temporary) {
+    const auto path = temporary.file("header-footer.docx");
+    NewDocumentBody body{{NewParagraph{{NewRun{"Body text", {}}}}}};
+    body.header_text = "Owl Docs";
+    body.footer_text = "Page {PAGE} of {PAGES}";
+    const auto save = DocxDocument::writeNew(path, body);
+    check(save.saved,
+          save.error ? save.error->message : "header/footer DOCX was not saved");
+
+    const std::string document_xml = readMember(path, "word/document.xml");
+    const std::string header_xml = readMember(path, "word/header1.xml");
+    const std::string footer_xml = readMember(path, "word/footer1.xml");
+    check(document_xml.find(
+              "<w:headerReference w:type=\"default\" r:id=\"rIdHeader1\"/>") !=
+              std::string::npos &&
+              document_xml.find(
+              "<w:footerReference w:type=\"default\" r:id=\"rIdFooter1\"/>") !=
+              std::string::npos,
+          "document section omitted its header/footer references");
+    check(header_xml.find("<w:t>Owl Docs</w:t>") != std::string::npos,
+          "header text was not serialized");
+    check(footer_xml.find("w:instr=\" PAGE \"") != std::string::npos &&
+              footer_xml.find("w:instr=\" NUMPAGES \"") != std::string::npos,
+          "footer page fields were not serialized as Word fields");
+
+    Error error;
+    auto reopened = DocxDocument::open(path, &error);
+    check(reopened != nullptr, error.message);
+    check(reopened->headerText() == std::optional<std::string>{"Owl Docs"} &&
+              reopened->footerText() ==
+                  std::optional<std::string>{"Page {PAGE} of {PAGES}"},
+          "header/footer text and page-field tokens did not reopen");
+    check(reopened->isCanonicalRegeneratableSimplePackage(
+              DocumentDefaults{}),
+          "an Owl Docs header/footer package was not safely regeneratable");
+}
+
 void testUnsupportedFormattingIsReported(const TemporaryDirectory& temporary) {
     const auto path = temporary.file("unsupported-formatting.docx");
     createPackage(
@@ -2854,6 +2891,7 @@ int main() {
         testNewDocumentDefaultStyle(temporary);
         testCustomDocumentDefaults(temporary);
         testNewRunTabsAndBreaks(temporary);
+        testHeaderFooterRoundTrip(temporary);
         testExactUnchangedSave(temporary);
         testTextPatchPreservesOpaqueMembers(temporary);
         testUnsupportedFormattingIsReported(temporary);

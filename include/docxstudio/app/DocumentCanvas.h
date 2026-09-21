@@ -244,6 +244,11 @@ public:
     bool setCurrentListLayout(const core::ListLayout& layout);
     bool changeListLevel(bool outdent);
     void insertPageBreak();
+    QString headerText() const;
+    QString footerText() const;
+    bool setHeaderText(const QString& text);
+    bool setFooterText(const QString& text);
+    bool setHeaderFooterText(const QString& header, const QString& footer);
     void applyCharacterFormat(const core::CharacterFormatDelta& delta);
     void applyParagraphFormat(const core::ParagraphFormatDelta& delta);
     void applyParagraphStyle(const QString& styleId);

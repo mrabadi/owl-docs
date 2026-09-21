@@ -4091,6 +4091,40 @@ void DocumentCanvas::renderPage(QPainter& painter, int pageIndexValue,
     // viewed at non-integral zoom levels. This does not rewrite source bytes.
     painter.setRenderHint(QPainter::SmoothPixmapTransform, true);
 
+    const auto expandedStoryText = [this, pageIndexValue](
+                                       const std::u16string& source) {
+        QString text = fromUtf16(source);
+        text.replace(QStringLiteral("{PAGE}"),
+                     QString::number(pageIndexValue + 1),
+                     Qt::CaseInsensitive);
+        text.replace(QStringLiteral("{PAGES}"), QString::number(pageCount_),
+                     Qt::CaseInsensitive);
+        return text;
+    };
+    QFont storyFont(defaultFontFamily_);
+    storyFont.setPointSizeF(defaultFontPointSize_);
+    painter.setFont(storyFont);
+    painter.setPen(Qt::black);
+    const double storyLeft = marginLeftPoints_;
+    const double storyWidth = std::max(
+        1.0, pageWidthPoints_ - marginLeftPoints_ - marginRightPoints_);
+    if (!snap.document.headerText().empty()) {
+        const QRectF headerRect(
+            storyLeft, 18.0, storyWidth,
+            std::max(12.0, marginTopPoints_ - 27.0));
+        painter.drawText(headerRect,
+                         Qt::AlignLeft | Qt::AlignTop | Qt::TextWordWrap,
+                         expandedStoryText(snap.document.headerText()));
+    }
+    if (!snap.document.footerText().empty()) {
+        const QRectF footerRect(
+            storyLeft, pageHeightPoints_ - marginBottomPoints_ + 9.0,
+            storyWidth, std::max(12.0, marginBottomPoints_ - 18.0));
+        painter.drawText(footerRect,
+                         Qt::AlignLeft | Qt::AlignBottom | Qt::TextWordWrap,
+                         expandedStoryText(snap.document.footerText()));
+    }
+
     for (const auto& tableVisual : tableVisuals_) {
         const auto& table = *tableVisual;
         const bool tableObjectSelected =
@@ -9216,6 +9250,28 @@ void DocumentCanvas::insertPageBreak() {
     delta.page_break_before = core::PropertyDelta<bool>::set(true);
     operations.push_back(core::SetParagraphFormat{{newId}, delta});
     apply(std::move(operations), core::Position{newId, 0});
+}
+
+QString DocumentCanvas::headerText() const {
+    return fromUtf16(session_->snapshot().document.headerText());
+}
+
+QString DocumentCanvas::footerText() const {
+    return fromUtf16(session_->snapshot().document.footerText());
+}
+
+bool DocumentCanvas::setHeaderText(const QString& text) {
+    return apply({core::SetHeaderText{toUtf16(text)}});
+}
+
+bool DocumentCanvas::setFooterText(const QString& text) {
+    return apply({core::SetFooterText{toUtf16(text)}});
+}
+
+bool DocumentCanvas::setHeaderFooterText(const QString& header,
+                                         const QString& footer) {
+    return apply({core::SetHeaderText{toUtf16(header)},
+                  core::SetFooterText{toUtf16(footer)}});
 }
 
 void DocumentCanvas::setMarginsPoints(double top, double right, double bottom, double left) {

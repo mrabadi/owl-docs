@@ -102,6 +102,18 @@ int main(int argc, char** argv) {
     docxstudio::app::DocumentCanvas canvas(spelling);
     canvas.resize(900, 700);
 
+    check(canvas.setHeaderFooterText(
+              QStringLiteral("Owl Docs"),
+              QStringLiteral("Page {PAGE} of {PAGES}")),
+          "could not set the document header and footer");
+    check(canvas.headerText() == QStringLiteral("Owl Docs") &&
+              canvas.footerText() ==
+                  QStringLiteral("Page {PAGE} of {PAGES}"),
+          "the canvas did not retain header/footer text");
+    canvas.undo();
+    check(canvas.headerText().isEmpty() && canvas.footerText().isEmpty(),
+          "header and footer were not one undoable transaction");
+
     canvas.insertText(QStringLiteral("Helo world"));
     check(textOf(canvas.snapshot()) == QStringLiteral("Helo world"),
           "typing did not update the semantic document");
