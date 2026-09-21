@@ -393,6 +393,32 @@ QIcon colorChoiceIcon(const QColor& color, const QWidget* widget) {
     return QIcon(pixmap);
 }
 
+const std::vector<std::pair<QString, QColor>>& lightBrandColors() {
+    static const std::vector<std::pair<QString, QColor>> colors{
+        {QObject::tr("Black"), QColor(QStringLiteral("#000000"))},
+        {QObject::tr("White"), QColor(QStringLiteral("#FFFFFF"))},
+        {QObject::tr("Core - Warm White"), QColor(QStringLiteral("#FAFAF7"))},
+        {QObject::tr("Core - Forest"), QColor(QStringLiteral("#173B32"))},
+        {QObject::tr("Core - Slate"), QColor(QStringLiteral("#626A66"))},
+        {QObject::tr("Core - Graphite"), QColor(QStringLiteral("#222624"))},
+        {QObject::tr("Figure - Green 01"), QColor(QStringLiteral("#2F6B57"))},
+        {QObject::tr("Figure - Green 02"), QColor(QStringLiteral("#69947B"))},
+        {QObject::tr("Figure - Brown 01"), QColor(QStringLiteral("#6F5747"))},
+        {QObject::tr("Figure - Brown 02"), QColor(QStringLiteral("#9C765C"))},
+        {QObject::tr("Figure - Purple 01"), QColor(QStringLiteral("#66507A"))},
+        {QObject::tr("Figure - Purple 02"), QColor(QStringLiteral("#9A7EAD"))},
+        {QObject::tr("Figure - Blue 01"), QColor(QStringLiteral("#356078"))},
+        {QObject::tr("Figure - Blue 02"), QColor(QStringLiteral("#6F94AC"))},
+        {QObject::tr("Figure - Yellow 01"), QColor(QStringLiteral("#8F6B1C"))},
+        {QObject::tr("Figure - Yellow 02"), QColor(QStringLiteral("#B38B30"))},
+        {QObject::tr("Figure - Red 01"), QColor(QStringLiteral("#994A55"))},
+        {QObject::tr("Figure - Red 02"), QColor(QStringLiteral("#C06B73"))},
+        {QObject::tr("Figure - Orange 01"), QColor(QStringLiteral("#A95F2B"))},
+        {QObject::tr("Figure - Orange 02"), QColor(QStringLiteral("#C37C40"))},
+    };
+    return colors;
+}
+
 QIcon tableStyleChoiceIcon(const QColor& header, const QColor& band,
                            const QColor& grid, const QWidget* widget) {
     QPixmap pixmap(42, 28);
@@ -586,22 +612,13 @@ QWidget* RibbonWidget::makeHomeTab(CommandRegistry& commands) {
     textColor_->setFocusPolicy(Qt::NoFocus);
     auto* textColorMenu = new QMenu(textColor_);
     textColorMenu->setObjectName(QStringLiteral("ribbonMenu.textColor"));
-    const std::vector<std::pair<QString, QColor>> textColors{
-        {tr("Black"), QColor(QStringLiteral("#000000"))},
-        {tr("Dark red"), QColor(QStringLiteral("#C00000"))},
-        {tr("Red"), QColor(QStringLiteral("#FF0000"))},
-        {tr("Orange"), QColor(QStringLiteral("#E95420"))},
-        {tr("Yellow"), QColor(QStringLiteral("#FFC000"))},
-        {tr("Green"), QColor(QStringLiteral("#008000"))},
-        {tr("Blue"), QColor(QStringLiteral("#0070C0"))},
-        {tr("Purple"), QColor(QStringLiteral("#7030A0"))},
-        {tr("White"), QColor(QStringLiteral("#FFFFFF"))},
-    };
+    const auto& textColors = lightBrandColors();
     for (std::size_t index = 0; index < textColors.size(); ++index) {
         const auto& [label, color] = textColors[index];
         auto* action = textColorMenu->addAction(
             colorChoiceIcon(color, textColor_), label);
         action->setObjectName(QStringLiteral("ribbonColor.text.%1").arg(index));
+        action->setData(color);
         connect(action, &QAction::triggered, this,
                 [this, color] { emit textColorSelected(color); });
     }
@@ -650,6 +667,7 @@ QWidget* RibbonWidget::makeHomeTab(CommandRegistry& commands) {
             colorChoiceIcon(color, highlightColor_), label);
         action->setObjectName(
             QStringLiteral("ribbonColor.highlight.%1").arg(index));
+        action->setData(color);
         connect(action, &QAction::triggered, this,
                 [this, color] { emit highlightColorSelected(color); });
     }

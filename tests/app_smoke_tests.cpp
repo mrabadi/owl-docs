@@ -1325,7 +1325,7 @@ int main(int argc, char** argv) {
                      &docxstudio::app::RibbonWidget::clearHighlightRequested,
                      [&clearHighlightRequested] { clearHighlightRequested = true; });
     auto* textPaletteChoice = iconRibbon.findChild<QAction*>(
-        QStringLiteral("ribbonColor.text.2"));
+        QStringLiteral("ribbonColor.text.16"));
     auto* highlightPaletteChoice = iconRibbon.findChild<QAction*>(
         QStringLiteral("ribbonColor.highlight.0"));
     auto* noHighlightChoice = iconRibbon.findChild<QAction*>(
@@ -1335,7 +1335,7 @@ int main(int argc, char** argv) {
     textPaletteChoice->trigger();
     highlightPaletteChoice->trigger();
     noHighlightChoice->trigger();
-    check(selectedTextColor == QColor(QStringLiteral("#ff0000")) &&
+    check(selectedTextColor == QColor(QStringLiteral("#994a55")) &&
               selectedHighlightColor == QColor(QStringLiteral("#fff200")) &&
               clearHighlightRequested,
           "a palette click was not applied immediately");

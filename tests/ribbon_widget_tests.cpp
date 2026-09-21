@@ -181,6 +181,25 @@ int main(int argc, char** argv) {
               fontPicker->currentText() == QStringLiteral("Helvetica"),
           "ribbon does not retain the Helvetica document-family name");
 
+    const QStringList expectedLightPalette{
+        QStringLiteral("#000000"), QStringLiteral("#ffffff"),
+        QStringLiteral("#fafaf7"), QStringLiteral("#173b32"),
+        QStringLiteral("#626a66"), QStringLiteral("#222624"),
+        QStringLiteral("#2f6b57"), QStringLiteral("#69947b"),
+        QStringLiteral("#6f5747"), QStringLiteral("#9c765c"),
+        QStringLiteral("#66507a"), QStringLiteral("#9a7ead"),
+        QStringLiteral("#356078"), QStringLiteral("#6f94ac"),
+        QStringLiteral("#8f6b1c"), QStringLiteral("#b38b30"),
+        QStringLiteral("#994a55"), QStringLiteral("#c06b73"),
+        QStringLiteral("#a95f2b"), QStringLiteral("#c37c40")};
+    for (qsizetype index = 0; index < expectedLightPalette.size(); ++index) {
+        auto* action = ribbon.findChild<QAction*>(
+            QStringLiteral("ribbonColor.text.%1").arg(index));
+        check(action && action->data().value<QColor>().name() ==
+                            expectedLightPalette[index],
+              "font-color palette differs from the light core/figure system");
+    }
+
     // Replacing Qt's noisy delegate must not filter multilingual fonts out of
     // the model: editing imported Arabic/CJK/Indic text still needs every
     // installed family to remain selectable.
@@ -193,8 +212,12 @@ int main(int argc, char** argv) {
     for (int index = 0; index < fontPicker->count(); ++index) {
         owlFamilies.insert(fontPicker->itemText(index));
     }
-    check(owlFamilies == stockFamilies,
-          "readable font picker filtered or added installed font families");
+    QSet<QString> expectedFamilies = stockFamilies;
+    expectedFamilies.insert(QStringLiteral("Helvetica"));
+    check(owlFamilies == expectedFamilies &&
+              fontPicker->findText(QStringLiteral("Helvetica"),
+                                   Qt::MatchFixedString) >= 0,
+          "font picker did not preserve installed families plus Helvetica");
 
     // The clean label should still act as a live font preview: each family
     // name is painted in that family, with no sample suffix or type icon.

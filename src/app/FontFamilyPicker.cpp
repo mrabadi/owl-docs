@@ -66,6 +66,13 @@ FontFamilyPicker::FontFamilyPicker(QWidget* parent) : QFontComboBox(parent) {
     // because that is the local rendering face.
     setEditable(true);
     setInsertPolicy(QComboBox::NoInsert);
+
+    // Helvetica is a valid portable DOCX/Excalidraw family even when Linux
+    // renders it through a Fontconfig substitute. Put the document-facing
+    // family in the actual popup as well as accepting it in the edit field.
+    if (findText(QStringLiteral("Helvetica"), Qt::MatchFixedString) < 0) {
+        insertItem(0, QStringLiteral("Helvetica"));
+    }
 }
 
 }  // namespace docxstudio::app

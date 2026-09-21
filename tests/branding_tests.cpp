@@ -578,7 +578,7 @@ int main(int argc, char** argv) {
     auto* yellowHighlight = window.findChild<QAction*>(
         QStringLiteral("ribbonColor.highlight.0"));
     auto* redText = window.findChild<QAction*>(
-        QStringLiteral("ribbonColor.text.2"));
+        QStringLiteral("ribbonColor.text.16"));
     auto* noHighlight = window.findChild<QAction*>(
         QStringLiteral("ribbonColor.highlight.none"));
     check(yellowHighlight && redText && noHighlight,
@@ -590,7 +590,7 @@ int main(int argc, char** argv) {
     const auto recolored = canvas->snapshot().document.paragraphs().front()
                                .characterFormatAt(1);
     check(!recolored.highlight_argb.has_value() &&
-              recolored.foreground_argb == 0xffff0000U,
+              recolored.foreground_argb == 0xff994a55U,
           "No Highlight failed or also removed the selected font color");
 
     auto* moreTextColors = window.findChild<QAction*>(
