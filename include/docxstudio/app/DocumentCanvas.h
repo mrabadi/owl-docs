@@ -206,6 +206,10 @@ public:
     // to that text boundary as surrounding content changes.
     bool insertInlineImage(std::vector<std::uint8_t> encodedBytes,
                            const QString& accessibleName);
+    // Inserts into the currently active on-page header/footer region. Returns
+    // false when header/footer editing is not active or the image is invalid.
+    bool insertHeaderFooterImage(std::vector<std::uint8_t> encodedBytes,
+                                 const QString& accessibleName);
     std::optional<QByteArray> selectedExcalidrawScene() const;
     bool replaceSelectedExcalidrawFigure(
         std::vector<std::uint8_t> encodedPng);
@@ -573,7 +577,8 @@ private:
     void loadStoryEditors(bool footer);
     void updateStoryEditorGeometry();
     void applyStoryEditorText();
-    void pasteStoryImage(QPlainTextEdit* editor, const QMimeData* mime);
+    bool pasteStoryImage(QPlainTextEdit* editor, const QMimeData* mime,
+                         const QString& accessibleNameOverride = {});
     static std::array<QString, 3> splitStorySections(const QString& text);
     static QString joinStorySections(
         const std::array<QPlainTextEdit*, 3>& editors);
@@ -604,6 +609,7 @@ private:
     std::array<QPlainTextEdit*, 3> footerEditors_{};
     bool headerFooterEditing_{false};
     bool activeStoryIsFooter_{false};
+    int activeStoryRegion_{0};
     int activeStoryPage_{0};
     bool loadingStoryEditors_{false};
     bool storyEditHasTransaction_{false};

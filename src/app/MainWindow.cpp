@@ -4842,12 +4842,19 @@ void MainWindow::insertImage() {
         reinterpret_cast<const std::uint8_t*>(encoded.constData()),
         reinterpret_cast<const std::uint8_t*>(encoded.constData()) +
             encoded.size());
-    if (canvas->insertInlineImage(
-            std::move(bytes), QFileInfo(path).fileName())) {
+    const bool storyPicture = canvas->isHeaderFooterEditing();
+    const bool inserted = storyPicture
+        ? canvas->insertHeaderFooterImage(
+              std::move(bytes), QFileInfo(path).fileName())
+        : canvas->insertInlineImage(
+              std::move(bytes), QFileInfo(path).fileName());
+    if (inserted) {
         statusBar()->showMessage(
-            tr("Picture inserted in line with text"), 4000);
+            storyPicture ? tr("Picture inserted in header or footer")
+                         : tr("Picture inserted in line with text"),
+            4000);
     }
-    canvas->setFocus();
+    if (!storyPicture) canvas->setFocus();
 }
 
 void MainWindow::insertExcalidrawFigure() {

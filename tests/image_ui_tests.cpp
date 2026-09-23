@@ -1158,12 +1158,13 @@ void testHeaderFooterImagePasteZoomHistoryAndRecovery(
               center->geometry().height() > geometry100.height() * 1.8,
           "header/footer editor font and geometry did not scale with zoom");
 
-    const auto png = encodedPng(QColor(12, 170, 73), 80, 40);
     auto* mime = new QMimeData;
-    mime->setData(QStringLiteral("image/png"), asByteArray(png));
+    QImage clipboardImage(80, 40, QImage::Format_ARGB32_Premultiplied);
+    clipboardImage.fill(QColor(12, 170, 73));
+    mime->setImageData(clipboardImage);
     QApplication::clipboard()->setMimeData(mime);
     center->setFocus();
-    center->paste();
+    canvas.paste();
     QApplication::processEvents();
     auto snapshot = canvas.snapshot();
     check(snapshot.document.headerImages().size() == 1 &&
@@ -1512,15 +1513,22 @@ void testDialogSaveAndReopen() {
         QStringLiteral("headerStoryEditor1"));
     check(headerCenter && headerCenter->isVisible(),
           "could not reach the center header before DOCX save");
-    auto* headerMime = new QMimeData;
-    headerMime->setData(QStringLiteral("image/png"), asByteArray(png));
-    QApplication::clipboard()->setMimeData(headerMime);
     headerCenter->setFocus();
-    headerCenter->paste();
-    QApplication::processEvents();
+    bool selectedHeaderSource = false;
+    QTimer::singleShot(0, &window, [&] {
+        auto* dialog = window.findChild<QFileDialog*>();
+        check(dialog != nullptr,
+              "header Picture command did not open a file dialog");
+        dialog->selectFile(source);
+        selectedHeaderSource = true;
+        check(QMetaObject::invokeMethod(dialog, "accept", Qt::DirectConnection),
+              "could not accept header picture dialog");
+    });
+    insert->trigger();
     canvas->endHeaderFooterEditing();
-    check(canvas->snapshot().document.headerImages().size() == 1,
-          "could not insert a semantic header picture before DOCX save");
+    check(selectedHeaderSource &&
+              canvas->snapshot().document.headerImages().size() == 1,
+          "Picture command did not insert into the active header region");
 
     const QString saved = temporary.filePath(QStringLiteral("image.docx"));
     auto* saveAs = window.findChild<QAction*>(QStringLiteral("file.saveAs"));

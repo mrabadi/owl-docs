@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.22)
 
-project(OwlDocs VERSION 0.5.14 LANGUAGES CXX)
+project(OwlDocs VERSION 0.5.15 LANGUAGES CXX)
 
 include(GNUInstallDirs)
 include(CTest)

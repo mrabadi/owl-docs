@@ -19,6 +19,7 @@
 #include <QDoubleSpinBox>
 #include <QFont>
 #include <QFontMetricsF>
+#include <QFocusEvent>
 #include <QFrame>
 #include <QFormLayout>
 #include <QGlyphRun>
@@ -89,10 +90,30 @@ public:
         : QPlainTextEdit(parent) {}
 
     PasteImage pasteImage;
+    std::function<void()> activated;
 
 protected:
+    bool canInsertFromMimeData(const QMimeData* source) const override {
+        return hasPicture(source) ||
+            QPlainTextEdit::canInsertFromMimeData(source);
+    }
+
     void insertFromMimeData(const QMimeData* source) override {
-        const bool hasPicture = source &&
+        if (hasPicture(source) && pasteImage) {
+            pasteImage(source);
+            return;
+        }
+        QPlainTextEdit::insertFromMimeData(source);
+    }
+
+    void focusInEvent(QFocusEvent* event) override {
+        QPlainTextEdit::focusInEvent(event);
+        if (activated) activated();
+    }
+
+private:
+    static bool hasPicture(const QMimeData* source) {
+        return source &&
             (source->hasFormat(QString::fromLatin1(
                  kInlineImageClipboardMime)) ||
              source->hasFormat(QString::fromLatin1(
@@ -100,11 +121,6 @@ protected:
              source->hasFormat(QStringLiteral("image/png")) ||
              source->hasFormat(QStringLiteral("image/jpeg")) ||
              source->hasImage());
-        if (hasPicture && pasteImage) {
-            pasteImage(source);
-            return;
-        }
-        QPlainTextEdit::insertFromMimeData(source);
     }
 };
 
@@ -5057,6 +5073,35 @@ bool DocumentCanvas::insertInlineImage(
         std::move(encodedBytes), accessibleName, std::nullopt, std::nullopt);
 }
 
+bool DocumentCanvas::insertHeaderFooterImage(
+    std::vector<std::uint8_t> encodedBytes,
+    const QString& accessibleName) {
+    if (!headerFooterEditing_ || encodedBytes.empty() ||
+        encodedBytes.size() > core::kMaximumEncodedImageBytes) {
+        return false;
+    }
+    raster::ValidationLimits limits;
+    limits.maximum_encoded_bytes = core::kMaximumEncodedImageBytes;
+    const auto inspection = raster::inspect(encodedBytes,
+                                             raster::Format::unknown,
+                                             limits);
+    if (!inspection.ok()) {
+        emit operationFailed(tr(
+            "The picture is not a valid bounded PNG or JPEG image."));
+        return false;
+    }
+    const QString mimeType = inspection.format == raster::Format::png
+        ? QStringLiteral("image/png") : QStringLiteral("image/jpeg");
+    QMimeData mime;
+    mime.setData(mimeType, QByteArray(
+        reinterpret_cast<const char*>(encodedBytes.data()),
+        static_cast<qsizetype>(encodedBytes.size())));
+    auto& editors = activeStoryIsFooter_ ? footerEditors_ : headerEditors_;
+    auto* target = editors[static_cast<std::size_t>(
+        std::clamp(activeStoryRegion_, 0, 2))];
+    return pasteStoryImage(target, &mime, accessibleName);
+}
+
 std::optional<QByteArray> DocumentCanvas::selectedExcalidrawScene() const {
     const auto selected = selectedInlineImage();
     if (!selected || selected->second.format != core::ImageFormat::png) {
@@ -6990,6 +7035,25 @@ void DocumentCanvas::paste() {
     resetVerticalNavigation();
     clearPendingSpellingWord();
     const QMimeData* mime = QApplication::clipboard()->mimeData();
+    if (headerFooterEditing_) {
+        auto& editors = activeStoryIsFooter_ ? footerEditors_ : headerEditors_;
+        auto* target = editors[static_cast<std::size_t>(
+            std::clamp(activeStoryRegion_, 0, 2))];
+        const bool hasPicture = mime &&
+            (mime->hasFormat(QString::fromLatin1(
+                 kInlineImageClipboardMime)) ||
+             mime->hasFormat(QString::fromLatin1(
+                 kInlineImageClipboardLegacyMime)) ||
+             mime->hasFormat(QStringLiteral("image/png")) ||
+             mime->hasFormat(QStringLiteral("image/jpeg")) ||
+             mime->hasImage());
+        if (hasPicture) {
+            static_cast<void>(pasteStoryImage(target, mime));
+        } else if (target) {
+            target->paste();
+        }
+        return;
+    }
     if (!tableCursor_ && !selectedTable_ && mime &&
         (mime->hasFormat(QString::fromLatin1(kInlineImageClipboardMime)) ||
          mime->hasFormat(
@@ -9508,7 +9572,10 @@ void DocumentCanvas::ensureStoryEditors() {
             connect(editor, &QPlainTextEdit::textChanged, this,
                     [this] { applyStoryEditorText(); });
             editor->pasteImage = [this, editor](const QMimeData* mime) {
-                pasteStoryImage(editor, mime);
+                static_cast<void>(pasteStoryImage(editor, mime));
+            };
+            editor->activated = [this, index] {
+                activeStoryRegion_ = index;
             };
             editors[static_cast<std::size_t>(index)] = editor;
         }
@@ -9538,12 +9605,13 @@ void DocumentCanvas::beginHeaderFooterEditing(bool footer, int section,
     ensureStoryEditors();
     headerFooterEditing_ = true;
     activeStoryIsFooter_ = footer;
+    activeStoryRegion_ = std::clamp(section, 0, 2);
     activeStoryPage_ = std::clamp(pageIndex, 0, std::max(0, pageCount_ - 1));
     storyEditHasTransaction_ = false;
     loadStoryEditors(footer);
     updateStoryEditorGeometry();
     auto& editors = footer ? footerEditors_ : headerEditors_;
-    auto* target = editors[static_cast<std::size_t>(std::clamp(section, 0, 2))];
+    auto* target = editors[static_cast<std::size_t>(activeStoryRegion_)];
     target->setFocus();
     target->moveCursor(QTextCursor::End);
     viewport()->update();
@@ -9576,11 +9644,12 @@ void DocumentCanvas::applyStoryEditorText() {
     }
 }
 
-void DocumentCanvas::pasteStoryImage(QPlainTextEdit* editor,
-                                     const QMimeData* mime) {
+bool DocumentCanvas::pasteStoryImage(
+    QPlainTextEdit* editor, const QMimeData* mime,
+    const QString& accessibleNameOverride) {
     if (!editor || !mime || !headerFooterEditing_ ||
         rejectLiveEditDuringPreview()) {
-        return;
+        return false;
     }
     std::vector<std::uint8_t> encodedBytes;
     QString accessibleName = tr("Pasted picture");
@@ -9600,7 +9669,7 @@ void DocumentCanvas::pasteStoryImage(QPlainTextEdit* editor,
         if (!image) {
             emit operationFailed(tr(
                 "The Owl Docs picture on the clipboard is malformed or exceeds the safety limits."));
-            return;
+            return false;
         }
         encodedBytes = image->encodedBytes;
         accessibleName = image->accessibleName;
@@ -9629,24 +9698,24 @@ void DocumentCanvas::pasteStoryImage(QPlainTextEdit* editor,
                     64LL * 1024LL * 1024LL) {
                 emit operationFailed(tr(
                     "The clipboard picture exceeds the supported image dimensions."));
-                return;
+                return false;
             }
             QBuffer buffer(&encoded);
             if (!buffer.open(QIODevice::WriteOnly) ||
                 !clipboardImage.save(&buffer, "PNG")) {
                 emit operationFailed(tr(
                     "The clipboard picture could not be encoded as PNG."));
-                return;
+                return false;
             }
             format = QStringLiteral("image/png");
         } else {
-            return;
+            return false;
         }
         if (encoded.isEmpty() || encoded.size() >
                 static_cast<qsizetype>(core::kMaximumEncodedImageBytes)) {
             emit operationFailed(tr(
                 "The clipboard picture is empty or exceeds the 16 MiB encoded-picture limit."));
-            return;
+            return false;
         }
         encodedBytes.assign(
             reinterpret_cast<const std::uint8_t*>(encoded.constData()),
@@ -9669,7 +9738,7 @@ void DocumentCanvas::pasteStoryImage(QPlainTextEdit* editor,
     if (!decoded.ok() || decoded.format != expected) {
         emit operationFailed(tr(
             "The picture is not a valid bounded PNG or JPEG image."));
-        return;
+        return false;
     }
 
     const double storyHeight = activeStoryIsFooter_
@@ -9698,7 +9767,7 @@ void DocumentCanvas::pasteStoryImage(QPlainTextEdit* editor,
 
     auto& editors = activeStoryIsFooter_ ? footerEditors_ : headerEditors_;
     const auto found = std::find(editors.begin(), editors.end(), editor);
-    if (found == editors.end()) return;
+    if (found == editors.end()) return false;
     const int region = static_cast<int>(std::distance(editors.begin(), found));
     auto sections = splitStorySections(
         activeStoryIsFooter_ ? footerText() : headerText());
@@ -9716,7 +9785,9 @@ void DocumentCanvas::pasteStoryImage(QPlainTextEdit* editor,
     }
     const QString updated = sections[0] + QLatin1Char('\t') +
         sections[1] + QLatin1Char('\t') + sections[2];
-    QString safeName = accessibleName.trimmed();
+    QString safeName = (accessibleNameOverride.isEmpty()
+                            ? accessibleName
+                            : accessibleNameOverride).trimmed();
     if (safeName.isEmpty()) safeName = tr("Picture");
     QByteArray encodedName = safeName.toUtf8();
     while (encodedName.size() >
@@ -9734,7 +9805,7 @@ void DocumentCanvas::pasteStoryImage(QPlainTextEdit* editor,
         activeStoryIsFooter_, globalOffset,
         core::EncodedImagePayload(std::move(encodedBytes)), requestedFormat,
         encodedName.toStdString(), widthEmu, heightEmu, imageId});
-    if (!apply(std::move(operations))) return;
+    if (!apply(std::move(operations))) return false;
     const auto [cached, inserted] = decodedImages_.emplace(
         imageId, std::move(decoded.image));
     if (inserted) decodedImageBytes_ += cached->second.sizeInBytes();
@@ -9746,6 +9817,7 @@ void DocumentCanvas::pasteStoryImage(QPlainTextEdit* editor,
     target->setFocus();
     storyEditHasTransaction_ = false;
     viewport()->update();
+    return true;
 }
 
 void DocumentCanvas::updateStoryEditorGeometry() {
