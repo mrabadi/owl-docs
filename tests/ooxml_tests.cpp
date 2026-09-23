@@ -2517,7 +2517,7 @@ void testNewRunTabsAndBreaks(const TemporaryDirectory& temporary) {
 void testHeaderFooterRoundTrip(const TemporaryDirectory& temporary) {
     const auto path = temporary.file("header-footer.docx");
     NewDocumentBody body{{NewParagraph{{NewRun{"Body text", {}}}}}};
-    body.header_text = "Owl Docs";
+    body.header_text = "Owl Docs\tConfidential\tSeptember";
     body.footer_text = "Page {PAGE} of {PAGES}";
     const auto save = DocxDocument::writeNew(path, body);
     check(save.saved,
@@ -2533,8 +2533,12 @@ void testHeaderFooterRoundTrip(const TemporaryDirectory& temporary) {
               "<w:footerReference w:type=\"default\" r:id=\"rIdFooter1\"/>") !=
               std::string::npos,
           "document section omitted its header/footer references");
-    check(header_xml.find("<w:t>Owl Docs</w:t>") != std::string::npos,
-          "header text was not serialized");
+    check(header_xml.find("<w:t>Owl Docs</w:t>") != std::string::npos &&
+              header_xml.find("w:val=\"center\" w:pos=\"4680\"") !=
+                  std::string::npos &&
+              header_xml.find("w:val=\"right\" w:pos=\"9360\"") !=
+                  std::string::npos,
+          "three-region header text or its native alignment stops were not serialized");
     check(footer_xml.find("w:instr=\" PAGE \"") != std::string::npos &&
               footer_xml.find("w:instr=\" NUMPAGES \"") != std::string::npos,
           "footer page fields were not serialized as Word fields");
@@ -2542,7 +2546,8 @@ void testHeaderFooterRoundTrip(const TemporaryDirectory& temporary) {
     Error error;
     auto reopened = DocxDocument::open(path, &error);
     check(reopened != nullptr, error.message);
-    check(reopened->headerText() == std::optional<std::string>{"Owl Docs"} &&
+    check(reopened->headerText() == std::optional<std::string>{
+              "Owl Docs\tConfidential\tSeptember"} &&
               reopened->footerText() ==
                   std::optional<std::string>{"Page {PAGE} of {PAGES}"},
           "header/footer text and page-field tokens did not reopen");

@@ -12,6 +12,7 @@
 #include <QString>
 
 #include <cstdint>
+#include <array>
 #include <map>
 #include <memory>
 #include <optional>
@@ -21,6 +22,7 @@
 #include <vector>
 
 class QInputMethodEvent;
+class QPlainTextEdit;
 class QMouseEvent;
 class QPaintEvent;
 class QPdfWriter;
@@ -249,6 +251,12 @@ public:
     bool setHeaderText(const QString& text);
     bool setFooterText(const QString& text);
     bool setHeaderFooterText(const QString& header, const QString& footer);
+    void beginHeaderFooterEditing(bool footer = false, int section = 0,
+                                  int pageIndex = 0);
+    void endHeaderFooterEditing();
+    bool isHeaderFooterEditing() const noexcept {
+        return headerFooterEditing_;
+    }
     void applyCharacterFormat(const core::CharacterFormatDelta& delta);
     void applyParagraphFormat(const core::ParagraphFormatDelta& delta);
     void applyParagraphStyle(const QString& styleId);
@@ -553,6 +561,20 @@ private:
     QString wordAt(const core::Position& position, core::Range* range = nullptr) const;
     void renderPage(QPainter& painter, int pageIndex, const QPointF& origin, double scale,
                     bool decorations) const;
+    struct StoryRegionHit {
+        bool footer{false};
+        int section{0};
+        int pageIndex{0};
+    };
+    std::optional<StoryRegionHit> storyRegionAt(
+        const QPoint& viewportPoint) const;
+    void ensureStoryEditors();
+    void loadStoryEditors(bool footer);
+    void updateStoryEditorGeometry();
+    void applyStoryEditorText();
+    static std::array<QString, 3> splitStorySections(const QString& text);
+    static QString joinStorySections(
+        const std::array<QPlainTextEdit*, 3>& editors);
 
     SpellChecker& spelling_;
     std::unique_ptr<core::DocumentSession> session_;
@@ -576,6 +598,13 @@ private:
     double defaultFontPointSize_{11.0};
     int tabWidthSpaces_{4};
     core::ListLayout defaultListLayout_;
+    std::array<QPlainTextEdit*, 3> headerEditors_{};
+    std::array<QPlainTextEdit*, 3> footerEditors_{};
+    bool headerFooterEditing_{false};
+    bool activeStoryIsFooter_{false};
+    int activeStoryPage_{0};
+    bool loadingStoryEditors_{false};
+    bool storyEditHasTransaction_{false};
 
     mutable core::Revision layoutRevision_;
     mutable bool layoutValid_{false};

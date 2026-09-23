@@ -52,7 +52,6 @@
 #include <QMimeData>
 #include <QPrintDialog>
 #include <QPrintPreviewDialog>
-#include <QPlainTextEdit>
 #include <QPushButton>
 #include <QRegularExpression>
 #include <QSettings>
@@ -4655,64 +4654,7 @@ void MainWindow::insertTable() {
 void MainWindow::showHeaderFooterEditor() {
     auto* canvas = activeCanvas();
     if (!canvas) return;
-
-    QDialog dialog(this);
-    dialog.setObjectName(QStringLiteral("headerFooterDialog"));
-    dialog.setWindowTitle(tr("Header and Footer"));
-    dialog.setModal(true);
-    auto* outer = new QVBoxLayout(&dialog);
-    auto* explanation = new QLabel(
-        tr("Enter text shown on every page. Use {PAGE} for the current page "
-           "and {PAGES} for the total page count."), &dialog);
-    explanation->setWordWrap(true);
-    outer->addWidget(explanation);
-
-    auto* form = new QFormLayout;
-    auto* header = new QPlainTextEdit(canvas->headerText(), &dialog);
-    header->setObjectName(QStringLiteral("headerFooter.header"));
-    header->setAccessibleName(tr("Header text"));
-    header->setMaximumHeight(90);
-    form->addRow(tr("Header:"), header);
-    auto* footer = new QPlainTextEdit(canvas->footerText(), &dialog);
-    footer->setObjectName(QStringLiteral("headerFooter.footer"));
-    footer->setAccessibleName(tr("Footer text"));
-    footer->setMaximumHeight(90);
-    form->addRow(tr("Footer:"), footer);
-    outer->addLayout(form);
-
-    auto* tokenRow = new QHBoxLayout;
-    auto* page = new QPushButton(tr("Insert Page Number"), &dialog);
-    page->setObjectName(QStringLiteral("headerFooter.insertPage"));
-    auto* pages = new QPushButton(tr("Insert Total Pages"), &dialog);
-    pages->setObjectName(QStringLiteral("headerFooter.insertPages"));
-    tokenRow->addWidget(page);
-    tokenRow->addWidget(pages);
-    tokenRow->addStretch(1);
-    outer->addLayout(tokenRow);
-    const auto insertToken = [&dialog, header, footer](const QString& token) {
-        auto* target = qobject_cast<QPlainTextEdit*>(dialog.focusWidget());
-        if (target != header && target != footer) target = footer;
-        target->insertPlainText(token);
-        target->setFocus();
-    };
-    connect(page, &QPushButton::clicked, &dialog,
-            [insertToken] { insertToken(QStringLiteral("{PAGE}")); });
-    connect(pages, &QPushButton::clicked, &dialog,
-            [insertToken] { insertToken(QStringLiteral("{PAGES}")); });
-
-    auto* buttons = new QDialogButtonBox(
-        QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
-    buttons->setObjectName(QStringLiteral("headerFooter.buttons"));
-    connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
-    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
-    outer->addWidget(buttons);
-    header->setFocus();
-
-    if (dialog.exec() == QDialog::Accepted) {
-        static_cast<void>(canvas->setHeaderFooterText(
-            header->toPlainText(), footer->toPlainText()));
-    }
-    canvas->setFocus();
+    canvas->beginHeaderFooterEditing(false, 0, 0);
 }
 
 void MainWindow::insertEquation() {

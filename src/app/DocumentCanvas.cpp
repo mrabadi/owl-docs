@@ -18,6 +18,7 @@
 #include <QDoubleSpinBox>
 #include <QFont>
 #include <QFontMetricsF>
+#include <QFrame>
 #include <QFormLayout>
 #include <QGlyphRun>
 #include <QInputMethodEvent>
@@ -31,6 +32,7 @@
 #include <QPageSize>
 #include <QPainter>
 #include <QPdfWriter>
+#include <QPlainTextEdit>
 #include <QPushButton>
 #include <QRegularExpression>
 #include <QRawFont>
@@ -40,6 +42,7 @@
 #include <QStringList>
 #include <QTextBoundaryFinder>
 #include <QTextCharFormat>
+#include <QTextCursor>
 #include <QTextLayout>
 #include <QTextOption>
 #include <QTimer>
@@ -2242,11 +2245,16 @@ DocumentCanvas::DocumentCanvas(SpellChecker& spelling,
     typingGroupTimer_->setInterval(1000);
     connect(typingGroupTimer_, &QTimer::timeout, this,
             &DocumentCanvas::endTypingGroup);
+    connect(verticalScrollBar(), &QScrollBar::valueChanged, this,
+            [this] { updateStoryEditorGeometry(); });
+    connect(horizontalScrollBar(), &QScrollBar::valueChanged, this,
+            [this] { updateStoryEditorGeometry(); });
 }
 
 DocumentCanvas::~DocumentCanvas() = default;
 
 void DocumentCanvas::setDocument(core::Document document) {
+    endHeaderFooterEditing();
     endTypingGroup();
     endColorAdjustment();
     resetVerticalNavigation();
@@ -4044,6 +4052,7 @@ void DocumentCanvas::updateScrollBars() const {
 
 void DocumentCanvas::paintEvent(QPaintEvent*) {
     ensureLayout();
+    updateStoryEditorGeometry();
     QPainter painter(viewport());
     painter.fillRect(viewport()->rect(), QColor(QStringLiteral("#e8eaed")));
     const double scale = kScreenPointsScale * zoomPercent_ / 100.0;
@@ -4091,16 +4100,6 @@ void DocumentCanvas::renderPage(QPainter& painter, int pageIndexValue,
     // viewed at non-integral zoom levels. This does not rewrite source bytes.
     painter.setRenderHint(QPainter::SmoothPixmapTransform, true);
 
-    const auto expandedStoryText = [this, pageIndexValue](
-                                       const std::u16string& source) {
-        QString text = fromUtf16(source);
-        text.replace(QStringLiteral("{PAGE}"),
-                     QString::number(pageIndexValue + 1),
-                     Qt::CaseInsensitive);
-        text.replace(QStringLiteral("{PAGES}"), QString::number(pageCount_),
-                     Qt::CaseInsensitive);
-        return text;
-    };
     QFont storyFont(defaultFontFamily_);
     storyFont.setPointSizeF(defaultFontPointSize_);
     painter.setFont(storyFont);
@@ -4108,21 +4107,53 @@ void DocumentCanvas::renderPage(QPainter& painter, int pageIndexValue,
     const double storyLeft = marginLeftPoints_;
     const double storyWidth = std::max(
         1.0, pageWidthPoints_ - marginLeftPoints_ - marginRightPoints_);
+    const auto drawStory = [&](const std::u16string& source, bool footer) {
+        const auto sections = splitStorySections(fromUtf16(source));
+        const double top = footer
+            ? pageHeightPoints_ - marginBottomPoints_ + 9.0 : 18.0;
+        const double height = footer
+            ? std::max(12.0, marginBottomPoints_ - 18.0)
+            : std::max(12.0, marginTopPoints_ - 27.0);
+        for (int index = 0; index < 3; ++index) {
+            const QRectF rect(
+                storyLeft + storyWidth * static_cast<double>(index) / 3.0,
+                top, storyWidth / 3.0, height);
+            QString text = sections[static_cast<std::size_t>(index)];
+            text.replace(QStringLiteral("{PAGE}"),
+                         QString::number(pageIndexValue + 1),
+                         Qt::CaseInsensitive);
+            text.replace(QStringLiteral("{PAGES}"),
+                         QString::number(pageCount_), Qt::CaseInsensitive);
+            const auto horizontal = index == 0 ? Qt::AlignLeft
+                : index == 1 ? Qt::AlignHCenter : Qt::AlignRight;
+            painter.drawText(rect, horizontal |
+                (footer ? Qt::AlignBottom : Qt::AlignTop) |
+                Qt::TextWordWrap, text);
+        }
+    };
     if (!snap.document.headerText().empty()) {
-        const QRectF headerRect(
-            storyLeft, 18.0, storyWidth,
-            std::max(12.0, marginTopPoints_ - 27.0));
-        painter.drawText(headerRect,
-                         Qt::AlignLeft | Qt::AlignTop | Qt::TextWordWrap,
-                         expandedStoryText(snap.document.headerText()));
+        drawStory(snap.document.headerText(), false);
     }
     if (!snap.document.footerText().empty()) {
-        const QRectF footerRect(
-            storyLeft, pageHeightPoints_ - marginBottomPoints_ + 9.0,
-            storyWidth, std::max(12.0, marginBottomPoints_ - 18.0));
-        painter.drawText(footerRect,
-                         Qt::AlignLeft | Qt::AlignBottom | Qt::TextWordWrap,
-                         expandedStoryText(snap.document.footerText()));
+        drawStory(snap.document.footerText(), true);
+    }
+    if (decorations && headerFooterEditing_) {
+        painter.save();
+        painter.setPen(QPen(QColor(QStringLiteral("#7b8794")), 0.8,
+                            Qt::DashLine));
+        for (const bool footer : {false, true}) {
+            const double top = footer
+                ? pageHeightPoints_ - marginBottomPoints_ + 7.0 : 14.0;
+            const double height = footer
+                ? std::max(18.0, marginBottomPoints_ - 14.0)
+                : std::max(18.0, marginTopPoints_ - 21.0);
+            for (int index = 0; index < 3; ++index) {
+                painter.drawRect(QRectF(
+                    storyLeft + storyWidth * static_cast<double>(index) / 3.0,
+                    top, storyWidth / 3.0, height));
+            }
+        }
+        painter.restore();
     }
 
     for (const auto& tableVisual : tableVisuals_) {
@@ -6744,7 +6775,13 @@ void DocumentCanvas::undo() {
     emitCursorFormat();
     viewport()->update();
     updateStatus();
-    revealCursor();
+    if (headerFooterEditing_) {
+        loadStoryEditors(activeStoryIsFooter_);
+        storyEditHasTransaction_ = false;
+        updateStoryEditorGeometry();
+    } else {
+        revealCursor();
+    }
 }
 
 void DocumentCanvas::redo() {
@@ -6779,7 +6816,13 @@ void DocumentCanvas::redo() {
     emitCursorFormat();
     viewport()->update();
     updateStatus();
-    revealCursor();
+    if (headerFooterEditing_) {
+        loadStoryEditors(activeStoryIsFooter_);
+        storyEditHasTransaction_ = false;
+        updateStoryEditorGeometry();
+    } else {
+        revealCursor();
+    }
 }
 
 void DocumentCanvas::copy() {
@@ -7997,12 +8040,58 @@ DocumentCanvas::Hit DocumentCanvas::hitTest(const QPoint& viewportPoint) const {
     return hit;
 }
 
+std::optional<DocumentCanvas::StoryRegionHit> DocumentCanvas::storyRegionAt(
+    const QPoint& viewportPoint) const {
+    ensureLayout();
+    const double scale = kScreenPointsScale * zoomPercent_ / 100.0;
+    const double pagePixelWidth = pageWidthPoints_ * scale;
+    const double documentWidth = std::max(
+        pagePixelWidth + 2 * kCanvasPaddingPixels,
+        static_cast<double>(viewport()->width()));
+    const double left = (documentWidth - pagePixelWidth) / 2.0 -
+                        horizontalScrollBar()->value();
+    const double contentY = viewportPoint.y() + verticalScrollBar()->value() -
+                            kCanvasPaddingPixels;
+    const double pageStride = pageHeightPoints_ * scale + kPageGapPixels;
+    const int page = static_cast<int>(std::floor(contentY / pageStride));
+    if (page < 0 || page >= pageCount_) return std::nullopt;
+    const double pageTop = kCanvasPaddingPixels + page * pageStride -
+                           verticalScrollBar()->value();
+    const QPointF point((viewportPoint.x() - left) / scale,
+                        (viewportPoint.y() - pageTop) / scale);
+    const double storyWidth = pageWidthPoints_ - marginLeftPoints_ -
+                              marginRightPoints_;
+    if (storyWidth <= 0.0 || point.x() < marginLeftPoints_ ||
+        point.x() > marginLeftPoints_ + storyWidth) {
+        return std::nullopt;
+    }
+    const bool inHeader = point.y() >= 8.0 &&
+        point.y() <= std::max(32.0, marginTopPoints_ - 3.0);
+    const bool inFooter = point.y() >= std::min(
+        pageHeightPoints_ - 32.0,
+        pageHeightPoints_ - marginBottomPoints_ + 3.0) &&
+        point.y() <= pageHeightPoints_ - 8.0;
+    if (!inHeader && !inFooter) return std::nullopt;
+    const double relativeX = point.x() - marginLeftPoints_;
+    const int section = std::clamp(
+        static_cast<int>(relativeX * 3.0 / storyWidth), 0, 2);
+    return StoryRegionHit{inFooter, section, page};
+}
+
 void DocumentCanvas::mousePressEvent(QMouseEvent* event) {
     if (previewId_) {
         event->accept();
         return;
     }
     if (event->button() == Qt::LeftButton) {
+        if (const auto story = storyRegionAt(event->position().toPoint())) {
+            beginHeaderFooterEditing(story->footer, story->section,
+                                     story->pageIndex);
+            selecting_ = false;
+            event->accept();
+            return;
+        }
+        if (headerFooterEditing_) endHeaderFooterEditing();
         setFocus();
         const auto hit = hitTest(event->position().toPoint());
         const bool isTripleClick =
@@ -9272,6 +9361,164 @@ bool DocumentCanvas::setHeaderFooterText(const QString& header,
                                          const QString& footer) {
     return apply({core::SetHeaderText{toUtf16(header)},
                   core::SetFooterText{toUtf16(footer)}});
+}
+
+std::array<QString, 3> DocumentCanvas::splitStorySections(
+    const QString& text) {
+    const QStringList parts = text.split(QLatin1Char('\t'), Qt::KeepEmptyParts);
+    std::array<QString, 3> result{};
+    if (!parts.isEmpty()) result[0] = parts[0];
+    if (parts.size() > 1) result[1] = parts[1];
+    if (parts.size() > 2) {
+        result[2] = parts.mid(2).join(QStringLiteral(" "));
+    }
+    return result;
+}
+
+QString DocumentCanvas::joinStorySections(
+    const std::array<QPlainTextEdit*, 3>& editors) {
+    return editors[0]->toPlainText() + QLatin1Char('\t') +
+           editors[1]->toPlainText() + QLatin1Char('\t') +
+           editors[2]->toPlainText();
+}
+
+void DocumentCanvas::ensureStoryEditors() {
+    if (headerEditors_[0]) return;
+    const auto create = [this](std::array<QPlainTextEdit*, 3>& editors,
+                               const QString& prefix) {
+        for (int index = 0; index < 3; ++index) {
+            auto* editor = new QPlainTextEdit(viewport());
+            editor->setObjectName(prefix + QString::number(index));
+            editor->setAccessibleName(
+                (prefix.startsWith(QStringLiteral("header"))
+                     ? tr("Header") : tr("Footer")) +
+                QStringLiteral(" ") +
+                (index == 0 ? tr("left")
+                            : index == 1 ? tr("center") : tr("right")));
+            editor->setFrameShape(QFrame::NoFrame);
+            editor->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+            editor->setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+            editor->setTabChangesFocus(true);
+            editor->setWordWrapMode(QTextOption::WordWrap);
+            editor->setStyleSheet(QStringLiteral(
+                "QPlainTextEdit { background: rgba(255,255,255,235); "
+                "border: 1px dashed #7b8794; padding: 2px; color: #000000; } "
+                "QPlainTextEdit:focus { border: 2px solid #e95420; }"));
+            QFont font(defaultFontFamily_);
+            font.setPointSizeF(defaultFontPointSize_);
+            editor->setFont(font);
+            QTextOption option = editor->document()->defaultTextOption();
+            option.setAlignment(index == 0 ? Qt::AlignLeft
+                                           : index == 1 ? Qt::AlignHCenter
+                                                        : Qt::AlignRight);
+            editor->document()->setDefaultTextOption(option);
+            editor->hide();
+            connect(editor, &QPlainTextEdit::textChanged, this,
+                    [this] { applyStoryEditorText(); });
+            editors[static_cast<std::size_t>(index)] = editor;
+        }
+    };
+    create(headerEditors_, QStringLiteral("headerStoryEditor"));
+    create(footerEditors_, QStringLiteral("footerStoryEditor"));
+}
+
+void DocumentCanvas::loadStoryEditors(bool footer) {
+    ensureStoryEditors();
+    loadingStoryEditors_ = true;
+    const auto values = splitStorySections(footer ? footerText() : headerText());
+    auto& editors = footer ? footerEditors_ : headerEditors_;
+    for (int index = 0; index < 3; ++index) {
+        const QSignalBlocker blocker(
+            editors[static_cast<std::size_t>(index)]);
+        editors[static_cast<std::size_t>(index)]->setPlainText(
+            values[static_cast<std::size_t>(index)]);
+    }
+    loadingStoryEditors_ = false;
+}
+
+void DocumentCanvas::beginHeaderFooterEditing(bool footer, int section,
+                                               int pageIndex) {
+    if (previewId_) return;
+    ensureLayout();
+    ensureStoryEditors();
+    headerFooterEditing_ = true;
+    activeStoryIsFooter_ = footer;
+    activeStoryPage_ = std::clamp(pageIndex, 0, std::max(0, pageCount_ - 1));
+    storyEditHasTransaction_ = false;
+    loadStoryEditors(footer);
+    updateStoryEditorGeometry();
+    auto& editors = footer ? footerEditors_ : headerEditors_;
+    auto* target = editors[static_cast<std::size_t>(std::clamp(section, 0, 2))];
+    target->setFocus();
+    target->moveCursor(QTextCursor::End);
+    viewport()->update();
+}
+
+void DocumentCanvas::endHeaderFooterEditing() {
+    if (!headerFooterEditing_) return;
+    for (auto* editor : headerEditors_) if (editor) editor->hide();
+    for (auto* editor : footerEditors_) if (editor) editor->hide();
+    headerFooterEditing_ = false;
+    storyEditHasTransaction_ = false;
+    setFocus();
+    viewport()->update();
+}
+
+void DocumentCanvas::applyStoryEditorText() {
+    if (loadingStoryEditors_ || !headerFooterEditing_) return;
+    const auto& editors = activeStoryIsFooter_ ? footerEditors_ : headerEditors_;
+    std::vector<core::Operation> operations;
+    if (activeStoryIsFooter_) {
+        operations.push_back(core::SetFooterText{
+            toUtf16(joinStorySections(editors))});
+    } else {
+        operations.push_back(core::SetHeaderText{
+            toUtf16(joinStorySections(editors))});
+    }
+    if (apply(std::move(operations), std::nullopt, std::nullopt, false,
+              std::nullopt, storyEditHasTransaction_)) {
+        storyEditHasTransaction_ = true;
+    }
+}
+
+void DocumentCanvas::updateStoryEditorGeometry() {
+    if (!headerFooterEditing_ || !headerEditors_[0]) return;
+    for (auto* editor : headerEditors_) editor->hide();
+    for (auto* editor : footerEditors_) editor->hide();
+
+    const double scale = kScreenPointsScale * zoomPercent_ / 100.0;
+    const double pagePixelWidth = pageWidthPoints_ * scale;
+    const double documentWidth = std::max(
+        pagePixelWidth + 2 * kCanvasPaddingPixels,
+        static_cast<double>(viewport()->width()));
+    const double pageLeft = (documentWidth - pagePixelWidth) / 2.0 -
+                            horizontalScrollBar()->value();
+    const double pageTop = kCanvasPaddingPixels + activeStoryPage_ *
+        (pageHeightPoints_ * scale + kPageGapPixels) -
+        verticalScrollBar()->value();
+    const double left = pageLeft + marginLeftPoints_ * scale;
+    const double width = std::max(
+        3.0, (pageWidthPoints_ - marginLeftPoints_ - marginRightPoints_) * scale);
+    const double yPoints = activeStoryIsFooter_
+        ? pageHeightPoints_ - marginBottomPoints_ + 7.0 : 14.0;
+    const double heightPoints = activeStoryIsFooter_
+        ? std::max(18.0, marginBottomPoints_ - 14.0)
+        : std::max(18.0, marginTopPoints_ - 21.0);
+    const int y = static_cast<int>(std::round(pageTop + yPoints * scale));
+    const int height = std::max(24, static_cast<int>(std::round(
+        heightPoints * scale)));
+    const int gap = 3;
+    auto& editors = activeStoryIsFooter_ ? footerEditors_ : headerEditors_;
+    for (int index = 0; index < 3; ++index) {
+        const int x0 = static_cast<int>(std::round(
+            left + width * static_cast<double>(index) / 3.0));
+        const int x1 = static_cast<int>(std::round(
+            left + width * static_cast<double>(index + 1) / 3.0));
+        editors[static_cast<std::size_t>(index)]->setGeometry(
+            x0 + gap, y, std::max(20, x1 - x0 - 2 * gap), height);
+        editors[static_cast<std::size_t>(index)]->show();
+        editors[static_cast<std::size_t>(index)]->raise();
+    }
 }
 
 void DocumentCanvas::setMarginsPoints(double top, double right, double bottom, double left) {

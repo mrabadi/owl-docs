@@ -1743,29 +1743,49 @@ void testSingleDialogAndNativeSave() {
                   QKeySequence(QStringLiteral("Ctrl+Shift+V")),
           "could not reach the Paste as Text Only command and shortcut");
 
-    bool inspectedHeaderFooterDialog = false;
-    QTimer::singleShot(0, &window, [&] {
-        auto* dialog = window.findChild<QDialog*>(
-            QStringLiteral("headerFooterDialog"));
-        auto* header = dialog ? dialog->findChild<QPlainTextEdit*>(
-            QStringLiteral("headerFooter.header")) : nullptr;
-        auto* footer = dialog ? dialog->findChild<QPlainTextEdit*>(
-            QStringLiteral("headerFooter.footer")) : nullptr;
-        auto* buttons = dialog ? dialog->findChild<QDialogButtonBox*>(
-            QStringLiteral("headerFooter.buttons")) : nullptr;
-        check(dialog && dialog->isModal() && header && footer && buttons,
-              "Header & Footer did not open its complete modal editor");
-        header->setPlainText(QStringLiteral("Owl Docs"));
-        footer->setPlainText(QStringLiteral("Page {PAGE} of {PAGES}"));
-        inspectedHeaderFooterDialog = true;
-        buttons->button(QDialogButtonBox::Ok)->click();
-    });
     headerFooterAction->trigger();
-    check(inspectedHeaderFooterDialog &&
-              canvas->headerText() == QStringLiteral("Owl Docs") &&
+    auto* headerLeft = canvas->findChild<QPlainTextEdit*>(
+        QStringLiteral("headerStoryEditor0"));
+    auto* headerCenter = canvas->findChild<QPlainTextEdit*>(
+        QStringLiteral("headerStoryEditor1"));
+    auto* headerRight = canvas->findChild<QPlainTextEdit*>(
+        QStringLiteral("headerStoryEditor2"));
+    check(canvas->isHeaderFooterEditing() && headerLeft && headerCenter &&
+              headerRight && headerLeft->isVisible() &&
+              headerCenter->isVisible() && headerRight->isVisible(),
+          "Header & Footer did not expose three on-page editing regions");
+    headerLeft->setPlainText(QStringLiteral("Owl Docs"));
+    headerCenter->setPlainText(QStringLiteral("Confidential"));
+    canvas->undo();
+    check(canvas->headerText().isEmpty() && headerLeft->toPlainText().isEmpty() &&
+              headerCenter->toPlainText().isEmpty(),
+          "one Undo did not remove and refresh the on-page header edit");
+    canvas->redo();
+    check(canvas->headerText() ==
+              QStringLiteral("Owl Docs\tConfidential\t") &&
+              headerLeft->toPlainText() == QStringLiteral("Owl Docs") &&
+              headerCenter->toPlainText() == QStringLiteral("Confidential"),
+          "Redo did not restore and refresh the on-page header edit");
+    canvas->beginHeaderFooterEditing(true, 2, 0);
+    auto* footerRight = canvas->findChild<QPlainTextEdit*>(
+        QStringLiteral("footerStoryEditor2"));
+    check(footerRight && footerRight->isVisible(),
+          "footer right region was not directly editable");
+    footerRight->setPlainText(QStringLiteral("Page {PAGE} of {PAGES}"));
+    canvas->endHeaderFooterEditing();
+    check(canvas->headerText() ==
+              QStringLiteral("Owl Docs\tConfidential\t") &&
               canvas->footerText() ==
-                  QStringLiteral("Page {PAGE} of {PAGES}"),
-          "Header & Footer dialog did not apply both stories");
+                  QStringLiteral("\t\tPage {PAGE} of {PAGES}"),
+          "on-page header/footer regions did not apply to the document");
+    const QPoint headerCenterPoint(canvas->viewport()->width() / 2, 58);
+    sendMouseEvent(*canvas, QEvent::MouseButtonPress, headerCenterPoint,
+                   Qt::LeftButton, Qt::LeftButton);
+    sendMouseEvent(*canvas, QEvent::MouseButtonRelease, headerCenterPoint,
+                   Qt::LeftButton, Qt::NoButton);
+    check(canvas->isHeaderFooterEditing() && headerCenter->hasFocus(),
+          "clicking the center header region did not activate it in place");
+    canvas->endHeaderFooterEditing();
 
     bool inspectedDialog = false;
     QTimer::singleShot(0, &window, [&] {

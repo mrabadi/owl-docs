@@ -338,7 +338,8 @@ std::string buildNewStylesXml(
     const DocumentDefaults& defaults,
     const NewParagraphStyleCatalog& paragraph_styles);
 std::string buildNewSettingsXml(const DocumentDefaults& defaults);
-std::string buildStoryXml(std::string_view text, bool header);
+std::string buildStoryXml(std::string_view text, bool header,
+                          const PageSettings& page);
 
 void setError(Error* error, ErrorCode code, std::string message) {
     if (error != nullptr) {
@@ -4253,6 +4254,9 @@ std::optional<std::string> parseSimpleStoryText(
     std::string result;
     const auto appendNode = [&](const auto& self,
                                 const pugi::xml_node& node) -> void {
+        if (isWordElement(node, "pPr") || isWordElement(node, "rPr")) {
+            return;
+        }
         if (isWordElement(node, "t")) {
             result += node.child_value();
             return;
@@ -5061,9 +5065,11 @@ std::optional<DocumentDefaults> canonicalSimpleRegenerationDefaults(
         root_relationships_xml != kNewRootRelationships ||
         document_relationships_xml != expected_relationships ||
         (parsed.header_text &&
-         parsed.header_xml != buildStoryXml(*parsed.header_text, true)) ||
+         (!parsed.page_settings || parsed.header_xml != buildStoryXml(
+             *parsed.header_text, true, *parsed.page_settings))) ||
         (parsed.footer_text &&
-         parsed.footer_xml != buildStoryXml(*parsed.footer_text, false))) {
+         (!parsed.page_settings || parsed.footer_xml != buildStoryXml(
+             *parsed.footer_text, false, *parsed.page_settings)))) {
         return std::nullopt;
     }
     for (const auto name : expected_members) {
@@ -7291,11 +7297,21 @@ void appendStoryRunContents(std::ostringstream& output,
     }
 }
 
-std::string buildStoryXml(std::string_view text, bool header) {
+std::string buildStoryXml(std::string_view text, bool header,
+                          const PageSettings& page) {
+    const std::uint32_t content_width = page.width_twips >
+            page.margin_left_twips + page.margin_right_twips
+        ? page.width_twips - page.margin_left_twips - page.margin_right_twips
+        : 1U;
     std::ostringstream output;
     output << "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
            << (header ? "<w:hdr" : "<w:ftr")
-           << " xmlns:w=\"" << kWordNamespace << "\"><w:p>";
+           << " xmlns:w=\"" << kWordNamespace << "\"><w:p>"
+           << "<w:pPr><w:tabs><w:tab w:val=\"center\" w:pos=\""
+           << content_width / 2U
+           << "\"/><w:tab w:val=\"right\" w:pos=\""
+           << content_width
+           << "\"/></w:tabs></w:pPr>";
     appendStoryRunContents(output, text);
     output << "</w:p>" << (header ? "</w:hdr>" : "</w:ftr>");
     return output.str();
@@ -8298,9 +8314,9 @@ SaveResult DocxDocument::writeNew(
         }
     }
     const std::string header_xml = has_header
-        ? buildStoryXml(*body.header_text, true) : std::string{};
+        ? buildStoryXml(*body.header_text, true, page) : std::string{};
     const std::string footer_xml = has_footer
-        ? buildStoryXml(*body.footer_text, false) : std::string{};
+        ? buildStoryXml(*body.footer_text, false, page) : std::string{};
     const std::string content_types = newContentTypes(
         has_numbering, has_header, has_footer, images);
     const std::string document_relationships =
