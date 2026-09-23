@@ -113,6 +113,13 @@ Result<void> applyOne(Document& document, const Operation& operation) {
                 return document.setHeaderText(typed.text);
             } else if constexpr (std::is_same_v<Type, SetFooterText>) {
                 return document.setFooterText(typed.text);
+            } else if constexpr (
+                std::is_same_v<Type, InsertHeaderFooterImage>) {
+                return document.insertHeaderFooterImage(
+                    typed.footer, typed.utf16_offset,
+                    typed.encoded_payload, typed.image_format,
+                    typed.accessible_name, typed.width_emu,
+                    typed.height_emu, typed.image_id);
             }
         },
         operation);
@@ -129,6 +136,13 @@ void collectPayloadIdentities(
             if (!bytes.empty()) {
                 identities.insert(bytes.data());
             }
+        }
+    }
+    for (const auto* story : {&document.headerImages(),
+                              &document.footerImages()}) {
+        for (const auto& image : *story) {
+            const auto bytes = image.encoded_payload.bytes();
+            if (!bytes.empty()) identities.insert(bytes.data());
         }
     }
 }

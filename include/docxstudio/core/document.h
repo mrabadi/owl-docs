@@ -405,6 +405,12 @@ public:
     [[nodiscard]] const std::u16string& footerText() const noexcept {
         return footer_text_;
     }
+    [[nodiscard]] const std::vector<ImageAtom>& headerImages() const noexcept {
+        return header_images_;
+    }
+    [[nodiscard]] const std::vector<ImageAtom>& footerImages() const noexcept {
+        return footer_images_;
+    }
     [[nodiscard]] const Paragraph* findParagraph(NodeId id) const noexcept;
     [[nodiscard]] const Table* findTable(NodeId id) const noexcept;
     [[nodiscard]] const EquationAtom* findEquation(NodeId id) const noexcept;
@@ -503,6 +509,11 @@ public:
     [[nodiscard]] Result<void> deleteTable(NodeId table_id);
     [[nodiscard]] Result<void> setHeaderText(std::u16string text);
     [[nodiscard]] Result<void> setFooterText(std::u16string text);
+    [[nodiscard]] Result<void> insertHeaderFooterImage(
+        bool footer, std::size_t utf16_offset,
+        EncodedImagePayload encoded_payload, ImageFormat image_format,
+        std::string accessible_name, std::int64_t width_emu,
+        std::int64_t height_emu, NodeId image_id = NodeId::generate());
 
     auto operator<=>(const Document&) const = default;
 
@@ -518,6 +529,8 @@ private:
     std::vector<BodyBlockRef> body_blocks_;
     std::u16string header_text_;
     std::u16string footer_text_;
+    std::vector<ImageAtom> header_images_;
+    std::vector<ImageAtom> footer_images_;
 };
 
 [[nodiscard]] bool isValidUtf16(const std::u16string& text) noexcept;

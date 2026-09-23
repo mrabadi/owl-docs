@@ -235,6 +235,13 @@ struct InlineImagePayload {
     auto operator<=>(const InlineImagePayload&) const = default;
 };
 
+struct ImportedStoryImage {
+    std::size_t text_offset_bytes{0};
+    InlineImagePayload image;
+
+    auto operator<=>(const ImportedStoryImage&) const = default;
+};
+
 enum class FragmentKind { text, tab, line_break, page_break, equation, inline_image };
 using TextSpanId = std::uint64_t;
 
@@ -489,6 +496,16 @@ struct NewInlineImage {
     auto operator<=>(const NewInlineImage&) const = default;
 };
 
+// An image anchored to a U+FFFC placeholder in a UTF-8 header/footer story.
+// The byte offset is used so the writer can stream the original UTF-8 text
+// without transcoding while still preserving exact inline object order.
+struct NewStoryImage {
+    std::size_t text_offset_bytes{0};
+    NewInlineImage image;
+
+    auto operator<=>(const NewStoryImage&) const = default;
+};
+
 struct NewRun {
     NewRun() = default;
     NewRun(std::string new_text, BasicRunFormat new_format)
@@ -613,6 +630,8 @@ struct NewDocumentBody {
     std::vector<NewBodyBlock> blocks;
     std::optional<std::string> header_text;
     std::optional<std::string> footer_text;
+    std::vector<NewStoryImage> header_images;
+    std::vector<NewStoryImage> footer_images;
 };
 
 struct PageSettings {
@@ -757,6 +776,8 @@ public:
     [[nodiscard]] const std::vector<ImportedSection>& sections() const noexcept;
     [[nodiscard]] const std::optional<std::string>& headerText() const noexcept;
     [[nodiscard]] const std::optional<std::string>& footerText() const noexcept;
+    [[nodiscard]] const std::vector<ImportedStoryImage>& headerImages() const noexcept;
+    [[nodiscard]] const std::vector<ImportedStoryImage>& footerImages() const noexcept;
     [[nodiscard]] const CompatibilityReport& compatibility() const noexcept;
     // True only for the deliberately narrow, text-only package shape emitted
     // by this writer when every package part and document structure is covered

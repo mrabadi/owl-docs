@@ -22,6 +22,7 @@
 #include <vector>
 
 class QInputMethodEvent;
+class QMimeData;
 class QPlainTextEdit;
 class QMouseEvent;
 class QPaintEvent;
@@ -572,6 +573,7 @@ private:
     void loadStoryEditors(bool footer);
     void updateStoryEditorGeometry();
     void applyStoryEditorText();
+    void pasteStoryImage(QPlainTextEdit* editor, const QMimeData* mime);
     static std::array<QString, 3> splitStorySections(const QString& text);
     static QString joinStorySections(
         const std::array<QPlainTextEdit*, 3>& editors);

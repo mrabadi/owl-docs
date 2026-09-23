@@ -276,10 +276,10 @@ void codecRoundTrip() {
     check(!RecoveryCodec::decode(invalidIndent, error),
           "recovery codec accepted an out-of-range bullet indentation");
 
-    const auto version = futureVersion.find("\"version\":12");
+    const auto version = futureVersion.find("\"version\":13");
     check(version != std::string::npos, "encoded recovery version was absent");
-    futureVersion.replace(version, std::string("\"version\":12").size(),
-                          "\"version\":13");
+    futureVersion.replace(version, std::string("\"version\":13").size(),
+                          "\"version\":14");
     check(!RecoveryCodec::decode(futureVersion, error),
           "recovery codec accepted an unsupported future version");
     check(!RecoveryCodec::decode("{not-json", error),
@@ -782,8 +782,8 @@ void semanticImageAdversarialLimits() {
     using namespace docxstudio::app;
     using namespace docxstudio::core;
 
-    check(RecoveryCodec::currentVersion == 12,
-          "recovery schema version was not bumped for header/footer stories");
+    check(RecoveryCodec::currentVersion == 13,
+          "recovery schema version was not bumped for header/footer pictures");
     check(kMaximumInlineImagesPerDocument == 512 &&
               kMaximumEncodedImageBytes == 16U * 1024U * 1024U &&
               kMaximumDocumentEncodedImageBytes == 32U * 1024U * 1024U &&

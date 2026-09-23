@@ -40,6 +40,18 @@ using docxstudio::ooxml::NewRun;
 using docxstudio::ooxml::NewTable;
 using docxstudio::ooxml::OpenOptions;
 
+std::vector<std::uint8_t> onePixelPng() {
+    return {
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00,
+        0x00, 0x0d, 0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01,
+        0x00, 0x00, 0x00, 0x01, 0x08, 0x04, 0x00, 0x00, 0x00, 0xb5,
+        0x1c, 0x0c, 0x02, 0x00, 0x00, 0x00, 0x0b, 0x49, 0x44, 0x41,
+        0x54, 0x78, 0xda, 0x63, 0x64, 0xf8, 0x0f, 0x00, 0x01, 0x05,
+        0x01, 0x01, 0x27, 0x18, 0xe3, 0x66, 0x00, 0x00, 0x00, 0x00,
+        0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+    };
+}
+
 void check(bool condition, std::string_view message) {
     if (!condition) {
         throw std::runtime_error(std::string(message));
@@ -2556,6 +2568,56 @@ void testHeaderFooterRoundTrip(const TemporaryDirectory& temporary) {
           "an Owl Docs header/footer package was not safely regeneratable");
 }
 
+void testHeaderFooterImageRoundTrip(const TemporaryDirectory& temporary) {
+    using namespace docxstudio::ooxml;
+    const auto path = temporary.file("header-footer-image.docx");
+    NewDocumentBody body{{NewParagraph{{NewRun{"Body text", {}}}}}};
+    body.header_text = std::string("Left\t") + "\xef\xbf\xbc" +
+        "\tRight";
+    NewInlineImage image;
+    image.format = docxstudio::raster::Format::png;
+    image.name = "Header picture";
+    image.accessible_name = "Header picture";
+    image.width_emu = 914400;
+    image.height_emu = 457200;
+    image.bytes = onePixelPng();
+    body.header_images.push_back({5, image});
+    const auto save = DocxDocument::writeNew(path, body);
+    check(save.saved,
+          save.error ? save.error->message
+                     : "header picture DOCX was not saved");
+
+    const std::string headerXml = readMember(path, "word/header1.xml");
+    const std::string relationships = readMember(
+        path, "word/_rels/header1.xml.rels");
+    check(headerXml.find("<w:drawing>") != std::string::npos &&
+              headerXml.find("cx=\"914400\" cy=\"457200\"") !=
+                  std::string::npos &&
+              headerXml.find("noChangeAspect=\"1\"") !=
+                  std::string::npos,
+          "header picture was not written as aspect-locked DrawingML");
+    check(relationships.find("relationships/image") != std::string::npos &&
+              relationships.find("Target=\"media/image1.png\"") !=
+                  std::string::npos &&
+              readMember(path, "word/media/image1.png") ==
+                  std::string(image.bytes.begin(), image.bytes.end()),
+          "header picture relationship or media part was omitted");
+
+    Error error;
+    auto reopened = DocxDocument::open(path, &error);
+    check(reopened != nullptr, error.message);
+    check(reopened->headerText() == body.header_text &&
+              reopened->headerImages().size() == 1 &&
+              reopened->headerImages().front().text_offset_bytes == 5 &&
+              reopened->headerImages().front().image.renderable() &&
+              reopened->headerImages().front().image.bytes == image.bytes &&
+              reopened->headerImages().front().image.width_emu ==
+                  image.width_emu &&
+              reopened->headerImages().front().image.height_emu ==
+                  image.height_emu,
+          "header picture did not survive DOCX save/reopen round-trip");
+}
+
 void testUnsupportedFormattingIsReported(const TemporaryDirectory& temporary) {
     const auto path = temporary.file("unsupported-formatting.docx");
     createPackage(
@@ -2897,6 +2959,7 @@ int main() {
         testCustomDocumentDefaults(temporary);
         testNewRunTabsAndBreaks(temporary);
         testHeaderFooterRoundTrip(temporary);
+        testHeaderFooterImageRoundTrip(temporary);
         testExactUnchangedSave(temporary);
         testTextPatchPreservesOpaqueMembers(temporary);
         testUnsupportedFormattingIsReported(temporary);

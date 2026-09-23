@@ -8,6 +8,7 @@
 
 #include <QApplication>
 #include <QAction>
+#include <QBuffer>
 #include <QClipboard>
 #include <QColor>
 #include <QContextMenuEvent>
@@ -55,6 +56,7 @@
 #include <cmath>
 #include <limits>
 #include <iterator>
+#include <functional>
 #include <map>
 #include <numeric>
 #include <set>
@@ -78,6 +80,33 @@ constexpr char kInlineImageClipboardLegacyMagic[] = "OWLDIMG1";
 constexpr char kInlineImageClipboardMagic[] = "OWLDIMG2";
 constexpr qsizetype kInlineImageClipboardLegacyHeaderBytes = 33;
 constexpr qsizetype kInlineImageClipboardHeaderBytes = 67;
+
+class StoryTextEdit final : public QPlainTextEdit {
+public:
+    using PasteImage = std::function<void(const QMimeData*)>;
+
+    explicit StoryTextEdit(QWidget* parent = nullptr)
+        : QPlainTextEdit(parent) {}
+
+    PasteImage pasteImage;
+
+protected:
+    void insertFromMimeData(const QMimeData* source) override {
+        const bool hasPicture = source &&
+            (source->hasFormat(QString::fromLatin1(
+                 kInlineImageClipboardMime)) ||
+             source->hasFormat(QString::fromLatin1(
+                 kInlineImageClipboardLegacyMime)) ||
+             source->hasFormat(QStringLiteral("image/png")) ||
+             source->hasFormat(QStringLiteral("image/jpeg")) ||
+             source->hasImage());
+        if (hasPicture && pasteImage) {
+            pasteImage(source);
+            return;
+        }
+        QPlainTextEdit::insertFromMimeData(source);
+    }
+};
 
 bool isPasteTextOnlyShortcut(const QKeyEvent& event) {
     constexpr auto relevantModifiers =
@@ -2472,6 +2501,7 @@ void DocumentCanvas::setZoomPercent(int percent) {
     // zoom must therefore leave the document revision, editing state, and
     // cached pagination untouched; only the scrollable pixel extent changes.
     updateScrollBars();
+    updateStoryEditorGeometry();
     viewport()->update();
     emit zoomChanged(zoomPercent_);
 }
@@ -4107,7 +4137,9 @@ void DocumentCanvas::renderPage(QPainter& painter, int pageIndexValue,
     const double storyLeft = marginLeftPoints_;
     const double storyWidth = std::max(
         1.0, pageWidthPoints_ - marginLeftPoints_ - marginRightPoints_);
-    const auto drawStory = [&](const std::u16string& source, bool footer) {
+    const auto drawStory = [&](const std::u16string& source,
+                               const std::vector<core::ImageAtom>& images,
+                               bool footer) {
         const auto sections = splitStorySections(fromUtf16(source));
         const double top = footer
             ? pageHeightPoints_ - marginBottomPoints_ + 9.0 : 18.0;
@@ -4124,18 +4156,78 @@ void DocumentCanvas::renderPage(QPainter& painter, int pageIndexValue,
                          Qt::CaseInsensitive);
             text.replace(QStringLiteral("{PAGES}"),
                          QString::number(pageCount_), Qt::CaseInsensitive);
-            const auto horizontal = index == 0 ? Qt::AlignLeft
-                : index == 1 ? Qt::AlignHCenter : Qt::AlignRight;
-            painter.drawText(rect, horizontal |
-                (footer ? Qt::AlignBottom : Qt::AlignTop) |
-                Qt::TextWordWrap, text);
+            std::vector<const core::ImageAtom*> regionImages;
+            for (const auto& image : images) {
+                int imageRegion = 0;
+                for (std::size_t offset = 0;
+                     offset < image.utf16_offset && offset < source.size();
+                     ++offset) {
+                    if (source[offset] == u'\t') {
+                        imageRegion = std::min(2, imageRegion + 1);
+                    }
+                }
+                if (imageRegion == index) regionImages.push_back(&image);
+            }
+            const QStringList parts = text.split(
+                QChar(core::kInlineObjectReplacementCharacter),
+                Qt::KeepEmptyParts);
+            const QFontMetricsF metrics(painter.font());
+            std::vector<double> imageWidths;
+            std::vector<double> imageHeights;
+            double totalWidth = 0.0;
+            for (int part = 0; part < parts.size(); ++part) {
+                totalWidth += metrics.horizontalAdvance(parts[part]);
+                if (part >= static_cast<int>(regionImages.size())) continue;
+                const auto* image = regionImages[static_cast<std::size_t>(part)];
+                const double naturalWidth =
+                    static_cast<double>(image->width_emu) / kEmuPerPoint;
+                const double naturalHeight =
+                    static_cast<double>(image->height_emu) / kEmuPerPoint;
+                const double fit = std::min(
+                    {1.0, rect.height() / std::max(1.0, naturalHeight),
+                     rect.width() / std::max(1.0, naturalWidth)});
+                imageWidths.push_back(naturalWidth * fit);
+                imageHeights.push_back(naturalHeight * fit);
+                totalWidth += imageWidths.back();
+            }
+            double x = index == 0 ? rect.left()
+                : index == 1 ? rect.center().x() - totalWidth / 2.0
+                             : rect.right() - totalWidth;
+            x = std::max(rect.left(), x);
+            std::size_t imageIndex = 0;
+            for (int part = 0; part < parts.size(); ++part) {
+                const QString& fragment = parts[part];
+                const double textWidth = metrics.horizontalAdvance(fragment);
+                const double textY = footer
+                    ? rect.bottom() - metrics.descent()
+                    : rect.top() + metrics.ascent();
+                painter.drawText(QPointF(x, textY), fragment);
+                x += textWidth;
+                if (part >= static_cast<int>(regionImages.size())) continue;
+                const auto* image = regionImages[imageIndex];
+                const QImage* decoded = decodedInlineImage(*image);
+                const double imageWidth = imageWidths[imageIndex];
+                const double imageHeight = imageHeights[imageIndex];
+                const double imageY = footer
+                    ? rect.bottom() - imageHeight : rect.top();
+                if (decoded) {
+                    painter.drawImage(
+                        QRectF(x, imageY, imageWidth, imageHeight), *decoded);
+                }
+                x += imageWidth;
+                ++imageIndex;
+            }
         }
     };
-    if (!snap.document.headerText().empty()) {
-        drawStory(snap.document.headerText(), false);
+    if (!snap.document.headerText().empty() ||
+        !snap.document.headerImages().empty()) {
+        drawStory(snap.document.headerText(),
+                  snap.document.headerImages(), false);
     }
-    if (!snap.document.footerText().empty()) {
-        drawStory(snap.document.footerText(), true);
+    if (!snap.document.footerText().empty() ||
+        !snap.document.footerImages().empty()) {
+        drawStory(snap.document.footerText(),
+                  snap.document.footerImages(), true);
     }
     if (decorations && headerFooterEditing_) {
         painter.save();
@@ -9387,7 +9479,7 @@ void DocumentCanvas::ensureStoryEditors() {
     const auto create = [this](std::array<QPlainTextEdit*, 3>& editors,
                                const QString& prefix) {
         for (int index = 0; index < 3; ++index) {
-            auto* editor = new QPlainTextEdit(viewport());
+            auto* editor = new StoryTextEdit(viewport());
             editor->setObjectName(prefix + QString::number(index));
             editor->setAccessibleName(
                 (prefix.startsWith(QStringLiteral("header"))
@@ -9415,6 +9507,9 @@ void DocumentCanvas::ensureStoryEditors() {
             editor->hide();
             connect(editor, &QPlainTextEdit::textChanged, this,
                     [this] { applyStoryEditorText(); });
+            editor->pasteImage = [this, editor](const QMimeData* mime) {
+                pasteStoryImage(editor, mime);
+            };
             editors[static_cast<std::size_t>(index)] = editor;
         }
     };
@@ -9481,12 +9576,187 @@ void DocumentCanvas::applyStoryEditorText() {
     }
 }
 
+void DocumentCanvas::pasteStoryImage(QPlainTextEdit* editor,
+                                     const QMimeData* mime) {
+    if (!editor || !mime || !headerFooterEditing_ ||
+        rejectLiveEditDuringPreview()) {
+        return;
+    }
+    std::vector<std::uint8_t> encodedBytes;
+    QString accessibleName = tr("Pasted picture");
+    std::optional<std::int64_t> requestedWidth;
+    std::optional<std::int64_t> requestedHeight;
+    core::ImageFormat requestedFormat = core::ImageFormat::png;
+    const QString nativeFormat = mime->hasFormat(
+        QString::fromLatin1(kInlineImageClipboardMime))
+        ? QString::fromLatin1(kInlineImageClipboardMime)
+        : mime->hasFormat(QString::fromLatin1(
+              kInlineImageClipboardLegacyMime))
+            ? QString::fromLatin1(kInlineImageClipboardLegacyMime)
+            : QString();
+    if (!nativeFormat.isEmpty()) {
+        const auto image = decodeClipboardInlineImage(
+            mime->data(nativeFormat));
+        if (!image) {
+            emit operationFailed(tr(
+                "The Owl Docs picture on the clipboard is malformed or exceeds the safety limits."));
+            return;
+        }
+        encodedBytes = image->encodedBytes;
+        accessibleName = image->accessibleName;
+        requestedWidth = image->widthEmu;
+        requestedHeight = image->heightEmu;
+        requestedFormat = image->format;
+    } else {
+        QString format;
+        for (const auto& candidate : {QStringLiteral("image/png"),
+                                      QStringLiteral("image/jpeg")}) {
+            if (mime->hasFormat(candidate)) {
+                format = candidate;
+                break;
+            }
+        }
+        QByteArray encoded;
+        if (!format.isEmpty()) {
+            encoded = mime->data(format);
+        } else if (mime->hasImage()) {
+            const QImage clipboardImage =
+                qvariant_cast<QImage>(mime->imageData());
+            if (clipboardImage.isNull() || clipboardImage.width() > 16'384 ||
+                clipboardImage.height() > 16'384 ||
+                static_cast<std::int64_t>(clipboardImage.width()) *
+                        clipboardImage.height() >
+                    64LL * 1024LL * 1024LL) {
+                emit operationFailed(tr(
+                    "The clipboard picture exceeds the supported image dimensions."));
+                return;
+            }
+            QBuffer buffer(&encoded);
+            if (!buffer.open(QIODevice::WriteOnly) ||
+                !clipboardImage.save(&buffer, "PNG")) {
+                emit operationFailed(tr(
+                    "The clipboard picture could not be encoded as PNG."));
+                return;
+            }
+            format = QStringLiteral("image/png");
+        } else {
+            return;
+        }
+        if (encoded.isEmpty() || encoded.size() >
+                static_cast<qsizetype>(core::kMaximumEncodedImageBytes)) {
+            emit operationFailed(tr(
+                "The clipboard picture is empty or exceeds the 16 MiB encoded-picture limit."));
+            return;
+        }
+        encodedBytes.assign(
+            reinterpret_cast<const std::uint8_t*>(encoded.constData()),
+            reinterpret_cast<const std::uint8_t*>(encoded.constData()) +
+                encoded.size());
+        requestedFormat = format == QStringLiteral("image/png")
+            ? core::ImageFormat::png : core::ImageFormat::jpeg;
+    }
+
+    RasterDecodeLimits limits;
+    limits.maximum_encoded_bytes = core::kMaximumEncodedImageBytes;
+    limits.maximum_decoded_bytes = std::min(
+        limits.maximum_decoded_bytes,
+        kMaximumAggregateDecodedRasterBytes -
+            std::min(decodedImageBytes_,
+                     kMaximumAggregateDecodedRasterBytes));
+    auto decoded = decodeRasterImage(encodedBytes, limits);
+    const auto expected = requestedFormat == core::ImageFormat::png
+        ? raster::Format::png : raster::Format::jpeg;
+    if (!decoded.ok() || decoded.format != expected) {
+        emit operationFailed(tr(
+            "The picture is not a valid bounded PNG or JPEG image."));
+        return;
+    }
+
+    const double storyHeight = activeStoryIsFooter_
+        ? std::max(18.0, marginBottomPoints_ - 14.0)
+        : std::max(18.0, marginTopPoints_ - 21.0);
+    const double storyWidth = std::max(
+        18.0, (pageWidthPoints_ - marginLeftPoints_ -
+               marginRightPoints_) / 3.0 - 6.0);
+    double widthPoints = requestedWidth
+        ? static_cast<double>(*requestedWidth) / kEmuPerPoint
+        : static_cast<double>(decoded.image.width()) * 0.75;
+    const double sourceAspect = static_cast<double>(decoded.image.width()) /
+        static_cast<double>(decoded.image.height());
+    double heightPoints = widthPoints / sourceAspect;
+    if (requestedHeight && !requestedWidth) {
+        heightPoints = static_cast<double>(*requestedHeight) / kEmuPerPoint;
+        widthPoints = heightPoints * sourceAspect;
+    }
+    const double fit = std::min(
+        {1.0, storyWidth / std::max(1.0, widthPoints),
+         storyHeight / std::max(1.0, heightPoints)});
+    const auto widthEmu = static_cast<std::int64_t>(std::llround(
+        widthPoints * fit * kEmuPerPoint));
+    const auto heightEmu = static_cast<std::int64_t>(std::llround(
+        heightPoints * fit * kEmuPerPoint));
+
+    auto& editors = activeStoryIsFooter_ ? footerEditors_ : headerEditors_;
+    const auto found = std::find(editors.begin(), editors.end(), editor);
+    if (found == editors.end()) return;
+    const int region = static_cast<int>(std::distance(editors.begin(), found));
+    auto sections = splitStorySections(
+        activeStoryIsFooter_ ? footerText() : headerText());
+    QTextCursor cursor = editor->textCursor();
+    const int selectionStart = std::min(
+        cursor.anchor(), cursor.position());
+    const int selectionEnd = std::max(
+        cursor.anchor(), cursor.position());
+    sections[static_cast<std::size_t>(region)].remove(
+        selectionStart, selectionEnd - selectionStart);
+    std::size_t globalOffset = static_cast<std::size_t>(selectionStart);
+    for (int index = 0; index < region; ++index) {
+        globalOffset += static_cast<std::size_t>(
+            sections[static_cast<std::size_t>(index)].size()) + 1U;
+    }
+    const QString updated = sections[0] + QLatin1Char('\t') +
+        sections[1] + QLatin1Char('\t') + sections[2];
+    QString safeName = accessibleName.trimmed();
+    if (safeName.isEmpty()) safeName = tr("Picture");
+    QByteArray encodedName = safeName.toUtf8();
+    while (encodedName.size() >
+               static_cast<qsizetype>(core::kMaximumImageAccessibleNameBytes) &&
+           !safeName.isEmpty()) {
+        safeName.chop(1);
+        encodedName = safeName.toUtf8();
+    }
+    const auto imageId = core::NodeId::generate();
+    std::vector<core::Operation> operations;
+    operations.emplace_back(activeStoryIsFooter_
+        ? core::Operation(core::SetFooterText{toUtf16(updated)})
+        : core::Operation(core::SetHeaderText{toUtf16(updated)}));
+    operations.emplace_back(core::InsertHeaderFooterImage{
+        activeStoryIsFooter_, globalOffset,
+        core::EncodedImagePayload(std::move(encodedBytes)), requestedFormat,
+        encodedName.toStdString(), widthEmu, heightEmu, imageId});
+    if (!apply(std::move(operations))) return;
+    const auto [cached, inserted] = decodedImages_.emplace(
+        imageId, std::move(decoded.image));
+    if (inserted) decodedImageBytes_ += cached->second.sizeInBytes();
+    loadStoryEditors(activeStoryIsFooter_);
+    auto* target = editors[static_cast<std::size_t>(region)];
+    QTextCursor restored = target->textCursor();
+    restored.setPosition(selectionStart + 1);
+    target->setTextCursor(restored);
+    target->setFocus();
+    storyEditHasTransaction_ = false;
+    viewport()->update();
+}
+
 void DocumentCanvas::updateStoryEditorGeometry() {
     if (!headerFooterEditing_ || !headerEditors_[0]) return;
     for (auto* editor : headerEditors_) editor->hide();
     for (auto* editor : footerEditors_) editor->hide();
 
     const double scale = kScreenPointsScale * zoomPercent_ / 100.0;
+    QFont editorFont(defaultFontFamily_);
+    editorFont.setPointSizeF(
+        defaultFontPointSize_ * static_cast<double>(zoomPercent_) / 100.0);
     const double pagePixelWidth = pageWidthPoints_ * scale;
     const double documentWidth = std::max(
         pagePixelWidth + 2 * kCanvasPaddingPixels,
@@ -9514,6 +9784,7 @@ void DocumentCanvas::updateStoryEditorGeometry() {
             left + width * static_cast<double>(index) / 3.0));
         const int x1 = static_cast<int>(std::round(
             left + width * static_cast<double>(index + 1) / 3.0));
+        editors[static_cast<std::size_t>(index)]->setFont(editorFont);
         editors[static_cast<std::size_t>(index)]->setGeometry(
             x0 + gap, y, std::max(20, x1 - x0 - 2 * gap), height);
         editors[static_cast<std::size_t>(index)]->show();

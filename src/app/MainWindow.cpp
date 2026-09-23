@@ -1520,20 +1520,78 @@ core::Result<ImportedSemanticDocument> documentFromOoxml(
         tablePresentations.push_back(std::move(tablePresentation));
     }
 
-    if (package.headerText()) {
-        const auto applied = document.setHeaderText(
-            QString::fromUtf8(package.headerText()->data(),
-                              static_cast<qsizetype>(package.headerText()->size()))
-                .toStdU16String());
+    const auto restoreStory = [&](bool footer) -> core::Result<void> {
+        const auto& sourceText = footer ? package.footerText()
+                                        : package.headerText();
+        if (!sourceText) return {};
+        QString story = QString::fromUtf8(
+            sourceText->data(), static_cast<qsizetype>(sourceText->size()));
+        const auto& sourceImages = footer ? package.footerImages()
+                                          : package.headerImages();
+        QString plain = story;
+        plain.remove(QChar(core::kInlineObjectReplacementCharacter));
+        auto applied = footer
+            ? document.setFooterText(plain.toStdU16String())
+            : document.setHeaderText(plain.toStdU16String());
         if (!applied) return applied.error();
-    }
-    if (package.footerText()) {
-        const auto applied = document.setFooterText(
-            QString::fromUtf8(package.footerText()->data(),
-                              static_cast<qsizetype>(package.footerText()->size()))
-                .toStdU16String());
-        if (!applied) return applied.error();
-    }
+        for (const auto& storyImage : sourceImages) {
+            const auto& sourceImage = storyImage.image;
+            if (!sourceImage.renderable() ||
+                storyImage.text_offset_bytes >= sourceText->size()) {
+                continue;
+            }
+            const auto inspection = raster::inspect(
+                sourceImage.bytes.view(), raster::Format::unknown,
+                imageLimits.per_image);
+            if (!inspection.ok()) continue;
+            if (importedImageCount >=
+                    core::kMaximumInlineImagesPerDocument ||
+                sourceImage.bytes.size() >
+                    core::kMaximumDocumentEncodedImageBytes -
+                        std::min(importedEncodedImageBytes,
+                                 core::kMaximumDocumentEncodedImageBytes)) {
+                return core::Error{
+                    core::ErrorCode::invalid_operation,
+                    "Imported document exceeds Owl Docs' bounded inline-picture budget"};
+            }
+            auto decoded = imageCache.decode(
+                sourceImage.package_member, sourceImage.bytes.view());
+            if (!decoded.ok()) continue;
+            auto encoded = encodedImageCache.find(sourceImage.package_member);
+            if (encoded == encodedImageCache.end()) {
+                encoded = encodedImageCache.emplace(
+                    sourceImage.package_member,
+                    core::EncodedImagePayload(std::vector<std::uint8_t>(
+                        sourceImage.bytes.view().begin(),
+                        sourceImage.bytes.view().end()))).first;
+            }
+            const QString prefix = QString::fromUtf8(
+                sourceText->data(), static_cast<qsizetype>(
+                    storyImage.text_offset_bytes));
+            const std::size_t offset = static_cast<std::size_t>(prefix.size());
+            const auto imageId = core::NodeId::generate();
+            applied = document.insertHeaderFooterImage(
+                footer, offset, encoded->second,
+                inspection.format == raster::Format::png
+                    ? core::ImageFormat::png
+                    : core::ImageFormat::jpeg,
+                sourceImage.accessible_name.empty()
+                    ? (sourceImage.name.empty() ? std::string("Picture")
+                                                : sourceImage.name)
+                    : sourceImage.accessible_name,
+                sourceImage.width_emu, sourceImage.height_emu, imageId);
+            if (!applied) return applied.error();
+            imagePresentations.emplace_back(
+                imageId, std::move(decoded.image));
+            ++importedImageCount;
+            importedEncodedImageBytes += sourceImage.bytes.size();
+        }
+        return {};
+    };
+    const auto restoredHeader = restoreStory(false);
+    if (!restoredHeader) return restoredHeader.error();
+    const auto restoredFooter = restoreStory(true);
+    if (!restoredFooter) return restoredFooter.error();
 
     return ImportedSemanticDocument{std::move(document),
                                     std::move(sourceIndices),
@@ -2461,6 +2519,52 @@ ooxml::NewDocumentBody toOoxmlBody(
             static_cast<qsizetype>(snapshot.document.footerText().size()))
                                  .toUtf8().toStdString();
     }
+    const auto appendStoryImages = [&losses](
+        const std::u16string& text,
+        const std::vector<core::ImageAtom>& images,
+        std::vector<ooxml::NewStoryImage>& destination) {
+        destination.reserve(images.size());
+        for (const auto& image : images) {
+            const auto bytes = image.encoded_payload.bytes();
+            if (bytes.empty() || image.width_emu <= 0 ||
+                image.height_emu <= 0) {
+                losses.push_back(QObject::tr(
+                    "A header/footer picture lacks a valid PNG/JPEG source or display size"));
+                continue;
+            }
+            QString safeName = QString::fromStdString(
+                image.accessible_name);
+            safeName.remove(QRegularExpression(
+                QStringLiteral("[\\x00-\\x1f\\x7f/\\\\]")));
+            if (safeName.trimmed().isEmpty()) {
+                safeName = QObject::tr("Picture");
+            }
+            safeName.truncate(120);
+            const QByteArray encodedName = safeName.toUtf8();
+            ooxml::NewInlineImage serialized;
+            serialized.format = image.format == core::ImageFormat::png
+                ? raster::Format::png : raster::Format::jpeg;
+            serialized.name = encodedName.toStdString();
+            serialized.accessible_name = image.accessible_name;
+            serialized.width_emu = image.width_emu;
+            serialized.height_emu = image.height_emu;
+            serialized.bytes.assign(bytes.begin(), bytes.end());
+            serialized.layout.placement =
+                ooxml::ImagePlacement::inline_with_text;
+            serialized.layout.move_with_text = true;
+            const QString prefix = QString::fromUtf16(
+                text.data(), static_cast<qsizetype>(image.utf16_offset));
+            destination.push_back({
+                static_cast<std::size_t>(prefix.toUtf8().size()),
+                std::move(serialized)});
+        }
+    };
+    appendStoryImages(snapshot.document.headerText(),
+                      snapshot.document.headerImages(),
+                      output.header_images);
+    appendStoryImages(snapshot.document.footerText(),
+                      snapshot.document.footerImages(),
+                      output.footer_images);
     output.blocks.reserve(snapshot.document.bodyBlocks().size());
     for (const auto& block : snapshot.document.bodyBlocks()) {
         if (block.kind == core::BodyBlockKind::paragraph) {

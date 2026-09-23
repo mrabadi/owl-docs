@@ -254,6 +254,17 @@ struct SetFooterText {
     std::u16string text;
 };
 
+struct InsertHeaderFooterImage {
+    bool footer{false};
+    std::size_t utf16_offset{0};
+    EncodedImagePayload encoded_payload;
+    ImageFormat image_format{ImageFormat::png};
+    std::string accessible_name;
+    std::int64_t width_emu{0};
+    std::int64_t height_emu{0};
+    NodeId image_id{NodeId::generate()};
+};
+
 using Operation = std::variant<InsertText, InsertEquation, InsertImage,
                                ResizeImage, ReplaceImagePayload, SetImageLayout,
                                SetImageAccessibleName, DeleteRange, ReplaceRange,
@@ -269,6 +280,7 @@ using Operation = std::variant<InsertText, InsertEquation, InsertImage,
                                InsertTableRow, DeleteTableRows,
                                InsertTableColumn, DeleteTableColumns,
                                SetTableStyle, MoveTable, DeleteTable,
-                               SetHeaderText, SetFooterText>;
+                               SetHeaderText, SetFooterText,
+                               InsertHeaderFooterImage>;
 
 }  // namespace docxstudio::core

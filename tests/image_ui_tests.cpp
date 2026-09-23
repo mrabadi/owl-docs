@@ -18,10 +18,12 @@
 #include <QMimeData>
 #include <QMouseEvent>
 #include <QProcess>
+#include <QPlainTextEdit>
 #include <QStandardPaths>
 #include <QTemporaryDir>
 #include <QTimer>
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdlib>
@@ -1135,6 +1137,101 @@ void testClipboardValidation(docxstudio::app::SpellChecker& spelling) {
           "over-dimensional decoded clipboard image mutated the document");
 }
 
+void testHeaderFooterImagePasteZoomHistoryAndRecovery(
+    docxstudio::app::SpellChecker& spelling) {
+    using namespace docxstudio;
+    DocumentCanvas canvas(spelling);
+    canvas.resize(1000, 760);
+    canvas.show();
+    canvas.beginHeaderFooterEditing(false, 1, 0);
+    QApplication::processEvents();
+    auto* center = canvas.findChild<QPlainTextEdit*>(
+        QStringLiteral("headerStoryEditor1"));
+    check(center && center->isVisible(),
+          "header center editor was not available for picture paste");
+    const double font100 = center->font().pointSizeF();
+    const QRect geometry100 = center->geometry();
+    canvas.setZoomPercent(200);
+    QApplication::processEvents();
+    check(std::abs(center->font().pointSizeF() - font100 * 2.0) < 0.05 &&
+              center->geometry().width() > geometry100.width() * 1.8 &&
+              center->geometry().height() > geometry100.height() * 1.8,
+          "header/footer editor font and geometry did not scale with zoom");
+
+    const auto png = encodedPng(QColor(12, 170, 73), 80, 40);
+    auto* mime = new QMimeData;
+    mime->setData(QStringLiteral("image/png"), asByteArray(png));
+    QApplication::clipboard()->setMimeData(mime);
+    center->setFocus();
+    center->paste();
+    QApplication::processEvents();
+    auto snapshot = canvas.snapshot();
+    check(snapshot.document.headerImages().size() == 1 &&
+              snapshot.document.footerImages().empty() &&
+              snapshot.document.headerText().size() == 3 &&
+              snapshot.document.headerText()[0] == u'\t' &&
+              snapshot.document.headerText()[1] ==
+                  core::kInlineObjectReplacementCharacter &&
+              snapshot.document.headerText()[2] == u'\t',
+          "pasting into the center header did not create a semantic story image");
+    const auto& image = snapshot.document.headerImages().front();
+    check(std::abs(static_cast<double>(image.width_emu) /
+                       static_cast<double>(image.height_emu) -
+                   2.0) < 0.001,
+          "header picture paste did not preserve the source aspect ratio");
+    canvas.undo();
+    check(canvas.snapshot().document.headerImages().empty(),
+          "Undo did not remove a pasted header picture");
+    canvas.redo();
+    snapshot = canvas.snapshot();
+    check(snapshot.document.headerImages().size() == 1,
+          "Redo did not restore a pasted header picture");
+
+    std::string error;
+    const auto encoded = app::RecoveryCodec::encode(
+        {snapshot.document, {}}, error);
+    check(encoded.has_value(),
+          "recovery could not encode a header picture");
+    const auto recovered = app::RecoveryCodec::decode(*encoded, error);
+    check(recovered && recovered->document.headerImages().size() == 1 &&
+              recovered->document.headerText() ==
+                  snapshot.document.headerText() &&
+              recovered->document.headerImages().front().encoded_payload ==
+                  snapshot.document.headerImages().front().encoded_payload &&
+              recovered->document.headerImages().front().width_emu ==
+                  snapshot.document.headerImages().front().width_emu &&
+              recovered->document.headerImages().front().height_emu ==
+                  snapshot.document.headerImages().front().height_emu,
+          "header picture did not survive recovery round-trip");
+
+    const auto pasteIntoStoryRegion = [&](bool footer, int region) {
+        canvas.beginHeaderFooterEditing(footer, region, 0);
+        QApplication::processEvents();
+        auto* target = canvas.findChild<QPlainTextEdit*>(
+            (footer ? QStringLiteral("footerStoryEditor")
+                    : QStringLiteral("headerStoryEditor")) +
+            QString::number(region));
+        check(target && target->isVisible(),
+              "requested header/footer picture region was unavailable");
+        target->setFocus();
+        target->moveCursor(QTextCursor::End);
+        target->paste();
+        QApplication::processEvents();
+    };
+    pasteIntoStoryRegion(false, 0);
+    pasteIntoStoryRegion(false, 2);
+    pasteIntoStoryRegion(true, 0);
+    pasteIntoStoryRegion(true, 1);
+    pasteIntoStoryRegion(true, 2);
+    snapshot = canvas.snapshot();
+    check(snapshot.document.headerImages().size() == 3 &&
+              snapshot.document.footerImages().size() == 3 &&
+              snapshot.document.headerText() == u"\ufffc\t\ufffc\t\ufffc" &&
+              snapshot.document.footerText() == u"\ufffc\t\ufffc\t\ufffc",
+          "picture paste did not work in every header/footer alignment region");
+    canvas.hide();
+}
+
 void testMixedObjectOrdering(docxstudio::app::SpellChecker& spelling) {
     DocumentCanvas canvas(spelling);
     canvas.insertText(QStringLiteral("AC"));
@@ -1409,6 +1506,22 @@ void testDialogSaveAndReopen() {
     check(canvas->insertEquation(QStringLiteral("x^2")),
           "could not insert equation after adjacent images before DOCX save");
 
+    canvas->beginHeaderFooterEditing(false, 1, 0);
+    QApplication::processEvents();
+    auto* headerCenter = canvas->findChild<QPlainTextEdit*>(
+        QStringLiteral("headerStoryEditor1"));
+    check(headerCenter && headerCenter->isVisible(),
+          "could not reach the center header before DOCX save");
+    auto* headerMime = new QMimeData;
+    headerMime->setData(QStringLiteral("image/png"), asByteArray(png));
+    QApplication::clipboard()->setMimeData(headerMime);
+    headerCenter->setFocus();
+    headerCenter->paste();
+    QApplication::processEvents();
+    canvas->endHeaderFooterEditing();
+    check(canvas->snapshot().document.headerImages().size() == 1,
+          "could not insert a semantic header picture before DOCX save");
+
     const QString saved = temporary.filePath(QStringLiteral("image.docx"));
     auto* saveAs = window.findChild<QAction*>(QStringLiteral("file.saveAs"));
     check(saveAs != nullptr, "could not reach Save As");
@@ -1430,7 +1543,11 @@ void testDialogSaveAndReopen() {
     auto package = docxstudio::ooxml::DocxDocument::open(
         std::filesystem::path(QFile::encodeName(saved).constData()),
         &openError);
-    check(package && package->paragraphs().size() == 1,
+    check(package && package->paragraphs().size() == 1 &&
+              package->headerImages().size() == 1 &&
+              package->headerImages().front().image.bytes == png &&
+              package->headerImages().front().image.width_emu > 0 &&
+              package->headerImages().front().image.height_emu > 0,
           "saved image DOCX did not reopen in the OOXML engine");
     bool foundImage = false;
     int imageCount = 0;
@@ -1492,7 +1609,15 @@ void testDialogSaveAndReopen() {
     const auto reopenedImages = reopenedCanvas
         ? imageAtoms(*reopenedCanvas)
         : std::vector<docxstudio::core::ImageAtom>{};
-    check(reopenedCanvas && reopenedImages.size() == 2 &&
+    check(reopenedCanvas != nullptr,
+          "desktop reopen did not provide a populated document canvas");
+    const auto reopenedSnapshot = reopenedCanvas->snapshot();
+    const auto reopenedHeaderBytes =
+        reopenedSnapshot.document.headerImages().empty()
+        ? std::span<const std::uint8_t>{}
+        : reopenedSnapshot.document.headerImages().front()
+              .encoded_payload.bytes();
+    check(reopenedImages.size() == 2 &&
               reopenedImages.front().encoded_payload.size() == png.size() &&
               reopenedImages[0].accessible_name ==
                   "Quarterly owl diagram" &&
@@ -1500,10 +1625,13 @@ void testDialogSaveAndReopen() {
               reopenedImages[1].accessible_name ==
                   "Supporting owl figure" &&
               reopenedImages[1].layout == topBottomLayout &&
-              reopenedCanvas->snapshot().document.paragraphs().front()
+              reopenedSnapshot.document.headerImages().size() == 1 &&
+              std::equal(reopenedHeaderBytes.begin(), reopenedHeaderBytes.end(),
+                         png.begin(), png.end()) &&
+              reopenedSnapshot.document.paragraphs().front()
                       .equations().size() == 1 &&
               !reopenedCanvas->isModified(),
-          "desktop reopen did not reconstruct mixed semantic objects, picture layout, or alt text");
+          "desktop reopen did not reconstruct mixed semantic objects, story pictures, picture layout, or alt text");
 }
 
 }  // namespace
@@ -1523,6 +1651,7 @@ int main(int argc, char** argv) {
     testAnchoredMultipageFlowIsPageLocal(spelling);
     testResizeHandleDragIsOneUndo(spelling);
     testClipboardValidation(spelling);
+    testHeaderFooterImagePasteZoomHistoryAndRecovery(spelling);
     testMixedObjectOrdering(spelling);
     testInlineObjectTypingOverrideProvenance(spelling);
     testImageBudgetEvictionKeepsCanvasHistoryUsable(spelling);

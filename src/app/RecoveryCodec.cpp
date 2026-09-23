@@ -1185,6 +1185,25 @@ std::optional<std::string> RecoveryCodec::encode(const RecoveryDocument& recover
     }
     root["header_text_utf16"] = encodeUtf16(recovery.document.headerText());
     root["footer_text_utf16"] = encodeUtf16(recovery.document.footerText());
+    const auto encodeStoryImages = [](const std::vector<core::ImageAtom>& images) {
+        Json encoded = Json::array();
+        for (const auto& image : images) {
+            encoded.push_back(
+                {{"id", image.id.toString()},
+                 {"offset", image.utf16_offset},
+                 {"width_emu", image.width_emu},
+                 {"height_emu", image.height_emu},
+                 {"accessible_name", image.accessible_name},
+                 {"format", imageFormatName(image.format)},
+                 {"encoded_base64",
+                  base64Encode(image.encoded_payload.bytes())}});
+        }
+        return encoded;
+    };
+    root["header_images"] = encodeStoryImages(
+        recovery.document.headerImages());
+    root["footer_images"] = encodeStoryImages(
+        recovery.document.footerImages());
     try {
         std::string payload = root.dump();
         if (payload.size() > kMaximumPayloadBytes) {
@@ -2118,10 +2137,97 @@ std::optional<RecoveryDocument> RecoveryCodec::decode(std::string_view payload,
                              totalCodeUnits, error)) {
                 return std::nullopt;
             }
-            const auto headerResult = document.value().setHeaderText(
-                std::move(header));
-            const auto footerResult = document.value().setFooterText(
-                std::move(footer));
+            const auto restoreStory = [&](bool isFooter,
+                                          std::u16string story) {
+                const Json* encodedImages = nullptr;
+                if (version >= 13) {
+                    encodedImages = &root.at(
+                        isFooter ? "footer_images" : "header_images");
+                    if (!encodedImages->is_array() ||
+                        encodedImages->size() >
+                            core::kMaximumInlineImagesPerDocument -
+                                totalImages ||
+                        static_cast<std::size_t>(std::count(
+                            story.begin(), story.end(),
+                            core::kInlineObjectReplacementCharacter)) !=
+                            encodedImages->size()) {
+                        return core::Result<void>(core::Error{
+                            core::ErrorCode::invalid_operation,
+                            "Recovery header/footer picture list is invalid"});
+                    }
+                }
+                std::u16string plain;
+                plain.reserve(story.size());
+                std::copy_if(
+                    story.begin(), story.end(), std::back_inserter(plain),
+                    [](char16_t value) {
+                        return value !=
+                            core::kInlineObjectReplacementCharacter;
+                    });
+                auto result = isFooter
+                    ? document.value().setFooterText(std::move(plain))
+                    : document.value().setHeaderText(std::move(plain));
+                if (!result || !encodedImages) return result;
+                std::size_t previousOffset = 0;
+                bool first = true;
+                for (const auto& encodedImage : *encodedImages) {
+                    if (!encodedImage.is_object()) {
+                        return core::Result<void>(core::Error{
+                            core::ErrorCode::invalid_operation,
+                            "Recovery header/footer picture is invalid"});
+                    }
+                    const auto imageId = core::NodeId::parse(
+                        encodedImage.at("id").get<std::string>());
+                    const auto offset64 =
+                        encodedImage.at("offset").get<std::uint64_t>();
+                    const auto format = parseImageFormat(
+                        encodedImage.at("format").get<std::string>());
+                    const auto accessibleName =
+                        encodedImage.at("accessible_name").get<std::string>();
+                    const auto width =
+                        encodedImage.at("width_emu").get<std::int64_t>();
+                    const auto height =
+                        encodedImage.at("height_emu").get<std::int64_t>();
+                    const std::size_t remaining =
+                        core::kMaximumDocumentEncodedImageBytes -
+                        totalImageBytes;
+                    auto bytes = base64Decode(
+                        encodedImage.at("encoded_base64").get<std::string>(),
+                        std::min(core::kMaximumEncodedImageBytes, remaining));
+                    if (!imageId || !format || !bytes ||
+                        !imageIds.insert(*imageId).second ||
+                        offset64 > std::numeric_limits<std::size_t>::max() ||
+                        offset64 >= story.size() ||
+                        story[static_cast<std::size_t>(offset64)] !=
+                            core::kInlineObjectReplacementCharacter ||
+                        (!first && offset64 <= previousOffset) ||
+                        accessibleName.size() >
+                            core::kMaximumImageAccessibleNameBytes ||
+                        width <= 0 || height <= 0) {
+                        return core::Result<void>(core::Error{
+                            core::ErrorCode::invalid_operation,
+                            "Recovery header/footer picture is invalid"});
+                    }
+                    core::EncodedImagePayload imagePayload(
+                        std::move(*bytes));
+                    if (!validEncodedImage(imagePayload, *format)) {
+                        return core::Result<void>(core::Error{
+                            core::ErrorCode::invalid_operation,
+                            "Recovery header/footer picture payload is invalid"});
+                    }
+                    totalImageBytes += imagePayload.size();
+                    ++totalImages;
+                    previousOffset = static_cast<std::size_t>(offset64);
+                    first = false;
+                    result = document.value().insertHeaderFooterImage(
+                        isFooter, previousOffset, std::move(imagePayload), *format,
+                        accessibleName, width, height, *imageId);
+                    if (!result) return result;
+                }
+                return core::Result<void>{};
+            };
+            const auto headerResult = restoreStory(false, std::move(header));
+            const auto footerResult = restoreStory(true, std::move(footer));
             if (!headerResult || !footerResult) {
                 error = !headerResult ? headerResult.error().message
                                       : footerResult.error().message;

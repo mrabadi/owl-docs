@@ -327,6 +327,8 @@ struct ParsedPackage {
     std::vector<ImportedSection> sections;
     std::optional<std::string> header_text;
     std::optional<std::string> footer_text;
+    std::vector<ImportedStoryImage> header_images;
+    std::vector<ImportedStoryImage> footer_images;
     std::string header_xml;
     std::string footer_xml;
     std::vector<SpanLocation> spans;
@@ -334,12 +336,26 @@ struct ParsedPackage {
     std::optional<DocumentDefaults> canonical_simple_regeneration_defaults;
 };
 
+struct ParsedStory {
+    std::string text;
+    std::vector<ImportedStoryImage> images;
+};
+
 std::string buildNewStylesXml(
     const DocumentDefaults& defaults,
     const NewParagraphStyleCatalog& paragraph_styles);
 std::string buildNewSettingsXml(const DocumentDefaults& defaults);
-std::string buildStoryXml(std::string_view text, bool header,
-                          const PageSettings& page);
+enum class ImagePartOwner;
+struct AuthoredImagePart;
+
+std::string buildStoryXml(
+    std::string_view text, const std::vector<NewStoryImage>& story_images,
+    bool header, const PageSettings& page,
+    const std::vector<struct AuthoredImagePart>* images = nullptr,
+    std::size_t first_image_index = 0);
+std::string newStoryRelationships(
+    ImagePartOwner owner,
+    const std::vector<AuthoredImagePart>& images);
 
 void setError(Error* error, ErrorCode code, std::string message) {
     if (error != nullptr) {
@@ -4240,7 +4256,7 @@ AuxiliaryPartTargets auxiliaryPartTargets(
     return targets;
 }
 
-std::optional<std::string> parseSimpleStoryText(
+std::optional<ParsedStory> parseSimpleStory(
     std::string_view xml, const OpenOptions& options) {
     if (xml.empty()) return std::nullopt;
     pugi::xml_document story;
@@ -4251,22 +4267,30 @@ std::optional<std::string> parseSimpleStoryText(
              .accepted()) {
         return std::nullopt;
     }
-    std::string result;
+    ParsedStory result;
     const auto appendNode = [&](const auto& self,
                                 const pugi::xml_node& node) -> void {
         if (isWordElement(node, "pPr") || isWordElement(node, "rPr")) {
             return;
         }
         if (isWordElement(node, "t")) {
-            result += node.child_value();
+            result.text += node.child_value();
             return;
         }
         if (isWordElement(node, "tab")) {
-            result.push_back('\t');
+            result.text.push_back('\t');
             return;
         }
         if (isWordElement(node, "br") || isWordElement(node, "cr")) {
-            result.push_back('\n');
+            result.text.push_back('\n');
+            return;
+        }
+        if (isWordElement(node, "drawing")) {
+            if (auto image = parseInlineImage(node)) {
+                result.images.push_back(
+                    {result.text.size(), std::move(*image)});
+                result.text += "\xef\xbf\xbc";
+            }
             return;
         }
         if (isWordElement(node, "fldSimple")) {
@@ -4279,8 +4303,8 @@ std::optional<std::string> parseSimpleStoryText(
                            instruction.begin(), [](unsigned char value) {
                                return static_cast<char>(std::toupper(value));
                            });
-            if (instruction == "PAGE") result += "{PAGE}";
-            else if (instruction == "NUMPAGES") result += "{PAGES}";
+            if (instruction == "PAGE") result.text += "{PAGE}";
+            else if (instruction == "NUMPAGES") result.text += "{PAGES}";
             else for (const auto child : node.children()) self(self, child);
             return;
         }
@@ -4289,7 +4313,7 @@ std::optional<std::string> parseSimpleStoryText(
     bool firstParagraph = true;
     for (const auto node : story.document_element().children()) {
         if (!isWordElement(node, "p")) continue;
-        if (!firstParagraph) result.push_back('\n');
+        if (!firstParagraph) result.text.push_back('\n');
         firstParagraph = false;
         appendNode(appendNode, node);
     }
@@ -4324,73 +4348,77 @@ void resolveInlineImages(ParsedPackage& parsed, const OpenOptions& options) {
             }
         }
     }
+    needs_images = needs_images || !parsed.header_images.empty() ||
+                   !parsed.footer_images.empty();
     if (!needs_images) return;
-
-    const auto relationships_entry = std::find_if(
-        parsed.entries.begin(), parsed.entries.end(), [](const EntryRecord& entry) {
-            return entry.member.name == kDocumentRelationshipsPart;
-        });
-    if (relationships_entry == parsed.entries.end()) return;
 
     Error ignored_error;
     zip_t* archive = openZipFromBytes(parsed.bytes, &ignored_error);
     if (!archive) return;
-    std::string relationships_xml;
-    if (!readEntry(
-            archive, relationships_entry->index,
-            options.max_document_xml_bytes, relationships_xml,
-            &ignored_error)) {
-        zip_discard(archive);
-        return;
-    }
-
-    pugi::xml_document relationships;
-    if (!relationships.load_buffer(
-            relationships_xml.data(), relationships_xml.size(),
-            pugi::parse_default, pugi::encoding_auto)) {
-        zip_discard(archive);
-        return;
-    }
-    const auto complexity = ::docxstudio::xml::inspectComplexity(
-        relationships, options.max_xml_depth, options.max_xml_nodes);
-    if (!complexity.accepted()) {
-        zip_discard(archive);
-        return;
-    }
-    const pugi::xml_node root = relationships.document_element();
-    const std::string relationship_namespace = namespaceUri(root);
     constexpr std::string_view transitional_package_relationships =
         "http://schemas.openxmlformats.org/package/2006/relationships";
     constexpr std::string_view strict_package_relationships =
         "http://purl.oclc.org/ooxml/package/relationships";
-    if (localName(root.name()) != "Relationships" ||
-        (relationship_namespace != transitional_package_relationships &&
-         relationship_namespace != strict_package_relationships)) {
-        zip_discard(archive);
-        return;
-    }
-
-    std::unordered_map<std::string, std::string> image_members;
-    for (const pugi::xml_node relationship : root.children()) {
-        if (!isNamespacedElement(
-                relationship, "Relationship", relationship_namespace)) {
-            continue;
+    const auto readRelationships = [&](std::string_view part) {
+        std::unordered_map<std::string, std::string> members;
+        const auto entry = std::find_if(
+            parsed.entries.begin(), parsed.entries.end(),
+            [part](const EntryRecord& candidate) {
+                return candidate.member.name == part;
+            });
+        if (entry == parsed.entries.end()) return members;
+        std::string xml;
+        if (!readEntry(archive, entry->index, options.max_document_xml_bytes,
+                       xml, &ignored_error)) {
+            return members;
         }
-        const std::string_view mode = relationship.attribute("TargetMode").value();
-        if (mode == "External") continue;
-        const std::string_view type = relationship.attribute("Type").value();
-        if (!(type.ends_with("/image") &&
-              (type.starts_with(kOfficeRelationshipsNamespace) ||
-               type.starts_with(kStrictOfficeRelationshipsNamespace)))) {
-            continue;
+        pugi::xml_document relationships;
+        if (!relationships.load_buffer(
+                xml.data(), xml.size(), pugi::parse_default,
+                pugi::encoding_auto) ||
+            !::docxstudio::xml::inspectComplexity(
+                 relationships, options.max_xml_depth,
+                 options.max_xml_nodes).accepted()) {
+            return members;
         }
-        const std::string id = relationship.attribute("Id").value();
-        const auto member = safeDocumentRelationshipTarget(
-            relationship.attribute("Target").value());
-        if (!id.empty() && member && !imageContentTypeForMember(*member).empty()) {
-            image_members.emplace(id, *member);
+        const auto root = relationships.document_element();
+        const std::string relationship_namespace = namespaceUri(root);
+        if (localName(root.name()) != "Relationships" ||
+            (relationship_namespace != transitional_package_relationships &&
+             relationship_namespace != strict_package_relationships)) {
+            return members;
         }
-    }
+        for (const auto relationship : root.children()) {
+            if (!isNamespacedElement(
+                    relationship, "Relationship",
+                    relationship_namespace) ||
+                std::string_view(
+                    relationship.attribute("TargetMode").value()) ==
+                    "External") {
+                continue;
+            }
+            const std::string_view type =
+                relationship.attribute("Type").value();
+            if (!type.ends_with("/image") ||
+                !(type.starts_with(kOfficeRelationshipsNamespace) ||
+                  type.starts_with(kStrictOfficeRelationshipsNamespace))) {
+                continue;
+            }
+            const std::string id = relationship.attribute("Id").value();
+            const auto member = safeDocumentRelationshipTarget(
+                relationship.attribute("Target").value());
+            if (!id.empty() && member &&
+                !imageContentTypeForMember(*member).empty()) {
+                members.emplace(id, *member);
+            }
+        }
+        return members;
+    };
+    const auto body_members = readRelationships(kDocumentRelationshipsPart);
+    const auto header_members = readRelationships(
+        "word/_rels/header1.xml.rels");
+    const auto footer_members = readRelationships(
+        "word/_rels/footer1.xml.rels");
 
     constexpr std::uint64_t kMaximumRenderedImageBytes =
         64ULL * 1024ULL * 1024ULL;
@@ -4403,21 +4431,14 @@ void resolveInlineImages(ParsedPackage& parsed, const OpenOptions& options) {
         std::shared_ptr<const std::vector<std::uint8_t>>> cached_bytes;
     std::uint64_t aggregate_cached_bytes = 0U;
     std::size_t attempted_references = 0U;
-    for (auto& paragraph : parsed.paragraphs) {
-        for (auto& run : paragraph.runs) {
-            for (auto& fragment : run.fragments) {
-                if (fragment.kind != FragmentKind::inline_image ||
-                    !fragment.inline_image) {
-                    continue;
-                }
-                if (attempted_references >=
-                    kMaximumResolvedImageReferences) {
-                    continue;
+    const auto resolve = [&](InlineImagePayload& image,
+                             const auto& image_members) {
+                if (attempted_references >= kMaximumResolvedImageReferences) {
+                    return;
                 }
                 ++attempted_references;
-                auto& image = *fragment.inline_image;
                 const auto related = image_members.find(image.relationship_id);
-                if (related == image_members.end()) continue;
+                if (related == image_members.end()) return;
                 const auto package_entry = std::find_if(
                     parsed.entries.begin(), parsed.entries.end(),
                     [&related](const EntryRecord& entry) {
@@ -4427,7 +4448,7 @@ void resolveInlineImages(ParsedPackage& parsed, const OpenOptions& options) {
                     package_entry->member.uncompressed_size >
                         std::min(options.max_member_uncompressed_bytes,
                                  kMaximumRenderedImageBytes)) {
-                    continue;
+                    return;
                 }
                 auto cached = cached_bytes.find(related->second);
                 if (cached == cached_bytes.end()) {
@@ -4436,7 +4457,7 @@ void resolveInlineImages(ParsedPackage& parsed, const OpenOptions& options) {
                         package_entry->member.uncompressed_size >
                             kMaximumAggregateRenderedImageBytes -
                                 aggregate_cached_bytes) {
-                        continue;
+                        return;
                     }
                     std::string contents;
                     if (!readEntry(
@@ -4445,7 +4466,7 @@ void resolveInlineImages(ParsedPackage& parsed, const OpenOptions& options) {
                                      kMaximumRenderedImageBytes),
                             contents, &ignored_error)) {
                         cached_bytes.emplace(related->second, nullptr);
-                        continue;
+                        return;
                     }
                     auto shared_contents =
                         std::make_shared<const std::vector<std::uint8_t>>(
@@ -4455,12 +4476,26 @@ void resolveInlineImages(ParsedPackage& parsed, const OpenOptions& options) {
                     aggregate_cached_bytes +=
                         static_cast<std::uint64_t>(contents.size());
                 }
-                if (!cached->second) continue;
+                if (!cached->second) return;
                 image.package_member = related->second;
                 image.content_type = imageContentTypeForMember(related->second);
                 image.bytes = SharedImageBytes(cached->second);
+    };
+    for (auto& paragraph : parsed.paragraphs) {
+        for (auto& run : paragraph.runs) {
+            for (auto& fragment : run.fragments) {
+                if (fragment.kind == FragmentKind::inline_image &&
+                    fragment.inline_image) {
+                    resolve(*fragment.inline_image, body_members);
+                }
             }
         }
+    }
+    for (auto& image : parsed.header_images) {
+        resolve(image.image, header_members);
+    }
+    for (auto& image : parsed.footer_images) {
+        resolve(image.image, footer_members);
     }
     zip_discard(archive);
 }
@@ -5066,10 +5101,10 @@ std::optional<DocumentDefaults> canonicalSimpleRegenerationDefaults(
         document_relationships_xml != expected_relationships ||
         (parsed.header_text &&
          (!parsed.page_settings || parsed.header_xml != buildStoryXml(
-             *parsed.header_text, true, *parsed.page_settings))) ||
+             *parsed.header_text, {}, true, *parsed.page_settings))) ||
         (parsed.footer_text &&
          (!parsed.page_settings || parsed.footer_xml != buildStoryXml(
-             *parsed.footer_text, false, *parsed.page_settings)))) {
+             *parsed.footer_text, {}, false, *parsed.page_settings)))) {
         return std::nullopt;
     }
     for (const auto name : expected_members) {
@@ -5396,13 +5431,19 @@ bool inspectPackage(
             error)) {
         return false;
     }
-    resolveInlineImages(parsed, options);
     parsed.sections = parseBodySections(parsed.document_xml);
     parsed.page_settings = parseBodyPageSettings(parsed.document_xml);
     parsed.header_xml = header_xml;
     parsed.footer_xml = footer_xml;
-    parsed.header_text = parseSimpleStoryText(header_xml, options);
-    parsed.footer_text = parseSimpleStoryText(footer_xml, options);
+    if (auto header = parseSimpleStory(header_xml, options)) {
+        parsed.header_text = std::move(header->text);
+        parsed.header_images = std::move(header->images);
+    }
+    if (auto footer = parseSimpleStory(footer_xml, options)) {
+        parsed.footer_text = std::move(footer->text);
+        parsed.footer_images = std::move(footer->images);
+    }
+    resolveInlineImages(parsed, options);
     parsed.canonical_simple_regeneration_defaults =
         canonicalSimpleRegenerationDefaults(
             parsed, content_types_xml, relationships_xml,
@@ -6118,8 +6159,11 @@ bool addBufferMember(
     return true;
 }
 
+enum class ImagePartOwner { document, header, footer };
+
 struct AuthoredImagePart {
     const NewInlineImage* image{nullptr};
+    ImagePartOwner owner{ImagePartOwner::document};
     std::string relationship_id;
     std::string package_member;
     std::string relationship_target;
@@ -6238,10 +6282,69 @@ bool collectParagraphImages(
         const std::string extension = png ? "png" : "jpg";
         images.push_back(AuthoredImagePart{
             &*run.inline_image,
+            ImagePartOwner::document,
             "rIdImage" + std::to_string(number),
             "word/media/image" + std::to_string(number) + "." + extension,
             "media/image" + std::to_string(number) + "." + extension,
             png ? "image/png" : "image/jpeg"});
+    }
+    return true;
+}
+
+bool collectStoryImages(
+    std::string_view text, const std::vector<NewStoryImage>& story_images,
+    ImagePartOwner owner,
+    std::vector<AuthoredImagePart>& images, LossReport& loss, Error* error) {
+    std::size_t previous_offset = 0;
+    bool first = true;
+    std::size_t owner_number = 0;
+    for (const auto& part : images) {
+        if (part.owner == owner) ++owner_number;
+    }
+    for (const auto& story_image : story_images) {
+        const auto offset = story_image.text_offset_bytes;
+        if (offset > text.size() || text.size() - offset < 3U ||
+            text.substr(offset, 3U) != "\xef\xbf\xbc" ||
+            (!first && offset <= previous_offset) ||
+            !validateNewInlineImage(
+                story_image.image, 0, loss, error)) {
+            if (error && error->code == ErrorCode::none) {
+                setError(error, ErrorCode::unsafe_edit,
+                         "Header/footer image offsets are not ordered");
+            }
+            return false;
+        }
+        previous_offset = story_image.text_offset_bytes;
+        first = false;
+        const std::size_t package_number = images.size() + 1U;
+        const bool png = story_image.image.format == RasterImageFormat::png;
+        const std::string extension = png ? "png" : "jpg";
+        ++owner_number;
+        images.push_back(AuthoredImagePart{
+            &story_image.image, owner,
+            "rIdImage" + std::to_string(owner_number),
+            "word/media/image" + std::to_string(package_number) + "." +
+                extension,
+            "media/image" + std::to_string(package_number) + "." +
+                extension,
+            png ? "image/png" : "image/jpeg"});
+    }
+    std::size_t placeholders = 0;
+    for (std::size_t offset = 0; offset + 3U <= text.size();) {
+        if (text.substr(offset, 3U) == "\xef\xbf\xbc") {
+            ++placeholders;
+            offset += 3U;
+        } else {
+            ++offset;
+        }
+    }
+    if (placeholders != story_images.size()) {
+        const std::string message =
+            "Header/footer image placeholders do not match image metadata";
+        loss.issues.push_back(blockingIssue(
+            IssueCode::structural_rewrite_required, message));
+        setError(error, ErrorCode::unsafe_edit, message);
+        return false;
     }
     return true;
 }
@@ -6288,6 +6391,20 @@ bool writeNewArchive(
                  "Cannot create new DOCX archive: " + zipCodeError(open_error));
         return false;
     }
+    const bool has_header_images = std::any_of(
+        images.begin(), images.end(), [](const auto& image) {
+            return image.owner == ImagePartOwner::header;
+        });
+    const bool has_footer_images = std::any_of(
+        images.begin(), images.end(), [](const auto& image) {
+            return image.owner == ImagePartOwner::footer;
+        });
+    const std::string header_relationships = has_header_images
+        ? newStoryRelationships(ImagePartOwner::header, images)
+        : std::string{};
+    const std::string footer_relationships = has_footer_images
+        ? newStoryRelationships(ImagePartOwner::footer, images)
+        : std::string{};
     if (!addBufferMember(archive, std::string(kContentTypesPart), content_types, error) ||
         !addBufferMember(archive, std::string(kRootRelationshipsPart), root_relationships, error) ||
         !addBufferMember(archive, std::string(kDocumentPart), document_xml, error) ||
@@ -6299,6 +6416,12 @@ bool writeNewArchive(
          !addBufferMember(archive, "word/header1.xml", header_xml, error)) ||
         (!footer_xml.empty() &&
          !addBufferMember(archive, "word/footer1.xml", footer_xml, error)) ||
+        (has_header_images &&
+         !addBufferMember(archive, "word/_rels/header1.xml.rels",
+                          header_relationships, error)) ||
+        (has_footer_images &&
+         !addBufferMember(archive, "word/_rels/footer1.xml.rels",
+                          footer_relationships, error)) ||
         (!numbering_xml.empty() &&
          !addBufferMember(
              archive, "word/numbering.xml", numbering_xml, error))) {
@@ -7297,8 +7420,11 @@ void appendStoryRunContents(std::ostringstream& output,
     }
 }
 
-std::string buildStoryXml(std::string_view text, bool header,
-                          const PageSettings& page) {
+std::string buildStoryXml(
+    std::string_view text, const std::vector<NewStoryImage>& story_images,
+    bool header, const PageSettings& page,
+    const std::vector<AuthoredImagePart>* images,
+    std::size_t first_image_index) {
     const std::uint32_t content_width = page.width_twips >
             page.margin_left_twips + page.margin_right_twips
         ? page.width_twips - page.margin_left_twips - page.margin_right_twips
@@ -7306,13 +7432,34 @@ std::string buildStoryXml(std::string_view text, bool header,
     std::ostringstream output;
     output << "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
            << (header ? "<w:hdr" : "<w:ftr")
-           << " xmlns:w=\"" << kWordNamespace << "\"><w:p>"
+           << " xmlns:w=\"" << kWordNamespace << "\""
+           << " xmlns:r=\"" << kOfficeRelationshipsNamespace << "\""
+           << " xmlns:wp=\"" << kWordprocessingDrawingNamespace << "\""
+           << " xmlns:a=\"" << kDrawingMainNamespace << "\""
+           << " xmlns:pic=\"" << kDrawingPictureNamespace << "\"><w:p>"
            << "<w:pPr><w:tabs><w:tab w:val=\"center\" w:pos=\""
            << content_width / 2U
            << "\"/><w:tab w:val=\"right\" w:pos=\""
            << content_width
            << "\"/></w:tabs></w:pPr>";
-    appendStoryRunContents(output, text);
+    std::size_t cursor = 0;
+    for (std::size_t index = 0; index < story_images.size(); ++index) {
+        const auto offset = story_images[index].text_offset_bytes;
+        if (offset > cursor) {
+            appendStoryRunContents(output, text.substr(cursor, offset - cursor));
+        }
+        if (images && first_image_index + index < images->size()) {
+            NewRun run;
+            run.inline_image = story_images[index].image;
+            appendInlineImageDrawing(
+                output, run, (*images)[first_image_index + index],
+                first_image_index + index + 1U);
+        }
+        cursor = std::min(text.size(), offset + 3U);
+    }
+    if (cursor < text.size()) {
+        appendStoryRunContents(output, text.substr(cursor));
+    }
     output << "</w:p>" << (header ? "</w:hdr>" : "</w:ftr>");
     return output.str();
 }
@@ -7748,6 +7895,7 @@ std::string newDocumentRelationships(
                       "<Relationship Id=\"rIdFooter1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/footer\" Target=\"footer1.xml\"/>");
     }
     for (const auto& image : images) {
+        if (image.owner != ImagePartOwner::document) continue;
         const auto image_position = result.rfind(closing);
         if (image_position == std::string::npos) break;
         result.insert(
@@ -7757,6 +7905,22 @@ std::string newDocumentRelationships(
                 image.relationship_target + "\"/>");
     }
     return result;
+}
+
+std::string newStoryRelationships(
+    ImagePartOwner owner,
+    const std::vector<AuthoredImagePart>& images) {
+    std::ostringstream output;
+    output << "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+              "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">";
+    for (const auto& image : images) {
+        if (image.owner != owner) continue;
+        output << "<Relationship Id=\"" << image.relationship_id
+               << "\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/image\" Target=\""
+               << image.relationship_target << "\"/>";
+    }
+    output << "</Relationships>";
+    return output.str();
 }
 
 std::string buildNewStylesXml(
@@ -8003,6 +8167,16 @@ const std::optional<std::string>& DocxDocument::headerText() const noexcept {
 
 const std::optional<std::string>& DocxDocument::footerText() const noexcept {
     return impl_->package.footer_text;
+}
+
+const std::vector<ImportedStoryImage>&
+DocxDocument::headerImages() const noexcept {
+    return impl_->package.header_images;
+}
+
+const std::vector<ImportedStoryImage>&
+DocxDocument::footerImages() const noexcept {
+    return impl_->package.footer_images;
 }
 
 const CompatibilityReport& DocxDocument::compatibility() const noexcept {
@@ -8277,12 +8451,31 @@ SaveResult DocxDocument::writeNew(
         result.error = std::move(save_error);
         return result;
     }
+    const std::size_t body_image_count = images.size();
+    const std::size_t header_image_index = images.size();
+    if (body.header_text &&
+        !collectStoryImages(
+            *body.header_text, body.header_images,
+            ImagePartOwner::header, images, result.loss_report,
+            &save_error)) {
+        result.error = std::move(save_error);
+        return result;
+    }
+    const std::size_t footer_image_index = images.size();
+    if (body.footer_text &&
+        !collectStoryImages(
+            *body.footer_text, body.footer_images,
+            ImagePartOwner::footer, images, result.loss_report,
+            &save_error)) {
+        result.error = std::move(save_error);
+        return result;
+    }
     std::string document_xml;
     std::size_t image_index = 0;
     if (!buildNewDocumentXml(body, page, document_xml,
                              result.loss_report, &save_error, images,
                              image_index) ||
-        image_index != images.size()) {
+        image_index != body_image_count) {
         if (save_error.code == ErrorCode::none) {
             setError(&save_error, ErrorCode::save_validation_failed,
                      "Inline image catalog and document traversal differ");
@@ -8314,9 +8507,15 @@ SaveResult DocxDocument::writeNew(
         }
     }
     const std::string header_xml = has_header
-        ? buildStoryXml(*body.header_text, true, page) : std::string{};
+        ? buildStoryXml(
+              *body.header_text, body.header_images, true, page, &images,
+              header_image_index)
+        : std::string{};
     const std::string footer_xml = has_footer
-        ? buildStoryXml(*body.footer_text, false, page) : std::string{};
+        ? buildStoryXml(
+              *body.footer_text, body.footer_images, false, page, &images,
+              footer_image_index)
+        : std::string{};
     const std::string content_types = newContentTypes(
         has_numbering, has_header, has_footer, images);
     const std::string document_relationships =

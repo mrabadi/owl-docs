@@ -1477,6 +1477,12 @@ const ImageAtom* Document::findImage(NodeId id) const noexcept {
             return &*found;
         }
     }
+    for (const auto* story : {&header_images_, &footer_images_}) {
+        const auto found = std::find_if(
+            story->begin(), story->end(),
+            [id](const ImageAtom& image) { return image.id == id; });
+        if (found != story->end()) return &*found;
+    }
     return nullptr;
 }
 
@@ -1629,6 +1635,12 @@ Result<void> Document::insertImage(
             encoded_image_bytes += existing.encoded_payload.size();
         }
     }
+    for (const auto* story : {&header_images_, &footer_images_}) {
+        image_count += story->size();
+        for (const auto& existing : *story) {
+            encoded_image_bytes += existing.encoded_payload.size();
+        }
+    }
     if (image_count >= kMaximumInlineImagesPerDocument) {
         return Error{ErrorCode::invalid_operation,
                      "Document exceeds the inline-image count limit"};
@@ -1671,6 +1683,18 @@ Result<void> Document::resizeImage(NodeId image_id, std::int64_t width_emu,
             return {};
         }
     }
+    for (auto* story : {&header_images_, &footer_images_}) {
+        const auto found = std::find_if(
+            story->begin(), story->end(),
+            [image_id](const ImageAtom& image) {
+                return image.id == image_id;
+            });
+        if (found != story->end()) {
+            found->width_emu = width_emu;
+            found->height_emu = height_emu;
+            return {};
+        }
+    }
     return Error{ErrorCode::invalid_operation,
                  "Image not found: " + image_id.toString()};
 }
@@ -1692,6 +1716,12 @@ Result<void> Document::replaceImagePayload(
             } else {
                 encoded_image_bytes += image.encoded_payload.size();
             }
+        }
+    }
+    for (auto* story : {&header_images_, &footer_images_}) {
+        for (auto& image : *story) {
+            if (image.id == image_id) target = &image;
+            else encoded_image_bytes += image.encoded_payload.size();
         }
     }
     if (!target) {
@@ -1737,6 +1767,17 @@ Result<void> Document::setImageLayout(NodeId image_id, ImageLayout layout) {
             return {};
         }
     }
+    for (auto* story : {&header_images_, &footer_images_}) {
+        const auto found = std::find_if(
+            story->begin(), story->end(),
+            [image_id](const ImageAtom& image) {
+                return image.id == image_id;
+            });
+        if (found != story->end()) {
+            found->layout = layout;
+            return {};
+        }
+    }
     return Error{ErrorCode::invalid_operation,
                  "Image not found: " + image_id.toString()};
 }
@@ -1762,6 +1803,17 @@ Result<void> Document::setImageAccessibleName(
                 return image.id == image_id;
             });
         if (found != paragraph.images_.end()) {
+            found->accessible_name = std::move(accessible_name);
+            return {};
+        }
+    }
+    for (auto* story : {&header_images_, &footer_images_}) {
+        const auto found = std::find_if(
+            story->begin(), story->end(),
+            [image_id](const ImageAtom& image) {
+                return image.id == image_id;
+            });
+        if (found != story->end()) {
             found->accessible_name = std::move(accessible_name);
             return {};
         }
@@ -2626,28 +2678,114 @@ Result<void> validateHeaderFooterText(const std::u16string& text) {
                      "Header or footer text exceeds the size limit"};
     }
     if (!isValidUtf16(text) ||
-        std::find(text.begin(), text.end(), u'\0') != text.end() ||
-        std::find(text.begin(), text.end(),
-                  kInlineObjectReplacementCharacter) != text.end()) {
+        std::find(text.begin(), text.end(), u'\0') != text.end()) {
         return Error{ErrorCode::invalid_operation,
                      "Header or footer text contains invalid characters"};
     }
     return {};
 }
 
-}  // namespace
-
-Result<void> Document::setHeaderText(std::u16string text) {
+Result<void> setStoryText(std::u16string text,
+                          std::u16string& destination,
+                          std::vector<ImageAtom>& images) {
     const auto validation = validateHeaderFooterText(text);
     if (!validation) return validation.error();
-    header_text_ = std::move(text);
+    std::vector<std::size_t> offsets;
+    for (std::size_t offset = 0; offset < text.size(); ++offset) {
+        if (text[offset] == kInlineObjectReplacementCharacter) {
+            offsets.push_back(offset);
+        }
+    }
+    if (offsets.size() > images.size()) {
+        return Error{ErrorCode::invalid_operation,
+                     "Header or footer contains an orphan image placeholder"};
+    }
+    images.resize(offsets.size());
+    for (std::size_t index = 0; index < offsets.size(); ++index) {
+        images[index].utf16_offset = offsets[index];
+    }
+    destination = std::move(text);
     return {};
 }
 
+}  // namespace
+
+Result<void> Document::setHeaderText(std::u16string text) {
+    return setStoryText(std::move(text), header_text_, header_images_);
+}
+
 Result<void> Document::setFooterText(std::u16string text) {
-    const auto validation = validateHeaderFooterText(text);
-    if (!validation) return validation.error();
-    footer_text_ = std::move(text);
+    return setStoryText(std::move(text), footer_text_, footer_images_);
+}
+
+Result<void> Document::insertHeaderFooterImage(
+    bool footer, std::size_t utf16_offset,
+    EncodedImagePayload encoded_payload, ImageFormat image_format,
+    std::string accessible_name, std::int64_t width_emu,
+    std::int64_t height_emu, NodeId image_id) {
+    auto& text = footer ? footer_text_ : header_text_;
+    auto& images = footer ? footer_images_ : header_images_;
+    if (text.size() >= maximum_header_footer_code_units) {
+        return Error{ErrorCode::invalid_operation,
+                     "Header or footer text exceeds the size limit"};
+    }
+    if (!isUtf16Boundary(text, utf16_offset)) {
+        return Error{ErrorCode::invalid_position,
+                     "Header or footer image position is invalid"};
+    }
+    if (!image_id.isValid()) {
+        return Error{ErrorCode::invalid_node_id,
+                     "Image NodeId cannot be zero"};
+    }
+    if (nodeIdInUse(image_id)) {
+        return Error{ErrorCode::duplicate_node_id,
+                     "Image NodeId already exists"};
+    }
+    ImageLayout layout;
+    ImageAtom image{image_id, utf16_offset, std::move(encoded_payload),
+                    image_format, std::move(accessible_name), width_emu,
+                    height_emu, layout};
+    const auto metadata_validation = validateImageMetadata(image);
+    if (!metadata_validation) return metadata_validation.error();
+    const auto payload_validation = validateImagePayload(image);
+    if (!payload_validation) return payload_validation.error();
+
+    std::size_t image_count = header_images_.size() + footer_images_.size();
+    std::size_t encoded_image_bytes = 0;
+    for (const auto& paragraph : paragraphs_) {
+        image_count += paragraph.images().size();
+        for (const auto& existing : paragraph.images()) {
+            encoded_image_bytes += existing.encoded_payload.size();
+        }
+    }
+    for (const auto* story : {&header_images_, &footer_images_}) {
+        for (const auto& existing : *story) {
+            encoded_image_bytes += existing.encoded_payload.size();
+        }
+    }
+    if (image_count >= kMaximumInlineImagesPerDocument) {
+        return Error{ErrorCode::invalid_operation,
+                     "Document exceeds the inline-image count limit"};
+    }
+    if (encoded_image_bytes > kMaximumDocumentEncodedImageBytes ||
+        image.encoded_payload.size() >
+            kMaximumDocumentEncodedImageBytes - encoded_image_bytes) {
+        return Error{ErrorCode::invalid_operation,
+                     "Document exceeds the encoded-image byte limit"};
+    }
+
+    for (auto& existing : images) {
+        if (existing.utf16_offset >= utf16_offset) {
+            ++existing.utf16_offset;
+        }
+    }
+    text.insert(utf16_offset, 1, kInlineObjectReplacementCharacter);
+    const auto insertion = std::lower_bound(
+        images.begin(), images.end(), utf16_offset,
+        [](const ImageAtom& existing, std::size_t offset) {
+            return existing.utf16_offset < offset;
+        });
+    images.insert(insertion, std::move(image));
     return {};
 }
 
