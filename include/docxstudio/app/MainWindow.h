@@ -2,8 +2,10 @@
 
 #include "docxstudio/app/ChatStore.h"
 #include "docxstudio/app/CommandRegistry.h"
+#include "docxstudio/app/CodexController.h"
 #include "docxstudio/app/EditorPreferences.h"
 #include "docxstudio/app/SpellChecker.h"
+#include "docxstudio/core/types.h"
 #include "docxstudio/codex/types.hpp"
 
 #include <QMainWindow>
@@ -12,6 +14,7 @@
 
 #include <memory>
 #include <unordered_map>
+#include <vector>
 
 class QLabel;
 class QLockFile;
@@ -24,6 +27,7 @@ class QTabWidget;
 class QTimer;
 class QSlider;
 class QToolButton;
+class QResizeEvent;
 
 namespace docxstudio::core { class Document; }
 namespace docxstudio::ooxml { class DocxDocument; }
@@ -42,6 +46,7 @@ class MainWindow final : public QMainWindow {
 
 public:
     explicit MainWindow(QWidget* parent = nullptr);
+    MainWindow(QWidget* parent, CodexController::ProcessFactory processFactory);
     ~MainWindow() override;
 
     bool openPath(const QString& path);
@@ -51,12 +56,14 @@ protected:
     void closeEvent(QCloseEvent* event) override;
     void dragEnterEvent(QDragEnterEvent* event) override;
     void dropEvent(QDropEvent* event) override;
+    void resizeEvent(QResizeEvent* event) override;
 
 private:
     struct TabState;
 
     void registerCommands();
     void buildMenus();
+    void updateWorkspaceLayout();
     void connectRibbon();
     void applyTextColor(const QColor& color);
     void applyHighlightColor(const QColor& color);
@@ -84,6 +91,7 @@ private:
     void showFindReplace(bool replaceMode = false);
     void loadNavigationForActiveDocument();
     void refreshNavigationResults();
+    void refreshOutline();
     void synchronizeNavigationSelection();
     void activateNavigationResult(int index);
     void navigateSearchResult(bool forward);
@@ -143,11 +151,13 @@ private:
     QPointer<QColorDialog> textColorPicker_;
     QPointer<QColorDialog> highlightColorPicker_;
     bool recoveryOwner_{false};
+    bool lastAuxiliaryWasChat_{false};
     QString assistantForStore_;
     QString assistantDocumentKey_;
     QString previewDocumentKey_;
     QString previewLabel_;
     QString previewSummary_;
+    std::vector<core::NodeId> outlineParagraphIds_;
     std::unordered_map<DocumentCanvas*, std::unique_ptr<TabState>> states_;
 };
 

@@ -374,7 +374,36 @@ private:
             fail(ParseErrorCode::forbidden_command,
                  "Forbidden LaTeX command: \\" + command, command_offset);
         }
-        if (command == "frac") {
+        if (command == "text") {
+            skipWhitespace();
+            if (peek() != '{') fail(ParseErrorCode::missing_argument, "Text requires a braced argument");
+            ++position_;
+            const auto start = position_;
+            while (!eof() && peek() != '}') {
+                if (peek() == '\\' || peek() == '{' || peek() == '%' || peek() == '#') {
+                    fail(ParseErrorCode::forbidden_command, "Text accepts literal text, not commands or nested groups");
+                }
+                ++position_;
+            }
+            if (eof()) fail(ParseErrorCode::unexpected_end, "Unterminated text argument");
+            auto text = std::string(source_.substr(start, position_ - start));
+            ++position_;
+            return makeNode(Text{std::move(text)});
+        }
+        if (command == "mathrm" || command == "mathbf" || command == "mathit" || command == "operatorname") {
+            auto body = parseRequiredContent(command);
+            if (isEmptyRow(body)) fail(ParseErrorCode::empty_argument, "Font argument cannot be empty");
+            return makeNode(Styled{command, std::move(body)});
+        }
+        if (command == "hat" || command == "vec" || command == "bar" || command == "overline" || command == "underline") {
+            auto body = parseRequiredContent(command);
+            if (isEmptyRow(body)) fail(ParseErrorCode::empty_argument, "Accent argument cannot be empty");
+            return makeNode(Accent{command, std::move(body)});
+        }
+        if (command == "," || command == ":" || command == ";" || command == "!" || command == "quad" || command == "qquad" || command == " ") {
+            return makeNode(Spacing{command});
+        }
+        if (command == "frac" || command == "dfrac" || command == "tfrac") {
             auto numerator = parseRequiredContent("frac");
             auto denominator = parseRequiredContent("frac");
             if (isEmptyRow(numerator) || isEmptyRow(denominator)) {
@@ -386,9 +415,9 @@ private:
         if (command == "sqrt") {
             return parseRadical(command_offset);
         }
-        if (command == "sum" || command == "int") {
+        if (command == "sum" || command == "int" || command == "prod") {
             return makeNode(LargeOperator{command == "sum" ? LargeOperatorKind::sum
-                                                           : LargeOperatorKind::integral});
+                : command == "prod" ? LargeOperatorKind::product : LargeOperatorKind::integral});
         }
         if (command == "left") {
             return parseDelimited(command_offset);
@@ -527,6 +556,8 @@ private:
         if (name == "Bmatrix") return MatrixEnvironment::Bmatrix;
         if (name == "vmatrix") return MatrixEnvironment::vmatrix;
         if (name == "Vmatrix") return MatrixEnvironment::Vmatrix;
+        if (name == "aligned") return MatrixEnvironment::aligned;
+        if (name == "cases") return MatrixEnvironment::cases;
         return std::nullopt;
     }
 
@@ -555,6 +586,17 @@ private:
 
         DepthScope depth(*this);
         std::vector<std::vector<MathNodePtr>> rows;
+        const auto finish_matrix = [&] {
+            if (rows.empty()) {
+                fail(ParseErrorCode::empty_argument, "Matrix cannot be empty", command_offset);
+            }
+            std::size_t columns = 0;
+            for (const auto& row : rows) columns = std::max(columns, row.size());
+            for (auto& row : rows) {
+                while (row.size() < columns) row.push_back(makeNode(Row{}));
+            }
+            return makeNode(Matrix{*environment, std::move(rows)});
+        };
         while (true) {
             skipWhitespace();
             if (eof()) {
@@ -569,7 +611,9 @@ private:
             std::vector<MathNodePtr> cells;
             while (true) {
                 cells.push_back(parseSequence(Stop::matrix_cell));
-                if (cells.size() > limits_.max_matrix_columns) {
+                const auto maxColumns = (*environment == MatrixEnvironment::aligned || *environment == MatrixEnvironment::cases)
+                    ? std::min<std::size_t>(2, limits_.max_matrix_columns) : limits_.max_matrix_columns;
+                if (cells.size() > maxColumns) {
                     fail(ParseErrorCode::matrix_too_large,
                          "Maximum matrix column count exceeded", command_offset);
                 }
@@ -593,7 +637,7 @@ private:
                         fail(ParseErrorCode::matrix_too_large,
                              "Maximum matrix row count exceeded", command_offset);
                     }
-                    return makeNode(Matrix{*environment, std::move(rows)});
+                    return finish_matrix();
                 }
                 fail(ParseErrorCode::unexpected_token,
                      "Expected &, \\\\, or \\end inside matrix");
@@ -605,10 +649,7 @@ private:
                      "Maximum matrix row count exceeded", command_offset);
             }
         }
-        if (rows.empty()) {
-            fail(ParseErrorCode::empty_argument, "Matrix cannot be empty", command_offset);
-        }
-        return makeNode(Matrix{*environment, std::move(rows)});
+        return finish_matrix();
     }
 
     std::string_view source_;
@@ -629,6 +670,14 @@ ParseResult parseLatex(std::string_view source, const ParseLimits& limits) {
     if (const auto invalid = invalidUtf8Offset(source)) {
         return ParseError{ParseErrorCode::invalid_utf8, *invalid,
                           "LaTeX input is not valid UTF-8"};
+    }
+    for (std::size_t index = 0; index < source.size(); ++index) {
+        const auto byte = static_cast<unsigned char>(source[index]);
+        if ((byte < 0x20 && byte != '\t' && byte != '\n' && byte != '\r') ||
+            source.substr(index, 3) == "\xef\xbf\xbe" || source.substr(index, 3) == "\xef\xbf\xbf") {
+            return ParseError{ParseErrorCode::unexpected_token, index,
+                              "Character is not permitted in a document equation"};
+        }
     }
     try {
         return Parser(source, effective).parse();

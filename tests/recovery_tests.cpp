@@ -276,10 +276,10 @@ void codecRoundTrip() {
     check(!RecoveryCodec::decode(invalidIndent, error),
           "recovery codec accepted an out-of-range bullet indentation");
 
-    const auto version = futureVersion.find("\"version\":13");
+    const auto version = futureVersion.find("\"version\":14");
     check(version != std::string::npos, "encoded recovery version was absent");
-    futureVersion.replace(version, std::string("\"version\":13").size(),
-                          "\"version\":14");
+    futureVersion.replace(version, std::string("\"version\":14").size(),
+                          "\"version\":17");
     check(!RecoveryCodec::decode(futureVersion, error),
           "recovery codec accepted an unsupported future version");
     check(!RecoveryCodec::decode("{not-json", error),
@@ -782,7 +782,7 @@ void semanticImageAdversarialLimits() {
     using namespace docxstudio::app;
     using namespace docxstudio::core;
 
-    check(RecoveryCodec::currentVersion == 13,
+    check(RecoveryCodec::currentVersion == 14,
           "recovery schema version was not bumped for header/footer pictures");
     check(kMaximumInlineImagesPerDocument == 512 &&
               kMaximumEncodedImageBytes == 16U * 1024U * 1024U &&
@@ -1102,6 +1102,59 @@ void storeCrud() {
     std::filesystem::remove(databasePath.string() + "-shm", ignored);
 }
 
+void recoverySourcePersistence() {
+    using docxstudio::app::ChatStore;
+    using docxstudio::app::RecoveryRecord;
+    using docxstudio::app::RecoverySource;
+    const auto path = std::filesystem::temp_directory_path() /
+                      "owl-docs-recovery-source-tests.sqlite";
+    std::filesystem::remove(path);
+    ChatStore store;
+    std::string error;
+    check(store.open(path.string(), error), "could not open source recovery store");
+    RecoveryRecord record{"source-journal", "/removed/original.docx", "Original", "semantic", 0};
+    record.source = RecoverySource{std::string("PK\0opaque", 9), "{\"version\":1}"};
+    check(store.upsertRecovery(record, error), "could not persist retained source package");
+    store.close();
+    check(store.open(path.string(), error), "could not reopen source recovery store");
+    auto restored = store.recoveryRecord(record.journalKey);
+    check(restored && restored->source &&
+              restored->source->packageBytes == record.source->packageBytes &&
+              restored->source->context == record.source->context &&
+              restored->source->error.empty(),
+          "recovery lost original binary package or source context");
+    auto second = record;
+    second.journalKey = "second-source-journal";
+    check(store.upsertRecovery(second, error), "could not share retained source package");
+    check(store.deleteRecovery(record.journalKey, error), "could not delete first source journal");
+    restored = store.recoveryRecord(second.journalKey);
+    check(restored && restored->source &&
+              restored->source->packageBytes == second.source->packageBytes,
+          "deleting a journal lost a source shared by another checkpoint");
+    sqlite3* database = nullptr;
+    check(sqlite3_open(path.c_str(), &database) == SQLITE_OK,
+          "could not inspect source recovery database");
+    check(sqlite3_exec(database, "UPDATE recovery_sources SET context='tampered';",
+                       nullptr, nullptr, nullptr) == SQLITE_OK,
+          "could not corrupt source context fixture");
+    restored = store.recoveryRecord(second.journalKey);
+    check(restored && restored->source && !restored->source->error.empty(),
+          "corrupted recovery mapping context was not diagnosed");
+    check(store.upsertRecovery(second, error), "could not repair valid recovery fixture");
+    check(sqlite3_exec(database, "UPDATE recovery_packages SET bytes=X'00';",
+                       nullptr, nullptr, nullptr) == SQLITE_OK,
+          "could not corrupt retained source fixture");
+    sqlite3_close(database);
+    restored = store.recoveryRecord(second.journalKey);
+    check(restored && restored->source && !restored->source->error.empty(),
+          "corrupted original package was not diagnosed");
+    check(store.deleteRecovery(second.journalKey, error), "could not delete final source journal");
+    store.close();
+    std::filesystem::remove(path);
+    std::filesystem::remove(path.string() + "-wal");
+    std::filesystem::remove(path.string() + "-shm");
+}
+
 }  // namespace
 
 int main() {
@@ -1114,6 +1167,7 @@ int main() {
     semanticImageAdversarialLimits();
     semanticImageCountBoundary();
     storeCrud();
+    recoverySourcePersistence();
     std::cout << "recovery tests passed\n";
     return 0;
 }

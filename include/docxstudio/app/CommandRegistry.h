@@ -4,6 +4,7 @@
 #include <QKeySequence>
 #include <QObject>
 #include <QString>
+#include <QStringList>
 
 #include <functional>
 
@@ -30,6 +31,9 @@ public:
     QAction* action(const QString& id) const;
     QList<QAction*> actions() const;
     QStringList search(const QString& query) const;
+    void describe(const QString& id, const QString& category,
+                  const QStringList& keywords = {});
+    QString category(const QString& id) const;
 
 signals:
     void invoked(const QString& id);

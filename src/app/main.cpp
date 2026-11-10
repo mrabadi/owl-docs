@@ -1,5 +1,6 @@
 #include "docxstudio/app/MainWindow.h"
 #include "docxstudio/app/OwlDocsIcon.h"
+#include "docxstudio/app/ApplicationIdentity.h"
 
 #include <QApplication>
 #include <QCommandLineOption>
@@ -14,20 +15,14 @@
 
 int main(int argc, char** argv) {
     QApplication application(argc, argv);
-    // Keep the original internal storage identity so installing the renamed
-    // package retains recent files, recovery journals, chat history, and the
-    // personal dictionary. All visible product identity uses Owl Docs.
-    QCoreApplication::setOrganizationName(QStringLiteral("DOCX Studio"));
-    QCoreApplication::setApplicationName(QStringLiteral("DOCX Studio"));
-    QGuiApplication::setApplicationDisplayName(QStringLiteral("Owl Docs"));
+    docxstudio::app::configureApplicationIdentity(application);
     QCoreApplication::setApplicationVersion(QString::fromLatin1(DOCXSTUDIO_VERSION));
-    application.setDesktopFileName(QStringLiteral("owl-docs"));
     application.setFont(QFont(QStringLiteral("Carlito"), 10));
     application.setWindowIcon(docxstudio::app::owlDocsApplicationIcon());
 
     QCommandLineParser arguments;
     arguments.setApplicationDescription(
-        QStringLiteral("Owl Docs — offline DOCX editor"));
+        QStringLiteral("OwlDocs — offline DOCX editor"));
     arguments.addHelpOption();
     const QCommandLineOption versionOption(
         {QStringLiteral("v"), QStringLiteral("version")},
@@ -40,7 +35,7 @@ int main(int argc, char** argv) {
     arguments.process(application);
     if (arguments.isSet(versionOption)) {
         QTextStream output(stdout);
-        output << QStringLiteral("Owl Docs ")
+        output << QStringLiteral("OwlDocs ")
                << QCoreApplication::applicationVersion() << Qt::endl;
         return 0;
     }

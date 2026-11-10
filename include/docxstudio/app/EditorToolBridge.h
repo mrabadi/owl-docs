@@ -1,8 +1,10 @@
 #pragma once
 
 #include "docxstudio/codex/types.hpp"
+#include "docxstudio/app/ExcalidrawFigure.h"
 
 #include <QString>
+#include <functional>
 
 namespace docxstudio::app {
 
@@ -16,6 +18,9 @@ class DocumentCanvas;
     const QString& tool,
     const codex::Json& arguments,
     QString& previewSummary,
-    QString& error);
+    QString& error,
+    const ExcalidrawRenderer& figureRenderer = {},
+    const std::function<bool()>& stillCurrent = {},
+    const ExcalidrawSceneRenderer& nativeFigureRenderer = {});
 
 }  // namespace docxstudio::app

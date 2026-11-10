@@ -136,7 +136,9 @@ CharacterFormat characterBaseline(
     return format;
 }
 
-const std::array<ParagraphStyleDefinition, 14>& styleCatalog() {
+// Frozen 0.6.0 definitions remain available when reproducing an imported
+// package. New document defaults must not silently restyle existing files.
+const std::array<ParagraphStyleDefinition, 14>& legacyStyleCatalog() {
     static const std::array<ParagraphStyleDefinition, 14> catalog{{
         {"Normal", "Normal", "Normal", std::nullopt,
          characterBaseline(22, false, false, 0xff000000U),
@@ -182,6 +184,42 @@ const std::array<ParagraphStyleDefinition, 14>& styleCatalog() {
          characterBaseline(20, true, true, 0xff2c001eU),
          paragraphBaseline(4.0, 2.0, true, true)},
     }};
+    return catalog;
+}
+
+const std::array<ParagraphStyleDefinition, 14>& neutralStyleCatalog() {
+    static const auto catalog = [] {
+        auto styles = legacyStyleCatalog();
+        styles[2].character_format.foreground_argb = 0xff000000U;
+        styles[3].character_format.foreground_argb = 0xff606060U;
+        styles[3].character_format.italic = false;
+        styles[4].character_format.foreground_argb = 0xff404040U;
+        constexpr std::array<std::int32_t, 9> sizes{40, 32, 28, 24, 22, 22, 22, 22, 22};
+        constexpr std::array<double, 9> before{18, 14, 12, 10, 8, 8, 6, 6, 6};
+        constexpr std::array<double, 9> after{8, 6, 4, 4, 3, 3, 2, 2, 2};
+        for (std::size_t level = 0; level < sizes.size(); ++level) {
+            auto& heading = styles[level + 5];
+            heading.character_format = characterBaseline(sizes[level], level < 6,
+                level >= 5 && level <= 7, level >= 7 ? 0xff606060U : 0xff000000U);
+            heading.paragraph_format = paragraphBaseline(before[level], after[level], true, true);
+        }
+        return styles;
+    }();
+    return catalog;
+}
+
+const std::array<ParagraphStyleDefinition, 14>& styleCatalog() {
+    static const auto catalog=[] {
+        auto styles=neutralStyleCatalog();
+        styles[2].character_format.foreground_argb=0xff173b32U;
+        styles[3].character_format.foreground_argb=0xff626a66U;
+        constexpr std::array<std::uint32_t,9> colors{
+            0xff173b32U,0xff2f6b57U,0xff356078U,0xff66507aU,0xff6f5747U,
+            0xff2f6b57U,0xff626a66U,0xff626a66U,0xff626a66U};
+        for (std::size_t level=0;level<colors.size();++level)
+            styles[level+5].character_format.foreground_argb=colors[level];
+        return styles;
+    }();
     return catalog;
 }
 
@@ -457,6 +495,22 @@ const ParagraphStyleDefinition* findBuiltInParagraphStyle(
             return style.id == style_id;
         });
     return found == catalog.end() ? nullptr : &*found;
+}
+
+const ParagraphStyleDefinition* findLegacyBuiltInParagraphStyle(
+    std::string_view style_id) noexcept {
+    const auto& catalog = legacyStyleCatalog();
+    const auto found = std::find_if(catalog.begin(), catalog.end(),
+        [style_id](const auto& style) { return style.id == style_id; });
+    return found == catalog.end() ? nullptr : &*found;
+}
+
+const ParagraphStyleDefinition* findNeutralBuiltInParagraphStyle(
+    std::string_view style_id) noexcept {
+    const auto& catalog=neutralStyleCatalog();
+    const auto found=std::find_if(catalog.begin(),catalog.end(),
+        [style_id](const auto& style) { return style.id==style_id; });
+    return found==catalog.end() ? nullptr : &*found;
 }
 
 }  // namespace docxstudio::core

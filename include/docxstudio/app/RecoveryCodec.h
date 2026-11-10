@@ -33,7 +33,7 @@ struct RecoveryDocument {
 
 class RecoveryCodec final {
 public:
-    static constexpr int currentVersion = 13;
+    static constexpr int currentVersion = 14;
 
     [[nodiscard]] static std::optional<std::string> encode(
         const RecoveryDocument& recovery, std::string& error);

@@ -16,12 +16,20 @@ struct StoredChatMessage {
     std::int64_t createdAt{};
 };
 
+struct RecoverySource {
+    std::string packageBytes;
+    std::string context;
+    // Set on load when retained bytes are missing or fail their stored hash.
+    std::string error{};
+};
+
 struct RecoveryRecord {
     std::string journalKey;
     std::string sourcePath;
     std::string displayName;
     std::string payload;
     std::int64_t updatedAt{};
+    std::optional<RecoverySource> source{};
 };
 
 class ChatStore final {

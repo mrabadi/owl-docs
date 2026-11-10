@@ -26,6 +26,8 @@ const char* environmentName(MatrixEnvironment environment) noexcept {
             return "vmatrix";
         case MatrixEnvironment::Vmatrix:
             return "Vmatrix";
+        case MatrixEnvironment::aligned: return "aligned";
+        case MatrixEnvironment::cases: return "cases";
     }
     return "matrix";
 }
@@ -54,6 +56,14 @@ std::string serialize(const MathNodePtr& node) {
             [](const Identifier& identifier) { return identifier.text; },
             [](const Number& number) { return number.text; },
             [](const Operator& operation) { return operation.text; },
+            [](const Text& text) { return "\\text{" + text.text + "}"; },
+            [](const Styled& styled) {
+                return "\\" + styled.command + "{" + serialize(styled.body) + "}";
+            },
+            [](const Accent& accent) {
+                return "\\" + accent.command + "{" + serialize(accent.body) + "}";
+            },
+            [](const Spacing& spacing) { return "\\" + spacing.command; },
             [](const Fraction& fraction) {
                 return "\\frac{" + serialize(fraction.numerator) + "}{" +
                        serialize(fraction.denominator) + "}";
@@ -78,7 +88,8 @@ std::string serialize(const MathNodePtr& node) {
                 return result;
             },
             [](const LargeOperator& operation) {
-                return std::string(operation.kind == LargeOperatorKind::sum ? "\\sum" : "\\int");
+                return std::string(operation.kind == LargeOperatorKind::sum ? "\\sum" :
+                    operation.kind == LargeOperatorKind::product ? "\\prod" : "\\int");
             },
             [](const Delimited& delimited) {
                 const auto body = serialize(delimited.body);

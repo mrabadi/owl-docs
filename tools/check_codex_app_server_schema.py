@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify the installed Codex runtime exposes Owl Docs' pinned protocol fields."""
+"""Verify the installed Codex runtime exposes OwlDocs' pinned protocol fields."""
 
 from __future__ import annotations
 

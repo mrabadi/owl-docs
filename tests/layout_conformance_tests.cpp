@@ -1,4 +1,5 @@
 #include "docxstudio/app/DocumentCanvas.h"
+#include "docxstudio/app/AppTheme.h"
 #include "docxstudio/app/SpellChecker.h"
 
 #include <QApplication>
@@ -73,17 +74,34 @@ bool isGraphemeBoundary(const QString& text, qsizetype offset) {
     return finder.isAtBoundary();
 }
 
-int selectionBluePixels(DocumentCanvas& canvas) {
+int selectionAccentPixels(DocumentCanvas& canvas, const QRect& selectionBounds) {
     QApplication::processEvents();
     const QImage image = canvas.viewport()->grab().toImage().convertToFormat(
         QImage::Format_ARGB32);
+    const QString renderPath = qEnvironmentVariable("OWL_DOCS_RTL_RENDER_PATH");
+    if (!renderPath.isEmpty()) {
+        check(image.save(renderPath), "could not save the selected RTL QA image");
+    }
+    const QColor accent = docxstudio::app::accentColor();
+    const auto blendOverPaper = [](int channel) {
+        return (channel * 70 + 255 * (255 - 70) + 127) / 255;
+    };
+    const QColor selectedPaper(blendOverPaper(accent.red()),
+                               blendOverPaper(accent.green()),
+                               blendOverPaper(accent.blue()));
+    const qreal ratio = image.devicePixelRatio();
+    const QRect bounds = QRectF(selectionBounds.x() * ratio,
+                               selectionBounds.y() * ratio,
+                               selectionBounds.width() * ratio,
+                               selectionBounds.height() * ratio)
+                             .toAlignedRect().intersected(image.rect());
     int count = 0;
-    for (int y = 0; y < image.height(); ++y) {
-        for (int x = 0; x < image.width(); ++x) {
+    for (int y = bounds.top(); y <= bounds.bottom(); ++y) {
+        for (int x = bounds.left(); x <= bounds.right(); ++x) {
             const QColor pixel = image.pixelColor(x, y);
-            if (pixel.blue() - pixel.red() > 30 &&
-                pixel.blue() - pixel.green() > 10 &&
-                pixel.blue() > 180) {
+            if (std::abs(pixel.red() - selectedPaper.red()) <= 2 &&
+                std::abs(pixel.green() - selectedPaper.green()) <= 2 &&
+                std::abs(pixel.blue() - selectedPaper.blue()) <= 2) {
                 ++count;
             }
         }
@@ -191,7 +209,9 @@ void testRtlVisualCaretAndSelection(
               canvas.selectedText() ==
                   text.mid(firstBoundary, secondBoundary - firstBoundary),
           "Shift+Left split or selected the wrong RTL grapheme");
-    check(selectionBluePixels(canvas) > 12,
+    const QRect selectedCaretBounds =
+        firstCaret.united(cursorRect(canvas)).adjusted(-2, -2, 2, 2);
+    check(selectionAccentPixels(canvas, selectedCaretBounds) > 12,
           "RTL selection produced no visible selection decoration");
 
     sendKey(canvas, Qt::Key_Right);
@@ -322,7 +342,7 @@ void testIndicClustersAndWrap(docxstudio::app::SpellChecker& spelling) {
     canvas.hide();
 }
 
-QRect saturatedColorBounds(const QImage& image, bool red) {
+QRectF saturatedColorBounds(const QImage& image, bool red) {
     QRect result;
     for (int y = 0; y < image.height(); ++y) {
         for (int x = 0; x < image.width(); ++x) {
@@ -337,7 +357,12 @@ QRect saturatedColorBounds(const QImage& image, bool red) {
                                       : QRect(x, y, 1, 1);
         }
     }
-    return result;
+    if (!result.isValid()) return {};
+    // IME carets and mouse events use widget logical coordinates; grabs contain
+    // physical pixels when a high-DPI scale factor is active.
+    const qreal ratio = image.devicePixelRatio();
+    return QRectF(QPointF(result.left() / ratio, result.top() / ratio),
+                  QPointF(result.right() / ratio, result.bottom() / ratio));
 }
 
 std::vector<std::uint8_t> encodedColorPng(const QColor& color,
@@ -388,8 +413,8 @@ void testViewOnlyInlineImagesKeepFragmentOrder(
           "caret did not navigate across both semantic image atoms");
 
     const QImage painted = canvas.viewport()->grab().toImage();
-    const QRect redBounds = saturatedColorBounds(painted, true);
-    const QRect blueBounds = saturatedColorBounds(painted, false);
+    const QRectF redBounds = saturatedColorBounds(painted, true);
+    const QRectF blueBounds = saturatedColorBounds(painted, false);
     check(redBounds.isValid() && blueBounds.isValid(),
           "inline image test colors were not painted");
     check(redBounds.right() < blueBounds.left(),
@@ -414,7 +439,7 @@ void testViewOnlyInlineImagesKeepFragmentOrder(
     canvas.hide();
 }
 
-QRect paintedRedBounds(DocumentCanvas& canvas) {
+QRectF paintedRedBounds(DocumentCanvas& canvas) {
     QApplication::processEvents();
     return saturatedColorBounds(canvas.viewport()->grab().toImage(), true);
 }
@@ -453,7 +478,7 @@ void testInlineImageAnchorsTrackEditsAndStructure(
                       .images().front().utf16_offset == 10,
           "insertion before an image did not move its semantic atom");
     collapseFindToRight(insertion, QStringLiteral("ii"));
-    const QRect shiftedImage = paintedRedBounds(insertion);
+    const QRectF shiftedImage = paintedRedBounds(insertion);
     check(shiftedImage.isValid() &&
               cursorRect(insertion).x() < shiftedImage.left(),
           "an insertion before an imported image left its anchor stale");
@@ -464,7 +489,7 @@ void testInlineImageAnchorsTrackEditsAndStructure(
               insertedSnapshot.document.paragraphs().front()
                       .images().front().utf16_offset == 2,
           "undo did not restore the image atom offset");
-    const QRect undoneImage = paintedRedBounds(insertion);
+    const QRectF undoneImage = paintedRedBounds(insertion);
     check(undoneImage.isValid(), "undo did not render the restored image atom");
     insertion.redo();
     insertedSnapshot = insertion.snapshot();
@@ -487,12 +512,12 @@ void testInlineImageAnchorsTrackEditsAndStructure(
     structure.show();
     structure.setFocus();
     QApplication::processEvents();
-    const QRect oneLineImage = paintedRedBounds(structure);
+    const QRectF oneLineImage = paintedRedBounds(structure);
 
     sendKey(structure, Qt::Key_Home, Qt::ControlModifier);
     sendKey(structure, Qt::Key_Right);
     sendKey(structure, Qt::Key_Return);
-    const QRect splitImage = paintedRedBounds(structure);
+    const QRectF splitImage = paintedRedBounds(structure);
     auto structureSnapshot = structure.snapshot();
     check(structureSnapshot.document.paragraphs().size() == 2 &&
               structureSnapshot.document.paragraphs()[0].text() == u"A" &&
@@ -506,7 +531,7 @@ void testInlineImageAnchorsTrackEditsAndStructure(
           "splitting before an image did not move the atom to the new paragraph");
 
     sendKey(structure, Qt::Key_Backspace);
-    const QRect mergedImage = paintedRedBounds(structure);
+    const QRectF mergedImage = paintedRedBounds(structure);
     structureSnapshot = structure.snapshot();
     check(structureSnapshot.document.paragraphs().size() == 1 &&
               structureSnapshot.document.paragraphs().front().text() ==
@@ -539,7 +564,7 @@ void testInlineImageAnchorsTrackEditsAndStructure(
     preview.show();
     preview.setFocus();
     QApplication::processEvents();
-    const QRect previewBaseline = paintedRedBounds(preview);
+    const QRectF previewBaseline = paintedRedBounds(preview);
     const auto previewLive = preview.snapshot();
     const auto previewRevision = previewLive.revision;
     const auto previewParagraph =
@@ -553,14 +578,14 @@ void testInlineImageAnchorsTrackEditsAndStructure(
               previewRevision, previewOperations,
               QStringLiteral("Move imported picture anchor"), summary, error),
           "could not create an image-anchor preview");
-    const QRect previewedImage = paintedRedBounds(preview);
+    const QRectF previewedImage = paintedRedBounds(preview);
     check(preview.hasPreview() && previewedImage.isValid() &&
               previewedImage.left() > previewBaseline.left() + 10 &&
               preview.snapshot().document.paragraphs().front().text() ==
                   u"AB\ufffcCD",
           "preview did not transform the image anchor without changing live text");
     preview.discardPreview();
-    const QRect discardedImage = paintedRedBounds(preview);
+    const QRectF discardedImage = paintedRedBounds(preview);
     check(!preview.hasPreview() && discardedImage.isValid() &&
               std::abs(discardedImage.left() - previewBaseline.left()) <= 1 &&
               preview.snapshot().document.paragraphs().front().text() ==
@@ -575,7 +600,7 @@ void testInlineImageAnchorsTrackEditsAndStructure(
               error) &&
               preview.acceptPreview(error),
           "could not accept an image-anchor preview");
-    const QRect acceptedImage = paintedRedBounds(preview);
+    const QRectF acceptedImage = paintedRedBounds(preview);
     check(acceptedImage.isValid() &&
               acceptedImage.left() > previewBaseline.left() + 10 &&
               preview.snapshot().document.paragraphs().front().text() ==
@@ -605,7 +630,7 @@ void testInlineImageAnchorsTrackEditsAndStructure(
     replacement.show();
     replacement.setFocus();
     QApplication::processEvents();
-    const QRect replacementBaseline = paintedRedBounds(replacement);
+    const QRectF replacementBaseline = paintedRedBounds(replacement);
     const auto replacementParagraph =
         replacement.snapshot().document.paragraphs().front().id();
     const std::vector<docxstudio::core::Operation> replacementOperations{
@@ -620,7 +645,7 @@ void testInlineImageAnchorsTrackEditsAndStructure(
               error) &&
               replacement.acceptPreview(error),
           "could not replace text spanning an imported image anchor");
-    const QRect replacementImage = paintedRedBounds(replacement);
+    const QRectF replacementImage = paintedRedBounds(replacement);
     check(replacement.snapshot().document.paragraphs().front().text() ==
                   u"AXYZCD" &&
               replacement.snapshot().document.paragraphs().front()

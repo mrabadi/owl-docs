@@ -397,7 +397,7 @@ void testForeignBuiltInSimplifiedSavePreservesAppearance(
             auto* box = qobject_cast<QMessageBox*>(widget);
             if (!box || !box->isVisible()) continue;
             if (box->windowTitle() ==
-                QStringLiteral("Compatibility warning")) {
+                QStringLiteral("Save an editable copy")) {
                 confirmedSimplification = true;
                 box->done(QMessageBox::Yes);
             } else {
@@ -504,7 +504,7 @@ void saveAsForTest(docxstudio::app::MainWindow& window, QAction& saveAs,
             auto* box = qobject_cast<QMessageBox*>(widget);
             if (!box || !box->isVisible()) continue;
             if (box->windowTitle() ==
-                QStringLiteral("Compatibility warning")) {
+                QStringLiteral("Save an editable copy")) {
                 confirmedSimplification = true;
                 box->done(QMessageBox::Yes);
             } else {
@@ -576,10 +576,10 @@ void testImportedEmptyStyledParagraphMarkLifecycle(
     check(transitionedParagraph.text().empty() &&
               transitionedParagraph.styleId() ==
                   std::optional<std::string>{"Heading2"} &&
-              transitionedMark.font_size_half_points == 26 &&
+              transitionedMark.font_size_half_points == 32 &&
               transitionedMark.bold == true &&
               !transitionedMark.italic.value_or(false) &&
-              transitionedMark.foreground_argb == 0xff77216fU &&
+              transitionedMark.foreground_argb == 0xff2f6b57U &&
               transitionedParagraph.styleProvenance() &&
               transitionedParagraph.styleProvenance()
                       ->paragraph_mark_overrides.empty(),
@@ -624,7 +624,7 @@ void testImportedEmptyStyledParagraphMarkLifecycle(
     const auto& directTransitionParagraph =
         directTransition.document.paragraphs().front();
     check(directTransitionParagraph.characterFormatAt(1)
-                  .font_size_half_points == 26 &&
+                  .font_size_half_points == 32 &&
               directTransitionParagraph.characterFormatAt(1).bold == false &&
               directTransitionParagraph.characterFormatAt(1).italic == false &&
               directTransitionParagraph.characterFormatAt(1)
@@ -677,7 +677,7 @@ void testImportedEmptyStyledParagraphMarkLifecycle(
     const auto& directAfterParagraph =
         directAfter.document.paragraphs().front();
     check(directAfterParagraph.characterFormatAt(1)
-                  .font_size_half_points == 26 &&
+                  .font_size_half_points == 32 &&
               directAfterParagraph.characterFormatAt(1).bold == false &&
               directAfterParagraph.characterFormatAt(1).italic == false &&
               directAfterParagraph.characterFormatAt(1).foreground_argb ==
@@ -708,10 +708,10 @@ void testAuthoredEmptyStyledParagraphRoundTrip(QTemporaryDir& temporary) {
               authoredParagraph.styleId() ==
                   std::optional<std::string>{"Heading1"} &&
               authoredParagraph.paragraphMarkCharacterFormat()
-                      .font_size_half_points == 32 &&
+                      .font_size_half_points == 40 &&
               authoredParagraph.paragraphMarkCharacterFormat().bold == true &&
               authoredParagraph.paragraphMarkCharacterFormat()
-                      .foreground_argb == 0xffe95420U,
+                      .foreground_argb == 0xff173b32U,
           "authored empty Heading 1 did not establish its insertion baseline");
     saveAsForTest(authored, *saveAs, path, false);
     check(!canvas->isModified(),
@@ -743,8 +743,8 @@ void testAuthoredEmptyStyledParagraphRoundTrip(QTemporaryDir& temporary) {
     const auto after = reopenedCanvas->snapshot();
     const auto& format =
         after.document.paragraphs().front().characterFormatAt(1);
-    check(format.font_size_half_points == 32 && format.bold == true &&
-              format.foreground_argb == 0xffe95420U,
+    check(format.font_size_half_points == 40 && format.bold == true &&
+              format.foreground_argb == 0xff173b32U,
           "typing into reopened authored Heading 1 used editor defaults");
 }
 
@@ -849,9 +849,9 @@ void testCanonicalSimpleSaveGuard(QTemporaryDir& temporary) {
         defaultsMonitor.start();
         save->trigger();
         defaultsMonitor.stop();
-        check(defaultsMismatchWarnings == 1 && !canvas->isModified() &&
+        check(defaultsMismatchWarnings == 0 && !canvas->isModified() &&
                   readFile(path) != beforeDefaultsChange,
-              "confirmed compatibility save did not overwrite the reopened document");
+              "changing insertion preferences caused an unnecessary compatibility warning");
 
         canvas->selectAll();
         canvas->toggleUnderline();
@@ -882,6 +882,7 @@ void testCanonicalSimpleSaveGuard(QTemporaryDir& temporary) {
     replacePackageMembers(
         opaquePath, {{"customXml/item1.bin", opaquePayload}});
     const QByteArray opaqueBefore = readFile(opaquePath);
+    const QString opaqueCopyPath = temporary.filePath(QStringLiteral("editable-copy.docx"));
     {
         docxstudio::app::MainWindow imported;
         check(imported.openPath(opaquePath),
@@ -900,10 +901,14 @@ void testCanonicalSimpleSaveGuard(QTemporaryDir& temporary) {
         monitor.setInterval(1);
         QObject::connect(&monitor, &QTimer::timeout, &imported, [&] {
             for (auto* widget : QApplication::topLevelWidgets()) {
+                if (auto* dialog = qobject_cast<QFileDialog*>(widget); dialog && dialog->isVisible()) {
+                    dialog->selectFile(opaqueCopyPath);
+                    QMetaObject::invokeMethod(dialog, "accept", Qt::DirectConnection);
+                    continue;
+                }
                 auto* box = qobject_cast<QMessageBox*>(widget);
                 if (!box || !box->isVisible()) continue;
-                if (box->windowTitle() ==
-                    QStringLiteral("Compatibility warning")) {
+                if (box->windowTitle() == QStringLiteral("Save an editable copy")) {
                     ++preservationWarnings;
                     warningText = box->text();
                     box->done(QMessageBox::Yes);
@@ -917,10 +922,10 @@ void testCanonicalSimpleSaveGuard(QTemporaryDir& temporary) {
         monitor.stop();
         check(preservationWarnings == 1 &&
                   warningText.contains(
-                      QStringLiteral("preserves but cannot safely rewrite")) &&
+                      QStringLiteral("original")) &&
                   !canvas->isModified() &&
-                  readFile(opaquePath) != opaqueBefore,
-              "confirmed opaque-content warning did not permit atomic overwrite");
+                  readFile(opaquePath) == opaqueBefore && QFileInfo::exists(opaqueCopyPath),
+              "conversion did not preserve the imported original and save a distinct copy");
     }
 }
 
@@ -1008,14 +1013,14 @@ void testNativeParagraphStyleRoundTrip(QTemporaryDir& temporary) {
     canvas->applyParagraphStyle(QStringLiteral("Heading2"));
     const auto headingTwoSnapshot = canvas->snapshot();
     const auto& headingTwo = headingTwoSnapshot.document.paragraphs()[0];
-    check(headingTwo.characterFormatAt(1).font_size_half_points == 26 &&
+    check(headingTwo.characterFormatAt(1).font_size_half_points == 32 &&
               headingTwo.characterFormatAt(1).foreground_argb ==
-                  0xff77216fU &&
+                  0xff2f6b57U &&
               headingTwo.characterFormatAt(8).foreground_argb ==
                   0xffcc0000U &&
               headingTwo.characterFormatAt(8).bold == true &&
-              headingTwo.format().space_before_emu == 10 * 12'700 &&
-              headingTwo.format().space_after_emu == 4 * 12'700,
+              headingTwo.format().space_before_emu == 14 * 12'700 &&
+              headingTwo.format().space_after_emu == 6 * 12'700,
           "save/reopen turned inherited Heading 1 properties into direct overrides");
     bool unexpectedWarning = false;
     QTimer monitor;
@@ -1152,6 +1157,31 @@ void testNativeStyledObjectFormatsAreSparse(QTemporaryDir& temporary) {
               !reopened->paragraphs()[0]
                    .style_provenance->direct_space_after_twips,
           "styled object paragraph serialized inherited spacing directly");
+
+    docxstudio::app::MainWindow editor;
+    check(editor.openPath(path), "could not reopen rich document in editor");
+    auto* richCanvas = canvasWithText(editor, QStringLiteral("Styled objects \ufffc\ufffc"));
+    auto* save = editor.findChild<QAction*>(QStringLiteral("file.save"));
+    check(richCanvas && save, "could not reach rich document Save command");
+    richCanvas->selectAll();
+    richCanvas->toggleItalic();
+    bool warned = false;
+    QTimer monitor;
+    monitor.setInterval(1);
+    QObject::connect(&monitor, &QTimer::timeout, &editor, [&] {
+        for (auto* widget : QApplication::topLevelWidgets()) {
+            if (auto* box = qobject_cast<QMessageBox*>(widget);
+                box && box->isVisible()) {
+                warned = true;
+                box->reject();
+            }
+        }
+    });
+    monitor.start();
+    save->trigger();
+    monitor.stop();
+    check(!warned && !richCanvas->isModified(),
+          "reopened authored equations/pictures incorrectly required conversion");
 }
 
 void testNativeEquationDirectFormatSurvivesStyleTransitions(
@@ -1183,7 +1213,7 @@ void testNativeEquationDirectFormatSurvivesStyleTransitions(
         authoredParagraph.characterFormatAt(equationOffset + 1);
     const auto authoredEquationMask =
         authoredParagraph.styleOverrideMaskAt(equationOffset + 1);
-    check(authoredEquationFormat.font_size_half_points == 32 &&
+    check(authoredEquationFormat.font_size_half_points == 40 &&
               authoredEquationFormat.bold == false &&
               authoredEquationFormat.foreground_argb == 0xffcc0000U &&
               authoredEquationMask.foreground_argb &&
@@ -1211,7 +1241,7 @@ void testNativeEquationDirectFormatSurvivesStyleTransitions(
                 });
         });
     check(equationRun != package->paragraphs()[0].runs.end() &&
-              equationRun->format.font_size_half_points == 32 &&
+              equationRun->format.font_size_half_points == 40 &&
               equationRun->format.bold == false &&
               equationRun->format.foreground_rgb == 0x00cc0000U &&
               equationRun->paragraph_style_overrides.foreground_rgb ==
@@ -1237,21 +1267,19 @@ void testNativeEquationDirectFormatSurvivesStyleTransitions(
           "equation atom was lost during Heading 2 transition");
     const auto headingTwoEquationOffset =
         headingTwo.equations().front().utf16_offset;
-    check(headingTwo.characterFormatAt(1).font_size_half_points == 26 &&
+    check(headingTwo.characterFormatAt(1).font_size_half_points == 32 &&
               headingTwo.characterFormatAt(1).foreground_argb ==
-                  0xff77216fU &&
+                  0xff2f6b57U &&
               headingTwo.characterFormatAt(headingTwoEquationOffset + 1)
-                      .font_size_half_points == 26 &&
+                      .font_size_half_points == 32 &&
               headingTwo.characterFormatAt(headingTwoEquationOffset + 1)
                       .bold == false &&
               headingTwo.characterFormatAt(headingTwoEquationOffset + 1)
                       .foreground_argb == 0xffcc0000U,
           "equation style transition failed to update inheritance or retain direct red/bold clear");
-    // Imported packages containing equations are deliberately outside the
-    // narrow current-writer canonical-envelope proof. Exercise the explicit
-    // simplified-copy path rather than weakening that safety gate.
+    // Supported authored equations remain eligible after reopening.
     saveAsForTest(
-        reopened, *transitionSaveAs, transitionedPath, true);
+        reopened, *transitionSaveAs, transitionedPath, false);
     check(!reopenedCanvas->isModified(),
           "direct-equation Heading 2 simplified Save As did not complete");
 
@@ -1279,12 +1307,58 @@ void testNativeEquationDirectFormatSurvivesStyleTransitions(
           "equation direct formatting changed after save/reopen and Normal transition");
 }
 
+void testCancelledPatchDoesNotLeakIntoUnchangedCopy(QTemporaryDir& temporary) {
+    using namespace docxstudio::ooxml;
+    const auto path = temporary.filePath(QStringLiteral("cancelled-patch-source.docx"));
+    const auto copy = temporary.filePath(QStringLiteral("cancelled-patch-copy.docx"));
+    NewParagraph first{{NewRun{"Alpha", {}}}};
+    NewParagraph second{{NewRun{"Beta", {}}}};
+    second.numbering = NewNumbering{};
+    second.numbering->num_id = 1;
+    check(DocxDocument::writeNew(std::filesystem::path(QFile::encodeName(path).constData()),
+              NewDocumentBody{{first, second}}).saved,
+          "could not create cancelled patch fixture");
+    replacePackageMembers(path, {{"customXml/opaque.bin", "preserve me"}});
+    const auto original = readFile(path);
+    docxstudio::app::MainWindow window;
+    check(window.openPath(path), "could not open cancelled patch fixture");
+    auto* canvas = canvasWithText(window, QStringLiteral("Alpha"));
+    auto* save = window.findChild<QAction*>(QStringLiteral("file.save"));
+    auto* saveAs = window.findChild<QAction*>(QStringLiteral("file.saveAs"));
+    check(canvas && save && saveAs, "could not reach cancelled patch editor");
+    check(canvas->replaceAllMatches(QStringLiteral("Alpha"), QStringLiteral("Changed")) == 1 &&
+              canvas->replaceAllMatches(QStringLiteral("1."), QStringLiteral("X.")) == 1,
+          "could not prepare a partial patch followed by an unsafe list marker edit");
+    bool cancelled = false;
+    QTimer monitor;
+    monitor.setInterval(1);
+    QObject::connect(&monitor, &QTimer::timeout, &window, [&] {
+        for (auto* widget : QApplication::topLevelWidgets()) {
+            if (auto* message = qobject_cast<QMessageBox*>(widget); message && message->isVisible()) {
+                cancelled = true;
+                message->reject();
+            }
+        }
+    });
+    monitor.start();
+    save->trigger();
+    monitor.stop();
+    check(cancelled && readFile(path) == original, "cancelled conversion modified the original");
+    canvas->undo();
+    canvas->undo();
+    check(!canvas->isModified(), "undo did not return cancelled patch fixture to its saved state");
+    saveAsForTest(window, *saveAs, copy, false);
+    check(readFile(copy) == original,
+          "a staged edit from a cancelled save leaked into an unchanged Save As");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     QApplication application(argc, argv);
     QTemporaryDir temporary;
     check(temporary.isValid(), "temporary directory failed");
+    testCancelledPatchDoesNotLeakIntoUnchangedCopy(temporary);
     testCanonicalSimpleSaveGuard(temporary);
     testNativeParagraphStyleRoundTrip(temporary);
     testNativeStyledObjectFormatsAreSparse(temporary);

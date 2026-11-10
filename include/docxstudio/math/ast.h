@@ -33,6 +33,24 @@ struct Operator {
     std::string text;
 };
 
+struct Text {
+    std::string text;
+};
+
+struct Styled {
+    std::string command;
+    MathNodePtr body;
+};
+
+struct Accent {
+    std::string command;
+    MathNodePtr body;
+};
+
+struct Spacing {
+    std::string command;
+};
+
 struct Fraction {
     MathNodePtr numerator;
     MathNodePtr denominator;
@@ -49,7 +67,7 @@ struct Script {
     std::optional<MathNodePtr> superscript;
 };
 
-enum class LargeOperatorKind { sum, integral };
+enum class LargeOperatorKind { sum, integral, product };
 
 struct LargeOperator {
     LargeOperatorKind kind{LargeOperatorKind::sum};
@@ -62,7 +80,7 @@ struct Delimited {
     MathNodePtr body;
 };
 
-enum class MatrixEnvironment { matrix, pmatrix, bmatrix, Bmatrix, vmatrix, Vmatrix };
+enum class MatrixEnvironment { matrix, pmatrix, bmatrix, Bmatrix, vmatrix, Vmatrix, aligned, cases };
 
 struct Matrix {
     MatrixEnvironment environment{MatrixEnvironment::matrix};
@@ -70,7 +88,7 @@ struct Matrix {
     std::vector<std::vector<MathNodePtr>> rows;
 };
 
-using MathNodeValue = std::variant<Row, Group, Identifier, Number, Operator, Fraction, Radical,
+using MathNodeValue = std::variant<Row, Group, Identifier, Number, Operator, Text, Styled, Accent, Spacing, Fraction, Radical,
                                    Script, LargeOperator, Delimited, Matrix>;
 
 struct MathNode {

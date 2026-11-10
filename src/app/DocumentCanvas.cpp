@@ -1,4 +1,8 @@
 #include "docxstudio/app/DocumentCanvas.h"
+#include "docxstudio/app/AppTheme.h"
+#include "docxstudio/app/RecoveryCodec.h"
+#include "docxstudio/app/EquationEditorDialog.h"
+#include "docxstudio/core/academic.h"
 #include "docxstudio/app/ExcalidrawFigure.h"
 
 #include "docxstudio/app/MathLayout.h"
@@ -22,10 +26,16 @@
 #include <QFocusEvent>
 #include <QFrame>
 #include <QFormLayout>
+#include <QGridLayout>
+#include <QHBoxLayout>
 #include <QGlyphRun>
 #include <QInputMethodEvent>
+#include <QInputMethod>
 #include <QKeyEvent>
 #include <QLabel>
+#include <QJsonDocument>
+#include <QJsonArray>
+#include <QJsonObject>
 #include <QLineEdit>
 #include <QMenu>
 #include <QMimeData>
@@ -41,6 +51,8 @@
 #include <QSaveFile>
 #include <QScrollBar>
 #include <QSignalBlocker>
+#include <QSpinBox>
+#include <QStyle>
 #include <QStringList>
 #include <QTextBoundaryFinder>
 #include <QTextCharFormat>
@@ -48,11 +60,13 @@
 #include <QTextLayout>
 #include <QTextOption>
 #include <QTimer>
+#include <QToolButton>
 #include <QVBoxLayout>
 #include <QWheelEvent>
 #include <QtPrintSupport/QPrinter>
 
 #include <algorithm>
+#include <unordered_set>
 #include <array>
 #include <cmath>
 #include <limits>
@@ -87,12 +101,195 @@ public:
     using PasteImage = std::function<void(const QMimeData*)>;
 
     explicit StoryTextEdit(QWidget* parent = nullptr)
-        : QPlainTextEdit(parent) {}
+        : QPlainTextEdit(parent) {
+        connect(this, &QPlainTextEdit::cursorPositionChanged, this, [this] {
+            if (!movingVisually_) previousLineAffinity_ = false;
+            normalizeFieldSelection();
+        });
+        connect(this, &QPlainTextEdit::selectionChanged, this, [this] { normalizeFieldSelection(); });
+    }
 
     PasteImage pasteImage;
     std::function<void()> activated;
+    std::function<void(QPainter&)> renderInline;
+    std::function<int(const QPointF&)> positionAt;
+    std::function<void()> closeStory;
+    std::function<void(QKeySequence::StandardKey)> clipboardAction;
+    std::function<QRectF(int)> cursorRectAt;
+    struct Movement { int position; double column; bool previousLine; };
+    std::function<Movement(int, double)> moveVisually;
+    bool previousLineAffinity() const { return previousLineAffinity_; }
+
+    QString layoutText() const {
+        QString result = toPlainText();
+        return result.insert(compositionPosition_, composition_);
+    }
+    int layoutPosition(int sourcePosition) const {
+        return sourcePosition + (sourcePosition >= compositionPosition_ ? static_cast<int>(composition_.size()) : 0);
+    }
+    int sourcePosition(int layoutPositionValue) const {
+        return layoutPositionValue <= compositionPosition_ ? layoutPositionValue
+            : std::max(compositionPosition_, layoutPositionValue - static_cast<int>(composition_.size()));
+    }
+    int visualCursorPosition() const {
+        return composition_.isEmpty() ? textCursor().position() : compositionPosition_ + compositionCursor_;
+    }
+    int compositionStart() const { return compositionPosition_; }
+    int compositionLength() const { return static_cast<int>(composition_.size()); }
 
 protected:
+    QVariant inputMethodQuery(Qt::InputMethodQuery query) const override {
+        if (cursorRectAt && (query == Qt::ImCursorRectangle || query == Qt::ImAnchorRectangle))
+            return cursorRectAt(query == Qt::ImCursorRectangle
+                ? visualCursorPosition() : layoutPosition(textCursor().anchor()));
+        return QPlainTextEdit::inputMethodQuery(query);
+    }
+    void inputMethodEvent(QInputMethodEvent* event) override {
+        previousLineAffinity_ = false;
+        // Native preedit changes its layout and can emit textChanged even
+        // though plain text is unchanged. Keep that transient state out of
+        // semantic transactions and recovery.
+        const bool commits = !event->commitString().isEmpty() || event->replacementLength() != 0;
+        const bool cancels = !composition_.isEmpty() && event->preeditString().isEmpty() && !commits;
+        if (composition_.isEmpty() && !event->preeditString().isEmpty()) {
+            compositionSource_ = toPlainText();
+            compositionAnchor_ = textCursor().anchor();
+            compositionOriginalPosition_ = textCursor().position();
+        }
+        QInputMethodEvent normalized(event->preeditString(), event->attributes());
+        QInputMethodEvent* effective = event;
+        if (commits) {
+            const QString source = toPlainText();
+            const int position = textCursor().position();
+            int start = std::clamp(position + event->replacementStart(), 0, static_cast<int>(source.size()));
+            int end = std::clamp(start + event->replacementLength(), start, static_cast<int>(source.size()));
+            static const QRegularExpression fields(QStringLiteral("\\{PAGES?\\}"), QRegularExpression::CaseInsensitiveOption);
+            auto matches = fields.globalMatch(source);
+            while (matches.hasNext()) {
+                const auto match = matches.next();
+                const int fieldStart = static_cast<int>(match.capturedStart());
+                const int fieldEnd = static_cast<int>(match.capturedEnd());
+                if ((start < fieldEnd && end > fieldStart) ||
+                    (start == end && start > fieldStart && start < fieldEnd)) {
+                    start = std::min(start, fieldStart);
+                    end = std::max(end, fieldEnd);
+                }
+            }
+            if (start != position + event->replacementStart() || end - start != event->replacementLength()) {
+                normalized.setCommitString(event->commitString(), start - position, end - start);
+                effective = &normalized;
+            }
+        }
+        handlingInputMethod_ = true;
+        if (!commits) {
+            const QSignalBlocker blocked(this);
+            QPlainTextEdit::inputMethodEvent(effective);
+        } else {
+            QPlainTextEdit::inputMethodEvent(effective);
+        }
+        event->setAccepted(effective->isAccepted());
+        if (cancels && compositionSource_) {
+            const QSignalBlocker blocked(this);
+            if (toPlainText() != *compositionSource_) setPlainText(*compositionSource_);
+            auto restored = textCursor();
+            const int size = static_cast<int>(toPlainText().size());
+            restored.setPosition(std::clamp(compositionAnchor_, 0, size));
+            restored.setPosition(std::clamp(compositionOriginalPosition_, 0, size), QTextCursor::KeepAnchor);
+            setTextCursor(restored);
+        }
+        composition_ = event->preeditString();
+        compositionPosition_ = textCursor().position();
+        compositionCursor_ = static_cast<int>(composition_.size());
+        for (const auto& attribute : event->attributes())
+            if (attribute.type == QInputMethodEvent::Cursor)
+                compositionCursor_ = std::clamp(attribute.start, 0, static_cast<int>(composition_.size()));
+        if (composition_.isEmpty()) compositionSource_.reset();
+        else if (commits) {
+            compositionSource_ = toPlainText();
+            compositionAnchor_ = textCursor().anchor();
+            compositionOriginalPosition_ = textCursor().position();
+        }
+        handlingInputMethod_ = false;
+        normalizeFieldSelection();
+        viewport()->update();
+    }
+    void keyPressEvent(QKeyEvent* event) override {
+        if (clipboardAction) {
+            for (const auto action : {QKeySequence::Copy, QKeySequence::Cut, QKeySequence::Paste, QKeySequence::SelectAll, QKeySequence::Undo, QKeySequence::Redo})
+                if (event->matches(action)) { clipboardAction(action); event->accept(); return; }
+        }
+        if (event->key() == Qt::Key_Escape && closeStory) { closeStory(); event->accept(); return; }
+        auto cursor = textCursor();
+        const bool vertical = event->key() == Qt::Key_Up || event->key() == Qt::Key_Down;
+        if (moveVisually && composition_.isEmpty() &&
+            (vertical || event->key() == Qt::Key_Home || event->key() == Qt::Key_End) &&
+            !(event->modifiers() & (Qt::ControlModifier | Qt::MetaModifier | Qt::AltModifier))) {
+            const auto movement = moveVisually(event->key(), preferredColumn_.value_or(std::numeric_limits<double>::quiet_NaN()));
+            if (vertical) preferredColumn_ = movement.column;
+            else preferredColumn_.reset();
+            cursor.setPosition(movement.position,
+                event->modifiers() & Qt::ShiftModifier ? QTextCursor::KeepAnchor : QTextCursor::MoveAnchor);
+            movingVisually_ = true;
+            setTextCursor(cursor);
+            movingVisually_ = false;
+            previousLineAffinity_ = movement.previousLine;
+            viewport()->update(); event->accept(); return;
+        }
+        previousLineAffinity_ = false;
+        preferredColumn_.reset();
+        if (!cursor.hasSelection() || (event->modifiers() & Qt::ShiftModifier)) {
+            static const QRegularExpression fields(QStringLiteral("\\{PAGES?\\}"), QRegularExpression::CaseInsensitiveOption);
+            auto matches = fields.globalMatch(toPlainText());
+            while (matches.hasNext()) {
+                const auto match = matches.next();
+                const int start = static_cast<int>(match.capturedStart());
+                const int end = static_cast<int>(match.capturedEnd());
+                const int position = cursor.position();
+                if ((event->key() == Qt::Key_Left && position > start && position <= end) ||
+                    (event->key() == Qt::Key_Right && position >= start && position < end)) {
+                    cursor.setPosition(event->key() == Qt::Key_Left ? start : end,
+                        event->modifiers() & Qt::ShiftModifier ? QTextCursor::KeepAnchor : QTextCursor::MoveAnchor);
+                    setTextCursor(cursor); event->accept(); return;
+                }
+                if (!cursor.hasSelection() &&
+                    ((event->key() == Qt::Key_Backspace && position > start && position <= end) ||
+                     (event->key() == Qt::Key_Delete && position >= start && position < end))) {
+                    cursor.setPosition(start); cursor.setPosition(end, QTextCursor::KeepAnchor);
+                    setTextCursor(cursor); break;
+                }
+            }
+        }
+        QPlainTextEdit::keyPressEvent(event);
+    }
+    void mousePressEvent(QMouseEvent* event) override {
+        finishComposition();
+        previousLineAffinity_ = false;
+        preferredColumn_.reset();
+        if (event->button() != Qt::LeftButton || !positionAt) { QPlainTextEdit::mousePressEvent(event); return; }
+        setFocus();
+        auto cursor = textCursor();
+        cursor.setPosition(positionAt(event->position()), event->modifiers() & Qt::ShiftModifier ? QTextCursor::KeepAnchor : QTextCursor::MoveAnchor);
+        setTextCursor(cursor);
+        dragging_ = true;
+        event->accept();
+    }
+    void mouseMoveEvent(QMouseEvent* event) override {
+        if (!dragging_ || !positionAt) { QPlainTextEdit::mouseMoveEvent(event); return; }
+        auto cursor = textCursor();
+        cursor.setPosition(positionAt(event->position()), QTextCursor::KeepAnchor);
+        setTextCursor(cursor);
+        event->accept();
+    }
+    void mouseReleaseEvent(QMouseEvent* event) override {
+        dragging_ = false;
+        if (event->button() == Qt::LeftButton) event->accept();
+        else QPlainTextEdit::mouseReleaseEvent(event);
+    }
+    void paintEvent(QPaintEvent* event) override {
+        if (!renderInline) { QPlainTextEdit::paintEvent(event); return; }
+        QPainter painter(viewport());
+        renderInline(painter);
+    }
     bool canInsertFromMimeData(const QMimeData* source) const override {
         return hasPicture(source) ||
             QPlainTextEdit::canInsertFromMimeData(source);
@@ -109,9 +306,60 @@ protected:
     void focusInEvent(QFocusEvent* event) override {
         QPlainTextEdit::focusInEvent(event);
         if (activated) activated();
+        viewport()->update();
+    }
+    void focusOutEvent(QFocusEvent* event) override {
+        finishComposition();
+        QPlainTextEdit::focusOutEvent(event);
+        composition_.clear();
+        viewport()->update();
     }
 
 private:
+    bool dragging_{false};
+    bool normalizing_{false};
+    bool handlingInputMethod_{false};
+    bool movingVisually_{false};
+    bool previousLineAffinity_{false};
+    std::optional<double> preferredColumn_;
+    QString composition_;
+    int compositionPosition_{};
+    int compositionCursor_{};
+    std::optional<QString> compositionSource_;
+    int compositionAnchor_{};
+    int compositionOriginalPosition_{};
+    void finishComposition() {
+        if (composition_.isEmpty()) return;
+        if (auto* method = QGuiApplication::inputMethod()) method->commit();
+        if (!composition_.isEmpty()) {
+            QInputMethodEvent cancel;
+            inputMethodEvent(&cancel);
+        }
+    }
+    void normalizeFieldSelection() {
+        if (normalizing_ || handlingInputMethod_ || !composition_.isEmpty()) return;
+        auto cursor = textCursor();
+        int start = cursor.selectionStart();
+        int end = cursor.selectionEnd();
+        static const QRegularExpression fields(QStringLiteral("\\{PAGES?\\}"), QRegularExpression::CaseInsensitiveOption);
+        auto matches = fields.globalMatch(toPlainText());
+        while (matches.hasNext()) {
+            const auto match = matches.next();
+            const int fieldStart = static_cast<int>(match.capturedStart());
+            const int fieldEnd = static_cast<int>(match.capturedEnd());
+            if (!cursor.hasSelection() && start > fieldStart && start < fieldEnd) {
+                start = end = start - fieldStart < fieldEnd - start ? fieldStart : fieldEnd;
+            } else if (cursor.hasSelection()) {
+                if (start > fieldStart && start < fieldEnd) start = fieldStart;
+                if (end > fieldStart && end < fieldEnd) end = fieldEnd;
+            }
+        }
+        if (start == cursor.selectionStart() && end == cursor.selectionEnd()) return;
+        const bool forward = cursor.position() >= cursor.anchor();
+        cursor.setPosition(forward ? start : end);
+        cursor.setPosition(forward ? end : start, QTextCursor::KeepAnchor);
+        normalizing_ = true; setTextCursor(cursor); normalizing_ = false;
+    }
     static bool hasPicture(const QMimeData* source) {
         return source &&
             (source->hasFormat(QString::fromLatin1(
@@ -449,7 +697,7 @@ struct SpellingWord {
 void fillSelectionBackground(QPainter& painter, const QTextLine& line,
                              int start, int end) {
     if (start >= end) return;
-    const QColor highlight(51, 132, 255, 70);
+    const QColor highlight(36, 86, 72, 70);
     bool painted = false;
     // One logical selection may occupy several disjoint visual runs in bidi
     // text.  QTextLine::glyphRuns() returns those shaped visual fragments;
@@ -612,12 +860,18 @@ QString equationFallback(const core::EquationAtom& equation) {
 }
 
 QString visibleParagraphText(const core::Paragraph& paragraph,
-                             std::size_t start, std::size_t end) {
+                             std::size_t start, std::size_t end,
+                             const core::AcademicResolution* academic = nullptr) {
     start = std::min(start, paragraph.text().size());
     end = std::clamp(end, start, paragraph.text().size());
     QString result;
     std::size_t cursor = start;
     while (cursor < end) {
+        if (const auto* field = paragraph.fieldAt(cursor)) {
+            result += academic ? fromUtf16(academic->fieldText(field->id)) : QStringLiteral("[Reference]");
+            ++cursor;
+            continue;
+        }
         if (const auto* equation = paragraph.equationAt(cursor)) {
             result += equationFallback(*equation);
             ++cursor;
@@ -682,6 +936,193 @@ QFont fontFrom(const core::CharacterFormat& format,
         static_cast<int>(font.styleStrategy()) |
         static_cast<int>(QFont::PreferNoShaping)));
     return font;
+}
+
+struct StoryLayoutImage {
+    core::ImageAtom image;
+    int offset{};
+    QSizeF size;
+};
+struct StoryLayout {
+    std::unique_ptr<QTextLayout> text;
+    std::vector<QTextLine> lines;
+    std::vector<StoryLayoutImage> images;
+    std::vector<int> sourceToDisplay;
+    std::vector<int> displayToSource;
+    double contentHeight{};
+    QRectF region;
+};
+
+QRectF storyRegionRect(double pageWidth, double pageHeight, double marginTop,
+    double marginRight, double marginBottom, double marginLeft, bool footer, int region) {
+    const double width = std::max(1.0, pageWidth - marginLeft - marginRight) / 3.0;
+    constexpr double nativeDistance = 36.0;  // supported w:header/w:footer = 720 twips
+    constexpr double bodyGap = 6.0;
+    const double height = std::max(0.0, (footer ? marginBottom : marginTop) - nativeDistance - bodyGap);
+    return {marginLeft + width * region,
+        footer ? pageHeight - nativeDistance - height : nativeDistance, width, height};
+}
+
+QRectF storyCapacityRect(double pageWidth, double pageHeight, double marginTop,
+    double marginRight, double marginBottom, double marginLeft, bool footer, int region) {
+    constexpr double distanceAndGap = 42.0;
+    constexpr double minimumBody = 48.0;
+    const double requested = footer ? marginBottom : marginTop;
+    const double opposite = footer ? marginTop : marginBottom;
+    const double half = (pageHeight - 2 * distanceAndGap - minimumBody) / 2;
+    const double capacity = std::max(0.0, std::min(std::max(half, requested - distanceAndGap),
+        pageHeight - std::max(opposite, distanceAndGap) - distanceAndGap - minimumBody));
+    return storyRegionRect(pageWidth, pageHeight, distanceAndGap + capacity,
+        marginRight, distanceAndGap + capacity, marginLeft, footer, region);
+}
+
+StoryLayout layoutStoryRegion(const QString& source, const std::vector<core::ImageAtom>& images,
+    std::size_t globalOffset, const QRectF& rect, int region, bool footer,
+    int page, int pages, const QFont& font) {
+    StoryLayout result;
+    result.region = rect;
+    QString display;
+    result.sourceToDisplay.resize(static_cast<std::size_t>(source.size()) + 1U);
+    result.displayToSource.push_back(0);
+    QList<QTextLayout::FormatRange> formats;
+    for (int cursor = 0; cursor < source.size();) {
+        const int start = cursor;
+        QString value;
+        int consumed = 1;
+        const auto remaining = QStringView(source).mid(cursor);
+        if (remaining.startsWith(QStringLiteral("{PAGES}"), Qt::CaseInsensitive)) {
+            value = QString::number(pages); consumed = 7;
+        } else if (remaining.startsWith(QStringLiteral("{PAGE}"), Qt::CaseInsensitive)) {
+            value = QString::number(page + 1); consumed = 6;
+        } else {
+            value = source.mid(cursor, 1);
+            if (value == QStringLiteral("\n")) value = QChar::LineSeparator;
+        }
+        const int displayStart = static_cast<int>(display.size());
+        if (source[cursor] == QChar::ObjectReplacementCharacter) {
+            value = QChar(0x00a0);
+            const auto image = std::find_if(images.begin(), images.end(), [globalOffset, cursor](const auto& atom) {
+                return atom.utf16_offset == globalOffset + static_cast<std::size_t>(cursor);
+            });
+            if (image != images.end()) {
+                const double width = static_cast<double>(image->width_emu) / kEmuPerPoint;
+                const double height = static_cast<double>(image->height_emu) / kEmuPerPoint;
+                const double fit = std::min({1.0, rect.width() / std::max(1.0, width), rect.height() / std::max(1.0, height)});
+                result.images.push_back({*image, displayStart, {width * fit, height * fit}});
+                QFont spacer = font;
+                spacer.setWordSpacing(std::max(0.0, width * fit - QFontMetricsF(font).horizontalAdvance(QChar(0x00a0))));
+                QTextLayout::FormatRange format;
+                format.start = displayStart; format.length = 1; format.format.setFont(spacer);
+                formats.push_back(format);
+            }
+        }
+        display += value;
+        for (int index = 0; index < consumed; ++index)
+            result.sourceToDisplay[static_cast<std::size_t>(start + index)] =
+                displayStart + (index * 2 < consumed ? 0 : static_cast<int>(value.size()));
+        for (int index = 1; index <= value.size(); ++index)
+            result.displayToSource.push_back(start + (index * 2 < value.size() ? 0 : consumed));
+        cursor += consumed;
+        result.sourceToDisplay[static_cast<std::size_t>(cursor)] = static_cast<int>(display.size());
+    }
+    result.text = std::make_unique<QTextLayout>(display, font);
+    QTextOption option;
+    option.setWrapMode(QTextOption::WrapAtWordBoundaryOrAnywhere);
+    option.setAlignment(region == 0 ? Qt::AlignLeft : region == 1 ? Qt::AlignHCenter : Qt::AlignRight);
+    option.setUseDesignMetrics(true);
+    result.text->setTextOption(option);
+    result.text->setFormats(formats);
+    std::vector<double> advances;
+    std::vector<double> paddings;
+    double totalHeight = 0.0;
+    result.text->beginLayout();
+    while (true) {
+        auto line = result.text->createLine();
+        if (!line.isValid()) break;
+        line.setLineWidth(rect.width());
+        double ascent = line.ascent();
+        for (const auto& image : result.images)
+            if (image.offset >= line.textStart() && image.offset < line.textStart() + line.textLength()) ascent = std::max(ascent, image.size.height());
+        const double padding = ascent - line.ascent();
+        const double advance = std::max(line.height(), ascent + line.descent() + line.leading());
+        result.lines.push_back(line); advances.push_back(advance); paddings.push_back(padding);
+        totalHeight += advance;
+    }
+    result.text->endLayout();
+    result.contentHeight = totalHeight;
+    double y = footer ? rect.bottom() - totalHeight : rect.top();
+    for (std::size_t index = 0; index < result.lines.size(); ++index) {
+        result.lines[index].setPosition(QPointF(rect.left(), y + paddings[index]));
+        y += advances[index];
+    }
+    return result;
+}
+
+bool storyChangeFits(const std::array<QString, 3>& before, const std::array<QString, 3>& after,
+    const std::vector<core::ImageAtom>& oldImages, const std::vector<core::ImageAtom>& newImages,
+    const std::array<QRectF, 3>& regions, bool footer, int page, int pages, const QFont& font,
+    const std::array<QRectF, 3>* previousRegions = nullptr, int previousPages = -1) {
+    const QFontMetricsF metrics(font);
+    const auto widestPageFor = [&](int count) {
+        int result = 0; double widest = 0.0;
+        for (int index = 0; index < std::max(1, count); ++index) {
+            const auto width = metrics.horizontalAdvance(QString::number(index + 1));
+            if (width > widest) { widest = width; result = index; }
+        }
+        return result;
+    };
+    if (previousPages < 1) previousPages = std::max(1, pages);
+    const int widestPage = widestPageFor(pages);
+    const int previousWidest = previousPages == pages ? widestPage : widestPageFor(previousPages);
+    std::size_t oldOffset = 0, newOffset = 0;
+    for (std::size_t region = 0; region < regions.size(); ++region) {
+        double oldHeight = 0.0, newHeight = 0.0;
+        const auto& previousRect = previousRegions ? (*previousRegions)[region] : regions[region];
+        for (const int pageIndex : {0, previousWidest, std::clamp(page, 0, previousPages - 1)}) {
+            if (!before[region].isEmpty())
+                oldHeight = std::max(oldHeight, layoutStoryRegion(before[region], oldImages, oldOffset,
+                    previousRect, static_cast<int>(region), footer, pageIndex, previousPages, font).contentHeight);
+        }
+        for (const int pageIndex : {0, widestPage, std::clamp(page, 0, std::max(1, pages) - 1)}) {
+            if (!after[region].isEmpty())
+                newHeight = std::max(newHeight, layoutStoryRegion(after[region], newImages, newOffset,
+                    regions[region], static_cast<int>(region), footer, pageIndex, pages, font).contentHeight);
+        }
+        if (previousRegions) {
+            const auto oldOverflow = std::max(0.0, oldHeight - previousRect.height());
+            const auto newOverflow = std::max(0.0, newHeight - regions[region].height());
+            if (newOverflow > oldOverflow + 0.01) return false;
+        } else if (newHeight > regions[region].height() + 0.01 &&
+                   !(newHeight <= oldHeight + 0.01 && (after[region] == before[region] ||
+                     after[region].size() < before[region].size() || newHeight < oldHeight - 0.01))) return false;
+        oldOffset += static_cast<std::size_t>(before[region].size()) + 1U;
+        newOffset += static_cast<std::size_t>(after[region].size()) + 1U;
+    }
+    return true;
+}
+
+void drawStoryLayout(QPainter& painter, const StoryLayout& story,
+    const std::function<const QImage*(const core::ImageAtom&)>& decode, bool showOverflow = true) {
+    painter.save();
+    painter.setClipRect(story.region, Qt::IntersectClip);
+    painter.setPen(Qt::black);
+    for (const auto& line : story.lines) {
+        line.draw(&painter, QPointF());
+        for (const auto& image : story.images) {
+            if (image.offset < line.textStart() || image.offset >= line.textStart() + line.textLength()) continue;
+            if (const auto* decoded = decode(image.image))
+                painter.drawImage(QRectF(QPointF(line.cursorToX(image.offset), line.y() + line.ascent() - image.size.height()), image.size), *decoded);
+        }
+    }
+    painter.restore();
+    if (showOverflow && story.contentHeight > story.region.height() + 0.01) {
+        painter.save();
+        painter.setPen(Qt::NoPen);
+        painter.setBrush(QColor(QStringLiteral("#b45309")));
+        painter.drawPolygon(QPolygonF{story.region.topRight() + QPointF(-8, 1),
+            story.region.topRight() + QPointF(-1, 1), story.region.topRight() + QPointF(-1, 8)});
+        painter.restore();
+    }
 }
 
 double requestedPointSize(const core::CharacterFormat& format,
@@ -2154,6 +2595,35 @@ struct DocumentCanvas::EquationVisual {
     std::unique_ptr<MathLayout> layout;
     MathLayoutMetrics metrics;
     QColor color{Qt::black};
+    bool display{false};
+};
+
+struct ParagraphFieldVisual {
+    core::NodeId id;
+    std::size_t offset{};
+    QString text;
+    QFont font;
+    QColor color;
+    bool superscript{false};
+};
+
+struct DocumentCanvas::NoteVisual {
+    core::NodeId id;
+    core::NoteKind kind;
+    std::unique_ptr<QTextLayout> layout;
+    std::vector<QTextLine> lines;
+    std::vector<int> pages;
+    std::size_t ordinal{};
+};
+
+struct DocumentCanvas::TocVisual {
+    core::NodeId tocId;
+    core::NodeId targetId;
+    QFont font;
+    QString pageText;
+    std::unique_ptr<QTextLayout> layout;
+    std::vector<QTextLine> lines;
+    std::vector<int> pages;
 };
 
 struct ParagraphImageVisual {
@@ -2172,10 +2642,15 @@ struct DocumentCanvas::ParagraphVisual {
     std::unique_ptr<QTextLayout> layout;
     std::vector<VisualLine> lines;
     std::vector<EquationVisual> equations;
+    std::vector<ParagraphFieldVisual> fields;
+    std::vector<int> coreToLayout;
+    std::vector<std::size_t> layoutToCore;
+    bool generated{false};
     std::vector<ParagraphImageVisual> images;
 
     [[nodiscard]] int layoutOffsetForCore(std::size_t offset) const {
         offset = std::min(offset, static_cast<std::size_t>(text.size()));
+        if (!coreToLayout.empty()) return coreToLayout[offset];
         return static_cast<int>(std::min<std::size_t>(
             offset, static_cast<std::size_t>(std::numeric_limits<int>::max())));
     }
@@ -2188,12 +2663,14 @@ struct DocumentCanvas::ParagraphVisual {
             static_cast<std::size_t>(std::numeric_limits<int>::max())));
         const std::size_t bounded = static_cast<std::size_t>(
             std::clamp(offset, 0, maximum));
+        if (!layoutToCore.empty()) return layoutToCore[bounded];
         return std::min(
             static_cast<std::size_t>(text.size()), bounded);
     }
 };
 
 struct DocumentCanvas::TableCellVisual {
+    std::vector<ParagraphImageVisual> images;
     std::size_t row{};
     std::size_t column{};
     QString text;
@@ -2251,7 +2728,9 @@ struct DocumentCanvas::Hit {
     int layoutLineStart{};
     std::optional<TableCursor> tableCursor;
     std::optional<core::NodeId> tableHandle;
+    std::optional<TableBoundary> tableBoundary;
     std::optional<core::NodeId> image;
+    std::optional<core::NodeId> tocTarget;
     std::optional<ImageResizeHandle> imageResizeHandle;
     QPointF pagePoint;
     int pageIndex{};
@@ -2291,20 +2770,29 @@ DocumentCanvas::DocumentCanvas(SpellChecker& spelling,
     connect(typingGroupTimer_, &QTimer::timeout, this,
             &DocumentCanvas::endTypingGroup);
     connect(verticalScrollBar(), &QScrollBar::valueChanged, this,
-            [this] { updateStoryEditorGeometry(); });
+            [this] { cancelTableResize(); updateStoryEditorGeometry(); });
     connect(horizontalScrollBar(), &QScrollBar::valueChanged, this,
-            [this] { updateStoryEditorGeometry(); });
+            [this] { cancelTableResize(); updateStoryEditorGeometry(); });
 }
 
-DocumentCanvas::~DocumentCanvas() = default;
+DocumentCanvas::~DocumentCanvas() {
+    delete storyTools_.data();
+}
 
 void DocumentCanvas::setDocument(core::Document document) {
+    previewOriginalCursorState_.reset();
+    if (previewOriginalLayout_) {
+        useRenderedPageLayout(*previewOriginalLayout_);
+        previewOriginalLayout_.reset();
+    }
+    cancelTableResize();
     endHeaderFooterEditing();
     endTypingGroup();
     endColorAdjustment();
     resetVerticalNavigation();
     clearPendingSpellingWord();
     decodedImages_.clear();
+    decodedImagePayloads_.clear();
     decodedImageBytes_ = 0;
     importedTables_.clear();
     // Recognize contiguous literal-marker runs without changing their text.
@@ -2390,7 +2878,14 @@ core::DocumentSnapshot DocumentCanvas::snapshot() const { return session_->snaps
 core::Range DocumentCanvas::selection() const { return selection_; }
 
 QString DocumentCanvas::selectedText() const {
+    if (headerFooterEditing_) {
+        const auto& editors = activeStoryIsFooter_ ? footerEditors_ : headerEditors_;
+        if (const auto* editor = editors[static_cast<std::size_t>(activeStoryRegion_)])
+            return QString(editor->textCursor().selectedText()).replace(QChar::ParagraphSeparator, QLatin1Char('\n'));
+        return {};
+    }
     const auto snap = session_->snapshot();
+    const auto academic = core::resolveAcademic(snap.document);
     if (selectedTable_) {
         const auto* table = snap.document.findTable(*selectedTable_);
         if (!table) return {};
@@ -2453,7 +2948,7 @@ QString DocumentCanvas::selectedText() const {
         const std::size_t end = index == range.end_paragraph_index
                                     ? range.end.utf16_offset
                                     : paragraph.text().size();
-        result += visibleParagraphText(paragraph, start, end);
+        result += visibleParagraphText(paragraph, start, end, &academic);
         if (index != range.end_paragraph_index) {
             result += QLatin1Char('\n');
         }
@@ -2462,6 +2957,11 @@ QString DocumentCanvas::selectedText() const {
 }
 
 bool DocumentCanvas::hasClipboardSelection() const noexcept {
+    if (headerFooterEditing_) {
+        const auto& editors = activeStoryIsFooter_ ? footerEditors_ : headerEditors_;
+        const auto* editor = editors[static_cast<std::size_t>(activeStoryRegion_)];
+        return editor && editor->textCursor().hasSelection();
+    }
     if (tableCursor_) {
         return tableSelectionAnchor_ &&
                *tableSelectionAnchor_ != tableCursor_->utf16Offset;
@@ -2473,6 +2973,7 @@ bool DocumentCanvas::hasClipboardSelection() const noexcept {
 
 QString DocumentCanvas::outlineText(std::size_t maxCharacters) const {
     const auto snap = session_->snapshot();
+    const auto academic = core::resolveAcademic(snap.document);
     QString result;
     std::size_t index = 0;
     for (const auto& block : snap.document.bodyBlocks()) {
@@ -2481,7 +2982,7 @@ QString DocumentCanvas::outlineText(std::size_t maxCharacters) const {
             const auto* paragraph = snap.document.findParagraph(block.id);
             if (paragraph) {
                 text = visibleParagraphText(
-                           *paragraph, 0, paragraph->text().size())
+                           *paragraph, 0, paragraph->text().size(), &academic)
                            .trimmed();
             }
         } else if (const auto* table = snap.document.findTable(block.id)) {
@@ -2506,25 +3007,77 @@ QString DocumentCanvas::outlineText(std::size_t maxCharacters) const {
     return result;
 }
 
+void DocumentCanvas::cancelTableResize() {
+    if (!tableResizeDrag_) return;
+    tableResizeDrag_.reset();
+    invalidateLayout();
+    viewport()->setCursor(Qt::IBeamCursor);
+    viewport()->update();
+}
+
 void DocumentCanvas::setZoomPercent(int percent) {
     const int bounded = std::clamp(
         percent, kMinimumZoomPercent, kMaximumZoomPercent);
     if (zoomPercent_ == bounded) {
         return;
     }
+    cancelTableResize();
     zoomPercent_ = bounded;
     // Pagination and line layout use points, not screen pixels. A view-only
     // zoom must therefore leave the document revision, editing state, and
     // cached pagination untouched; only the scrollable pixel extent changes.
     updateScrollBars();
     updateStoryEditorGeometry();
+    if (headerFooterEditing_) revealCursor();
     viewport()->update();
     emit zoomChanged(zoomPercent_);
+}
+
+void DocumentCanvas::fitToWidth() {
+    // Scrollbar visibility is applied asynchronously by Qt. Predict the
+    // vertical scrollbar before fitting instead of flushing UI events here.
+    int available = viewport()->width();
+    const double candidate = std::clamp(
+        std::floor(std::max(1.0, available - kCanvasPaddingPixels * 2.0) /
+                   (pageWidthPoints_ * kScreenPointsScale) * 100.0),
+        static_cast<double>(kMinimumZoomPercent), static_cast<double>(kMaximumZoomPercent));
+    const int pages = pageCount();
+    const double predictedHeight = kCanvasPaddingPixels * 2.0 + pages * pageHeightPoints_ *
+        kScreenPointsScale * candidate / 100.0 + std::max(0, pages - 1) * kPageGapPixels;
+    if (!verticalScrollBar()->isVisible() && predictedHeight > viewport()->height()) {
+        available -= style()->pixelMetric(QStyle::PM_ScrollBarExtent, nullptr, this);
+    }
+    setZoomPercent(static_cast<int>(std::floor(
+        std::max(1.0, available - kCanvasPaddingPixels * 2.0) /
+        (pageWidthPoints_ * kScreenPointsScale) * 100.0)));
+}
+
+bool DocumentCanvas::navigateToParagraph(core::NodeId paragraphId) {
+    const auto snap = visibleDocumentSnapshot();
+    if (!snap.document.findParagraph(paragraphId)) return false;
+    if (!previewId_) {
+        setCursor({paragraphId, 0}, false);
+        return true;
+    }
+    ensureLayout();
+    for (const auto& placement : blockPlacements_) if (placement.id == paragraphId) {
+        const double scale = kScreenPointsScale * zoomPercent_ / 100.0;
+        verticalScrollBar()->setValue(static_cast<int>(std::max(0.0,
+            placement.firstPage * (pageHeightPoints_ * scale + kPageGapPixels) + placement.top * scale)));
+        return true;
+    }
+    return false;
 }
 
 int DocumentCanvas::pageCount() const {
     ensureLayout();
     return pageCount_;
+}
+
+int DocumentCanvas::paragraphPageNumber(core::NodeId paragraphId) const {
+    ensureLayout();
+    for (const auto& placement : blockPlacements_) if (placement.id == paragraphId) return placement.firstPage + 1;
+    return 0;
 }
 
 std::uint64_t DocumentCanvas::layoutGeneration() const {
@@ -2586,14 +3139,14 @@ void DocumentCanvas::markSaved() noexcept {
     updateDirtyFlags();
 }
 
-void DocumentCanvas::markRecovered() {
+void DocumentCanvas::markRecovered(bool nonTextChanged, bool pageLayoutChanged) {
     endTypingGroup();
     endColorAdjustment();
     resetVerticalNavigation();
     clearPendingSpellingWord();
     currentStateId_ = nextStateId_++;
-    currentNonTextStateId_ = nextNonTextStateId_++;
-    currentPageLayoutStateId_ = nextPageLayoutStateId_++;
+    if (nonTextChanged) currentNonTextStateId_ = nextNonTextStateId_++;
+    if (pageLayoutChanged) currentPageLayoutStateId_ = nextPageLayoutStateId_++;
     updateDirtyFlags();
     emit documentChanged(session_->snapshot().revision.value());
 }
@@ -2691,6 +3244,7 @@ void DocumentCanvas::setImportedPresentation(
     std::vector<ImportedInlineImagePresentation> images,
     std::vector<ImportedTablePresentation> tables) {
     decodedImages_.clear();
+    decodedImagePayloads_.clear();
     decodedImageBytes_ = 0;
     const auto snapshot = session_->snapshot();
     for (auto& image : images) {
@@ -2705,6 +3259,8 @@ void DocumentCanvas::setImportedPresentation(
             image.id, std::move(image.image));
         if (inserted) {
             decodedImageBytes_ += found->second.sizeInBytes();
+            decodedImagePayloads_.emplace(image.id,
+                snapshot.document.findImage(image.id)->encoded_payload);
         }
     }
     importedTables_ = std::move(tables);
@@ -2715,10 +3271,17 @@ void DocumentCanvas::setImportedPresentation(
 
 std::optional<std::pair<core::Position, core::ImageAtom>>
 DocumentCanvas::selectedInlineImage() const {
-    if (selectedTable_ || tableCursor_ || tableCellSelection_) {
+    const auto snapshot = session_->snapshot();
+    if (tableCursor_ && !tableCellSelection_) {
+        const auto* table = snapshot.document.findTable(tableCursor_->tableId);
+        const auto* cell = table ? table->cell(tableCursor_->row, tableCursor_->column) : nullptr;
+        const auto start = std::min(tableCursor_->utf16Offset, tableSelectionAnchor_.value_or(tableCursor_->utf16Offset));
+        const auto end = std::max(tableCursor_->utf16Offset, tableSelectionAnchor_.value_or(tableCursor_->utf16Offset));
+        if (cell && end == start + 1U)
+            if (const auto* image = cell->imageAt(start)) return std::pair{core::Position{cell->id, start}, *image};
         return std::nullopt;
     }
-    const auto snapshot = session_->snapshot();
+    if (selectedTable_ || tableCellSelection_) return std::nullopt;
     const auto normalized = snapshot.document.normalizeRange(selection_);
     if (!normalized ||
         normalized.value().start_paragraph_index !=
@@ -2761,7 +3324,14 @@ QString DocumentCanvas::selectedImageAccessibleName() const {
 const QImage* DocumentCanvas::decodedInlineImage(
     const core::ImageAtom& image) const {
     const auto cached = decodedImages_.find(image.id);
-    if (cached != decodedImages_.end()) return &cached->second;
+    const auto payload = decodedImagePayloads_.find(image.id);
+    if (cached != decodedImages_.end() && payload != decodedImagePayloads_.end() &&
+        payload->second == image.encoded_payload) return &cached->second;
+    if (cached != decodedImages_.end()) {
+        decodedImageBytes_ -= cached->second.sizeInBytes();
+        decodedImages_.erase(cached);
+    }
+    decodedImagePayloads_.erase(image.id);
 
     if (decodedImageBytes_ >= kMaximumAggregateDecodedRasterBytes) {
         return nullptr;
@@ -2785,17 +3355,21 @@ const QImage* DocumentCanvas::decodedInlineImage(
         image.id, std::move(decoded.image));
     if (!wasInserted) return &inserted->second;
     decodedImageBytes_ += inserted->second.sizeInBytes();
+    decodedImagePayloads_.emplace(image.id, image.encoded_payload);
     return &inserted->second;
 }
 
 void DocumentCanvas::reconcileDecodedImageCache() {
     const auto snapshot = session_->snapshot();
     for (auto cached = decodedImages_.begin(); cached != decodedImages_.end();) {
-        if (snapshot.document.findImage(cached->first)) {
+        const auto* image = snapshot.document.findImage(cached->first);
+        const auto payload = decodedImagePayloads_.find(cached->first);
+        if (image && payload != decodedImagePayloads_.end() && payload->second == image->encoded_payload) {
             ++cached;
             continue;
         }
         decodedImageBytes_ -= cached->second.sizeInBytes();
+        decodedImagePayloads_.erase(cached->first);
         cached = decodedImages_.erase(cached);
     }
     decodedImageBytes_ = std::max<std::int64_t>(0, decodedImageBytes_);
@@ -2967,6 +3541,8 @@ void DocumentCanvas::resetVerticalNavigation() noexcept {
 void DocumentCanvas::invalidateLayout() {
     layoutValid_ = false;
     visuals_.clear();
+    noteVisuals_.clear();
+    tocVisuals_.clear();
     tableVisuals_.clear();
     blockPlacements_.clear();
     updateScrollBars();
@@ -2998,14 +3574,71 @@ void DocumentCanvas::rebuildLayout() const {
         }
     }
     visuals_.clear();
+    noteVisuals_.clear();
+    tocVisuals_.clear();
     tableVisuals_.clear();
     blockPlacements_.clear();
     visuals_.reserve(snap.document.paragraphs().size());
     tableVisuals_.reserve(snap.document.tables().size());
     blockPlacements_.reserve(snap.document.bodyBlocks().size());
+    const auto margins = storyBodyMargins(snap.document, storyPaginationPass_ == 0 ? 1 : pageCount_);
+    const double bodyTop = margins.first;
+    const double bodyBottomMargin = margins.second;
+    bodyMarginTopPoints_ = bodyTop;
+    bodyMarginBottomPoints_ = bodyBottomMargin;
     int page = 0;
-    double y = marginTopPoints_;
-    const double pageBottom = pageHeightPoints_ - marginBottomPoints_;
+    double y = bodyTop;
+    const double pageBottom = pageHeightPoints_ - bodyBottomMargin;
+    const auto academic = core::resolveAcademic(snap.document);
+    const double noteWidth = std::max(36.0, pageWidthPoints_ - marginLeftPoints_ - marginRightPoints_);
+    std::unordered_map<core::NodeId, NoteVisual*, core::NodeIdHash> notesById;
+    for (const auto& note : academic.notes) {
+        auto visual = std::make_unique<NoteVisual>();
+        visual->id = note.id;
+        visual->kind = note.kind;
+        visual->ordinal = noteVisuals_.size();
+        QString text = QString::number(note.number) + QStringLiteral(". ") + fromUtf16(note.text);
+        text.replace(QLatin1Char('\n'), QChar::LineSeparator);
+        QFont noteFont = fontFrom({}, defaultFontFamily_, std::max(8.0, defaultFontPointSize_ * 0.85));
+        visual->layout = std::make_unique<QTextLayout>(text, noteFont);
+        QTextOption option;
+        option.setWrapMode(QTextOption::WrapAtWordBoundaryOrAnywhere);
+        visual->layout->setTextOption(option);
+        visual->layout->beginLayout();
+        while (true) {
+            auto line = visual->layout->createLine();
+            if (!line.isValid()) break;
+            line.setLineWidth(noteWidth);
+            visual->lines.push_back(line);
+            visual->pages.push_back(-1);
+        }
+        visual->layout->endLayout();
+        notesById.emplace(note.id, visual.get());
+        noteVisuals_.push_back(std::move(visual));
+    }
+    using FooterLine = std::pair<NoteVisual*, std::size_t>;
+    using Footers = std::map<int, std::vector<FooterLine>>;
+    Footers footers;
+    std::unordered_set<core::NodeId, core::NodeIdHash> assignedNotes;
+    const auto footerHeight = [](const Footers& pages, int index) {
+        const auto found = pages.find(index);
+        if (found == pages.end() || found->second.empty()) return 0.0;
+        double height = 12.0;
+        for (const auto& [note, line] : found->second) height += note->lines[line].height();
+        return height;
+    };
+    const double maximumFooterHeight = std::max(24.0, (pageBottom - bodyTop) * 0.45);
+    const auto allocateNote = [&](Footers& destination, int startPage, NoteVisual* note, std::size_t firstLine = 0) {
+        int targetPage = startPage;
+        int firstPage = -1;
+        for (std::size_t index = firstLine; index < note->lines.size(); ++index) {
+            while (footerHeight(destination, targetPage) + note->lines[index].height() > maximumFooterHeight &&
+                   !destination[targetPage].empty()) ++targetPage;
+            destination[targetPage].push_back({note, index});
+            if (firstPage < 0) firstPage = targetPage;
+        }
+        return firstPage;
+    };
 
     struct ListVisualMetrics {
         qreal maximumMarkerWidth{0.0};
@@ -3045,9 +3678,9 @@ void DocumentCanvas::rebuildLayout() const {
                                      std::size_t paragraphIndexValue) {
         const auto& paragraphFormat = paragraph.format();
         y += emuToPoints(paragraphFormat.space_before_emu);
-        if (paragraphFormat.page_break_before.value_or(false) && y > marginTopPoints_) {
+        if (paragraphFormat.page_break_before.value_or(false) && y > bodyTop) {
             ++page;
-            y = marginTopPoints_;
+            y = bodyTop;
         }
         const int initialPage = page;
         const double initialY = y;
@@ -3068,10 +3701,32 @@ void DocumentCanvas::rebuildLayout() const {
             36.0, pageWidthPoints_ - marginLeftPoints_ -
                       marginRightPoints_ - leftIndent - rightIndent);
         const double pageContentHeight = std::max(
-            18.0, pageHeightPoints_ - marginTopPoints_ -
-                      marginBottomPoints_);
+            18.0, pageHeightPoints_ - bodyTop -
+                      bodyBottomMargin);
 
         QString layoutText = visual->text;
+        if (!paragraph.fields().empty()) {
+            // Resolved text participates in shaping and wrapping, while the
+            // document still owns one atomic field position. Map display
+            // positions back to that atom for selection, navigation and IME.
+            layoutText.clear();
+            for (std::size_t offset = 0; offset < paragraph.text().size(); ++offset) {
+                visual->coreToLayout.push_back(static_cast<int>(layoutText.size()));
+                QString displayed(visual->text.at(static_cast<qsizetype>(offset)));
+                if (const auto* field = paragraph.fieldAt(offset);
+                    field && field->kind != core::FieldKind::note_reference) {
+                    displayed = fromUtf16(academic.fieldText(field->id));
+                    if (displayed.isEmpty()) displayed = QString(QChar(0x2060));
+                }
+                for (qsizetype index = 0; index < displayed.size(); ++index) {
+                    visual->layoutToCore.push_back(offset +
+                        (index * 2 >= displayed.size() ? 1U : 0U));
+                }
+                layoutText += displayed;
+            }
+            visual->coreToLayout.push_back(static_cast<int>(layoutText.size()));
+            visual->layoutToCore.push_back(paragraph.text().size());
+        }
         visual->images.reserve(paragraph.images().size());
         for (const auto& image : paragraph.images()) {
             if (image.utf16_offset >=
@@ -3094,7 +3749,7 @@ void DocumentCanvas::rebuildLayout() const {
                  pageContentHeight / heightPoints});
             const double width = widthPoints * fitScale;
             const double height = heightPoints * fitScale;
-            const auto layoutOffset = coreOffset;
+            const auto layoutOffset = static_cast<std::size_t>(visual->layoutOffsetForCore(coreOffset));
             layoutText[static_cast<qsizetype>(layoutOffset)] = anchored
                 ? QChar(0x2060)
                 : QChar(0x00a0);
@@ -3191,7 +3846,39 @@ void DocumentCanvas::rebuildLayout() const {
             visual->equations.push_back(
                 {layoutOffset, std::move(equationLayout), metrics,
                  fromArgb(characterFormat.foreground_argb.value_or(
-                     kDefaultTextArgb))});
+                     kDefaultTextArgb)), equation.display});
+        }
+
+        for (const auto& field : paragraph.fields()) {
+            const auto text = fromUtf16(academic.fieldText(field.id));
+            const auto format = paragraph.characterFormatAt(field.utf16_offset + 1);
+            const bool superscript = field.kind == core::FieldKind::note_reference;
+            const auto offset = static_cast<std::size_t>(visual->layoutOffsetForCore(field.utf16_offset));
+            const auto* resolved = academic.findField(field.id);
+            const auto color = resolved && resolved->unresolved ? QColor(QStringLiteral("#a44432")) :
+                fromArgb(format.foreground_argb.value_or(kDefaultTextArgb));
+            if (!superscript) {
+                QTextLayout::FormatRange range;
+                range.start = static_cast<int>(offset);
+                range.length = visual->layoutOffsetForCore(field.utf16_offset + 1) - range.start;
+                range.format = qtFormat(format, defaultFontFamily_, defaultFontPointSize_);
+                range.format.setForeground(color);
+                ranges.push_back(range);
+                continue;
+            }
+            QFont font = fontFrom(format, defaultFontFamily_, defaultFontPointSize_);
+            if (superscript) font.setPixelSize(std::max(6, static_cast<int>(std::lround(font.pixelSize() * 0.75))));
+            const double width = std::max(1.0, QFontMetricsF(font).horizontalAdvance(text));
+            QFont spacer = fontFrom(format, defaultFontFamily_, defaultFontPointSize_);
+            spacer.setWordSpacing(std::max(0.0, width - QFontMetricsF(spacer).horizontalAdvance(QChar(0x00a0))));
+            layoutText[static_cast<qsizetype>(offset)] = QChar(0x00a0);
+            QTextLayout::FormatRange range;
+            range.start = static_cast<int>(offset);
+            range.length = 1;
+            range.format = qtFormat(format, defaultFontFamily_, defaultFontPointSize_);
+            range.format.setFont(spacer);
+            ranges.push_back(range);
+            visual->fields.push_back({field.id, offset, text, font, color, superscript});
         }
 
         bool semanticList = false;
@@ -3344,9 +4031,9 @@ void DocumentCanvas::rebuildLayout() const {
             }
             if (image.layout.move_with_text &&
                 anchorY + image.rect.height() > pageBottom &&
-                anchorY > marginTopPoints_) {
+                anchorY > bodyTop) {
                 ++page;
-                y = marginTopPoints_;
+                y = bodyTop;
                 anchorPage = page;
                 anchorY = y;
                 if (nonOverlapPage == anchorPage) {
@@ -3398,9 +4085,9 @@ void DocumentCanvas::rebuildLayout() const {
                     }
                 }
                 y = exclusionBottom;
-                if (y < pageBottom || y <= marginTopPoints_) break;
+                if (y < pageBottom || y <= bodyTop) break;
                 ++page;
-                y = marginTopPoints_;
+                y = bodyTop;
             }
         };
 
@@ -3443,13 +4130,30 @@ void DocumentCanvas::rebuildLayout() const {
                     y = wrapBottom;
                     if (y >= pageBottom) {
                         ++page;
-                        y = marginTopPoints_;
+                        y = bodyTop;
                     }
                     advancePastTopAndBottom();
                     std::tie(wrapOffset, wrapBottom) = squareWrapOffset();
                 }
                 line.setLineWidth(
                     std::max(18.0, baseWidth - extra - wrapOffset));
+                const auto constrainDisplayLine = [&]() -> const EquationVisual* {
+                    const auto start = static_cast<std::size_t>(line.textStart());
+                    for (const auto& equation : visual->equations) {
+                        if (!equation.display || equation.utf16Offset < start) continue;
+                        if (equation.utf16Offset == start) {
+                            line.setNumColumns(1, equation.metrics.width);
+                            return &equation;
+                        }
+                        if (equation.utf16Offset < start + static_cast<std::size_t>(line.textLength())) {
+                            line.setNumColumns(static_cast<int>(equation.utf16Offset - start),
+                                               std::max(18.0, baseWidth - extra - wrapOffset));
+                        }
+                        break;
+                    }
+                    return nullptr;
+                };
+                const EquationVisual* displayLine = constrainDisplayLine();
                 const auto measureLine = [&]() {
                     const auto lineStart = static_cast<std::size_t>(
                         line.textStart());
@@ -3510,9 +4214,63 @@ void DocumentCanvas::rebuildLayout() const {
                 };
                 auto [lineStart, lineEnd, topPadding, advance] =
                     measureLine();
-                if (y + advance > pageBottom && y > marginTopPoints_) {
+                const auto reserveLineNotes = [&]() {
+                    std::vector<core::NodeId> added;
+                    double firstLineHeight = 12.0;
+                    if (const auto prior = footers.find(page); prior != footers.end()) {
+                        for (const auto& [note, index] : prior->second) if (index == 0) firstLineHeight += note->lines[index].height();
+                    }
+                    const double firstLineCapacity = std::max(1.0, pageBottom - bodyTop - advance);
+                    for (const auto& field : paragraph.fields()) {
+                        const auto fieldOffset = static_cast<std::size_t>(visual->layoutOffsetForCore(field.utf16_offset));
+                        if (field.kind != core::FieldKind::note_reference || fieldOffset < lineStart || fieldOffset >= lineEnd || assignedNotes.contains(field.target_id)) continue;
+                        const auto found = notesById.find(field.target_id);
+                        if (found == notesById.end() || found->second->kind != core::NoteKind::footnote ||
+                            std::find(added.begin(), added.end(), field.target_id) != added.end()) continue;
+                        if (!found->second->lines.empty()) {
+                            const double height = found->second->lines.front().height();
+                            if (firstLineHeight + height > firstLineCapacity && fieldOffset > lineStart) {
+                                line.setNumColumns(static_cast<int>(fieldOffset - lineStart), line.width());
+                                std::tie(lineStart, lineEnd, topPadding, advance) = measureLine();
+                                break;
+                            }
+                            firstLineHeight += height;
+                        }
+                        added.push_back(field.target_id);
+                    }
+                    std::optional<Footers> candidate;
+                    if (added.empty()) return std::tuple{std::move(candidate), std::move(added), true};
+                    candidate = footers;
+                    bool firstLinesFit = true;
+                    const double firstReservationLimit = std::min(firstLineCapacity, std::max(maximumFooterHeight, firstLineHeight));
+                    for (const auto id : added) {
+                        auto* note = notesById.at(id);
+                        if (note->lines.empty()) continue;
+                        while (footerHeight(*candidate, page) + note->lines[0].height() > firstReservationLimit) {
+                            auto& current = (*candidate)[page];
+                            const auto movable = std::find_if(current.rbegin(), current.rend(), [](const FooterLine& item) { return item.second > 0; });
+                            if (movable == current.rend()) { firstLinesFit = false; break; }
+                            FooterLine carried = *movable;
+                            current.erase(std::next(movable).base());
+                            int spillPage = page + 1;
+                            while (true) {
+                                auto& destination = (*candidate)[spillPage];
+                                destination.insert(destination.begin(), carried);
+                                if (footerHeight(*candidate, spillPage) <= maximumFooterHeight || destination.size() == 1) break;
+                                carried = destination.back();
+                                destination.pop_back();
+                                ++spillPage;
+                            }
+                        }
+                        if (firstLinesFit) (*candidate)[page].push_back({note, 0});
+                    }
+                    for (const auto id : added) allocateNote(*candidate, page, notesById.at(id), 1);
+                    return std::tuple{std::move(candidate), std::move(added), firstLinesFit};
+                };
+                auto [candidateFooters, addedNotes, firstNoteLinesFit] = reserveLineNotes();
+                while ((!firstNoteLinesFit || y + advance > pageBottom - footerHeight(candidateFooters ? *candidateFooters : footers, page)) && y > bodyTop) {
                     ++page;
-                    y = marginTopPoints_;
+                    y = bodyTop;
                     advancePastTopAndBottom();
                     std::tie(wrapOffset, wrapBottom) = squareWrapOffset();
                     if (baseWidth - extra - wrapOffset < 18.0 &&
@@ -3520,7 +4278,7 @@ void DocumentCanvas::rebuildLayout() const {
                         y = wrapBottom;
                         if (y >= pageBottom) {
                             ++page;
-                            y = marginTopPoints_;
+                            y = bodyTop;
                         }
                         advancePastTopAndBottom();
                         std::tie(wrapOffset, wrapBottom) =
@@ -3528,10 +4286,15 @@ void DocumentCanvas::rebuildLayout() const {
                     }
                     line.setLineWidth(
                         std::max(18.0, baseWidth - extra - wrapOffset));
+                    displayLine = constrainDisplayLine();
                     std::tie(lineStart, lineEnd, topPadding, advance) =
                         measureLine();
+                    std::tie(candidateFooters, addedNotes, firstNoteLinesFit) = reserveLineNotes();
                 }
+                if (candidateFooters) footers = std::move(*candidateFooters);
+                for (const auto id : addedNotes) assignedNotes.insert(id);
                 line.setPosition(QPointF(
+                    displayLine ? marginLeftPoints_ + leftIndent + (baseWidth - displayLine->metrics.width) / 2.0 :
                     marginLeftPoints_ + leftIndent + extra + wrapOffset,
                     y + topPadding));
                 for (auto& image : visual->images) {
@@ -3654,7 +4417,15 @@ void DocumentCanvas::rebuildLayout() const {
             semanticPalette = tableStylePalette(*table.style());
         }
         std::vector<double> columnWidths(table.columnCount());
-        if (imported != importedTables_.end() &&
+        const auto& authoredGeometry = tableResizeDrag_ && tableResizeDrag_->boundary.tableId == table.id()
+            ? tableResizeDrag_->preview : table.geometry();
+        if (authoredGeometry.column_widths_twips.size() == table.columnCount()) {
+            const double requested = std::accumulate(authoredGeometry.column_widths_twips.begin(),
+                authoredGeometry.column_widths_twips.end(), 0.0) / 20.0;
+            const double fit = requested > availableWidth ? availableWidth / requested : 1.0;
+            std::transform(authoredGeometry.column_widths_twips.begin(), authoredGeometry.column_widths_twips.end(),
+                columnWidths.begin(), [fit](std::uint32_t value) { return value / 20.0 * fit; });
+        } else if (imported != importedTables_.end() &&
             imported->columnWidthsPoints.size() == table.columnCount() &&
             std::all_of(imported->columnWidthsPoints.begin(),
                         imported->columnWidthsPoints.end(),
@@ -3745,9 +4516,22 @@ void DocumentCanvas::rebuildLayout() const {
                         std::move(format),
                         sourceCell->default_character_format);
                 }
-                const QString cellLayoutText = cell.text.isEmpty()
+                QString cellLayoutText = cell.text.isEmpty()
                     ? QString(QChar(0x2060))
                     : cell.text;
+                if (sourceCell) for (const auto& image : sourceCell->images) {
+                    const auto* decoded = decodedInlineImage(image);
+                    if (!decoded || image.utf16_offset >= static_cast<std::size_t>(cell.text.size())) continue;
+                    const double sourceWidth = static_cast<double>(image.width_emu) / kEmuPerPoint;
+                    const double sourceHeight = static_cast<double>(image.height_emu) / kEmuPerPoint;
+                    const double pictureWidthLimit = std::max(1.0, columnWidths[column] -
+                        (presentation ? presentation->paddingLeftPoints + presentation->paddingRightPoints : 10.0));
+                    const double availableHeight = std::max(1.0, pageBottom - bodyTop - 8.0);
+                    const double fit = std::min({1.0, pictureWidthLimit / sourceWidth, availableHeight / sourceHeight});
+                    cellLayoutText[static_cast<qsizetype>(image.utf16_offset)] = QChar(0x00a0);
+                    cell.images.push_back({image.id, *decoded, image.utf16_offset, image.utf16_offset,
+                        QRectF(0, 0, sourceWidth * fit, sourceHeight * fit), 0, {}});
+                }
                 cell.layout = std::make_unique<QTextLayout>(
                     cellLayoutText, fontFrom(format, defaultFontFamily_,
                                               defaultFontPointSize_));
@@ -3785,6 +4569,17 @@ void DocumentCanvas::rebuildLayout() const {
                             defaultFontPointSize_);
                         ranges.push_back(range);
                     }
+                    }
+                    for (const auto& image : cell.images) {
+                        const auto imageFormat = resolvedCharacterFormat(format,
+                            sourceCell->characterFormatAt(image.coreUtf16Offset + 1U));
+                        QFont spacer = fontFrom(imageFormat, defaultFontFamily_, defaultFontPointSize_);
+                        const auto naturalWidth = QFontMetricsF(spacer).horizontalAdvance(QChar(0x00a0));
+                        spacer.setWordSpacing(std::max(0.0, image.rect.width() - naturalWidth));
+                        QTextLayout::FormatRange range;
+                        range.start = static_cast<int>(image.coreUtf16Offset); range.length = 1;
+                        range.format = qtFormat(imageFormat, defaultFontFamily_, defaultFontPointSize_);
+                        range.format.setFont(spacer); ranges.push_back(range);
                     }
                     cell.layout->setFormats(ranges);
                 }
@@ -3828,6 +4623,25 @@ void DocumentCanvas::rebuildLayout() const {
                     if (presentation->borderLeft) {
                         cell.borderLeft = presentation->borderLeft;
                     }
+                }
+                if (sourceCell) {
+                    const auto& direct = sourceCell->layout;
+                    if (direct.vertical_alignment) {
+                        switch (*direct.vertical_alignment) {
+                            case core::TableCellVerticalAlignment::top: cell.verticalAlignment = ImportedCellVerticalAlignment::top; break;
+                            case core::TableCellVerticalAlignment::center: cell.verticalAlignment = ImportedCellVerticalAlignment::center; break;
+                            case core::TableCellVerticalAlignment::bottom: cell.verticalAlignment = ImportedCellVerticalAlignment::bottom; break;
+                        }
+                    }
+                    const auto applyBorder = [](const std::optional<core::TableBorder>& source,
+                                                 std::optional<ImportedCellBorderPresentation>& target) {
+                        if (source) target = ImportedCellBorderPresentation{source->argb,
+                            source->style == core::TableBorderStyle::none ? 0.0 : source->width_eighth_points / 8.0};
+                    };
+                    applyBorder(direct.border_top, cell.borderTop);
+                    applyBorder(direct.border_right, cell.borderRight);
+                    applyBorder(direct.border_bottom, cell.borderBottom);
+                    applyBorder(direct.border_left, cell.borderLeft);
                 }
                 QTextOption option;
                 option.setWrapMode(QTextOption::WrapAtWordBoundaryOrAnywhere);
@@ -3974,8 +4788,19 @@ void DocumentCanvas::rebuildLayout() const {
                     line.setLineWidth(std::max(
                         8.0, columnWidths[column] - cell.paddingLeft -
                                  cell.paddingRight));
-                    line.setPosition(QPointF(0.0, relativeY));
-                    relativeY += lineAdvance(line);
+                    double ascent = line.ascent();
+                    bool hasLineImage = false;
+                    for (const auto& image : cell.images)
+                        if (image.coreUtf16Offset >= static_cast<std::size_t>(line.textStart()) &&
+                            image.coreUtf16Offset < static_cast<std::size_t>(line.textStart() + line.textLength())) {
+                            ascent = std::max(ascent, image.rect.height());
+                            hasLineImage = true;
+                        }
+                    const double padding = ascent - line.ascent();
+                    line.setPosition(QPointF(0.0, relativeY + padding));
+                    relativeY += hasLineImage
+                        ? std::max(lineAdvance(line) + padding, ascent + line.descent())
+                        : lineAdvance(line);
                     cell.lines.push_back(line);
                 }
                 cell.layout->endLayout();
@@ -3999,9 +4824,11 @@ void DocumentCanvas::rebuildLayout() const {
                 rowCells.push_back(std::move(cell));
             }
 
-            if (y + rowHeight > pageBottom && y > marginTopPoints_) {
+            if (authoredGeometry.row_minimum_heights_twips.size() == table.rowCount())
+                rowHeight = std::max(rowHeight, authoredGeometry.row_minimum_heights_twips[row] / 20.0);
+            if (y + rowHeight > pageBottom - footerHeight(footers, page) && y > bodyTop) {
                 ++page;
-                y = marginTopPoints_;
+                y = bodyTop;
             }
             if (row == 0) {
                 firstPage = page;
@@ -4042,6 +4869,15 @@ void DocumentCanvas::rebuildLayout() const {
                         y + topBorderExtent + cell.paddingTop +
                             verticalOffset + line.y()));
                 }
+                for (auto& image : cell.images) for (const auto& line : cell.lines) {
+                    if (image.coreUtf16Offset >= static_cast<std::size_t>(line.textStart()) &&
+                        image.coreUtf16Offset < static_cast<std::size_t>(line.textStart() + line.textLength())) {
+                        image.rect.moveTopLeft(QPointF(line.cursorToX(static_cast<int>(image.coreUtf16Offset)),
+                            line.y() + line.ascent() - image.rect.height()));
+                        image.pageIndex = page;
+                        break;
+                    }
+                }
                 visual->cells.push_back(std::move(cell));
             }
             y += rowHeight;
@@ -4053,6 +4889,50 @@ void DocumentCanvas::rebuildLayout() const {
         tableVisuals_.push_back(std::move(visual));
     };
 
+    const auto layoutToc = [&](const core::TocBlock& toc) {
+        const int firstPage = page;
+        const double firstY = y;
+        const auto addRow = [&](const QString& text, core::NodeId target, int level, bool heading) {
+            auto row = std::make_unique<TocVisual>();
+            row->tocId = toc.id;
+            row->targetId = target;
+            row->font = fontFrom({}, defaultFontFamily_, defaultFontPointSize_);
+            if (heading) { row->font.setBold(true); row->font.setPixelSize(std::max(14, row->font.pixelSize())); }
+            row->layout = std::make_unique<QTextLayout>(text, row->font);
+            QTextOption option;
+            option.setWrapMode(QTextOption::WrapAtWordBoundaryOrAnywhere);
+            row->layout->setTextOption(option);
+            const double indent = std::max(0, level - 1) * 12.0;
+            const double width = std::max(18.0, noteWidth - indent - (target.isValid() ? 60.0 : 0.0));
+            row->layout->beginLayout();
+            while (true) {
+                auto line = row->layout->createLine();
+                if (!line.isValid()) break;
+                line.setLineWidth(width);
+                if (y + line.height() > pageBottom - footerHeight(footers, page) && y > bodyTop) {
+                    ++page;
+                    y = bodyTop;
+                }
+                line.setPosition(QPointF(marginLeftPoints_ + indent, y));
+                row->lines.push_back(line);
+                row->pages.push_back(page);
+                y += line.height();
+            }
+            row->layout->endLayout();
+            y += heading ? 6.0 : 3.0;
+            tocVisuals_.push_back(std::move(row));
+        };
+        addRow(tr("Contents"), {}, 1, true);
+        bool any = false;
+        for (const auto& entry : academic.toc_entries) if (entry.level <= toc.max_level) {
+            addRow(fromUtf16(entry.text), entry.paragraph_id, entry.level, false);
+            any = true;
+        }
+        if (!any) addRow(tr("No headings yet"), {}, 1, false);
+        y += 8.0;
+        blockPlacements_.push_back({toc.id, core::BodyBlockKind::table_of_contents, firstPage, page, firstY, y});
+    };
+
     for (const auto& block : snap.document.bodyBlocks()) {
         if (block.kind == core::BodyBlockKind::paragraph) {
             const auto paragraphIndex = snap.document.paragraphIndex(block.id);
@@ -4060,12 +4940,52 @@ void DocumentCanvas::rebuildLayout() const {
             if (paragraph && paragraphIndex) {
                 layoutParagraph(*paragraph, *paragraphIndex);
             }
+        } else if (block.kind == core::BodyBlockKind::table_of_contents) {
+            if (const auto* toc = snap.document.findToc(block.id)) layoutToc(*toc);
         } else if (const auto* table = snap.document.findTable(block.id)) {
             layoutTable(*table);
         }
     }
 
+    for (auto& note : noteVisuals_) if (note->kind == core::NoteKind::endnote) {
+        y += 12.0;
+        for (std::size_t index = 0; index < note->lines.size(); ++index) {
+            auto& line = note->lines[index];
+            if (y + line.height() > pageBottom - footerHeight(footers, page) && y > bodyTop) { ++page; y = bodyTop; }
+            line.setPosition(QPointF(marginLeftPoints_, y));
+            note->pages[index] = page;
+            y += line.height();
+        }
+    }
+    for (auto& [footerPage, lines] : footers) {
+        std::stable_sort(lines.begin(), lines.end(), [](const FooterLine& left, const FooterLine& right) {
+            return left.first->ordinal == right.first->ordinal ? left.second < right.second : left.first->ordinal < right.first->ordinal;
+        });
+        double footerY = pageBottom - footerHeight(footers, footerPage) + 12.0;
+        for (const auto& [note, index] : lines) {
+            note->lines[index].setPosition(QPointF(marginLeftPoints_, footerY));
+            note->pages[index] = footerPage;
+            footerY += note->lines[index].height();
+        }
+        page = std::max(page, footerPage);
+    }
+    // Filling the fixed page-number column cannot change row widths/heights,
+    // so this second pass never repaginates or iterates to convergence.
+    for (auto& row : tocVisuals_) if (row->targetId.isValid()) {
+        const auto found = std::find_if(blockPlacements_.begin(), blockPlacements_.end(),
+            [&row](const auto& placement) { return placement.id == row->targetId; });
+        row->pageText = found == blockPlacements_.end() ? QStringLiteral("—") : QString::number(found->firstPage + 1);
+    }
+
     pageCount_ = std::max(1, page + 1);
+    const auto finalMargins = storyBodyMargins(snap.document, pageCount_);
+    if (storyPaginationPass_ < 8 &&
+        (finalMargins.first > bodyTop + 0.01 || finalMargins.second > bodyBottomMargin + 0.01)) {
+        ++storyPaginationPass_;
+        rebuildLayout();
+        --storyPaginationPass_;
+        return;
+    }
     layoutRevision_ = snap.revision;
     layoutIsPreview_ = preview;
     layoutValid_ = true;
@@ -4100,7 +5020,7 @@ void DocumentCanvas::paintEvent(QPaintEvent*) {
     ensureLayout();
     updateStoryEditorGeometry();
     QPainter painter(viewport());
-    painter.fillRect(viewport()->rect(), QColor(QStringLiteral("#e8eaed")));
+    painter.fillRect(viewport()->rect(), workspaceColor());
     const double scale = kScreenPointsScale * zoomPercent_ / 100.0;
     const double pagePixelWidth = pageWidthPoints_ * scale;
     const double documentWidth = std::max(pagePixelWidth + 2 * kCanvasPaddingPixels,
@@ -4116,15 +5036,15 @@ void DocumentCanvas::paintEvent(QPaintEvent*) {
         }
         painter.fillRect(pageRect.translated(3, 4), QColor(0, 0, 0, 38));
         painter.fillRect(pageRect, Qt::white);
-        painter.setPen(previewId_ ? QColor(QStringLiteral("#2f80ed"))
+        painter.setPen(previewId_ ? accentColor()
                                   : QColor(QStringLiteral("#c9cdd2")));
         painter.drawRect(pageRect);
         renderPage(painter, page, pageRect.topLeft(), scale, true);
         if (previewId_ && page == 0) {
             const QRectF badge(pageRect.left() + 10.0, pageRect.top() + 10.0,
                                160.0, 24.0);
-            painter.fillRect(badge, QColor(QStringLiteral("#eaf4ff")));
-            painter.setPen(QColor(QStringLiteral("#165d9c")));
+            painter.fillRect(badge, QColor(QStringLiteral("#eef5f1")));
+            painter.setPen(accentColor());
             painter.drawText(badge, Qt::AlignCenter, tr("CODEX PREVIEW — NOT APPLIED"));
         }
     }
@@ -4146,8 +5066,7 @@ void DocumentCanvas::renderPage(QPainter& painter, int pageIndexValue,
     // viewed at non-integral zoom levels. This does not rewrite source bytes.
     painter.setRenderHint(QPainter::SmoothPixmapTransform, true);
 
-    QFont storyFont(defaultFontFamily_);
-    storyFont.setPointSizeF(defaultFontPointSize_);
+    const QFont storyFont = fontFrom({}, defaultFontFamily_, defaultFontPointSize_);
     painter.setFont(storyFont);
     painter.setPen(Qt::black);
     const double storyLeft = marginLeftPoints_;
@@ -4157,82 +5076,14 @@ void DocumentCanvas::renderPage(QPainter& painter, int pageIndexValue,
                                const std::vector<core::ImageAtom>& images,
                                bool footer) {
         const auto sections = splitStorySections(fromUtf16(source));
-        const double top = footer
-            ? pageHeightPoints_ - marginBottomPoints_ + 9.0 : 18.0;
-        const double height = footer
-            ? std::max(12.0, marginBottomPoints_ - 18.0)
-            : std::max(12.0, marginTopPoints_ - 27.0);
+        std::size_t globalOffset = 0;
         for (int index = 0; index < 3; ++index) {
-            const QRectF rect(
-                storyLeft + storyWidth * static_cast<double>(index) / 3.0,
-                top, storyWidth / 3.0, height);
-            QString text = sections[static_cast<std::size_t>(index)];
-            text.replace(QStringLiteral("{PAGE}"),
-                         QString::number(pageIndexValue + 1),
-                         Qt::CaseInsensitive);
-            text.replace(QStringLiteral("{PAGES}"),
-                         QString::number(pageCount_), Qt::CaseInsensitive);
-            std::vector<const core::ImageAtom*> regionImages;
-            for (const auto& image : images) {
-                int imageRegion = 0;
-                for (std::size_t offset = 0;
-                     offset < image.utf16_offset && offset < source.size();
-                     ++offset) {
-                    if (source[offset] == u'\t') {
-                        imageRegion = std::min(2, imageRegion + 1);
-                    }
-                }
-                if (imageRegion == index) regionImages.push_back(&image);
-            }
-            const QStringList parts = text.split(
-                QChar(core::kInlineObjectReplacementCharacter),
-                Qt::KeepEmptyParts);
-            const QFontMetricsF metrics(painter.font());
-            std::vector<double> imageWidths;
-            std::vector<double> imageHeights;
-            double totalWidth = 0.0;
-            for (int part = 0; part < parts.size(); ++part) {
-                totalWidth += metrics.horizontalAdvance(parts[part]);
-                if (part >= static_cast<int>(regionImages.size())) continue;
-                const auto* image = regionImages[static_cast<std::size_t>(part)];
-                const double naturalWidth =
-                    static_cast<double>(image->width_emu) / kEmuPerPoint;
-                const double naturalHeight =
-                    static_cast<double>(image->height_emu) / kEmuPerPoint;
-                const double fit = std::min(
-                    {1.0, rect.height() / std::max(1.0, naturalHeight),
-                     rect.width() / std::max(1.0, naturalWidth)});
-                imageWidths.push_back(naturalWidth * fit);
-                imageHeights.push_back(naturalHeight * fit);
-                totalWidth += imageWidths.back();
-            }
-            double x = index == 0 ? rect.left()
-                : index == 1 ? rect.center().x() - totalWidth / 2.0
-                             : rect.right() - totalWidth;
-            x = std::max(rect.left(), x);
-            std::size_t imageIndex = 0;
-            for (int part = 0; part < parts.size(); ++part) {
-                const QString& fragment = parts[part];
-                const double textWidth = metrics.horizontalAdvance(fragment);
-                const double textY = footer
-                    ? rect.bottom() - metrics.descent()
-                    : rect.top() + metrics.ascent();
-                painter.drawText(QPointF(x, textY), fragment);
-                x += textWidth;
-                if (part >= static_cast<int>(regionImages.size())) continue;
-                const auto* image = regionImages[imageIndex];
-                const QImage* decoded = decodedInlineImage(*image);
-                const double imageWidth = imageWidths[imageIndex];
-                const double imageHeight = imageHeights[imageIndex];
-                const double imageY = footer
-                    ? rect.bottom() - imageHeight : rect.top();
-                if (decoded) {
-                    painter.drawImage(
-                        QRectF(x, imageY, imageWidth, imageHeight), *decoded);
-                }
-                x += imageWidth;
-                ++imageIndex;
-            }
+            const auto rect = storyRegion(footer, index);
+            const auto& text = sections[static_cast<std::size_t>(index)];
+            const auto story = layoutStoryRegion(text, images, globalOffset, rect, index, footer,
+                pageIndexValue, pageCount_, storyFont);
+            drawStoryLayout(painter, story, [this](const auto& image) { return decodedInlineImage(image); }, decorations);
+            globalOffset += static_cast<std::size_t>(text.size()) + 1U;
         }
     };
     if (!snap.document.headerText().empty() ||
@@ -4244,24 +5095,6 @@ void DocumentCanvas::renderPage(QPainter& painter, int pageIndexValue,
         !snap.document.footerImages().empty()) {
         drawStory(snap.document.footerText(),
                   snap.document.footerImages(), true);
-    }
-    if (decorations && headerFooterEditing_) {
-        painter.save();
-        painter.setPen(QPen(QColor(QStringLiteral("#7b8794")), 0.8,
-                            Qt::DashLine));
-        for (const bool footer : {false, true}) {
-            const double top = footer
-                ? pageHeightPoints_ - marginBottomPoints_ + 7.0 : 14.0;
-            const double height = footer
-                ? std::max(18.0, marginBottomPoints_ - 14.0)
-                : std::max(18.0, marginTopPoints_ - 21.0);
-            for (int index = 0; index < 3; ++index) {
-                painter.drawRect(QRectF(
-                    storyLeft + storyWidth * static_cast<double>(index) / 3.0,
-                    top, storyWidth / 3.0, height));
-            }
-        }
-        painter.restore();
     }
 
     for (const auto& tableVisual : tableVisuals_) {
@@ -4277,7 +5110,7 @@ void DocumentCanvas::renderPage(QPainter& painter, int pageIndexValue,
             const bool selectedCell = decorations &&
                 tableCellIsSelected(table.id, cell.row, cell.column);
             if (tableObjectSelected || selectedCell) {
-                painter.fillRect(cell.rect, QColor(51, 132, 255, 28));
+                painter.fillRect(cell.rect, QColor(36, 86, 72, 28));
             }
             std::optional<std::pair<std::size_t, std::size_t>>
                 activeCellTextSelection;
@@ -4308,7 +5141,7 @@ void DocumentCanvas::renderPage(QPainter& painter, int pageIndexValue,
                 const auto drawBorder = [&painter](
                     const std::optional<ImportedCellBorderPresentation>& border,
                     const QLineF& line) {
-                    if (!border) return;
+                    if (!border || border->widthPoints <= 0.0) return;
                     painter.setPen(QPen(
                         fromArgb(border->argb), border->widthPoints));
                     painter.drawLine(line);
@@ -4323,7 +5156,7 @@ void DocumentCanvas::renderPage(QPainter& painter, int pageIndexValue,
                            QLineF(cell.rect.topLeft(), cell.rect.bottomLeft()));
             }
             if (tableObjectSelected || selectedCell) {
-                painter.setPen(QPen(QColor(QStringLiteral("#2f80ed")), 1.2));
+                painter.setPen(QPen(accentColor(), 1.2));
                 painter.drawRect(cell.rect);
             }
             const auto cellSpellingWords =
@@ -4351,6 +5184,15 @@ void DocumentCanvas::renderPage(QPainter& painter, int pageIndexValue,
                     }
                 }
                 line.draw(&painter, QPointF());
+                for (const auto& image : cell.images) {
+                    if (image.coreUtf16Offset < static_cast<std::size_t>(line.textStart()) ||
+                        image.coreUtf16Offset >= static_cast<std::size_t>(line.textStart() + line.textLength())) continue;
+                    painter.drawImage(image.rect, image.image);
+                    if (decorations && selectedImage == image.id) {
+                        painter.setPen(QPen(accentColor(), 1.0));
+                        painter.setBrush(Qt::NoBrush); painter.drawRect(image.rect);
+                    }
+                }
                 if (!cellSpellingWords.empty()) {
                     const auto spellingLineStart = static_cast<std::size_t>(
                         std::max(0, line.textStart()));
@@ -4392,7 +5234,7 @@ void DocumentCanvas::renderPage(QPainter& painter, int pageIndexValue,
         if (decorations && table.handlePageIndex == pageIndexValue) {
             painter.fillRect(table.handleRect,
                              tableObjectSelected
-                                 ? QColor(QStringLiteral("#2f80ed"))
+                                 ? accentColor()
                                  : QColor(QStringLiteral("#5e2750")));
             painter.setPen(QPen(Qt::white, 0.8));
             const QPointF center = table.handleRect.center();
@@ -4406,7 +5248,7 @@ void DocumentCanvas::renderPage(QPainter& painter, int pageIndexValue,
     for (const auto& paragraphVisual : visuals_) {
         const auto& paragraph = *paragraphVisual;
         const auto paragraphSpellingWords =
-            decorations && spelling_.available()
+            decorations && !paragraph.generated && spelling_.available()
                 ? spellingWords(paragraph.text)
                 : std::vector<SpellingWord>{};
         for (const auto& image : paragraph.images) {
@@ -4421,10 +5263,10 @@ void DocumentCanvas::renderPage(QPainter& painter, int pageIndexValue,
                     image.id == *selectedImage) {
                     painter.setBrush(Qt::NoBrush);
                     painter.setPen(QPen(
-                        QColor(QStringLiteral("#2f80ed")), 1.2));
+                        accentColor(), 1.2));
                     painter.drawRect(renderedRect);
                     constexpr double kHandleSize = 5.0;
-                    painter.setBrush(QColor(QStringLiteral("#2f80ed")));
+                    painter.setBrush(accentColor());
                     const auto drawHandle =
                         [&painter, kHandleSize](const QPointF& center) {
                         painter.drawRect(QRectF(
@@ -4448,7 +5290,7 @@ void DocumentCanvas::renderPage(QPainter& painter, int pageIndexValue,
             if (visualLine.pageIndex != pageIndexValue) {
                 continue;
             }
-            if (decorations && normalized && !normalized.value().empty()) {
+            if (decorations && !paragraph.generated && normalized && !normalized.value().empty()) {
                 const auto& range = normalized.value();
                 if (visualLine.paragraphIndex >= range.start_paragraph_index &&
                     visualLine.paragraphIndex <= range.end_paragraph_index) {
@@ -4493,6 +5335,13 @@ void DocumentCanvas::renderPage(QPainter& painter, int pageIndexValue,
                                    visualLine.line.ascent()),
                     equation.color);
             }
+            for (const auto& field : paragraph.fields) {
+                if (field.offset < lineStart || field.offset >= lineEnd) continue;
+                painter.setFont(field.font);
+                painter.setPen(field.color);
+                painter.drawText(QPointF(visualLine.line.cursorToX(static_cast<int>(field.offset)),
+                    visualLine.line.y() + visualLine.line.ascent() - (field.superscript ? visualLine.line.ascent() * 0.30 : 0.0)), field.text);
+            }
 
             if (!paragraphSpellingWords.empty()) {
                 const auto spellingLineStart = static_cast<std::size_t>(
@@ -4532,7 +5381,7 @@ void DocumentCanvas::renderPage(QPainter& painter, int pageIndexValue,
 
     if (decorations && draggingTable_ && tableDropTargetValid_) {
         int targetPage = 0;
-        double targetY = marginTopPoints_;
+        double targetY = bodyMarginTopPoints_;
         if (tableDropBefore_) {
             const auto found = std::find_if(
                 blockPlacements_.begin(), blockPlacements_.end(),
@@ -4548,7 +5397,7 @@ void DocumentCanvas::renderPage(QPainter& painter, int pageIndexValue,
             targetY = blockPlacements_.back().bottom;
         }
         if (targetPage == pageIndexValue) {
-            painter.setPen(QPen(QColor(QStringLiteral("#2f80ed")), 2.0));
+            painter.setPen(QPen(accentColor(), 2.0));
             painter.drawLine(QPointF(marginLeftPoints_, targetY),
                              QPointF(pageWidthPoints_ - marginRightPoints_, targetY));
         }
@@ -4616,12 +5465,58 @@ void DocumentCanvas::renderPage(QPainter& painter, int pageIndexValue,
                                                 caretLine->line.height()));
         }
     }
+    for (const auto& row : tocVisuals_) {
+        painter.setPen(Qt::black);
+        for (std::size_t index = 0; index < row->lines.size(); ++index) {
+            if (row->pages[index] != pageIndexValue) continue;
+            row->lines[index].draw(&painter, QPointF());
+            if (index + 1 == row->lines.size() && !row->pageText.isEmpty()) {
+                painter.setFont(row->font);
+                painter.drawText(QPointF(pageWidthPoints_ - marginRightPoints_ - QFontMetricsF(row->font).horizontalAdvance(row->pageText),
+                    row->lines[index].y() + row->lines[index].ascent()), row->pageText);
+            }
+        }
+    }
+    bool separatorDrawn = false;
+    for (const auto& note : noteVisuals_) {
+        for (std::size_t index = 0; index < note->lines.size(); ++index) {
+            if (note->pages[index] != pageIndexValue) continue;
+            const auto& line = note->lines[index];
+            painter.setPen(Qt::black);
+            if (note->kind == core::NoteKind::footnote && !separatorDrawn) {
+                painter.setPen(QPen(QColor(QStringLiteral("#626a66")), 0.5));
+                painter.drawLine(QPointF(marginLeftPoints_, line.y() - 7.0),
+                    QPointF(marginLeftPoints_ + 90.0, line.y() - 7.0));
+                painter.setPen(Qt::black);
+                separatorDrawn = true;
+            }
+            line.draw(&painter, QPointF());
+        }
+    }
+    if (decorations && headerFooterEditing_) {
+        const double bodyBottom = pageHeightPoints_ - bodyMarginBottomPoints_;
+        painter.fillRect(QRectF(0, bodyMarginTopPoints_, pageWidthPoints_, std::max(0.0, bodyBottom - bodyMarginTopPoints_)), QColor(255, 255, 255, 165));
+        painter.setPen(QPen(QColor(QStringLiteral("#7b8794")), 0.7, Qt::DashLine));
+        painter.drawLine(QPointF(storyLeft, bodyMarginTopPoints_), QPointF(storyLeft + storyWidth, bodyMarginTopPoints_));
+        painter.drawLine(QPointF(storyLeft, bodyBottom), QPointF(storyLeft + storyWidth, bodyBottom));
+        painter.setFont(fontFrom({}, defaultFontFamily_, 8.0));
+        painter.setPen(QColor(QStringLiteral("#5f6b67")));
+        const QFontMetricsF labelMetrics(painter.font());
+        const auto headerLabel = tr("Header");
+        const auto footerLabel = tr("Footer");
+        painter.drawText(QPointF(storyLeft - labelMetrics.horizontalAdvance(headerLabel) - 4.0,
+            std::max(bodyMarginTopPoints_ - 4.0, 48.0)), headerLabel);
+        painter.drawText(QPointF(storyLeft - labelMetrics.horizontalAdvance(footerLabel) - 4.0,
+            bodyBottom + 7.0), footerLabel);
+    }
     painter.restore();
 }
 
 void DocumentCanvas::resizeEvent(QResizeEvent* event) {
+    cancelTableResize();
     QAbstractScrollArea::resizeEvent(event);
     updateScrollBars();
+    if (headerFooterEditing_) { updateStoryEditorGeometry(); revealCursor(); }
 }
 
 void DocumentCanvas::wheelEvent(QWheelEvent* event) {
@@ -4678,6 +5573,13 @@ bool DocumentCanvas::apply(std::vector<core::Operation> operations,
                            std::optional<LineAffinity> resultingLineAffinity,
                            std::optional<core::CharacterFormatMask>
                                resultingTypingOverrideMask) {
+    if (headerFooterEditing_ && std::any_of(operations.begin(), operations.end(), [](const core::Operation& operation) {
+            return !std::holds_alternative<core::SetHeaderText>(operation) && !std::holds_alternative<core::SetFooterText>(operation) &&
+                   !std::holds_alternative<core::InsertHeaderFooterImage>(operation);
+        })) {
+        emit operationFailed(tr("Close Header and Footer before editing the document body."));
+        return false;
+    }
     if (rejectLiveEditDuringPreview()) {
         return false;
     }
@@ -4702,6 +5604,9 @@ bool DocumentCanvas::apply(std::vector<core::Operation> operations,
         endTypingGroup();
         emit operationFailed(errorText(result.error()));
         return false;
+    }
+    if (plannedOperations_ && result.value().changed) {
+        plannedOperations_->insert(plannedOperations_->end(), operations.begin(), operations.end());
     }
     if (resultingSelection) {
         selection_ = *resultingSelection;
@@ -5066,6 +5971,341 @@ bool DocumentCanvas::insertEquation(const QString& latex, bool display) {
         std::move(formattingPlan.resulting_typing_override_mask));
 }
 
+std::optional<core::NodeId> DocumentCanvas::selectedEquationId() const {
+    if (tableCursor_ || selectedTable_ || headerFooterEditing_) return std::nullopt;
+    const auto snap = visibleDocumentSnapshot();
+    const auto normalized = snap.document.normalizeRange(selection_);
+    if (!normalized || normalized.value().start.paragraph_id != normalized.value().end.paragraph_id) return std::nullopt;
+    const auto* paragraph = snap.document.findParagraph(normalized.value().start.paragraph_id);
+    if (!paragraph) return std::nullopt;
+    const auto start = normalized.value().start.utf16_offset;
+    const auto end = normalized.value().end.utf16_offset;
+    if (end - start == 1) {
+        if (const auto* equation = paragraph->equationAt(start)) return equation->id;
+    }
+    return std::nullopt;
+}
+
+bool DocumentCanvas::selectEquation(core::NodeId equationId) {
+    if (previewId_) return false;
+    const auto snap = session_->snapshot();
+    for (const auto& paragraph : snap.document.paragraphs()) {
+        for (const auto& equation : paragraph.equations()) if (equation.id == equationId) {
+            const core::Position start{paragraph.id(), equation.utf16_offset};
+            const core::Position end{paragraph.id(), equation.utf16_offset + 1};
+            selectRange({start, end}, LineAffinity{paragraph.id(), static_cast<int>(equation.utf16_offset)});
+            return true;
+        }
+    }
+    return false;
+}
+
+bool DocumentCanvas::replaceSelectedEquation(const QString& latex, bool display) {
+    const auto id = selectedEquationId();
+    if (!id || rejectLiveEditDuringPreview()) return false;
+    const auto parsed = math::parseLatex(latex.toStdString(), editorEquationLimits());
+    if (!parsed) return false;
+    return apply({core::ReplaceEquation{*id, math::toCanonicalLatex(parsed.value()), display}});
+}
+
+void DocumentCanvas::showEquationEditor() {
+    if (rejectLiveEditDuringPreview()) return;
+    const auto snap = session_->snapshot();
+    const auto id = selectedEquationId();
+    const auto* equation = id ? snap.document.findEquation(*id) : nullptr;
+    EquationEditorDialog dialog(equation ? QString::fromStdString(equation->canonical_latex) : QString(),
+                                equation && equation->display, this);
+    if (dialog.exec() == QDialog::Accepted) {
+        if (equation) replaceSelectedEquation(dialog.canonicalLatex(), dialog.displayEquation());
+        else insertEquation(dialog.canonicalLatex(), dialog.displayEquation());
+    }
+    setFocus();
+}
+
+bool DocumentCanvas::insertNote(const QString& text, core::NoteKind kind) {
+    if (tableCursor_ || selectedTable_ || headerFooterEditing_ || rejectLiveEditDuringPreview()) return false;
+    const auto noteId = core::NodeId::generate();
+    auto position = selection_.focus;
+    auto end = position;
+    ++end.utf16_offset;
+    return apply({core::SetNote{{noteId, kind, text.toStdU16String()}},
+        core::InsertField{position, {core::NodeId::generate(), 0, core::FieldKind::note_reference, noteId}, typingFormat_}}, end);
+}
+
+bool DocumentCanvas::updateNote(core::NodeId id, const QString& text) {
+    const auto snap = session_->snapshot();
+    const auto* note = snap.document.findNote(id);
+    return note && apply({core::SetNote{{id, note->kind, text.toStdU16String()}}});
+}
+
+bool DocumentCanvas::insertCaption(core::CaptionLabel label, const QString& text) {
+    if (tableCursor_ || headerFooterEditing_ || rejectLiveEditDuringPreview()) return false;
+    const auto snap = session_->snapshot();
+    const auto* paragraph = snap.document.findParagraph(selection_.focus.paragraph_id);
+    if (!paragraph) return false;
+    const auto id = core::NodeId::generate();
+    const auto target = selectedTable_.value_or(selectedInlineImageId().value_or(selectedEquationId().value_or(paragraph->id())));
+    const auto end = core::Position{paragraph->id(), paragraph->text().size()};
+    std::vector<core::Operation> operations{
+        core::SplitParagraph{end, id},
+        core::SetParagraphStyle{{id}, std::string("Normal")},
+        core::SetCaption{id, core::CaptionMetadata{label, target}},
+        core::InsertText{{id, 0}, (QStringLiteral(": ") + text).toStdU16String(), std::nullopt},
+        core::InsertField{{id, 0}, {core::NodeId::generate(), 0, core::FieldKind::caption_number, id}, std::nullopt}};
+    if (selectedTable_) {
+        const auto block = std::find_if(snap.document.bodyBlocks().begin(), snap.document.bodyBlocks().end(),
+            [this](const auto& item) { return item.id == *selectedTable_; });
+        std::optional<core::NodeId> before;
+        if (block != snap.document.bodyBlocks().end() && std::next(block) != snap.document.bodyBlocks().end()) before = std::next(block)->id;
+        operations.push_back(core::MoveBodyBlock{id, before});
+    }
+    return apply(std::move(operations), core::Position{id, static_cast<std::size_t>(text.size()) + 3},
+                 std::nullopt, false, std::nullopt, false, true);
+}
+
+bool DocumentCanvas::insertBibliographyEntry(const QString& text) {
+    if (tableCursor_ || selectedTable_ || headerFooterEditing_ || rejectLiveEditDuringPreview()) return false;
+    const auto snap = session_->snapshot();
+    const auto* paragraph = snap.document.findParagraph(selection_.focus.paragraph_id);
+    if (!paragraph) return false;
+    const auto id = core::NodeId::generate();
+    return apply({core::SplitParagraph{{paragraph->id(), paragraph->text().size()}, id},
+        core::SetParagraphStyle{{id}, std::string("Normal")},
+        core::SetBibliographyEntry{id, true},
+        core::InsertText{{id, 0}, (QStringLiteral(". ") + text).toStdU16String(), std::nullopt},
+        core::InsertField{{id, 0}, {core::NodeId::generate(), 0, core::FieldKind::bibliography_number, id}, std::nullopt}},
+        core::Position{id, static_cast<std::size_t>(text.size()) + 3});
+}
+
+bool DocumentCanvas::insertAcademicField(core::FieldKind kind, core::NodeId target, const QString& locator, bool fullText) {
+    if (tableCursor_ || selectedTable_ || headerFooterEditing_ || rejectLiveEditDuringPreview()) return false;
+    const auto position = selection_.focus;
+    auto end = position;
+    ++end.utf16_offset;
+    core::FieldAtom field{core::NodeId::generate(), 0, kind, target, locator.toStdU16String(),
+        fullText ? core::CrossReferenceFormat::full_text : core::CrossReferenceFormat::label_number};
+    return apply({core::InsertField{position, field, typingFormat_}}, end);
+}
+
+bool DocumentCanvas::insertCitation(core::NodeId entryId, const QString& locator) {
+    const auto snap = session_->snapshot();
+    const auto* entry = snap.document.findParagraph(entryId);
+    return entry && entry->isBibliographyEntry() && insertAcademicField(core::FieldKind::citation, entryId, locator);
+}
+
+bool DocumentCanvas::insertCrossReference(core::NodeId targetId, bool fullText) {
+    const auto snap = session_->snapshot();
+    const auto* target = snap.document.findParagraph(targetId);
+    return target && insertAcademicField(core::FieldKind::cross_reference, targetId, {}, fullText);
+}
+
+bool DocumentCanvas::insertTableOfContents(int maximumLevel) {
+    if (tableCursor_ || selectedTable_ || headerFooterEditing_ || maximumLevel < 1 || maximumLevel > 9 || rejectLiveEditDuringPreview()) return false;
+    auto position = selection_.focus;
+    std::vector<core::Operation> operations;
+    if (position.utf16_offset > 0) {
+        const auto id = core::NodeId::generate();
+        operations.push_back(core::SplitParagraph{position, id});
+        position = {id, 0};
+    }
+    operations.push_back(core::InsertToc{position.paragraph_id, {core::NodeId::generate(), static_cast<std::uint8_t>(maximumLevel)}});
+    return apply(std::move(operations), position);
+}
+
+void DocumentCanvas::showReferencesEditor(const QString& kind) {
+    if (rejectLiveEditDuringPreview()) return;
+    const auto snap = session_->snapshot();
+    const auto resolved = core::resolveAcademic(snap.document);
+    const core::FieldAtom* selectedField = nullptr;
+    const auto selected = snap.document.normalizeRange(selection_);
+    if (selected && selected.value().start.paragraph_id == selected.value().end.paragraph_id &&
+        selected.value().end.utf16_offset - selected.value().start.utf16_offset == 1) {
+        if (const auto* paragraph = snap.document.findParagraph(selected.value().start.paragraph_id)) selectedField = paragraph->fieldAt(selected.value().start.utf16_offset);
+    }
+    QDialog dialog(this);
+    dialog.setObjectName(QStringLiteral("references.dialog"));
+    dialog.setWindowTitle(tr("References"));
+    dialog.resize(560, 360);
+    auto* layout = new QVBoxLayout(&dialog);
+    auto* form = new QFormLayout;
+    layout->addLayout(form);
+    auto* target = new QComboBox(&dialog);
+    target->setObjectName(QStringLiteral("references.target"));
+    target->setAccessibleName(tr("Reference target"));
+    std::vector<core::NodeId> targets;
+    auto* text = new QPlainTextEdit(&dialog);
+    text->setObjectName(QStringLiteral("references.text"));
+    text->setAccessibleName(tr("Reference text"));
+    auto* type = new QComboBox(&dialog);
+    type->setObjectName(QStringLiteral("references.type"));
+    type->setAccessibleName(tr("Caption type"));
+    type->addItems({tr("Figure"), tr("Table"), tr("Equation")});
+    auto* locator = new QLineEdit(&dialog);
+    locator->setObjectName(QStringLiteral("references.locator"));
+    locator->setAccessibleName(tr("Citation locator"));
+    locator->setPlaceholderText(tr("Optional, for example p. 42"));
+    locator->setMaxLength(256);
+    auto* fullText = new QCheckBox(tr("Include full caption text"), &dialog);
+    auto* level = new QSpinBox(&dialog);
+    level->setObjectName(QStringLiteral("references.level"));
+    level->setAccessibleName(tr("Maximum heading level"));
+    level->setRange(1, 9);
+    level->setValue(3);
+    const bool note = kind == QStringLiteral("footnote") || kind == QStringLiteral("endnote");
+    const bool editNote = kind == QStringLiteral("editNote");
+    const bool citation = kind == QStringLiteral("citation");
+    const bool reference = kind == QStringLiteral("crossReference");
+    const bool caption = kind == QStringLiteral("caption");
+    const bool bibliography = kind == QStringLiteral("bibliography");
+    const bool toc = kind == QStringLiteral("toc") || kind == QStringLiteral("manageToc");
+    const bool manageToc = kind == QStringLiteral("manageToc");
+    target->setVisible(editNote || citation || reference || manageToc);
+    text->setVisible(note || editNote || caption || bibliography);
+    type->setVisible(caption);
+    locator->setVisible(citation);
+    fullText->setVisible(reference);
+    level->setVisible(toc);
+    if (editNote) {
+        for (const auto& entry : resolved.notes) {
+            targets.push_back(entry.id);
+            target->addItem(tr("%1 %2 — %3").arg(entry.kind == core::NoteKind::footnote ? tr("Footnote") : tr("Endnote"))
+                .arg(entry.number).arg(fromUtf16(entry.text).left(60)));
+        }
+        form->addRow(tr("Note"), target);
+        const auto load = [target, text, &targets, &snap] {
+            const int index = target->currentIndex();
+            if (index >= 0 && static_cast<std::size_t>(index) < targets.size()) {
+                if (const auto* item = snap.document.findNote(targets[static_cast<std::size_t>(index)])) text->setPlainText(fromUtf16(item->text));
+            }
+        };
+        connect(target, &QComboBox::currentIndexChanged, &dialog, [load](int) { load(); });
+        load();
+    }
+    if (citation || reference) {
+        for (const auto& block : snap.document.bodyBlocks()) {
+            const auto* paragraph = snap.document.findParagraph(block.id);
+            if (!paragraph) continue;
+            const auto* style = paragraph->styleId() ? core::findBuiltInParagraphStyle(*paragraph->styleId()) : nullptr;
+            if ((citation && paragraph->isBibliographyEntry()) || (reference && (paragraph->caption() || (style && style->outline_level)))) {
+                targets.push_back(paragraph->id());
+                target->addItem(fromUtf16(core::academicParagraphText(*paragraph, resolved)).left(100));
+            }
+        }
+        form->addRow(citation ? tr("Bibliography entry") : tr("Heading or caption"), target);
+    }
+    if (manageToc) {
+        for (const auto& item : snap.document.tablesOfContents()) {
+            targets.push_back(item.id);
+            target->addItem(tr("Table of contents %1").arg(targets.size()));
+        }
+        form->addRow(tr("Table of contents"), target);
+        connect(target, &QComboBox::currentIndexChanged, &dialog, [target, level, &targets, &snap](int index) {
+            if (index >= 0 && static_cast<std::size_t>(index) < targets.size()) {
+                if (const auto* item = snap.document.findToc(targets[static_cast<std::size_t>(index)])) level->setValue(item->max_level);
+            }
+        });
+        if (!targets.empty()) level->setValue(snap.document.findToc(targets.front())->max_level);
+    }
+    if (caption) {
+        form->addRow(tr("Caption type"), type);
+        if (selectedTable_) type->setCurrentIndex(1);
+        else if (selectedEquationId()) type->setCurrentIndex(2);
+    }
+    if (note || editNote || caption || bibliography) {
+        form->addRow(note || editNote ? tr("Note text") : caption ? tr("Caption text") : tr("Bibliography entry"), text);
+        dialog.setWindowTitle(note ? (kind == QStringLiteral("endnote") ? tr("Insert Endnote") : tr("Insert Footnote")) :
+            editNote ? tr("Edit Note") : caption ? tr("Insert Caption") : tr("Add Bibliography Entry"));
+    }
+    if (citation) form->addRow(tr("Locator"), locator);
+    if (reference) form->addRow(QString(), fullText);
+    if (toc) form->addRow(tr("Include heading levels 1 through"), level);
+    if (selectedField) {
+        const auto found = std::find(targets.begin(), targets.end(), selectedField->target_id);
+        if (found != targets.end()) target->setCurrentIndex(static_cast<int>(std::distance(targets.begin(), found)));
+        locator->setText(fromUtf16(selectedField->locator));
+        fullText->setChecked(selectedField->reference_format == core::CrossReferenceFormat::full_text);
+    }
+    auto* error = new QLabel(&dialog);
+    error->setObjectName(QStringLiteral("references.error"));
+    error->setWordWrap(true);
+    error->setStyleSheet(QStringLiteral("color:#a44432"));
+    layout->addWidget(error);
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
+    buttons->setObjectName(QStringLiteral("references.buttons"));
+    buttons->button(QDialogButtonBox::Ok)->setText(manageToc || editNote ? tr("Apply") : tr("Insert"));
+    layout->addWidget(buttons);
+    const auto validate = [=, &targets] {
+        QString message;
+        if ((citation || reference || editNote || manageToc) && targets.empty()) message = citation ?
+            tr("Add a bibliography entry from References first.") : reference ? tr("Add a heading or caption first.") :
+            editNote ? tr("This document has no notes.") : tr("This document has no table of contents.");
+        if ((note || editNote) && (text->toPlainText().size() > static_cast<qsizetype>(core::kMaximumNoteCodeUnits) ||
+            text->toPlainText().contains(QChar::ObjectReplacementCharacter))) message = tr("Note text is too long or contains an embedded object.");
+        if ((caption || bibliography || note) && text->toPlainText().trimmed().isEmpty()) message = tr("Enter text to insert.");
+        error->setText(message);
+        buttons->button(QDialogButtonBox::Ok)->setEnabled(message.isEmpty());
+    };
+    connect(text, &QPlainTextEdit::textChanged, &dialog, validate);
+    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+    connect(buttons, &QDialogButtonBox::accepted, &dialog, [&, this] {
+        const int index = target->currentIndex();
+        const auto id = index >= 0 && static_cast<std::size_t>(index) < targets.size() ? targets[static_cast<std::size_t>(index)] : core::NodeId{};
+        bool applied = false;
+        if (note) applied = insertNote(text->toPlainText(), kind == QStringLiteral("endnote") ? core::NoteKind::endnote : core::NoteKind::footnote);
+        else if (editNote) applied = updateNote(id, text->toPlainText());
+        else if (caption) applied = insertCaption(static_cast<core::CaptionLabel>(type->currentIndex()), text->toPlainText());
+        else if (bibliography) applied = insertBibliographyEntry(text->toPlainText());
+        else if ((citation || reference) && selectedField &&
+                 selectedField->kind == (citation ? core::FieldKind::citation : core::FieldKind::cross_reference)) {
+            auto replacement = *selectedField;
+            replacement.target_id = id;
+            replacement.locator = locator->text().toStdU16String();
+            replacement.reference_format = fullText->isChecked() ? core::CrossReferenceFormat::full_text : core::CrossReferenceFormat::label_number;
+            applied = apply({core::ReplaceField{selectedField->id, replacement}});
+        }
+        else if (citation) applied = insertCitation(id, locator->text());
+        else if (reference) applied = insertCrossReference(id, fullText->isChecked());
+        else if (manageToc) applied = apply({core::ConfigureToc{id, static_cast<std::uint8_t>(level->value())}});
+        else if (toc) applied = insertTableOfContents(level->value());
+        if (applied) dialog.accept();
+        else error->setText(tr("This insertion is unavailable at the current selection."));
+    });
+    if (manageToc && !targets.empty()) {
+        auto* remove = buttons->addButton(tr("Remove"), QDialogButtonBox::DestructiveRole);
+        connect(remove, &QPushButton::clicked, &dialog, [&] {
+            const int index = target->currentIndex();
+            if (index >= 0 && apply({core::DeleteToc{targets[static_cast<std::size_t>(index)]}})) dialog.accept();
+        });
+    }
+    validate();
+    if (text->isVisible()) text->setFocus();
+    dialog.exec();
+    setFocus();
+}
+
+QRectF DocumentCanvas::equationBounds(core::NodeId equationId) const {
+    ensureLayout();
+    const auto snap = visibleDocumentSnapshot();
+    const auto* atom = snap.document.findEquation(equationId);
+    if (!atom) return {};
+    for (const auto& visual : visuals_) {
+        const auto* paragraph = snap.document.findParagraph(visual->id);
+        if (!paragraph || !paragraph->equationAt(atom->utf16_offset) ||
+            paragraph->equationAt(atom->utf16_offset)->id != equationId) continue;
+        const auto layoutOffset = static_cast<std::size_t>(visual->layoutOffsetForCore(atom->utf16_offset));
+        for (const auto& equation : visual->equations) if (equation.utf16Offset == layoutOffset) {
+            for (const auto& line : visual->lines) {
+                if (equation.utf16Offset < static_cast<std::size_t>(line.line.textStart()) ||
+                    equation.utf16Offset >= static_cast<std::size_t>(line.line.textStart() + line.line.textLength())) continue;
+                return QRectF(line.line.cursorToX(static_cast<int>(equation.utf16Offset)),
+                    line.line.y() + line.line.ascent() - equation.metrics.ascent,
+                    equation.metrics.width, equation.metrics.height());
+            }
+        }
+    }
+    return {};
+}
+
 bool DocumentCanvas::insertInlineImage(
     std::vector<std::uint8_t> encodedBytes,
     const QString& accessibleName) {
@@ -5138,8 +6378,9 @@ bool DocumentCanvas::replaceSelectedExcalidrawFigure(
             "The edited figure's display dimensions are invalid."));
         return false;
     }
+    const core::EncodedImagePayload payload(std::move(encodedPng));
     if (!apply({core::ReplaceImagePayload{
-            old.id, core::EncodedImagePayload(std::move(encodedPng)),
+            old.id, payload,
             core::ImageFormat::png, old.width_emu, height}},
             std::nullopt, std::nullopt, false, selection_)) {
         return false;
@@ -5151,7 +6392,10 @@ bool DocumentCanvas::replaceSelectedExcalidrawFigure(
     }
     const auto [inserted, wasInserted] =
         decodedImages_.emplace(old.id, std::move(decoded.image));
-    if (wasInserted) decodedImageBytes_ += inserted->second.sizeInBytes();
+    if (wasInserted) {
+        decodedImageBytes_ += inserted->second.sizeInBytes();
+        decodedImagePayloads_.insert_or_assign(old.id, payload);
+    }
     invalidateLayout();
     viewport()->update();
     return true;
@@ -5164,9 +6408,77 @@ bool DocumentCanvas::insertInlineImageWithGeometry(
     std::optional<std::int64_t> requestedHeightEmu,
     core::ImageLayout layout) {
     if (rejectLiveEditDuringPreview()) return false;
-    if (selectedTable_ || tableCursor_ || tableCellSelection_) {
+    if (tableCursor_ && !tableCellSelection_) {
+        if (layout != core::ImageLayout{}) {
+            emit operationFailed(tr("Pictures in table cells use inline layout."));
+            return false;
+        }
+        if (encodedBytes.empty() || encodedBytes.size() > core::kMaximumEncodedImageBytes ||
+            decodedImageBytes_ >= kMaximumAggregateDecodedRasterBytes) {
+            emit operationFailed(tr("The picture exceeds the encoded or decoded picture limits."));
+            return false;
+        }
+        RasterDecodeLimits limits;
+        limits.maximum_encoded_bytes = core::kMaximumEncodedImageBytes;
+        limits.maximum_decoded_bytes = std::min(limits.maximum_decoded_bytes,
+            kMaximumAggregateDecodedRasterBytes - decodedImageBytes_);
+        auto decoded = decodeRasterImage(encodedBytes, limits);
+        if (!decoded.ok() || (decoded.format != raster::Format::png && decoded.format != raster::Format::jpeg)) {
+            emit operationFailed(tr("The picture is not a valid bounded PNG or JPEG image."));
+            return false;
+        }
+        const auto snapshot = session_->snapshot();
+        const auto caret = *tableCursor_;
+        const auto* table = snapshot.document.findTable(caret.tableId);
+        const auto* cell = table ? table->cell(caret.row, caret.column) : nullptr;
+        if (!cell) return false;
+        const auto start = std::min(caret.utf16Offset, tableSelectionAnchor_.value_or(caret.utf16Offset));
+        const auto end = std::max(caret.utf16Offset, tableSelectionAnchor_.value_or(caret.utf16Offset));
+        if (requestedWidthEmu.has_value() != requestedHeightEmu.has_value()) {
+            emit operationFailed(tr("The pasted picture geometry is incomplete."));
+            return false;
+        }
+        auto widthEmu = requestedWidthEmu.value_or(0);
+        auto heightEmu = requestedHeightEmu.value_or(0);
+        if (!requestedWidthEmu) {
+            const auto fitted = fitTableCellImageSize(snapshot.document, caret.tableId, cell->id,
+                QSizeF(decoded.image.width() * 0.75, decoded.image.height() * 0.75));
+            if (!fitted) {
+                emit operationFailed(tr("The picture's table cell has no valid writing area."));
+                return false;
+            }
+            widthEmu = static_cast<std::int64_t>(std::llround(fitted->width() * kEmuPerPoint));
+            heightEmu = static_cast<std::int64_t>(std::llround(fitted->height() * kEmuPerPoint));
+        }
+        const auto imageId = core::NodeId::generate();
+        auto name = accessibleName.trimmed();
+        if (name.isEmpty()) name = tr("Picture");
+        while (name.toUtf8().size() > static_cast<qsizetype>(core::kMaximumImageAccessibleNameBytes)) name.chop(1);
+        std::vector<core::Operation> operations;
+        if (start != end) operations.emplace_back(core::ReplaceTableCellRange{
+            caret.tableId, caret.row, caret.column, start, end, {}, typingFormat_});
+        const core::EncodedImagePayload payload(std::move(encodedBytes));
+        operations.emplace_back(core::InsertTableCellImage{caret.tableId, caret.row, caret.column, start,
+            payload, decoded.format == raster::Format::png ? core::ImageFormat::png : core::ImageFormat::jpeg,
+            name.toStdString(), widthEmu, heightEmu, imageId, typingFormat_});
+        if (!apply(std::move(operations), std::nullopt, std::nullopt, false, std::nullopt, false, true,
+                TableCursor{caret.tableId, caret.row, caret.column, start + 1U}, caret.tableId)) return false;
+        tableSelectionAnchor_ = start;
+        if (!undoCursorHistory_.empty() && undoCursorHistory_.back().documentTransaction)
+            undoCursorHistory_.back().after = captureEditorState();
+        synchronizeCursorHistory();
+        const auto [cached, inserted] = decodedImages_.emplace(imageId, std::move(decoded.image));
+        if (inserted) {
+            decodedImageBytes_ += cached->second.sizeInBytes();
+            decodedImagePayloads_.insert_or_assign(imageId, payload);
+        }
+        invalidateLayout();
+        emit selectionChanged(); viewport()->update();
+        return true;
+    }
+    if (selectedTable_ || tableCellSelection_) {
         emit operationFailed(tr(
-            "Pictures inside table cells are not supported in this release."));
+            "Place the caret inside one table cell before inserting a picture."));
         return false;
     }
     if (encodedBytes.empty() ||
@@ -5281,8 +6593,9 @@ bool DocumentCanvas::insertInlineImageWithGeometry(
     if (!normalized.value().empty()) {
         operations.emplace_back(core::DeleteRange{selection_});
     }
+    const core::EncodedImagePayload payload(std::move(encodedBytes));
     operations.emplace_back(core::InsertImage{
-        insertion, core::EncodedImagePayload(std::move(encodedBytes)),
+        insertion, payload,
         decoded.format == raster::Format::png ? core::ImageFormat::png
                                               : core::ImageFormat::jpeg,
         encodedName.toStdString(), widthEmu, heightEmu, imageId,
@@ -5304,7 +6617,10 @@ bool DocumentCanvas::insertInlineImageWithGeometry(
     }
     const auto [cached, inserted] = decodedImages_.emplace(
         imageId, std::move(decoded.image));
-    if (inserted) decodedImageBytes_ += cached->second.sizeInBytes();
+    if (inserted) {
+        decodedImageBytes_ += cached->second.sizeInBytes();
+        decodedImagePayloads_.insert_or_assign(imageId, payload);
+    }
     invalidateLayout();
     viewport()->update();
     return true;
@@ -5313,6 +6629,17 @@ bool DocumentCanvas::insertInlineImageWithGeometry(
 bool DocumentCanvas::selectInlineImage(core::NodeId imageId) {
     if (previewId_) return false;
     const auto snapshot = session_->snapshot();
+    for (const auto& table : snapshot.document.tables())
+        for (std::size_t row = 0; row < table.rowCount(); ++row)
+            for (std::size_t column = 0; column < table.columnCount(); ++column) {
+                const auto* cell = table.cell(row, column);
+                for (const auto& image : cell->images) if (image.id == imageId) {
+                    if (!activateTableCell(table.id(), row, column, image.utf16_offset + 1U)) return false;
+                    tableSelectionAnchor_ = image.utf16_offset;
+                    emit selectionChanged(); emitCursorFormat(); viewport()->update();
+                    return true;
+                }
+            }
     std::optional<core::Position> start;
     for (const auto& paragraph : snapshot.document.paragraphs()) {
         const auto found = std::find_if(
@@ -5350,6 +6677,7 @@ bool DocumentCanvas::deleteSelectedInlineImage() {
     if (rejectLiveEditDuringPreview()) return false;
     const auto selected = selectedInlineImage();
     if (!selected) return false;
+    if (tableCursor_) return replaceTableCellText({}, false);
     const core::Position start = selected->first;
     core::Position end = start;
     ++end.utf16_offset;
@@ -5796,6 +7124,84 @@ bool DocumentCanvas::selectTableCells(core::NodeId tableId,
     return true;
 }
 
+QRectF DocumentCanvas::tableCellViewportRect(core::NodeId tableId, std::size_t row, std::size_t column) const {
+    ensureLayout();
+    const double scale = kScreenPointsScale * zoomPercent_ / 100.0;
+    const double pagePixelWidth = pageWidthPoints_ * scale;
+    const double documentWidth = std::max(pagePixelWidth + 2 * kCanvasPaddingPixels,
+        static_cast<double>(viewport()->width()));
+    const double left = (documentWidth - pagePixelWidth) / 2.0 - horizontalScrollBar()->value();
+    for (const auto& table : tableVisuals_) if (table->id == tableId) {
+        for (const auto& cell : table->cells) if (cell.row == row && cell.column == column) {
+            const double top = kCanvasPaddingPixels + cell.pageIndex *
+                (pageHeightPoints_ * scale + kPageGapPixels) - verticalScrollBar()->value();
+            return QRectF(left + cell.rect.left() * scale, top + cell.rect.top() * scale,
+                          cell.rect.width() * scale, cell.rect.height() * scale);
+        }
+    }
+    return {};
+}
+
+std::optional<QSizeF> DocumentCanvas::fitTableCellImageSize(
+    const core::Document& document, core::NodeId tableId,
+    core::NodeId cellId, QSizeF desiredPoints,
+    std::optional<PageLayoutSettings> proposedLayout) const {
+    if (!std::isfinite(desiredPoints.width()) || !std::isfinite(desiredPoints.height()) ||
+        desiredPoints.width() <= 0.0 || desiredPoints.height() <= 0.0) return std::nullopt;
+    const auto* table = document.findTable(tableId);
+    if (!table) return std::nullopt;
+    std::optional<std::pair<std::size_t, std::size_t>> target;
+    for (std::size_t row = 0; row < table->rowCount(); ++row)
+        for (std::size_t column = 0; column < table->columnCount(); ++column)
+            if (table->cell(row, column)->id == cellId) target = std::pair{row, column};
+    if (!target) return std::nullopt;
+    const auto layout = proposedLayout.value_or(renderedPageLayout());
+    const std::array<double, 6> settings{layout.widthPoints, layout.heightPoints, layout.marginTopPoints,
+        layout.marginRightPoints, layout.marginBottomPoints, layout.marginLeftPoints};
+    if (std::any_of(settings.begin(), settings.end(), [](double value) { return !std::isfinite(value) || value < 0.0; }) ||
+        layout.widthPoints < 72.0 || layout.heightPoints < 72.0 || layout.widthPoints > 3168.0 || layout.heightPoints > 3168.0 ||
+        layout.widthPoints - layout.marginLeftPoints - layout.marginRightPoints < 36.0 ||
+        layout.heightPoints - layout.marginTopPoints - layout.marginBottomPoints < 36.0) return std::nullopt;
+    DocumentCanvas probe(spelling_);
+    probe.session_ = std::make_unique<core::DocumentSession>(document);
+    probe.defaultFontFamily_ = defaultFontFamily_;
+    probe.defaultFontPointSize_ = defaultFontPointSize_;
+    probe.tabWidthSpaces_ = tabWidthSpaces_;
+    probe.importedTables_ = importedTables_;
+    probe.useRenderedPageLayout(layout);
+    probe.invalidateLayout();
+    probe.ensureLayout();
+    for (const auto& visual : probe.tableVisuals_) {
+        if (visual->id != tableId) continue;
+        for (const auto& cell : visual->cells) {
+            if (cell.row != target->first || cell.column != target->second) continue;
+            const double width = std::max(1.0, cell.rect.width() - cell.paddingLeft - cell.paddingRight);
+            const double height = std::max(1.0, layout.heightPoints - probe.bodyMarginTopPoints_ - probe.bodyMarginBottomPoints_ - 8.0);
+            const double fit = std::min({1.0, width / desiredPoints.width(), height / desiredPoints.height()});
+            return QSizeF(desiredPoints.width() * fit, desiredPoints.height() * fit);
+        }
+    }
+    return std::nullopt;
+}
+
+core::TableGeometry DocumentCanvas::resolvedTableGeometry(core::NodeId tableId) const {
+    const auto snap = session_->snapshot();
+    const auto* table = snap.document.findTable(tableId);
+    if (!table) return {};
+    auto result = table->geometry();
+    result.column_widths_twips.clear();
+    const double scale = kScreenPointsScale * zoomPercent_ / 100.0;
+    for (std::size_t column = 0; column < table->columnCount(); ++column) {
+        result.column_widths_twips.push_back(static_cast<std::uint32_t>(std::max(1LL,
+            std::llround(tableCellViewportRect(tableId, 0, column).width() / scale * 20.0))));
+    }
+    result.row_minimum_heights_twips.clear();
+    for (std::size_t row = 0; row < table->rowCount(); ++row)
+        result.row_minimum_heights_twips.push_back(static_cast<std::uint32_t>(std::max(0LL,
+            std::llround(tableCellViewportRect(tableId, row, 0).height() / scale * 20.0))));
+    return result;
+}
+
 bool DocumentCanvas::selectTable(core::NodeId tableId) {
     if (previewId_ || !session_->snapshot().document.findTable(tableId)) {
         return false;
@@ -6054,7 +7460,6 @@ bool DocumentCanvas::replaceTableCellText(const QString& insertedText,
     normalized.replace(QStringLiteral("\r\n"), QString(QChar::LineSeparator));
     normalized.replace(QLatin1Char('\r'), QChar::LineSeparator);
     normalized.replace(QLatin1Char('\n'), QChar::LineSeparator);
-    auto updated = fromUtf16(cell->text);
     const auto focus = static_cast<qsizetype>(std::min(
         tableCursor_->utf16Offset, cell->text.size()));
     const auto anchor = static_cast<qsizetype>(std::min(
@@ -6062,13 +7467,13 @@ bool DocumentCanvas::replaceTableCellText(const QString& insertedText,
         cell->text.size()));
     const auto start = std::min(anchor, focus);
     const auto end = std::max(anchor, focus);
-    updated.replace(start, end - start, normalized);
     const TableCursor cursor{tableCursor_->tableId, tableCursor_->row,
                              tableCursor_->column,
                              static_cast<std::size_t>(start + normalized.size())};
-    return apply({core::SetTableCellText{
+    return apply({core::ReplaceTableCellRange{
                       cursor.tableId, cursor.row, cursor.column,
-                      toUtf16(updated), typingFormat_}},
+                      static_cast<std::size_t>(start), static_cast<std::size_t>(end),
+                      toUtf16(normalized), typingFormat_}},
                  std::nullopt, std::nullopt, coalesceTyping, std::nullopt,
                  false, true, cursor, cursor.tableId);
 }
@@ -6167,7 +7572,7 @@ void DocumentCanvas::toggleBullets() { togglePlainTextList(false); }
 void DocumentCanvas::toggleNumbering() { togglePlainTextList(true); }
 
 bool DocumentCanvas::hasActiveList() const {
-    if (selectedTable_ || tableCursor_) return false;
+    if (headerFooterEditing_ || selectedTable_ || tableCursor_) return false;
     const auto snap = session_->snapshot();
     const auto normalized = snap.document.normalizeRange(selection_);
     if (!normalized) return false;
@@ -6345,6 +7750,7 @@ bool DocumentCanvas::setCurrentListLayout(const core::ListLayout& layout) {
 }
 
 void DocumentCanvas::togglePlainTextList(bool numbered) {
+    if (headerFooterEditing_) return;
     if (selectedTable_) {
         emit operationFailed(tr(
             "Lists inside table cells are not supported in this release."));
@@ -6737,7 +8143,9 @@ bool DocumentCanvas::changeListLevel(bool outdent) {
 }
 
 bool DocumentCanvas::resequenceNumberedList(
-    core::NodeId paragraphId, bool coalesceWithPrevious) {
+    core::NodeId paragraphId, bool coalesceWithPrevious,
+    const core::Document* numberingBaseline,
+    std::set<core::NodeId>* visitedRun) {
     const auto snap = session_->snapshot();
     const auto anchorIndex = snap.document.paragraphIndex(paragraphId);
     if (!anchorIndex) return true;
@@ -6764,6 +8172,7 @@ bool DocumentCanvas::resequenceNumberedList(
     while (first > 0 && belongsToList(first - 1)) --first;
     std::size_t last = *anchorIndex;
     while (last + 1 < paragraphs.size() && belongsToList(last + 1)) ++last;
+    if (visitedRun) for (std::size_t index = first; index <= last; ++index) visitedRun->insert(paragraphs[index].id());
 
     const core::NodeId listId = anchorListId.value_or(core::NodeId::generate());
     const core::ListLayout sharedLayout =
@@ -6778,6 +8187,20 @@ bool DocumentCanvas::resequenceNumberedList(
     std::vector<core::Operation> operations;
     std::array<qulonglong, core::kListLevelCount> counters{};
     std::array<bool, core::kListLevelCount> restartAtOne{};
+    std::array<std::optional<qulonglong>, core::kListLevelCount> originalStarts{};
+    if (numberingBaseline) {
+        std::set<core::NodeId> runIds;
+        for (std::size_t index = first; index <= last; ++index) runIds.insert(paragraphs[index].id());
+        for (const auto& original : numberingBaseline->paragraphs()) {
+            if (!runIds.contains(original.id())) continue;
+            const auto marker = plainTextListMarker(fromUtf16(original.text()));
+            if (!marker || marker->kind != PlainTextListMarker::Kind::numbered) continue;
+            const auto level = original.format().list_level
+                ? static_cast<std::size_t>(*original.format().list_level)
+                : listLevelForMarker(*marker, tabWidthSpaces_);
+            if (level < originalStarts.size() && !originalStarts[level]) originalStarts[level] = numberedOrdinal(marker->marker, level);
+        }
+    }
     for (std::size_t index = first; index <= last; ++index) {
         const auto& paragraph = paragraphs[index];
         const auto marker = plainTextListMarker(fromUtf16(paragraph.text()));
@@ -6795,7 +8218,7 @@ bool DocumentCanvas::resequenceNumberedList(
         if (counters[level] == 0) {
             counters[level] = restartAtOne[level]
                 ? 1U
-                : numberedOrdinal(marker->marker, level).value_or(1U);
+                : originalStarts[level].value_or(numberedOrdinal(marker->marker, level).value_or(1U));
             restartAtOne[level] = false;
         } else if (counters[level] <
                    std::numeric_limits<qulonglong>::max()) {
@@ -6962,12 +8385,323 @@ void DocumentCanvas::redo() {
     }
 }
 
+namespace {
+constexpr qsizetype kAcademicClipboardMaximumBytes = 8 * 1024 * 1024;
+constexpr std::size_t kAcademicClipboardMaximumParagraphs = 256;
+constexpr std::size_t kAcademicClipboardMaximumAtoms = 4096;
+constexpr qsizetype kTableClipboardMaximumBytes = 64 * 1024 * 1024;
+constexpr char kTableClipboardMime[] = "application/x-owl-docs-table-cells+json";
+
+core::TableCell clippedClipboardCell(const core::TableCell& source, std::size_t start, std::size_t end) {
+    auto result = source;
+    result.id = core::NodeId::generate();
+    result.text = source.text.substr(start, end - start);
+    result.character_formats.clear();
+    for (const auto& run : source.character_formats) {
+        const auto left = std::max(start, run.start), right = std::min(end, run.end);
+        if (left < right) result.character_formats.push_back({left - start, right - start, run.format});
+    }
+    std::erase_if(result.images, [start, end](const auto& image) { return image.utf16_offset < start || image.utf16_offset >= end; });
+    for (auto& image : result.images) image.utf16_offset -= start;
+    return result;
+}
+
+std::optional<QByteArray> tableClipboardPayload(const core::Table& source,
+    const std::vector<std::pair<std::size_t, std::size_t>>& selectedCells,
+    std::optional<std::pair<std::size_t, std::size_t>> range, QString& error) {
+    if (selectedCells.empty()) return std::nullopt;
+    std::size_t firstRow = source.rowCount(), firstColumn = source.columnCount(), lastRow = 0, lastColumn = 0;
+    for (const auto& [row, column] : selectedCells) {
+        firstRow = std::min(firstRow, row); firstColumn = std::min(firstColumn, column);
+        lastRow = std::max(lastRow, row); lastColumn = std::max(lastColumn, column);
+    }
+    std::vector<core::TableCell> cells;
+    for (auto row = firstRow; row <= lastRow; ++row) for (auto column = firstColumn; column <= lastColumn; ++column) {
+        const auto* cell = source.cell(row, column);
+        const auto start = range ? range->first : 0, end = range ? range->second : cell->text.size();
+        if (!core::isUtf16Boundary(cell->text, start) || !core::isUtf16Boundary(cell->text, end) || start > end) return std::nullopt;
+        cells.push_back(clippedClipboardCell(*cell, start, end));
+    }
+    core::TableGeometry geometry;
+    const auto& sourceGeometry = source.geometry();
+    if (!sourceGeometry.column_widths_twips.empty()) geometry.column_widths_twips.assign(
+        sourceGeometry.column_widths_twips.begin() + static_cast<std::ptrdiff_t>(firstColumn),
+        sourceGeometry.column_widths_twips.begin() + static_cast<std::ptrdiff_t>(lastColumn + 1U));
+    if (!sourceGeometry.row_minimum_heights_twips.empty()) geometry.row_minimum_heights_twips.assign(
+        sourceGeometry.row_minimum_heights_twips.begin() + static_cast<std::ptrdiff_t>(firstRow),
+        sourceGeometry.row_minimum_heights_twips.begin() + static_cast<std::ptrdiff_t>(lastRow + 1U));
+    auto table = core::Table::restore(lastRow - firstRow + 1U, lastColumn - firstColumn + 1U,
+        source.hasHeaderRow() && firstRow == 0, core::NodeId::generate(), std::move(cells), source.style(), std::move(geometry));
+    core::Document document;
+    if (!table || !document.insertTable(std::nullopt, std::move(table.value()))) return std::nullopt;
+    std::string codecError;
+    const auto encoded = RecoveryCodec::encode({std::move(document), {}}, codecError);
+    if (!encoded) { error = QString::fromStdString(codecError); return std::nullopt; }
+    const auto data = QJsonDocument(QJsonObject{{"version", 1}, {"cells", !range.has_value()},
+        {"recovery", QString::fromUtf8(encoded->data(), static_cast<qsizetype>(encoded->size()))}}).toJson(QJsonDocument::Compact);
+    if (data.size() > kTableClipboardMaximumBytes) { error = QStringLiteral("The copied cells exceed the clipboard size limit."); return std::nullopt; }
+    return data;
+}
+
+std::optional<std::pair<bool, core::Table>> decodedTableClipboard(const QByteArray& data) {
+    if (data.isEmpty() || data.size() > kTableClipboardMaximumBytes) return std::nullopt;
+    const auto object = QJsonDocument::fromJson(data).object();
+    if (object.value("version").toInt() != 1 || !object.value("cells").isBool() || !object.value("recovery").isString()) return std::nullopt;
+    const auto encoded = object.value("recovery").toString().toUtf8();
+    std::string error;
+    auto decoded = RecoveryCodec::decode(std::string_view(encoded.constData(), static_cast<std::size_t>(encoded.size())), error);
+    if (!decoded || decoded->document.tables().size() != 1 || !decoded->document.notes().empty() ||
+        !decoded->document.tablesOfContents().empty() || !decoded->document.headerText().empty() || !decoded->document.footerText().empty()) return std::nullopt;
+    return std::pair{object.value("cells").toBool(), decoded->document.tables().front()};
+}
+
+void setTableClipboard(const QByteArray& payload, const QString& text) {
+    auto* mime = new QMimeData;
+    mime->setData(QString::fromLatin1(kTableClipboardMime), payload);
+    mime->setText(text);
+    QApplication::clipboard()->setMimeData(mime);
+}
+
+core::TableCell insertedClipboardCell(const core::TableCell& destination, std::size_t start, std::size_t end,
+    const core::TableCell& fragment) {
+    auto result = destination;
+    std::vector<core::CharacterFormat> formats;
+    for (std::size_t index = 0; index < start; ++index) formats.push_back(destination.characterFormatAt(index + 1U));
+    for (std::size_t index = 0; index < fragment.text.size(); ++index) formats.push_back(fragment.characterFormatAt(index + 1U));
+    for (auto index = end; index < destination.text.size(); ++index) formats.push_back(destination.characterFormatAt(index + 1U));
+    result.text.replace(start, end - start, fragment.text);
+    result.character_formats.clear();
+    for (std::size_t index = 0; index < formats.size();) {
+        const auto begin = index;
+        while (++index < formats.size() && formats[index] == formats[begin]) {}
+        if (formats[begin] != result.default_character_format) result.character_formats.push_back({begin, index, formats[begin]});
+    }
+    std::erase_if(result.images, [start, end](const auto& image) { return image.utf16_offset >= start && image.utf16_offset < end; });
+    for (auto& image : result.images) if (image.utf16_offset >= end) image.utf16_offset = image.utf16_offset - (end - start) + fragment.text.size();
+    for (auto image : fragment.images) { image.id = core::NodeId::generate(); image.utf16_offset += start; result.images.push_back(std::move(image)); }
+    std::sort(result.images.begin(), result.images.end(), [](const auto& left, const auto& right) { return left.utf16_offset < right.utf16_offset; });
+    return result;
+}
+
+std::optional<QJsonObject> clipboardRangePayload(
+    const core::Document& document, const core::NormalizedRange& range) {
+    if (range.end_paragraph_index - range.start_paragraph_index + 1 > kAcademicClipboardMaximumParagraphs) return std::nullopt;
+    const auto first = std::find_if(document.bodyBlocks().begin(), document.bodyBlocks().end(),
+        [&range](const auto& block) { return block.id == range.start.paragraph_id; });
+    const auto last = std::find_if(document.bodyBlocks().begin(), document.bodyBlocks().end(),
+        [&range](const auto& block) { return block.id == range.end.paragraph_id; });
+    if (first == document.bodyBlocks().end() || last == document.bodyBlocks().end()) return std::nullopt;
+    for (auto block = first; block != std::next(last); ++block)
+        if (block->kind != core::BodyBlockKind::paragraph) return std::nullopt;
+    const auto academic = core::resolveAcademic(document);
+    QJsonArray paragraphs;
+    std::size_t atomCount = 0;
+    std::unordered_set<core::NodeId, core::NodeIdHash> movedObjects;
+    for (std::size_t index = range.start_paragraph_index; index <= range.end_paragraph_index; ++index) {
+        const auto& paragraph = document.paragraphs()[index];
+        const auto* style = paragraph.styleId() ? core::findBuiltInParagraphStyle(*paragraph.styleId()) : nullptr;
+        if (range.start_paragraph_index != range.end_paragraph_index &&
+            (paragraph.caption() || paragraph.isBibliographyEntry() || (style && style->outline_level))) return std::nullopt;
+        const auto start = index == range.start_paragraph_index ? range.start.utf16_offset : 0;
+        const auto end = index == range.end_paragraph_index ? range.end.utf16_offset : paragraph.text().size();
+        QJsonArray tokens;
+        for (std::size_t cursor = start; cursor < end;) {
+            QJsonObject token;
+            if (const auto* equation = paragraph.equationAt(cursor)) {
+                token = {{"equation", QString::fromStdString(equation->canonical_latex)}, {"display", equation->display}};
+                movedObjects.insert(equation->id);
+                ++cursor; ++atomCount;
+            } else if (const auto* field = paragraph.fieldAt(cursor)) {
+                if (field->kind == core::FieldKind::caption_number || field->kind == core::FieldKind::bibliography_number) return std::nullopt;
+                token = {{"field", static_cast<int>(field->kind)}, {"target", QString::fromStdString(field->target_id.toString())},
+                    {"locator", fromUtf16(field->locator)}, {"fullText", field->reference_format == core::CrossReferenceFormat::full_text},
+                    {"visible", fromUtf16(academic.fieldText(field->id))}};
+                if (field->kind == core::FieldKind::note_reference) {
+                    const auto* note = document.findNote(field->target_id);
+                    if (!note) return std::nullopt;
+                    token.insert("note", fromUtf16(note->text));
+                    token.insert("endnote", note->kind == core::NoteKind::endnote);
+                }
+                ++cursor; ++atomCount;
+            } else {
+                const auto begin = cursor;
+                while (cursor < end && paragraph.text()[cursor] != core::kInlineObjectReplacementCharacter) ++cursor;
+                if (cursor == begin) return std::nullopt; // Pictures need their dedicated clipboard path.
+                token.insert("text", fromUtf16(paragraph.text().substr(begin, cursor - begin)));
+            }
+            if (atomCount > kAcademicClipboardMaximumAtoms) return std::nullopt;
+            tokens.push_back(token);
+        }
+        paragraphs.push_back(tokens);
+    }
+    for (const auto& paragraph : document.paragraphs())
+        if (paragraph.caption() && movedObjects.contains(paragraph.caption()->target_id)) return std::nullopt;
+    QJsonObject payload{{"version", 2}, {"type", "range"}, {"paragraphs", paragraphs}};
+    if (QJsonDocument(payload).toJson(QJsonDocument::Compact).size() > kAcademicClipboardMaximumBytes) return std::nullopt;
+    return payload;
+}
+
+bool planClipboardRangePaste(const QJsonObject& payload, const core::Document& source,
+    const core::Range& selection, const core::CharacterFormat& format,
+    std::vector<core::Operation>& operations, core::Position& cursor) {
+    if (!payload.value("paragraphs").isArray()) return false;
+    const auto paragraphs = payload.value("paragraphs").toArray();
+    if (paragraphs.isEmpty() || paragraphs.size() > static_cast<qsizetype>(kAcademicClipboardMaximumParagraphs)) return false;
+    auto working = source;
+    const auto range = working.normalizeRange(selection);
+    if (!range) return false;
+    cursor = range.value().start;
+    if (!range.value().empty()) {
+        if (!working.deleteRange(selection)) return false;
+        operations.emplace_back(core::DeleteRange{selection});
+    }
+    std::unordered_map<core::NodeId, core::Note, core::NodeIdHash> copiedNotes;
+    std::size_t atoms = 0;
+    std::size_t tokens = 0;
+    const auto appendText = [&](const QString& value) {
+        const auto text = value.toStdU16String();
+        if (text.find(core::kInlineObjectReplacementCharacter) != std::u16string::npos || !working.insertText(cursor, text, format)) return false;
+        operations.emplace_back(core::InsertText{cursor, text, format});
+        cursor.utf16_offset += text.size();
+        return true;
+    };
+    bool firstParagraph = true;
+    for (const auto& paragraph : paragraphs) {
+        if (!paragraph.isArray()) return false;
+        if (!firstParagraph) {
+            const auto id = core::NodeId::generate();
+            if (!working.splitParagraph(cursor, id)) return false;
+            operations.emplace_back(core::SplitParagraph{cursor, id});
+            cursor = {id, 0};
+        }
+        firstParagraph = false;
+        for (const auto& value : paragraph.toArray()) {
+            if (++tokens > kAcademicClipboardMaximumAtoms * 2 + kAcademicClipboardMaximumParagraphs) return false;
+            if (!value.isObject()) return false;
+            const auto token = value.toObject();
+            if (token.contains("text")) {
+                if (!token.value("text").isString() || !appendText(token.value("text").toString())) return false;
+                continue;
+            }
+            if (++atoms > kAcademicClipboardMaximumAtoms) return false;
+            if (token.contains("equation")) {
+                if (!token.value("equation").isString() || !token.value("display").isBool()) return false;
+                const auto parsed = math::parseLatex(token.value("equation").toString().toStdString(), editorEquationLimits());
+                if (!parsed) return false;
+                const auto latex = math::toCanonicalLatex(parsed.value());
+                const auto id = core::NodeId::generate();
+                const auto display = token.value("display").toBool();
+                if (!working.insertEquation(cursor, latex, display, id, format)) return false;
+                operations.emplace_back(core::InsertEquation{cursor, latex, display, id, format});
+            } else {
+                if (!token.value("field").isDouble() || !token.value("target").isString() ||
+                    !token.value("locator").isString() || !token.value("fullText").isBool() || !token.value("visible").isString()) return false;
+                const int kind = token.value("field").toInt(-1);
+                if (kind != static_cast<int>(core::FieldKind::note_reference) && kind != static_cast<int>(core::FieldKind::cross_reference) &&
+                    kind != static_cast<int>(core::FieldKind::citation)) return false;
+                const auto target = core::NodeId::parse(token.value("target").toString().toStdString());
+                if (!target || !target->isValid()) return false;
+                core::FieldAtom field{core::NodeId::generate(), 0, static_cast<core::FieldKind>(kind), *target,
+                    token.value("locator").toString().toStdU16String(), token.value("fullText").toBool() ?
+                    core::CrossReferenceFormat::full_text : core::CrossReferenceFormat::label_number};
+                if (field.kind == core::FieldKind::note_reference) {
+                    if (!token.value("note").isString() || !token.value("endnote").isBool()) return false;
+                    const auto noteText = token.value("note").toString().toStdU16String();
+                    const auto noteKind = token.value("endnote").toBool() ? core::NoteKind::endnote : core::NoteKind::footnote;
+                    auto found = copiedNotes.find(*target);
+                    if (found == copiedNotes.end()) {
+                        core::Note note{core::NodeId::generate(), noteKind, noteText};
+                        if (!working.setNote(note)) return false;
+                        operations.emplace_back(core::SetNote{note});
+                        found = copiedNotes.emplace(*target, std::move(note)).first;
+                    } else if (found->second.text != noteText || found->second.kind != noteKind) return false;
+                    field.target_id = found->second.id;
+                } else {
+                    const auto* destination = working.findParagraph(*target);
+                    const auto* style = destination && destination->styleId() ? core::findBuiltInParagraphStyle(*destination->styleId()) : nullptr;
+                    const bool supported = destination && (field.kind == core::FieldKind::citation ? destination->isBibliographyEntry() :
+                        destination->caption().has_value() || (style && style->outline_level));
+                    if (!supported) {
+                        if (!appendText(token.value("visible").toString())) return false;
+                        continue;
+                    }
+                }
+                if (!working.insertField(cursor, field, format)) return false;
+                operations.emplace_back(core::InsertField{cursor, field, format});
+            }
+            ++cursor.utf16_offset;
+        }
+    }
+    return true;
+}
+}
+
 void DocumentCanvas::copy() {
+    if (headerFooterEditing_ && !previewId_) {
+        auto& editors = activeStoryIsFooter_ ? footerEditors_ : headerEditors_;
+        if (auto* editor = editors[static_cast<std::size_t>(activeStoryRegion_)]) {
+            const auto cursor = editor->textCursor();
+            if (cursor.selectedText() == QString(QChar::ObjectReplacementCharacter)) {
+                const auto snap = session_->snapshot();
+                const auto sections = splitStorySections(activeStoryIsFooter_ ? footerText() : headerText());
+                std::size_t offset = static_cast<std::size_t>(cursor.selectionStart());
+                for (int index = 0; index < activeStoryRegion_; ++index)
+                    offset += static_cast<std::size_t>(sections[static_cast<std::size_t>(index)].size()) + 1U;
+                const auto& images = activeStoryIsFooter_ ? snap.document.footerImages() : snap.document.headerImages();
+                const auto found = std::find_if(images.begin(), images.end(), [offset](const auto& image) { return image.utf16_offset == offset; });
+                if (found == images.end()) return;
+                const auto native = encodeClipboardInlineImage(*found);
+                if (native.isEmpty()) return;
+                auto* mime = new QMimeData;
+                mime->setData(QString::fromLatin1(kInlineImageClipboardMime), native);
+                const auto legacy = encodeClipboardInlineImage(*found, true);
+                if (!legacy.isEmpty()) mime->setData(QString::fromLatin1(kInlineImageClipboardLegacyMime), legacy);
+                const auto bytes = found->encoded_payload.bytes();
+                mime->setData(found->format == core::ImageFormat::png ? QStringLiteral("image/png") : QStringLiteral("image/jpeg"),
+                    QByteArray(reinterpret_cast<const char*>(bytes.data()), static_cast<qsizetype>(bytes.size())));
+                mime->setText(QString::fromStdString(found->accessible_name));
+                QApplication::clipboard()->setMimeData(mime);
+            } else {
+                editor->copy();
+            }
+        }
+        return;
+    }
     if (previewId_ || !hasClipboardSelection()) {
+        return;
+    }
+    if (selectedTable_ && !selectedInlineImage()) {
+        const auto snapshot = session_->snapshot();
+        const auto* table = snapshot.document.findTable(*selectedTable_);
+        if (!table) return;
+        std::optional<std::pair<std::size_t, std::size_t>> range;
+        if (tableCursor_) range = std::minmax(tableCursor_->utf16Offset,
+            tableSelectionAnchor_.value_or(tableCursor_->utf16Offset));
+        QString error;
+        const auto clipboardData = tableClipboardPayload(*table, selectedTableCells(*table), range, error);
+        if (!clipboardData) { emit operationFailed(error.isEmpty() ? tr("The selected cells cannot be copied safely.") : error); return; }
+        setTableClipboard(*clipboardData, selectedText());
         return;
     }
     endTypingGroup();
     resetVerticalNavigation();
+    const auto snap = session_->snapshot();
+    const auto range = snap.document.normalizeRange(selection_);
+    if (!selectedTable_ && range && range.value().start.paragraph_id == range.value().end.paragraph_id &&
+        range.value().end.utf16_offset - range.value().start.utf16_offset == 1) {
+        const auto* paragraph = snap.document.findParagraph(range.value().start.paragraph_id);
+        QJsonObject payload;
+        if (const auto* equation = paragraph->equationAt(range.value().start.utf16_offset)) {
+            payload = {{"version", 1}, {"type", "equation"}, {"source", QString::fromStdString(equation->canonical_latex)}, {"display", equation->display}};
+        }
+        if (!payload.isEmpty()) {
+            auto* mime = new QMimeData;
+            mime->setData(QStringLiteral("application/x-owl-docs-atom+json"), QJsonDocument(payload).toJson(QJsonDocument::Compact));
+            mime->setText(selectedText());
+            QApplication::clipboard()->setMimeData(mime);
+            return;
+        }
+    }
     if (const auto selected = selectedInlineImage()) {
         const QByteArray native = encodeClipboardInlineImage(selected->second);
         const QByteArray legacy = encodeClipboardInlineImage(
@@ -6993,6 +8727,15 @@ void DocumentCanvas::copy() {
         QApplication::clipboard()->setMimeData(mime);
         return;
     }
+    if (!selectedTable_ && range && !range.value().empty()) {
+        if (const auto payload = clipboardRangePayload(snap.document, range.value())) {
+            auto* mime = new QMimeData;
+            mime->setData(QStringLiteral("application/x-owl-docs-atom+json"), QJsonDocument(*payload).toJson(QJsonDocument::Compact));
+            mime->setText(selectedText());
+            QApplication::clipboard()->setMimeData(mime);
+            return;
+        }
+    }
     const auto text = selectedText();
     if (!text.isEmpty()) {
         QApplication::clipboard()->setText(text);
@@ -7003,6 +8746,24 @@ void DocumentCanvas::cut() {
     if (rejectLiveEditDuringPreview()) {
         return;
     }
+    if (headerFooterEditing_) {
+        auto& editors = activeStoryIsFooter_ ? footerEditors_ : headerEditors_;
+        if (auto* editor = editors[static_cast<std::size_t>(activeStoryRegion_)]) {
+            auto cursor = editor->textCursor();
+            if (cursor.selectedText().contains(QChar::ObjectReplacementCharacter)) {
+                if (cursor.selectedText().size() != 1) {
+                    emit operationFailed(tr("Cut one header or footer picture at a time so its clipboard data is preserved."));
+                    return;
+                }
+                copy();
+                cursor.removeSelectedText();
+                editor->setTextCursor(cursor);
+            } else {
+                editor->cut();
+            }
+        }
+        return;
+    }
     if (!hasClipboardSelection()) {
         return;
     }
@@ -7010,7 +8771,23 @@ void DocumentCanvas::cut() {
     resetVerticalNavigation();
     clearPendingSpellingWord();
     if (selectedTable_) {
-        copy();
+        if (const auto image = selectedInlineImage()) {
+            if (encodeClipboardInlineImage(image->second).isEmpty()) {
+                emit operationFailed(tr("The selected picture exceeds clipboard limits.")); return;
+            }
+            copy();
+        } else {
+            const auto snapshot = session_->snapshot();
+            const auto* table = snapshot.document.findTable(*selectedTable_);
+            if (!table) return;
+            std::optional<std::pair<std::size_t, std::size_t>> range;
+            if (tableCursor_) range = std::minmax(tableCursor_->utf16Offset,
+                tableSelectionAnchor_.value_or(tableCursor_->utf16Offset));
+            QString error;
+            const auto clipboardData = tableClipboardPayload(*table, selectedTableCells(*table), range, error);
+            if (!clipboardData) { emit operationFailed(error.isEmpty() ? tr("The selected cells cannot be cut safely.") : error); return; }
+            setTableClipboard(*clipboardData, selectedText());
+        }
         if (tableCursor_) {
             static_cast<void>(replaceTableCellText({}, false));
         } else if (tableCellSelection_) {
@@ -7021,6 +8798,12 @@ void DocumentCanvas::cut() {
         return;
     }
     if (selection_.anchor == selection_.focus) {
+        return;
+    }
+    const auto snapshot = session_->snapshot();
+    const auto range = snapshot.document.normalizeRange(selection_);
+    if (!selectedInlineImage() && (!range || !clipboardRangePayload(snapshot.document, range.value()))) {
+        emit operationFailed(tr("This selection includes a heading, caption, bibliography entry, generated block, mixed picture, or exceeds clipboard limits. Copy its visible text, or move its supported objects separately."));
         return;
     }
     copy();
@@ -7054,7 +8837,125 @@ void DocumentCanvas::paste() {
         }
         return;
     }
-    if (!tableCursor_ && !selectedTable_ && mime &&
+    if (mime && mime->hasFormat(QString::fromLatin1(kTableClipboardMime))) {
+        const auto decoded = decodedTableClipboard(mime->data(QString::fromLatin1(kTableClipboardMime)));
+        if (!decoded || (!decoded->first && (decoded->second.rowCount() != 1 || decoded->second.columnCount() != 1))) {
+            emit operationFailed(tr("The table cells on the clipboard are malformed or exceed supported limits.")); return;
+        }
+        const auto& source = decoded->second;
+        const auto snapshot = session_->snapshot();
+        std::vector<core::Operation> operations;
+        if (selectedTable_) {
+            const auto* table = snapshot.document.findTable(*selectedTable_);
+            if (!table) return;
+            const auto chosen = selectedTableCells(*table);
+            if (chosen.empty()) return;
+            const auto firstRow = chosen.front().first, firstColumn = chosen.front().second;
+            const bool insertFragment = tableCursor_ && source.rowCount() == 1 && source.columnCount() == 1;
+            if (source.rowCount() > table->rowCount() - firstRow || source.columnCount() > table->columnCount() - firstColumn) {
+                emit operationFailed(tr("The copied cells do not fit in the destination table.")); return;
+            }
+            std::vector<core::SetTableCellContent> contents;
+            for (std::size_t row = 0; row < source.rowCount(); ++row) for (std::size_t column = 0; column < source.columnCount(); ++column) {
+                const auto* destination = table->cell(firstRow + row, firstColumn + column);
+                auto content = *source.cell(row, column);
+                if (insertFragment) {
+                    const auto start = std::min(tableCursor_->utf16Offset, tableSelectionAnchor_.value_or(tableCursor_->utf16Offset));
+                    const auto end = std::max(tableCursor_->utf16Offset, tableSelectionAnchor_.value_or(tableCursor_->utf16Offset));
+                    content = insertedClipboardCell(*destination, start, end, content);
+                } else {
+                    content.id = destination->id;
+                    for (auto& image : content.images) image.id = core::NodeId::generate();
+                }
+                // Clear all destinations before filling them, so an atomic
+                // multi-cell replacement never exceeds its final media budget.
+                operations.emplace_back(core::SetTableCellContent{table->id(), firstRow + row, firstColumn + column,
+                    core::TableCell{destination->id, {}, {}, destination->paragraph_format, destination->default_character_format}});
+                contents.push_back({table->id(), firstRow + row, firstColumn + column, std::move(content)});
+            }
+            const auto endOffset = insertFragment
+                ? std::min(tableCursor_->utf16Offset, tableSelectionAnchor_.value_or(tableCursor_->utf16Offset)) + source.cell(0, 0)->text.size()
+                : contents.front().content.text.size();
+            for (auto& content : contents) operations.emplace_back(std::move(content));
+            apply(std::move(operations), std::nullopt, std::nullopt, false, std::nullopt, false, true,
+                TableCursor{table->id(), firstRow, firstColumn, endOffset}, table->id());
+        } else {
+            const auto range = snapshot.document.normalizeRange(selection_);
+            if (!range) return;
+            auto cells = source.cells();
+            for (auto& cell : cells) {
+                cell.id = core::NodeId::generate();
+                for (auto& image : cell.images) image.id = core::NodeId::generate();
+            }
+            const auto tableId = core::NodeId::generate();
+            auto table = core::Table::restore(source.rowCount(), source.columnCount(), source.hasHeaderRow(), tableId,
+                std::move(cells), source.style(), source.geometry());
+            if (!table) { emit operationFailed(errorText(table.error())); return; }
+            if (!range.value().empty()) operations.emplace_back(core::DeleteRange{selection_});
+            const auto rightParagraph = core::NodeId::generate();
+            operations.emplace_back(core::SplitParagraph{range.value().start, rightParagraph, typingFormat_});
+            operations.emplace_back(core::InsertTable{rightParagraph, std::move(table.value())});
+            const core::Range bodyCursor{{rightParagraph, 0}, {rightParagraph, 0}};
+            apply(std::move(operations), std::nullopt, std::nullopt, false, bodyCursor, false, true,
+                TableCursor{tableId, 0, 0, 0}, tableId);
+        }
+        return;
+    }
+    if (!tableCursor_ && !selectedTable_ && mime && mime->hasFormat(QStringLiteral("application/x-owl-docs-atom+json"))) {
+        const auto encoded = mime->data(QStringLiteral("application/x-owl-docs-atom+json"));
+        const auto payload = encoded.size() <= kAcademicClipboardMaximumBytes ? QJsonDocument::fromJson(encoded).object() : QJsonObject{};
+        if (payload.value("version").toInt() == 2 && payload.value("type").toString() == QStringLiteral("range")) {
+            std::vector<core::Operation> operations;
+            core::Position end;
+            if (planClipboardRangePaste(payload, session_->snapshot().document, selection_, typingFormat_, operations, end)) {
+                apply(std::move(operations), end);
+            } else {
+                emit operationFailed(tr("The OwlDocs range on the clipboard is malformed or exceeds supported limits."));
+            }
+            return;
+        } else if (payload.value("version").toInt() == 1 && payload.value("type").toString() == QStringLiteral("equation")) {
+            if (payload.value("source").isString() && payload.value("display").isBool()) {
+                insertEquation(payload.value("source").toString(), payload.value("display").toBool());
+                return;
+            }
+        } else if (payload.value("version").toInt() == 1 && payload.value("type").toString() == QStringLiteral("field")) {
+            const int kind = payload.value("kind").toInt(-1);
+            const auto target = core::NodeId::parse(payload.value("target").toString().toStdString());
+            const auto snap = session_->snapshot();
+            const auto range = snap.document.normalizeRange(selection_);
+            if ((kind == static_cast<int>(core::FieldKind::note_reference) || kind == static_cast<int>(core::FieldKind::citation) ||
+                 kind == static_cast<int>(core::FieldKind::cross_reference)) && target && range) {
+                const auto* destination = snap.document.findParagraph(*target);
+                const auto* style = destination && destination->styleId() ? core::findBuiltInParagraphStyle(*destination->styleId()) : nullptr;
+                const bool supported = kind == static_cast<int>(core::FieldKind::note_reference) ?
+                    payload.value("note").isString() || snap.document.findNote(*target) : destination &&
+                    (kind == static_cast<int>(core::FieldKind::citation) ? destination->isBibliographyEntry() :
+                     destination->caption().has_value() || (style && style->outline_level));
+                if (!supported) {
+                    replaceSelection(mime->text());
+                    return;
+                }
+                core::FieldAtom field{core::NodeId::generate(), 0, static_cast<core::FieldKind>(kind), *target,
+                    payload.value("locator").toString().toStdU16String(), payload.value("fullText").toBool() ?
+                    core::CrossReferenceFormat::full_text : core::CrossReferenceFormat::label_number};
+                std::vector<core::Operation> operations;
+                if (!range.value().empty()) operations.push_back(core::DeleteRange{selection_});
+                if (field.kind == core::FieldKind::note_reference && payload.value("note").isString()) {
+                    field.target_id = core::NodeId::generate();
+                    operations.push_back(core::SetNote{{field.target_id, payload.value("endnote").toBool() ? core::NoteKind::endnote : core::NoteKind::footnote,
+                        payload.value("note").toString().toStdU16String()}});
+                }
+                auto end = range.value().start;
+                ++end.utf16_offset;
+                operations.push_back(core::InsertField{range.value().start, field, typingFormat_});
+                apply(std::move(operations), end);
+                return;
+            }
+        }
+        // Interoperable text remains available if a foreign application
+        // supplied malformed or unsupported private clipboard metadata.
+    }
+    if ((!selectedTable_ || tableCursor_) && mime &&
         (mime->hasFormat(QString::fromLatin1(kInlineImageClipboardMime)) ||
          mime->hasFormat(
              QString::fromLatin1(kInlineImageClipboardLegacyMime)))) {
@@ -7066,15 +8967,15 @@ void DocumentCanvas::paste() {
             mime->data(nativeFormat));
         if (!image) {
             emit operationFailed(tr(
-                "The Owl Docs picture on the clipboard is malformed or exceeds the safety limits."));
+                "The OwlDocs picture on the clipboard is malformed or exceeds the safety limits."));
             return;
         }
         static_cast<void>(insertInlineImageWithGeometry(
             image->encodedBytes, image->accessibleName,
-            image->widthEmu, image->heightEmu, image->layout));
+            image->widthEmu, image->heightEmu, tableCursor_ ? core::ImageLayout{} : image->layout));
         return;
     }
-    if (!tableCursor_ && !selectedTable_ && mime) {
+    if ((!selectedTable_ || tableCursor_) && mime) {
         for (const QString& format : {QStringLiteral("image/png"),
                                       QStringLiteral("image/jpeg")}) {
             if (!mime->hasFormat(format)) continue;
@@ -7120,6 +9021,11 @@ void DocumentCanvas::pasteTextOnly() {
     }
     const QString text = mime->text();
     if (text.isEmpty()) {
+        return;
+    }
+    if (headerFooterEditing_) {
+        auto& editors = activeStoryIsFooter_ ? footerEditors_ : headerEditors_;
+        if (auto* editor = editors[static_cast<std::size_t>(activeStoryRegion_)]) editor->insertPlainText(text);
         return;
     }
 
@@ -7179,6 +9085,11 @@ void DocumentCanvas::pasteTextOnly() {
 
 void DocumentCanvas::selectAll() {
     if (previewId_) {
+        return;
+    }
+    if (headerFooterEditing_) {
+        auto& editors = activeStoryIsFooter_ ? footerEditors_ : headerEditors_;
+        if (auto* editor = editors[static_cast<std::size_t>(activeStoryRegion_)]) editor->selectAll();
         return;
     }
     endTypingGroup();
@@ -7496,6 +9407,11 @@ void DocumentCanvas::moveVertical(bool down, bool extend) {
 }
 
 void DocumentCanvas::keyPressEvent(QKeyEvent* event) {
+    if (tableResizeDrag_ && event->key() == Qt::Key_Escape) {
+        cancelTableResize();
+        event->accept();
+        return;
+    }
     if (imageResizeDrag_ && event->key() == Qt::Key_Escape) {
         imageResizeDrag_.reset();
         viewport()->setCursor(Qt::ArrowCursor);
@@ -7554,6 +9470,24 @@ void DocumentCanvas::keyPressEvent(QKeyEvent* event) {
             showSelectedImageSizeDialog();
         }
         return;
+    }
+    if (selectedEquationId() && event->key() == Qt::Key_F2) {
+        showEquationEditor();
+        return;
+    }
+    if (event->key() == Qt::Key_F2 && selection_.anchor != selection_.focus) {
+        const auto snap = session_->snapshot();
+        const auto range = snap.document.normalizeRange(selection_);
+        if (range && range.value().start.paragraph_id == range.value().end.paragraph_id &&
+            range.value().end.utf16_offset - range.value().start.utf16_offset == 1) {
+            const auto* paragraph = snap.document.findParagraph(range.value().start.paragraph_id);
+            const auto* field = paragraph ? paragraph->fieldAt(range.value().start.utf16_offset) : nullptr;
+            if (field && (field->kind == core::FieldKind::note_reference || field->kind == core::FieldKind::citation || field->kind == core::FieldKind::cross_reference)) {
+                showReferencesEditor(field->kind == core::FieldKind::note_reference ? QStringLiteral("editNote") :
+                    field->kind == core::FieldKind::citation ? QStringLiteral("citation") : QStringLiteral("crossReference"));
+                return;
+            }
+        }
     }
     const auto tableMoveShortcut =
         (event->modifiers() & (Qt::ShiftModifier | Qt::AltModifier |
@@ -7710,14 +9644,13 @@ void DocumentCanvas::keyPressEvent(QKeyEvent* event) {
                                      bool coalesceTyping) {
                 start = std::clamp<qsizetype>(start, 0, cellText.size());
                 end = std::clamp<qsizetype>(end, start, cellText.size());
-                QString updated = cellText;
-                updated.replace(start, end - start, replacement);
                 const TableCursor next{
                     cursor.tableId, cursor.row, cursor.column,
                     static_cast<std::size_t>(start + replacement.size())};
-                return apply({core::SetTableCellText{
+                return apply({core::ReplaceTableCellRange{
                                   cursor.tableId, cursor.row, cursor.column,
-                                  toUtf16(updated), typingFormat_}},
+                                  static_cast<std::size_t>(start), static_cast<std::size_t>(end),
+                                  toUtf16(replacement), typingFormat_}},
                              std::nullopt, std::nullopt, coalesceTyping,
                              std::nullopt, false, true, next,
                              cursor.tableId);
@@ -8041,7 +9974,18 @@ QVariant DocumentCanvas::inputMethodQuery(Qt::InputMethodQuery query) const {
     }
 }
 
-bool DocumentCanvas::focusNextPrevChild(bool) {
+bool DocumentCanvas::focusNextPrevChild(bool next) {
+    if (headerFooterEditing_) {
+        auto* focused = QApplication::focusWidget();
+        const auto& editors = activeStoryIsFooter_ ? footerEditors_ : headerEditors_;
+        for (auto* editor : editors) {
+            if (editor == focused || (editor && editor->isAncestorOf(focused)))
+                return QAbstractScrollArea::focusNextPrevChild(next);
+        }
+        auto* tools = storyTools_.data();
+        if (tools && tools->isAncestorOf(focused))
+            return QAbstractScrollArea::focusNextPrevChild(next);
+    }
     // QWidget normally consumes Tab and Backtab for focus traversal before
     // keyPressEvent() can apply editor semantics. Keep both keys in the
     // editing surface so body tabs and list indentation remain available.
@@ -8115,8 +10059,39 @@ DocumentCanvas::Hit DocumentCanvas::hitTest(const QPoint& viewportPoint) const {
             hit.tableHandle = tableVisual->id;
             return hit;
         }
+        constexpr double tolerancePixels = 5.0;
+        const double tolerance = tolerancePixels / scale;
+        for (const auto& cell : tableVisual->cells) {
+            const double endExclusion = std::min(tolerance, cell.rect.height() / 4.0);
+            if (cell.pageIndex == page && point.y() > cell.rect.top() + endExclusion &&
+                point.y() < cell.rect.bottom() - endExclusion &&
+                std::abs(point.x() - cell.rect.right()) <= tolerance) {
+                Hit hit;
+                hit.tableBoundary = TableBoundary{tableVisual->id, true, cell.column};
+                hit.pagePoint = point; hit.pageIndex = page;
+                return hit;
+            }
+        }
+        for (const auto& row : tableVisual->rowVisuals) {
+            const double rowTolerance = std::min(tolerance, row.rect.height() / 4.0);
+            if (row.pageIndex == page && point.x() >= row.rect.left() && point.x() <= row.rect.right() &&
+                std::abs(point.y() - row.rect.bottom()) <= rowTolerance) {
+                Hit hit;
+                hit.tableBoundary = TableBoundary{tableVisual->id, false,
+                    static_cast<std::size_t>(&row - tableVisual->rowVisuals.data())};
+                hit.pagePoint = point; hit.pageIndex = page;
+                return hit;
+            }
+        }
         for (const auto& cell : tableVisual->cells) {
             if (cell.pageIndex != page || !cell.rect.contains(point)) continue;
+            for (auto image = cell.images.rbegin(); image != cell.images.rend(); ++image) {
+                if (image->rect.contains(point)) {
+                    Hit hit;
+                    hit.image = image->id; hit.pagePoint = point; hit.pageIndex = page;
+                    return hit;
+                }
+            }
             std::size_t offset = 0;
             const QTextLine* nearestLine = nullptr;
             double nearestDistance = std::numeric_limits<double>::max();
@@ -8168,6 +10143,22 @@ DocumentCanvas::Hit DocumentCanvas::hitTest(const QPoint& viewportPoint) const {
             }
         }
     }
+    for (const auto& row : tocVisuals_) {
+        if (!row->targetId.isValid()) continue;
+        for (std::size_t index = 0; index < row->lines.size(); ++index) {
+            if (row->pages[index] != page) continue;
+            const auto& line = row->lines[index];
+            const QRectF link(line.x(), line.y(),
+                pageWidthPoints_ - marginRightPoints_ - line.x(), line.height());
+            if (link.contains(point)) {
+                Hit hit;
+                hit.tocTarget = row->targetId;
+                hit.pagePoint = point;
+                hit.pageIndex = page;
+                return hit;
+            }
+        }
+    }
     const VisualLine* nearest = nullptr;
     const ParagraphVisual* owner = nullptr;
     double best = std::numeric_limits<double>::max();
@@ -8187,6 +10178,8 @@ DocumentCanvas::Hit DocumentCanvas::hitTest(const QPoint& viewportPoint) const {
         point.x(), QTextLine::CursorBetweenCharacters);
     Hit hit;
     hit.position = {owner->id, owner->coreOffsetForLayout(offset)};
+    hit.pagePoint = point;
+    hit.pageIndex = page;
     hit.valid = true;
     hit.lineStart = static_cast<int>(owner->coreOffsetForLayout(
         nearest->line.textStart()));
@@ -8222,10 +10215,10 @@ std::optional<DocumentCanvas::StoryRegionHit> DocumentCanvas::storyRegionAt(
         return std::nullopt;
     }
     const bool inHeader = point.y() >= 8.0 &&
-        point.y() <= std::max(32.0, marginTopPoints_ - 3.0);
+        point.y() <= std::max(32.0, bodyMarginTopPoints_ - 3.0);
     const bool inFooter = point.y() >= std::min(
         pageHeightPoints_ - 32.0,
-        pageHeightPoints_ - marginBottomPoints_ + 3.0) &&
+        pageHeightPoints_ - bodyMarginBottomPoints_ + 3.0) &&
         point.y() <= pageHeightPoints_ - 8.0;
     if (!inHeader && !inFooter) return std::nullopt;
     const double relativeX = point.x() - marginLeftPoints_;
@@ -8241,8 +10234,7 @@ void DocumentCanvas::mousePressEvent(QMouseEvent* event) {
     }
     if (event->button() == Qt::LeftButton) {
         if (const auto story = storyRegionAt(event->position().toPoint())) {
-            beginHeaderFooterEditing(story->footer, story->section,
-                                     story->pageIndex);
+            if (headerFooterEditing_) beginHeaderFooterEditing(story->footer, story->section, story->pageIndex);
             selecting_ = false;
             event->accept();
             return;
@@ -8250,6 +10242,22 @@ void DocumentCanvas::mousePressEvent(QMouseEvent* event) {
         if (headerFooterEditing_) endHeaderFooterEditing();
         setFocus();
         const auto hit = hitTest(event->position().toPoint());
+        if (hit.tableBoundary) {
+            if (selectedTable_ != hit.tableBoundary->tableId) selectTable(hit.tableBoundary->tableId);
+            const auto snapshot = session_->snapshot();
+            const auto* table = snapshot.document.findTable(hit.tableBoundary->tableId);
+            if (table) tableResizeDrag_ = TableResizeDrag{*hit.tableBoundary, event->position(),
+                table->geometry(), resolvedTableGeometry(table->id()), table->geometry()};
+            selecting_ = false;
+            event->accept();
+            return;
+        }
+        if (hit.tocTarget) {
+            static_cast<void>(navigateToParagraph(*hit.tocTarget));
+            selecting_ = false;
+            event->accept();
+            return;
+        }
         const bool isTripleClick =
             tripleClickArmed_ && multiClickTimer_.isValid() &&
             multiClickTimer_.elapsed() <= QApplication::doubleClickInterval() &&
@@ -8401,6 +10409,15 @@ void DocumentCanvas::mouseDoubleClickEvent(QMouseEvent* event) {
     if (event->button() != Qt::LeftButton) {
         return;
     }
+    if (const auto story = storyRegionAt(event->position().toPoint())) {
+        beginHeaderFooterEditing(story->footer, story->section, story->pageIndex);
+        auto& editors = story->footer ? footerEditors_ : headerEditors_;
+        auto* target = editors[static_cast<std::size_t>(story->section)];
+        const QPointF point = event->position() - QPointF(target->x(), target->y());
+        QMouseEvent press(QEvent::MouseButtonPress, point, Qt::LeftButton, Qt::LeftButton, Qt::NoModifier);
+        QApplication::sendEvent(target->viewport(), &press);
+        selecting_ = false; tripleClickArmed_ = false; event->accept(); return;
+    }
 
     setFocus();
     const auto hit = hitTest(event->position().toPoint());
@@ -8408,6 +10425,20 @@ void DocumentCanvas::mouseDoubleClickEvent(QMouseEvent* event) {
     multiClickTimer_.start();
     tripleClickArmed_ = true;
     selecting_ = false;
+    if (hit.valid && !hit.tableCursor && !hit.image) {
+        const auto snap = session_->snapshot();
+        if (const auto* paragraph = snap.document.findParagraph(hit.position.paragraph_id)) {
+            for (const auto& equation : paragraph->equations()) {
+                if (equationBounds(equation.id).contains(hit.pagePoint)) {
+                    selectEquation(equation.id);
+                    tripleClickArmed_ = false;
+                    showEquationEditor();
+                    event->accept();
+                    return;
+                }
+            }
+        }
+    }
     if (hit.image) {
         if (selectInlineImage(*hit.image)) {
             tripleClickArmed_ = false;
@@ -8471,6 +10502,44 @@ void DocumentCanvas::mouseDoubleClickEvent(QMouseEvent* event) {
 void DocumentCanvas::mouseMoveEvent(QMouseEvent* event) {
     if (previewId_) {
         return;
+    }
+    if (tableResizeDrag_ && (event->buttons() & Qt::LeftButton)) {
+        auto& drag = *tableResizeDrag_;
+        const double scale = kScreenPointsScale * zoomPercent_ / 100.0;
+        const auto index = drag.boundary.index;
+        const auto& widths = drag.resolved.column_widths_twips;
+        if (drag.boundary.column && index < widths.size()) {
+            const double requested = (event->position().x() - drag.startViewportPoint.x()) / scale * 20.0;
+            const double minimum = std::min(360.0, static_cast<double>(widths[index])) - widths[index];
+            const double maximum = index + 1 < widths.size()
+                ? widths[index + 1] - std::min(360.0, static_cast<double>(widths[index + 1]))
+                : std::max(0.0, (pageWidthPoints_ - marginLeftPoints_ - marginRightPoints_) * 20.0 -
+                    std::accumulate(widths.begin(), widths.end(), 0.0));
+            const auto delta = static_cast<std::int64_t>(std::llround(std::clamp(requested,
+                minimum, maximum)));
+            drag.preview = drag.original;
+            if (delta != 0) {
+                drag.preview.column_widths_twips = widths;
+                drag.preview.column_widths_twips[index] = static_cast<std::uint32_t>(
+                    static_cast<std::int64_t>(widths[index]) + delta);
+                if (index + 1 < widths.size()) drag.preview.column_widths_twips[index + 1] =
+                    static_cast<std::uint32_t>(static_cast<std::int64_t>(widths[index + 1]) - delta);
+            }
+            invalidateLayout(); viewport()->update();
+        } else if (!drag.boundary.column && index < drag.resolved.row_minimum_heights_twips.size()) {
+            const double delta = (event->position().y() - drag.startViewportPoint.y()) / scale;
+            const double initial = drag.resolved.row_minimum_heights_twips[index] / 20.0;
+            const double maximum = std::max(0.0, pageHeightPoints_ - bodyMarginTopPoints_ - bodyMarginBottomPoints_);
+            const auto height = static_cast<std::uint32_t>(std::llround(std::clamp(initial + delta, 0.0, maximum) * 20.0));
+            drag.preview = drag.original;
+            if (height != drag.resolved.row_minimum_heights_twips[index]) {
+                if (drag.preview.row_minimum_heights_twips.empty())
+                    drag.preview.row_minimum_heights_twips.resize(drag.resolved.row_minimum_heights_twips.size());
+                drag.preview.row_minimum_heights_twips[index] = height;
+            }
+            invalidateLayout(); viewport()->update();
+        }
+        event->accept(); return;
     }
     if (imageResizeDrag_ && (event->buttons() & Qt::LeftButton)) {
         const double scale = kScreenPointsScale * zoomPercent_ / 100.0;
@@ -8558,7 +10627,9 @@ void DocumentCanvas::mouseMoveEvent(QMouseEvent* event) {
         return;
     }
     const auto hover = hitTest(event->position().toPoint());
-    if (hover.imageResizeHandle) {
+    if (hover.tableBoundary) {
+        viewport()->setCursor(hover.tableBoundary->column ? Qt::SizeHorCursor : Qt::SizeVerCursor);
+    } else if (hover.imageResizeHandle) {
         switch (*hover.imageResizeHandle) {
             case ImageResizeHandle::bottom_right:
                 viewport()->setCursor(Qt::SizeFDiagCursor);
@@ -8617,6 +10688,17 @@ void DocumentCanvas::mouseMoveEvent(QMouseEvent* event) {
 
 void DocumentCanvas::mouseReleaseEvent(QMouseEvent* event) {
     if (event->button() != Qt::LeftButton) return;
+    if (tableResizeDrag_) {
+        const auto drag = *tableResizeDrag_;
+        tableResizeDrag_.reset();
+        invalidateLayout();
+        if (drag.preview != drag.original) {
+            static_cast<void>(apply({core::SetTableGeometry{drag.boundary.tableId, drag.preview}}));
+        }
+        viewport()->setCursor(Qt::IBeamCursor);
+        viewport()->update();
+        event->accept(); return;
+    }
     selecting_ = false;
     tableMouseSelectionAnchor_.reset();
     if (imageResizeDrag_) {
@@ -8666,7 +10748,21 @@ void DocumentCanvas::contextMenuEvent(QContextMenuEvent* event) {
     endTypingGroup();
     resetVerticalNavigation();
     const auto hit = hitTest(event->pos());
-    if (hit.tableHandle) {
+    std::optional<core::NodeId> equationHit;
+    if (hit.valid && !hit.tableCursor && !hit.image) {
+        const auto snap = session_->snapshot();
+        if (const auto* paragraph = snap.document.findParagraph(hit.position.paragraph_id)) {
+            for (const auto& equation : paragraph->equations()) {
+                if (equationBounds(equation.id).contains(hit.pagePoint)) {
+                    equationHit = equation.id;
+                    break;
+                }
+            }
+        }
+    }
+    if (equationHit) {
+        static_cast<void>(selectEquation(*equationHit));
+    } else if (hit.tableHandle) {
         static_cast<void>(selectTable(*hit.tableHandle));
     } else if (hit.image) {
         static_cast<void>(selectInlineImage(*hit.image));
@@ -8719,6 +10815,13 @@ void DocumentCanvas::contextMenuEvent(QContextMenuEvent* event) {
         }
     }
     QMenu menu(this);
+    if (selectedEquationId()) {
+        auto* editEquation = menu.addAction(tr("Edit Equation…"));
+        editEquation->setObjectName(QStringLiteral("context.editEquation"));
+        editEquation->setShortcut(QKeySequence(Qt::Key_F2));
+        connect(editEquation, &QAction::triggered, this, &DocumentCanvas::showEquationEditor);
+        menu.addSeparator();
+    }
     if (selectedInlineImageId()) {
         if (selectedExcalidrawScene()) {
             auto* editFigure = menu.addAction(tr("Edit Excalidraw Figure…"));
@@ -8738,6 +10841,7 @@ void DocumentCanvas::contextMenuEvent(QContextMenuEvent* event) {
                 &DocumentCanvas::showSelectedImageAltTextDialog);
         auto* layout = menu.addAction(tr("Wrap and Layout…"));
         layout->setObjectName(QStringLiteral("context.pictureLayout"));
+        layout->setEnabled(!tableCursor_);
         connect(layout, &QAction::triggered, this,
                 &DocumentCanvas::showSelectedImageLayoutDialog);
         auto* remove = menu.addAction(tr("Delete Picture"));
@@ -8845,6 +10949,7 @@ void DocumentCanvas::focusInEvent(QFocusEvent* event) {
     QAbstractScrollArea::focusInEvent(event); viewport()->update();
 }
 void DocumentCanvas::focusOutEvent(QFocusEvent* event) {
+    cancelTableResize();
     endTypingGroup();
     clearPendingSpellingWord();
     imageResizeDrag_.reset();
@@ -9040,6 +11145,13 @@ DocumentCanvas::selectedCharacterOverrideMask() const {
 }
 
 core::CharacterFormat DocumentCanvas::activeCharacterFormat() const {
+    if (headerFooterEditing_) {
+        core::CharacterFormat format;
+        format.font_family = defaultFontFamily_.toStdString();
+        format.font_size_half_points = static_cast<std::int32_t>(std::lround(defaultFontPointSize_ * 2.0));
+        format.foreground_argb = kDefaultTextArgb;
+        return format;
+    }
     if (tableCursor_) {
         const bool hasSelection = tableSelectionAnchor_ &&
             *tableSelectionAnchor_ != tableCursor_->utf16Offset;
@@ -9056,6 +11168,7 @@ void DocumentCanvas::applyCharacterFormat(const core::CharacterFormatDelta& delt
 
 void DocumentCanvas::applyCharacterFormatInternal(
     const core::CharacterFormatDelta& delta, bool coalesceWithPrevious) {
+    if (headerFooterEditing_) return;
     if (rejectLiveEditDuringPreview()) {
         return;
     }
@@ -9226,6 +11339,7 @@ void DocumentCanvas::applyCharacterFormatInternal(
 }
 
 void DocumentCanvas::applyParagraphFormat(const core::ParagraphFormatDelta& delta) {
+    if (headerFooterEditing_) return;
     if (selectedTable_) {
         if (rejectLiveEditDuringPreview()) return;
         const auto snap = session_->snapshot();
@@ -9278,12 +11392,12 @@ void DocumentCanvas::applyParagraphFormat(const core::ParagraphFormatDelta& delt
 }
 
 bool DocumentCanvas::paragraphStylesAvailable() const noexcept {
-    return !previewId_ && !selectedTable_ && !tableCursor_ &&
+    return !headerFooterEditing_ && !previewId_ && !selectedTable_ && !tableCursor_ &&
            !tableCellSelection_;
 }
 
 QString DocumentCanvas::currentParagraphStyleId() const {
-    if (selectedTable_ || tableCursor_ || tableCellSelection_) return {};
+    if (headerFooterEditing_ || selectedTable_ || tableCursor_ || tableCellSelection_) return {};
     const auto snap = visibleDocumentSnapshot();
     const auto normalized = snap.document.normalizeRange(selection_);
     if (!normalized) return {};
@@ -9322,6 +11436,7 @@ std::vector<core::Operation> DocumentCanvas::planParagraphStyleOperations(
 
 void DocumentCanvas::applyParagraphStyleInternal(
     const QString& styleId, bool coalesceWithPrevious) {
+    if (headerFooterEditing_) return;
     if (selectedTable_ || tableCursor_ || tableCellSelection_) {
         emit operationFailed(tr(
             "Paragraph styles are not available inside or across table cells."));
@@ -9396,9 +11511,100 @@ void DocumentCanvas::setFontPointSize(double points) {
     applyCharacterFormat(delta);
 }
 void DocumentCanvas::setForeground(const QColor& color) {
+    if (!color.isValid() && !selectedTable_) {
+        if (headerFooterEditing_ || rejectLiveEditDuringPreview()) return;
+        const auto snapshot = session_->snapshot();
+        const auto normalized = snapshot.document.normalizeRange(selection_);
+        if (!normalized) return;
+        const auto& range = normalized.value();
+        std::vector<core::NodeId> ids;
+        for (std::size_t index = range.start_paragraph_index; index <= range.end_paragraph_index; ++index)
+            ids.push_back(snapshot.document.paragraphs()[index].id());
+        auto plan = planBuiltInStyleProvenanceInitialization(snapshot.document, ids,
+            defaultFontFamily_, defaultFontPointSize_, typingFormat_, selection_.focus, typingOverrideMask_);
+        const auto provenanceFor = [&](const core::Paragraph& paragraph) {
+            auto provenance = paragraph.styleProvenance();
+            if (!provenance) for (const auto& operation : plan.operations) {
+                if (const auto* initialization = std::get_if<core::SetParagraphStyleProvenance>(&operation);
+                    initialization && initialization->paragraph_id == paragraph.id()) {
+                    provenance = initialization->provenance;
+                    break;
+                }
+            }
+            return provenance;
+        };
+        auto typing = typingFormat_;
+        auto mask = typingOverrideMask_;
+        mask.foreground_argb = false;
+        if (const auto* focus = snapshot.document.findParagraph(selection_.focus.paragraph_id)) {
+            const auto provenance = provenanceFor(*focus);
+            typing.foreground_argb = provenance
+                ? (focus->text().empty() ? provenance->inherited_paragraph_mark_character_format.foreground_argb
+                                        : provenance->inherited_character_format.foreground_argb)
+                : std::nullopt;
+        }
+        if (range.empty() && !snapshot.document.paragraphs()[range.start_paragraph_index].text().empty()) {
+            endTypingGroup();
+            typingFormat_ = std::move(typing);
+            typingOverrideMask_ = mask;
+            emitCursorFormat();
+            return;
+        }
+        bool changed = false;
+        std::vector<core::Operation> operations = plan.operations;
+        for (std::size_t index = range.start_paragraph_index; index <= range.end_paragraph_index; ++index) {
+            const auto& paragraph = snapshot.document.paragraphs()[index];
+            const auto start = index == range.start_paragraph_index ? range.start.utf16_offset : 0;
+            const auto end = index == range.end_paragraph_index ? range.end.utf16_offset : paragraph.text().size();
+            auto provenance = provenanceFor(paragraph);
+            const auto inherited = provenance
+                ? (paragraph.text().empty() ? provenance->inherited_paragraph_mark_character_format.foreground_argb
+                                          : provenance->inherited_character_format.foreground_argb)
+                : std::nullopt;
+            core::CharacterFormatDelta delta;
+            delta.foreground_argb = inherited ? core::PropertyDelta<std::uint32_t>::set(*inherited)
+                                             : core::PropertyDelta<std::uint32_t>::clear();
+            if (paragraph.text().empty()) {
+                changed = changed || paragraph.paragraphMarkCharacterFormat().foreground_argb != inherited ||
+                    (provenance && provenance->paragraph_mark_overrides.foreground_argb);
+                operations.emplace_back(core::SetParagraphMarkCharacterFormat{paragraph.id(), delta});
+                if (provenance) provenance->paragraph_mark_overrides.foreground_argb = false;
+            } else if (start < end) {
+                for (std::size_t offset = start; offset < end; ++offset)
+                    changed = changed || paragraph.characterFormatAt(offset + 1).foreground_argb != inherited ||
+                        paragraph.styleOverrideMaskAt(offset + 1).foreground_argb;
+                operations.emplace_back(core::SetCharacterFormat{{{paragraph.id(), start}, {paragraph.id(), end}}, delta});
+                if (provenance) {
+                    std::vector<core::ParagraphStyleProvenance::OverrideRun> runs;
+                    const auto append = [&](std::size_t first, std::size_t last, core::CharacterFormatMask properties) {
+                        if (first >= last || properties.empty()) return;
+                        if (!runs.empty() && runs.back().end == first && runs.back().properties == properties)
+                            runs.back().end = last;
+                        else runs.push_back({first, last, properties});
+                    };
+                    for (const auto& run : provenance->character_overrides) {
+                        if (run.end <= start || run.start >= end) { append(run.start, run.end, run.properties); continue; }
+                        append(run.start, std::min(start, run.end), run.properties);
+                        auto properties = run.properties;
+                        properties.foreground_argb = false;
+                        append(std::max(start, run.start), std::min(end, run.end), properties);
+                        append(std::max(end, run.start), run.end, run.properties);
+                    }
+                    provenance->character_overrides = std::move(runs);
+                }
+            }
+            if (provenance) operations.emplace_back(core::SetParagraphStyleProvenance{paragraph.id(), std::move(provenance)});
+        }
+        if (changed) apply(std::move(operations), std::nullopt, std::move(typing), false,
+            std::nullopt, false, false, std::nullopt, std::nullopt, std::nullopt, mask);
+        else { typingFormat_ = std::move(typing); typingOverrideMask_ = mask; emitCursorFormat(); }
+        return;
+    }
     const auto before = session_->snapshot().revision;
     core::CharacterFormatDelta delta;
-    delta.foreground_argb = core::PropertyDelta<std::uint32_t>::set(toArgb(color));
+    delta.foreground_argb = color.isValid()
+        ? core::PropertyDelta<std::uint32_t>::set(toArgb(color))
+        : core::PropertyDelta<std::uint32_t>::clear();
     const bool coalesce = colorAdjustmentActive_ &&
                           colorAdjustmentLastRevision_ == before;
     applyCharacterFormatInternal(delta, coalesce);
@@ -9505,6 +11711,15 @@ QString DocumentCanvas::footerText() const {
     return fromUtf16(session_->snapshot().document.footerText());
 }
 
+std::optional<StorySelection> DocumentCanvas::activeStorySelection() const {
+    if (!headerFooterEditing_ || activeStoryRegion_ < 0 || activeStoryRegion_ > 2) return std::nullopt;
+    const auto& editors = activeStoryIsFooter_ ? footerEditors_ : headerEditors_;
+    const auto* editor = editors[static_cast<std::size_t>(activeStoryRegion_)];
+    if (!editor) return std::nullopt;
+    const auto cursor = editor->textCursor();
+    return StorySelection{activeStoryIsFooter_, activeStoryRegion_, static_cast<std::size_t>(std::max(0, cursor.selectionStart())), static_cast<std::size_t>(std::max(0, cursor.selectionEnd()))};
+}
+
 bool DocumentCanvas::setHeaderText(const QString& text) {
     return apply({core::SetHeaderText{toUtf16(text)}});
 }
@@ -9538,6 +11753,67 @@ QString DocumentCanvas::joinStorySections(
            editors[2]->toPlainText();
 }
 
+std::array<int, 3> DocumentCanvas::measureStoryLines(
+    const core::Document& document, bool footer,
+    const QSizeF& pageSizePoints, const QMarginsF& marginsPoints,
+    const QString& fontFamily, double fontPointSize, int pageCount) {
+    const auto sections = splitStorySections(fromUtf16(
+        footer ? document.footerText() : document.headerText()));
+    const auto& images = footer ? document.footerImages() : document.headerImages();
+    const auto font = fontFrom({}, fontFamily, fontPointSize);
+    const int pages = std::max(1, pageCount);
+    std::array<int, 3> result{};
+    std::size_t offset = 0;
+    for (std::size_t region = 0; region < sections.size(); ++region) {
+        const auto rect = storyCapacityRect(pageSizePoints.width(), pageSizePoints.height(),
+            marginsPoints.top(), marginsPoints.right(), marginsPoints.bottom(), marginsPoints.left(),
+            footer, static_cast<int>(region));
+        const int renderedPages = sections[region].contains(QStringLiteral("{PAGE}"), Qt::CaseInsensitive) ? pages : 1;
+        for (int page = 0; page < renderedPages; ++page) {
+            const auto story = layoutStoryRegion(sections[region], images, offset, rect,
+                static_cast<int>(region), footer, page, pages, font);
+            result[region] = std::max(result[region], static_cast<int>(story.lines.size()));
+        }
+        offset += static_cast<std::size_t>(sections[region].size()) + 1U;
+    }
+    return result;
+}
+
+std::pair<double, double> DocumentCanvas::storyBodyMargins(const core::Document& document, int pages) const {
+    constexpr double nativeDistance = 36.0;
+    constexpr double gap = 6.0;
+    const auto font = fontFrom({}, defaultFontFamily_, defaultFontPointSize_);
+    const auto reserve = [&](bool footer) {
+        const auto& raw = footer ? document.footerText() : document.headerText();
+        const auto& images = footer ? document.footerImages() : document.headerImages();
+        const auto sections = splitStorySections(fromUtf16(raw));
+        double height = 0;
+        std::size_t offset = 0;
+        for (std::size_t index = 0; index < sections.size(); ++index) {
+            if (!sections[index].isEmpty()) {
+                const auto rect = storyCapacityRect(pageWidthPoints_, pageHeightPoints_, marginTopPoints_,
+                    marginRightPoints_, marginBottomPoints_, marginLeftPoints_, footer, static_cast<int>(index));
+                const int renderedPages = sections[index].contains(QStringLiteral("{PAGE}"), Qt::CaseInsensitive) ? std::max(1, pages) : 1;
+                for (int page = 0; page < renderedPages; ++page)
+                    height = std::max(height, layoutStoryRegion(sections[index], images, offset, rect,
+                        static_cast<int>(index), footer, page, std::max(1, pages), font).contentHeight);
+            }
+            offset += static_cast<std::size_t>(sections[index].size()) + 1U;
+        }
+        const double requested = footer ? marginBottomPoints_ : marginTopPoints_;
+        const auto available = storyCapacityRect(pageWidthPoints_, pageHeightPoints_, marginTopPoints_,
+            marginRightPoints_, marginBottomPoints_, marginLeftPoints_, footer, 0).height();
+        return height > 0 ? std::max(requested, nativeDistance + gap + std::min(available, height)) : requested;
+    };
+    return {reserve(false), reserve(true)};
+}
+
+QRectF DocumentCanvas::storyRegion(bool footer, int region) const {
+    ensureLayout();
+    return storyRegionRect(pageWidthPoints_, pageHeightPoints_, bodyMarginTopPoints_, marginRightPoints_,
+        bodyMarginBottomPoints_, marginLeftPoints_, footer, region);
+}
+
 void DocumentCanvas::ensureStoryEditors() {
     if (headerEditors_[0]) return;
     const auto create = [this](std::array<QPlainTextEdit*, 3>& editors,
@@ -9556,10 +11832,135 @@ void DocumentCanvas::ensureStoryEditors() {
             editor->setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
             editor->setTabChangesFocus(true);
             editor->setWordWrapMode(QTextOption::WordWrap);
+            editor->document()->setDocumentMargin(0.0);
             editor->setStyleSheet(QStringLiteral(
-                "QPlainTextEdit { background: rgba(255,255,255,235); "
-                "border: 1px dashed #7b8794; padding: 2px; color: #000000; } "
-                "QPlainTextEdit:focus { border: 2px solid #e95420; }"));
+                "QPlainTextEdit { background: transparent; border: 0; padding: 0; color: #000000; }"));
+            const bool footer = prefix.startsWith(QStringLiteral("footer"));
+            const auto regionRect = [this, footer, index] {
+                return storyRegion(footer, index);
+            };
+            const auto layout = [this, editor, footer, index, regionRect] {
+                const auto snap = session_->snapshot();
+                const auto sections = splitStorySections(footer ? footerText() : headerText());
+                std::size_t globalOffset = 0;
+                for (int before = 0; before < index; ++before) globalOffset += static_cast<std::size_t>(sections[static_cast<std::size_t>(before)].size()) + 1U;
+                auto images = footer ? snap.document.footerImages() : snap.document.headerImages();
+                if (editor->compositionLength() > 0)
+                    for (auto& image : images)
+                        if (image.utf16_offset >= globalOffset + static_cast<std::size_t>(editor->compositionStart()))
+                            image.utf16_offset += static_cast<std::size_t>(editor->compositionLength());
+                return layoutStoryRegion(editor->layoutText(), images,
+                    globalOffset, regionRect(), index, footer, activeStoryPage_, pageCount_, fontFrom({}, defaultFontFamily_, defaultFontPointSize_));
+            };
+            const auto pageOrigin = [this] {
+                const double scale = kScreenPointsScale * zoomPercent_ / 100.0;
+                const double pageWidth = pageWidthPoints_ * scale;
+                const double pageLeft = (std::max(pageWidth + 2 * kCanvasPaddingPixels,
+                    static_cast<double>(viewport()->width())) - pageWidth) / 2.0 - horizontalScrollBar()->value();
+                const double pageTop = kCanvasPaddingPixels + activeStoryPage_ *
+                    (pageHeightPoints_ * scale + kPageGapPixels) - verticalScrollBar()->value();
+                return QPointF(pageLeft, pageTop);
+            };
+            editor->positionAt = [this, editor, layout, pageOrigin](const QPointF& point) {
+                const double scale = kScreenPointsScale * zoomPercent_ / 100.0;
+                const auto pagePoint = (point + QPointF(editor->x(), editor->y()) - pageOrigin()) / scale;
+                const auto story = layout();
+                if (story.lines.empty()) return 0;
+                const QTextLine* nearest = &story.lines.front();
+                for (const auto& line : story.lines) {
+                    nearest = &line;
+                    if (pagePoint.y() <= line.y() + line.height()) break;
+                }
+                const int displayPosition = nearest->xToCursor(pagePoint.x());
+                return editor->sourcePosition(story.displayToSource[static_cast<std::size_t>(std::clamp(displayPosition, 0, static_cast<int>(story.displayToSource.size()) - 1))]);
+            };
+            editor->cursorRectAt = [this, editor, footer, index, layout, regionRect, pageOrigin](int layoutPosition) {
+                const double scale = kScreenPointsScale * zoomPercent_ / 100.0;
+                const auto rect = regionRect();
+                const auto font = fontFrom({}, defaultFontFamily_, defaultFontPointSize_);
+                const auto story = layout();
+                const int position = story.sourceToDisplay[static_cast<std::size_t>(
+                    std::clamp(layoutPosition, 0, static_cast<int>(story.sourceToDisplay.size()) - 1))];
+                QPointF top(rect.left(), footer ? rect.bottom() - QFontMetricsF(font).height() : rect.top());
+                double height = QFontMetricsF(font).height();
+                if (index == 1) top.setX(rect.center().x());
+                else if (index == 2) top.setX(rect.right());
+                for (std::size_t candidate = 0; candidate < story.lines.size(); ++candidate) {
+                    const auto& line = story.lines[candidate];
+                    if (position < line.textStart() ||
+                        (candidate + 1 < story.lines.size() &&
+                            (position > story.lines[candidate + 1].textStart() ||
+                             (position == story.lines[candidate + 1].textStart() && !editor->previousLineAffinity())))) continue;
+                    top = {line.cursorToX(position), line.y()}; height = line.height(); break;
+                }
+                return QRectF(top * scale + pageOrigin() - QPointF(editor->x(), editor->y()), QSizeF(1.0, height * scale));
+            };
+            editor->moveVisually = [editor, layout](int key, double preferredColumn) {
+                const auto story = layout();
+                if (story.lines.empty()) return StoryTextEdit::Movement{0, 0.0, false};
+                const int current = story.sourceToDisplay[static_cast<std::size_t>(std::clamp(
+                    editor->layoutPosition(editor->textCursor().position()), 0, static_cast<int>(story.sourceToDisplay.size()) - 1))];
+                int lineIndex = 0;
+                for (int candidate = 0; candidate < static_cast<int>(story.lines.size()); ++candidate) {
+                    lineIndex = candidate;
+                    if (candidate + 1 == static_cast<int>(story.lines.size()) ||
+                        current < story.lines[static_cast<std::size_t>(candidate + 1)].textStart() ||
+                        (current == story.lines[static_cast<std::size_t>(candidate + 1)].textStart() && editor->previousLineAffinity())) break;
+                }
+                const auto& line = story.lines[static_cast<std::size_t>(lineIndex)];
+                const double column = std::isfinite(preferredColumn) ? preferredColumn : line.cursorToX(current);
+                int target = line.textStart();
+                int targetLine = lineIndex;
+                if (key == Qt::Key_End) {
+                    target += line.textLength();
+                    if (target > line.textStart() && story.text->text().at(target - 1) == QChar::LineSeparator) --target;
+                } else if (key == Qt::Key_Up || key == Qt::Key_Down) {
+                    const int next = lineIndex + (key == Qt::Key_Up ? -1 : 1);
+                    targetLine = std::clamp(next, 0, static_cast<int>(story.lines.size()) - 1);
+                    target = next < 0 ? 0 : next >= static_cast<int>(story.lines.size()) ? static_cast<int>(story.text->text().size())
+                        : story.lines[static_cast<std::size_t>(next)].xToCursor(column);
+                }
+                const int source = story.displayToSource[static_cast<std::size_t>(std::clamp(
+                    target, 0, static_cast<int>(story.displayToSource.size()) - 1))];
+                const bool previousLine = targetLine + 1 < static_cast<int>(story.lines.size()) &&
+                    target == story.lines[static_cast<std::size_t>(targetLine + 1)].textStart();
+                return StoryTextEdit::Movement{editor->sourcePosition(source), column, previousLine};
+            };
+            editor->renderInline = [this, editor, layout, pageOrigin](QPainter& painter) {
+                const double scale = kScreenPointsScale * zoomPercent_ / 100.0;
+                painter.fillRect(editor->viewport()->rect(), Qt::white);
+                painter.translate(pageOrigin() - QPointF(editor->x(), editor->y()));
+                painter.scale(scale, scale);
+                const auto story = layout();
+                const auto cursor = editor->textCursor();
+                const auto mappedLayout = [&story](int position) {
+                    return story.sourceToDisplay[static_cast<std::size_t>(std::clamp(position, 0, static_cast<int>(story.sourceToDisplay.size()) - 1))];
+                };
+                if (cursor.hasSelection()) {
+                    const int start = mappedLayout(editor->layoutPosition(cursor.selectionStart()));
+                    const int end = mappedLayout(editor->layoutPosition(cursor.selectionEnd()));
+                    for (const auto& line : story.lines) fillSelectionBackground(painter, line,
+                        std::max(start, line.textStart()), std::min(end, line.textStart() + line.textLength()));
+                }
+                drawStoryLayout(painter, story, [this](const auto& image) { return decodedInlineImage(image); });
+                if (editor->compositionLength() > 0) {
+                    const int start = mappedLayout(editor->compositionStart());
+                    const int end = mappedLayout(editor->compositionStart() + editor->compositionLength());
+                    painter.setPen(QPen(Qt::black, 1.0 / scale, Qt::DashLine));
+                    for (const auto& line : story.lines) {
+                        const int left = std::max(start, line.textStart());
+                        const int right = std::min(end, line.textStart() + line.textLength());
+                        if (left < right) painter.drawLine(QPointF(line.cursorToX(left), line.y() + line.height()),
+                            QPointF(line.cursorToX(right), line.y() + line.height()));
+                    }
+                }
+                if (editor->hasFocus()) {
+                    const auto caret = editor->cursorRectAt(editor->visualCursorPosition());
+                    painter.resetTransform();
+                    painter.setPen(QPen(Qt::black, 1.0));
+                    painter.drawLine(caret.topLeft(), caret.bottomLeft());
+                }
+            };
             QFont font(defaultFontFamily_);
             font.setPointSizeF(defaultFontPointSize_);
             editor->setFont(font);
@@ -9571,29 +11972,138 @@ void DocumentCanvas::ensureStoryEditors() {
             editor->hide();
             connect(editor, &QPlainTextEdit::textChanged, this,
                     [this] { applyStoryEditorText(); });
+            connect(editor, &QPlainTextEdit::cursorPositionChanged, editor->viewport(), QOverload<>::of(&QWidget::update));
+            connect(editor, &QPlainTextEdit::selectionChanged, editor->viewport(), QOverload<>::of(&QWidget::update));
             editor->pasteImage = [this, editor](const QMimeData* mime) {
                 static_cast<void>(pasteStoryImage(editor, mime));
             };
+            editor->closeStory = [this] { endHeaderFooterEditing(); };
+            editor->clipboardAction = [this](QKeySequence::StandardKey action) {
+                switch (action) {
+                    case QKeySequence::Copy: copy(); break;
+                    case QKeySequence::Cut: cut(); break;
+                    case QKeySequence::Paste: paste(); break;
+                    case QKeySequence::SelectAll: selectAll(); break;
+                    case QKeySequence::Undo: undo(); break;
+                    case QKeySequence::Redo: redo(); break;
+                    default: break;
+                }
+            };
             editor->activated = [this, index] {
                 activeStoryRegion_ = index;
+                if (auto* region = storyTools_ ? storyTools_->findChild<QComboBox*>(QStringLiteral("story.region")) : nullptr) {
+                    const QSignalBlocker blocker(region);
+                    region->setCurrentIndex(index);
+                }
             };
             editors[static_cast<std::size_t>(index)] = editor;
         }
     };
     create(headerEditors_, QStringLiteral("headerStoryEditor"));
     create(footerEditors_, QStringLiteral("footerStoryEditor"));
+    auto* tools = new QFrame(viewport());
+    storyTools_ = tools;
+    tools->setObjectName(QStringLiteral("story.tools"));
+    tools->setAccessibleName(tr("Header and Footer controls"));
+    tools->setFrameShape(QFrame::StyledPanel);
+    tools->setAutoFillBackground(true);
+    auto* row = new QGridLayout(tools);
+    row->setContentsMargins(6, 3, 6, 3);
+    row->setSpacing(4);
+    const auto button = [tools, row](const QString& name, const QString& text) {
+        auto* control = new QPushButton(text, tools);
+        control->setObjectName(name);
+        control->setFocusPolicy(Qt::StrongFocus);
+        control->setAutoDefault(true);
+        row->addWidget(control, 0, row->count()); return control;
+    };
+    connect(button(QStringLiteral("story.header"), tr("Header")), &QPushButton::clicked, this,
+        [this] { beginHeaderFooterEditing(false, activeStoryRegion_, activeStoryPage_); });
+    connect(button(QStringLiteral("story.footer"), tr("Footer")), &QPushButton::clicked, this,
+        [this] { beginHeaderFooterEditing(true, activeStoryRegion_, activeStoryPage_); });
+    auto* region = new QComboBox(tools);
+    region->setObjectName(QStringLiteral("story.region"));
+    region->setAccessibleName(tr("Header or footer alignment region"));
+    region->addItems({tr("Left"), tr("Center"), tr("Right")});
+    row->addWidget(region, 0, row->count());
+    connect(region, &QComboBox::activated, this, [this](int index) {
+        beginHeaderFooterEditing(activeStoryIsFooter_, index, activeStoryPage_);
+    });
+    connect(region, &QComboBox::currentIndexChanged, this, [this](int index) {
+        if (headerFooterEditing_ && index != activeStoryRegion_) beginHeaderFooterEditing(activeStoryIsFooter_, index, activeStoryPage_);
+    });
+    const auto insertField = [this](const QString& token) {
+        auto& editors = activeStoryIsFooter_ ? footerEditors_ : headerEditors_;
+        auto* target = editors[static_cast<std::size_t>(activeStoryRegion_)];
+        target->setFocus(); target->insertPlainText(token);
+    };
+    connect(button(QStringLiteral("story.insertPage"), tr("Page Number")), &QPushButton::clicked, this,
+        [insertField] { insertField(QStringLiteral("{PAGE}")); });
+    connect(button(QStringLiteral("story.insertPages"), tr("Page Count")), &QPushButton::clicked, this,
+        [insertField] { insertField(QStringLiteral("{PAGES}")); });
+    connect(button(QStringLiteral("story.close"), tr("Close Header and Footer")), &QPushButton::clicked, this, &DocumentCanvas::endHeaderFooterEditing);
+    QWidget* previous = nullptr;
+    for (const auto* name : {"story.header", "story.footer", "story.region", "story.insertPage", "story.insertPages", "story.close"}) {
+        auto* control = tools->findChild<QWidget*>(QString::fromUtf8(name));
+        if (previous) QWidget::setTabOrder(previous, control);
+        previous = control;
+    }
+    auto* closeShortcut = new QAction(this);
+    closeShortcut->setObjectName(QStringLiteral("story.closeShortcut"));
+    closeShortcut->setShortcut(QKeySequence(Qt::Key_Escape));
+    closeShortcut->setShortcutContext(Qt::WidgetWithChildrenShortcut);
+    closeShortcut->setEnabled(false); addAction(closeShortcut); tools->addAction(closeShortcut);
+    connect(closeShortcut, &QAction::triggered, this, &DocumentCanvas::endHeaderFooterEditing);
+    tools->hide();
 }
 
 void DocumentCanvas::loadStoryEditors(bool footer) {
     ensureStoryEditors();
     loadingStoryEditors_ = true;
     const auto values = splitStorySections(footer ? footerText() : headerText());
+    const auto snap = session_->snapshot();
+    const auto& images = footer ? snap.document.footerImages() : snap.document.headerImages();
+    std::size_t globalOffset = 0;
     auto& editors = footer ? footerEditors_ : headerEditors_;
     for (int index = 0; index < 3; ++index) {
-        const QSignalBlocker blocker(
-            editors[static_cast<std::size_t>(index)]);
-        editors[static_cast<std::size_t>(index)]->setPlainText(
-            values[static_cast<std::size_t>(index)]);
+        auto* editor = editors[static_cast<std::size_t>(index)];
+        if (!editor->property("story.tracksValidCursor").toBool()) {
+            editor->setProperty("story.tracksValidCursor", true);
+            connect(editor->document(), &QTextDocument::contentsChange, this,
+                [this, editor](int position, int removed, int) {
+                    editor->setProperty("story.hasChange", !loadingStoryEditors_);
+                    editor->setProperty("story.changePosition", position);
+                    editor->setProperty("story.changeRemoved", removed);
+                });
+            const auto remember = [this, editor, footer, index] {
+                const auto source = splitStorySections(footer ? footerText() : headerText());
+                if (loadingStoryEditors_ || editor->toPlainText() != source[static_cast<std::size_t>(index)]) return;
+                editor->setProperty("story.validPosition", editor->textCursor().position());
+                editor->setProperty("story.validAnchor", editor->textCursor().anchor());
+                if (headerFooterEditing_ && footer == activeStoryIsFooter_ && index == activeStoryRegion_) emit selectionChanged();
+            };
+            connect(editor, &QPlainTextEdit::cursorPositionChanged, this, remember);
+            connect(editor, &QPlainTextEdit::selectionChanged, this, remember);
+        }
+        const bool changed = editor->toPlainText() != values[static_cast<std::size_t>(index)];
+        const int position = changed ? editor->property("story.validPosition").toInt() : editor->textCursor().position();
+        const int anchor = changed ? editor->property("story.validAnchor").toInt() : editor->textCursor().anchor();
+        const QSignalBlocker blocker(editor);
+        if (changed) editor->setPlainText(values[static_cast<std::size_t>(index)]);
+        auto cursor = editor->textCursor();
+        const int length = static_cast<int>(values[static_cast<std::size_t>(index)].size());
+        cursor.setPosition(std::clamp(anchor, 0, length));
+        cursor.setPosition(std::clamp(position, 0, length), QTextCursor::KeepAnchor);
+        editor->setTextCursor(cursor);
+        editor->setProperty("story.validPosition", cursor.position());
+        editor->setProperty("story.validAnchor", cursor.anchor());
+        const auto rect = storyRegion(footer, index);
+        const auto story = layoutStoryRegion(values[static_cast<std::size_t>(index)], images, globalOffset, rect,
+            index, footer, activeStoryPage_, pageCount_, fontFrom({}, defaultFontFamily_, defaultFontPointSize_));
+        editor->setToolTip(story.contentHeight > rect.height() + 0.01
+            ? (footer ? tr("Some footer content exceeds the visible region. Increase the bottom margin or shorten its text.")
+                      : tr("Some header content exceeds the visible region. Increase the top margin or shorten its text.")) : QString());
+        globalOffset += static_cast<std::size_t>(values[static_cast<std::size_t>(index)].size()) + 1U;
     }
     loadingStoryEditors_ = false;
 }
@@ -9612,35 +12122,96 @@ void DocumentCanvas::beginHeaderFooterEditing(bool footer, int section,
     updateStoryEditorGeometry();
     auto& editors = footer ? footerEditors_ : headerEditors_;
     auto* target = editors[static_cast<std::size_t>(activeStoryRegion_)];
+    if (target->geometry().top() < 48) verticalScrollBar()->setValue(verticalScrollBar()->value() + target->geometry().top() - 48);
+    else if (target->geometry().bottom() > viewport()->height() - 20)
+        verticalScrollBar()->setValue(verticalScrollBar()->value() + target->geometry().bottom() - viewport()->height() + 20);
+    updateStoryEditorGeometry();
+    if (auto* action = findChild<QAction*>(QStringLiteral("story.closeShortcut"))) action->setEnabled(true);
     target->setFocus();
     target->moveCursor(QTextCursor::End);
+    revealCursor();
+    if (!target->toolTip().isEmpty()) emit operationFailed(target->toolTip());
     viewport()->update();
+    emit selectionChanged();
+    emitCursorFormat();
+}
+
+QWidget* DocumentCanvas::headerFooterControls() {
+    ensureStoryEditors();
+    return storyTools_.data();
 }
 
 void DocumentCanvas::endHeaderFooterEditing() {
     if (!headerFooterEditing_) return;
     for (auto* editor : headerEditors_) if (editor) editor->hide();
     for (auto* editor : footerEditors_) if (editor) editor->hide();
+    if (storyTools_) storyTools_->hide();
+    if (auto* action = findChild<QAction*>(QStringLiteral("story.closeShortcut"))) action->setEnabled(false);
     headerFooterEditing_ = false;
     storyEditHasTransaction_ = false;
     setFocus();
     viewport()->update();
+    emit selectionChanged();
+    emitCursorFormat();
 }
 
 void DocumentCanvas::applyStoryEditorText() {
     if (loadingStoryEditors_ || !headerFooterEditing_) return;
     const auto& editors = activeStoryIsFooter_ ? footerEditors_ : headerEditors_;
+    const auto before = session_->snapshot().document;
+    auto candidate = before;
+    const QString nextText = joinStorySections(editors);
+    const QString oldText = activeStoryIsFooter_ ? footerText() : headerText();
+    const auto oldSections = splitStorySections(oldText);
+    auto* editor = editors[static_cast<std::size_t>(activeStoryRegion_)];
+    std::optional<core::StoryTextEditRange> replacedRange;
+    if (editor->property("story.hasChange").toBool() && static_cast<StoryTextEdit*>(editor)->compositionLength() == 0 &&
+        oldText == oldSections[0] + QLatin1Char('\t') + oldSections[1] + QLatin1Char('\t') + oldSections[2]) {
+        const int position = editor->property("story.changePosition").toInt();
+        const int removed = editor->property("story.changeRemoved").toInt();
+        const auto oldLength = oldSections[static_cast<std::size_t>(activeStoryRegion_)].size();
+        if (position >= 0 && removed >= 0 && position <= oldLength && removed <= oldLength - position) {
+            std::size_t prefix = 0;
+            for (int index = 0; index < activeStoryRegion_; ++index)
+                prefix += static_cast<std::size_t>(oldSections[static_cast<std::size_t>(index)].size()) + 1U;
+            replacedRange = core::StoryTextEditRange{prefix + static_cast<std::size_t>(position), static_cast<std::size_t>(removed)};
+        }
+    }
+    editor->setProperty("story.hasChange", false);
+    const auto validated = activeStoryIsFooter_ ? candidate.setFooterText(toUtf16(nextText), replacedRange)
+                                               : candidate.setHeaderText(toUtf16(nextText), replacedRange);
+    if (!validated) {
+        emit operationFailed(errorText(validated.error()));
+        loadStoryEditors(activeStoryIsFooter_);
+        return;
+    }
+    std::array<QRectF, 3> regions;
+    for (int index = 0; index < 3; ++index)
+        regions[static_cast<std::size_t>(index)] = storyCapacityRect(pageWidthPoints_, pageHeightPoints_, marginTopPoints_,
+            marginRightPoints_, marginBottomPoints_, marginLeftPoints_, activeStoryIsFooter_, index);
+    if (!storyChangeFits(splitStorySections(activeStoryIsFooter_ ? footerText() : headerText()), splitStorySections(nextText),
+            activeStoryIsFooter_ ? before.footerImages() : before.headerImages(),
+            activeStoryIsFooter_ ? candidate.footerImages() : candidate.headerImages(), regions,
+            activeStoryIsFooter_, activeStoryPage_, pageCount_, fontFrom({}, defaultFontFamily_, defaultFontPointSize_))) {
+        emit operationFailed(activeStoryIsFooter_
+            ? tr("The footer does not fit. Increase the bottom margin or shorten its text.")
+            : tr("The header does not fit. Increase the top margin or shorten its text."));
+        loadStoryEditors(activeStoryIsFooter_);
+        return;
+    }
     std::vector<core::Operation> operations;
     if (activeStoryIsFooter_) {
         operations.push_back(core::SetFooterText{
-            toUtf16(joinStorySections(editors))});
+            toUtf16(nextText), replacedRange});
     } else {
         operations.push_back(core::SetHeaderText{
-            toUtf16(joinStorySections(editors))});
+            toUtf16(nextText), replacedRange});
     }
     if (apply(std::move(operations), std::nullopt, std::nullopt, false,
               std::nullopt, storyEditHasTransaction_)) {
         storyEditHasTransaction_ = true;
+    } else {
+        loadStoryEditors(activeStoryIsFooter_);
     }
 }
 
@@ -9668,7 +12239,7 @@ bool DocumentCanvas::pasteStoryImage(
             mime->data(nativeFormat));
         if (!image) {
             emit operationFailed(tr(
-                "The Owl Docs picture on the clipboard is malformed or exceeds the safety limits."));
+                "The OwlDocs picture on the clipboard is malformed or exceeds the safety limits."));
             return false;
         }
         encodedBytes = image->encodedBytes;
@@ -9741,12 +12312,11 @@ bool DocumentCanvas::pasteStoryImage(
         return false;
     }
 
-    const double storyHeight = activeStoryIsFooter_
-        ? std::max(18.0, marginBottomPoints_ - 14.0)
-        : std::max(18.0, marginTopPoints_ - 21.0);
-    const double storyWidth = std::max(
-        18.0, (pageWidthPoints_ - marginLeftPoints_ -
-               marginRightPoints_) / 3.0 - 6.0);
+    const auto pictureRegion = storyCapacityRect(pageWidthPoints_, pageHeightPoints_, marginTopPoints_,
+        marginRightPoints_, marginBottomPoints_, marginLeftPoints_, activeStoryIsFooter_, activeStoryRegion_);
+    const QFontMetricsF storyMetrics(fontFrom({}, defaultFontFamily_, defaultFontPointSize_));
+    const double storyHeight = std::max(1.0, pictureRegion.height() - storyMetrics.descent() - storyMetrics.leading());
+    const double storyWidth = pictureRegion.width();
     double widthPoints = requestedWidth
         ? static_cast<double>(*requestedWidth) / kEmuPerPoint
         : static_cast<double>(decoded.image.width()) * 0.75;
@@ -9769,8 +12339,9 @@ bool DocumentCanvas::pasteStoryImage(
     const auto found = std::find(editors.begin(), editors.end(), editor);
     if (found == editors.end()) return false;
     const int region = static_cast<int>(std::distance(editors.begin(), found));
-    auto sections = splitStorySections(
-        activeStoryIsFooter_ ? footerText() : headerText());
+    const QString previousText = activeStoryIsFooter_ ? footerText() : headerText();
+    const auto oldSections = splitStorySections(previousText);
+    auto sections = oldSections;
     QTextCursor cursor = editor->textCursor();
     const int selectionStart = std::min(
         cursor.anchor(), cursor.position());
@@ -9785,6 +12356,9 @@ bool DocumentCanvas::pasteStoryImage(
     }
     const QString updated = sections[0] + QLatin1Char('\t') +
         sections[1] + QLatin1Char('\t') + sections[2];
+    std::optional<core::StoryTextEditRange> replacedRange;
+    if (previousText == oldSections[0] + QLatin1Char('\t') + oldSections[1] + QLatin1Char('\t') + oldSections[2])
+        replacedRange = core::StoryTextEditRange{globalOffset, static_cast<std::size_t>(selectionEnd - selectionStart)};
     QString safeName = (accessibleNameOverride.isEmpty()
                             ? accessibleName
                             : accessibleNameOverride).trimmed();
@@ -9797,18 +12371,42 @@ bool DocumentCanvas::pasteStoryImage(
         encodedName = safeName.toUtf8();
     }
     const auto imageId = core::NodeId::generate();
+    const auto before = session_->snapshot().document;
+    auto candidate = before;
+    const auto candidateText = activeStoryIsFooter_ ? candidate.setFooterText(toUtf16(updated), replacedRange)
+                                                   : candidate.setHeaderText(toUtf16(updated), replacedRange);
+    if (!candidateText) { emit operationFailed(errorText(candidateText.error())); return false; }
+    const core::EncodedImagePayload payload(std::move(encodedBytes));
+    const auto candidateImage = candidate.insertHeaderFooterImage(activeStoryIsFooter_, globalOffset, payload,
+        requestedFormat, encodedName.toStdString(), widthEmu, heightEmu, imageId);
+    if (!candidateImage) { emit operationFailed(errorText(candidateImage.error())); return false; }
+    std::array<QRectF, 3> regions;
+    for (int index = 0; index < 3; ++index)
+        regions[static_cast<std::size_t>(index)] = storyCapacityRect(pageWidthPoints_, pageHeightPoints_, marginTopPoints_,
+            marginRightPoints_, marginBottomPoints_, marginLeftPoints_, activeStoryIsFooter_, index);
+    if (!storyChangeFits(oldSections, splitStorySections(fromUtf16(activeStoryIsFooter_ ? candidate.footerText() : candidate.headerText())),
+            activeStoryIsFooter_ ? before.footerImages() : before.headerImages(),
+            activeStoryIsFooter_ ? candidate.footerImages() : candidate.headerImages(), regions, activeStoryIsFooter_, activeStoryPage_, pageCount_,
+            fontFrom({}, defaultFontFamily_, defaultFontPointSize_))) {
+        emit operationFailed(activeStoryIsFooter_ ? tr("The picture and footer text do not fit. Increase the bottom margin or shorten its text.")
+                                                 : tr("The picture and header text do not fit. Increase the top margin or shorten its text."));
+        return false;
+    }
     std::vector<core::Operation> operations;
     operations.emplace_back(activeStoryIsFooter_
-        ? core::Operation(core::SetFooterText{toUtf16(updated)})
-        : core::Operation(core::SetHeaderText{toUtf16(updated)}));
+        ? core::Operation(core::SetFooterText{toUtf16(updated), replacedRange})
+        : core::Operation(core::SetHeaderText{toUtf16(updated), replacedRange}));
     operations.emplace_back(core::InsertHeaderFooterImage{
         activeStoryIsFooter_, globalOffset,
-        core::EncodedImagePayload(std::move(encodedBytes)), requestedFormat,
+        payload, requestedFormat,
         encodedName.toStdString(), widthEmu, heightEmu, imageId});
     if (!apply(std::move(operations))) return false;
     const auto [cached, inserted] = decodedImages_.emplace(
         imageId, std::move(decoded.image));
-    if (inserted) decodedImageBytes_ += cached->second.sizeInBytes();
+    if (inserted) {
+        decodedImageBytes_ += cached->second.sizeInBytes();
+        decodedImagePayloads_.insert_or_assign(imageId, payload);
+    }
     loadStoryEditors(activeStoryIsFooter_);
     auto* target = editors[static_cast<std::size_t>(region)];
     QTextCursor restored = target->textCursor();
@@ -9822,8 +12420,7 @@ bool DocumentCanvas::pasteStoryImage(
 
 void DocumentCanvas::updateStoryEditorGeometry() {
     if (!headerFooterEditing_ || !headerEditors_[0]) return;
-    for (auto* editor : headerEditors_) editor->hide();
-    for (auto* editor : footerEditors_) editor->hide();
+    for (auto* editor : activeStoryIsFooter_ ? headerEditors_ : footerEditors_) editor->hide();
 
     const double scale = kScreenPointsScale * zoomPercent_ / 100.0;
     QFont editorFont(defaultFontFamily_);
@@ -9841,15 +12438,12 @@ void DocumentCanvas::updateStoryEditorGeometry() {
     const double left = pageLeft + marginLeftPoints_ * scale;
     const double width = std::max(
         3.0, (pageWidthPoints_ - marginLeftPoints_ - marginRightPoints_) * scale);
-    const double yPoints = activeStoryIsFooter_
-        ? pageHeightPoints_ - marginBottomPoints_ + 7.0 : 14.0;
-    const double heightPoints = activeStoryIsFooter_
-        ? std::max(18.0, marginBottomPoints_ - 14.0)
-        : std::max(18.0, marginTopPoints_ - 21.0);
+    const auto storyRect = storyRegion(activeStoryIsFooter_, 0);
+    const double yPoints = storyRect.top();
+    const double heightPoints = storyRect.height();
     const int y = static_cast<int>(std::round(pageTop + yPoints * scale));
     const int height = std::max(24, static_cast<int>(std::round(
         heightPoints * scale)));
-    const int gap = 3;
     auto& editors = activeStoryIsFooter_ ? footerEditors_ : headerEditors_;
     for (int index = 0; index < 3; ++index) {
         const int x0 = static_cast<int>(std::round(
@@ -9858,9 +12452,41 @@ void DocumentCanvas::updateStoryEditorGeometry() {
             left + width * static_cast<double>(index + 1) / 3.0));
         editors[static_cast<std::size_t>(index)]->setFont(editorFont);
         editors[static_cast<std::size_t>(index)]->setGeometry(
-            x0 + gap, y, std::max(20, x1 - x0 - 2 * gap), height);
-        editors[static_cast<std::size_t>(index)]->show();
+            x0, y, std::max(20, x1 - x0), height);
+        if (!editors[static_cast<std::size_t>(index)]->isVisible()) editors[static_cast<std::size_t>(index)]->show();
         editors[static_cast<std::size_t>(index)]->raise();
+    }
+    if (auto* tools = storyTools_.data()) {
+        if (auto* region = tools->findChild<QComboBox*>(QStringLiteral("story.region"))) {
+            const QSignalBlocker blocker(region); region->setCurrentIndex(activeStoryRegion_);
+        }
+        // Embedded workspace controls are measured and positioned by the
+        // ribbon. Scrolling or zooming must never move them onto the paper.
+        if (tools->parentWidget() != viewport()) return;
+        if (auto* layout = qobject_cast<QGridLayout*>(tools->layout())) {
+            const QStringList names = {QStringLiteral("story.header"), QStringLiteral("story.footer"),
+                QStringLiteral("story.region"), QStringLiteral("story.insertPage"),
+                QStringLiteral("story.insertPages"), QStringLiteral("story.close")};
+            int naturalWidth = 12 + 5 * layout->spacing();
+            for (const auto& name : names) naturalWidth += tools->findChild<QWidget*>(name)->sizeHint().width();
+            const bool narrow = naturalWidth > viewport()->width() - 20;
+            while (auto* item = layout->takeAt(0)) delete item;
+            for (int index = 0; index < names.size(); ++index) {
+                auto* control = tools->findChild<QWidget*>(names[index]);
+                if (!narrow || index < 4) layout->addWidget(control, 0, index);
+                else if (index == 4) layout->addWidget(control, 1, 0);
+                else layout->addWidget(control, 1, 1, 1, 3);
+            }
+            layout->invalidate();
+        }
+        tools->adjustSize();
+        const int toolsX = std::max(8, viewport()->width() - tools->width() - 10);
+        int toolsY = 8;
+        const auto activeRegion = editors[static_cast<std::size_t>(activeStoryRegion_)]->geometry();
+        if (QRect(QPoint(toolsX, toolsY), tools->size()).intersects(activeRegion))
+            toolsY = std::clamp(activeRegion.bottom() + 8, 8, std::max(8, viewport()->height() - tools->height() - 8));
+        tools->move(toolsX, toolsY);
+        tools->show(); tools->raise();
     }
 }
 
@@ -10527,7 +13153,7 @@ bool DocumentCanvas::exportPdf(const QString& path, QString& error) {
     {
         QPdfWriter writer(&output);
         writer.setTitle(tr("Document"));
-        writer.setCreator(QStringLiteral("Owl Docs"));
+        writer.setCreator(QStringLiteral("OwlDocs"));
         writer.setResolution(72);
         writer.setPageSize(QPageSize(
             QSizeF(pageWidthPoints_, pageHeightPoints_), QPageSize::Point,
@@ -10770,12 +13396,26 @@ bool DocumentCanvas::createReplacementPreview(const QString& replacement,
     return true;
 }
 
+PageLayoutSettings DocumentCanvas::renderedPageLayout() const noexcept {
+    return {pageWidthPoints_, pageHeightPoints_, marginTopPoints_, marginRightPoints_, marginBottomPoints_, marginLeftPoints_};
+}
+
+void DocumentCanvas::useRenderedPageLayout(const PageLayoutSettings& layout) noexcept {
+    pageWidthPoints_ = layout.widthPoints;
+    pageHeightPoints_ = layout.heightPoints;
+    marginTopPoints_ = layout.marginTopPoints;
+    marginRightPoints_ = layout.marginRightPoints;
+    marginBottomPoints_ = layout.marginBottomPoints;
+    marginLeftPoints_ = layout.marginLeftPoints;
+}
+
 bool DocumentCanvas::createOperationsPreview(
     core::Revision expectedRevision,
     const std::vector<core::Operation>& operations,
     const QString& label,
     QString& summary,
-    QString& error) {
+    QString& error,
+    std::optional<PageLayoutSettings> proposedLayout) {
     endTypingGroup();
     resetVerticalNavigation();
     clearPendingSpellingWord();
@@ -10784,7 +13424,20 @@ bool DocumentCanvas::createOperationsPreview(
         return false;
     }
     previewHasNonTextChanges_ = false;
-    if (operations.empty()) {
+    if (proposedLayout) {
+        const auto& layout = *proposedLayout;
+        const std::array<double, 6> values{layout.widthPoints, layout.heightPoints, layout.marginTopPoints,
+            layout.marginRightPoints, layout.marginBottomPoints, layout.marginLeftPoints};
+        if (std::any_of(values.begin(), values.end(), [](double value) { return !std::isfinite(value) || value < 0.0; }) ||
+            layout.widthPoints < 72.0 || layout.heightPoints < 72.0 || layout.widthPoints > 3168.0 || layout.heightPoints > 3168.0 ||
+            layout.widthPoints - layout.marginLeftPoints - layout.marginRightPoints < 36.0 ||
+            layout.heightPoints - layout.marginTopPoints - layout.marginBottomPoints < 36.0) {
+            error = tr("The proposed page size or margins leave an invalid writing area.");
+            return false;
+        }
+        if (*proposedLayout == renderedPageLayout()) proposedLayout.reset();
+    }
+    if (operations.empty() && !proposedLayout) {
         error = tr("The proposed preview contains no operations.");
         return false;
     }
@@ -10795,6 +13448,7 @@ bool DocumentCanvas::createOperationsPreview(
                     .arg(live.revision.value());
         return false;
     }
+    const auto originalCursor = captureEditorState();
     const auto created = session_->createPreview(expectedRevision);
     if (!created) {
         error = errorText(created.error());
@@ -10807,16 +13461,103 @@ bool DocumentCanvas::createOperationsPreview(
         error = errorText(applied.error());
         return false;
     }
-    if (!applied.value().changed) {
+    if (!applied.value().changed && !proposedLayout) {
         static_cast<void>(session_->discardPreview(created.value().id));
         error = tr("The proposed preview does not change the document.");
         return false;
+    }
+    const auto candidate = session_->previewSnapshot(created.value().id);
+    if (candidate) {
+        const auto originalLayout = renderedPageLayout();
+        const auto layout = proposedLayout.value_or(originalLayout);
+        const int previousPageCount = pageCount();
+        int proposedPages = previousPageCount;
+        const bool hasPageFields = fromUtf16(candidate.value().document.headerText()).contains(QStringLiteral("{PAGE"), Qt::CaseInsensitive) ||
+            fromUtf16(candidate.value().document.footerText()).contains(QStringLiteral("{PAGE"), Qt::CaseInsensitive);
+        if (hasPageFields) {
+            DocumentCanvas probe(spelling_);
+            probe.setEditorDefaults(defaultFontFamily_, defaultFontPointSize_, tabWidthSpaces_);
+            probe.setDocument(candidate.value().document);
+            probe.setImportedPageLayout(layout.widthPoints, layout.heightPoints, layout.marginTopPoints, layout.marginRightPoints,
+                layout.marginBottomPoints, layout.marginLeftPoints);
+            probe.importedTables_ = importedTables_;
+            proposedPages = probe.pageCount();
+        }
+        for (const bool footer : {false, true}) {
+            const auto& oldText = footer ? live.document.footerText() : live.document.headerText();
+            const auto& newText = footer ? candidate.value().document.footerText() : candidate.value().document.headerText();
+            const auto& oldImages = footer ? live.document.footerImages() : live.document.headerImages();
+            const auto& newImages = footer ? candidate.value().document.footerImages() : candidate.value().document.headerImages();
+            if (oldText == newText && oldImages == newImages && !proposedLayout) continue;
+            std::array<QRectF, 3> regions, oldRegions;
+            for (int index = 0; index < 3; ++index) {
+                regions[static_cast<std::size_t>(index)] = storyCapacityRect(layout.widthPoints, layout.heightPoints,
+                    layout.marginTopPoints, layout.marginRightPoints, layout.marginBottomPoints, layout.marginLeftPoints, footer, index);
+                oldRegions[static_cast<std::size_t>(index)] = storyCapacityRect(originalLayout.widthPoints, originalLayout.heightPoints,
+                    originalLayout.marginTopPoints, originalLayout.marginRightPoints, originalLayout.marginBottomPoints, originalLayout.marginLeftPoints, footer, index);
+            }
+            if (!storyChangeFits(splitStorySections(fromUtf16(oldText)), splitStorySections(fromUtf16(newText)), oldImages,
+                    newImages, regions, footer, 0, proposedPages, fontFrom({}, defaultFontFamily_, defaultFontPointSize_),
+                    proposedLayout ? &oldRegions : nullptr, previousPageCount)) {
+                static_cast<void>(session_->discardPreview(created.value().id));
+                error = footer ? tr("The proposed footer does not fit. Increase its margin or shorten its content.")
+                               : tr("The proposed header does not fit. Increase its margin or shorten its content.");
+                return false;
+            }
+        }
+    }
+    endHeaderFooterEditing();
+    previewOriginalCursorState_ = originalCursor;
+    // Follow stable cells into the proposed table instead of keeping row/
+    // column coordinates that may now belong to an inserted neighbor.
+    if (selectedTable_ && candidate) {
+        const auto* oldTable = live.document.findTable(*selectedTable_);
+        const auto* newTable = candidate.value().document.findTable(*selectedTable_);
+        const auto mapCell = [&](std::size_t row, std::size_t column) -> std::optional<std::pair<std::size_t, std::size_t>> {
+            const auto* cell = oldTable ? oldTable->cell(row, column) : nullptr;
+            if (!cell || !newTable) return std::nullopt;
+            for (std::size_t nextRow = 0; nextRow < newTable->rowCount(); ++nextRow)
+                for (std::size_t nextColumn = 0; nextColumn < newTable->columnCount(); ++nextColumn)
+                    if (newTable->cell(nextRow, nextColumn)->id == cell->id) return std::pair{nextRow, nextColumn};
+            return std::nullopt;
+        };
+        bool keepTable = oldTable && newTable;
+        if (keepTable && tableCursor_) {
+            const auto mapped = mapCell(tableCursor_->row, tableCursor_->column);
+            if (mapped) {
+                tableCursor_->row = mapped->first; tableCursor_->column = mapped->second;
+                const auto* cell = newTable->cell(mapped->first, mapped->second);
+                const auto clamp = [cell](std::size_t offset) {
+                    offset = std::min(offset, cell->text.size());
+                    while (offset > 0 && !core::isUtf16Boundary(cell->text, offset)) --offset;
+                    return offset;
+                };
+                tableCursor_->utf16Offset = clamp(tableCursor_->utf16Offset);
+                if (tableSelectionAnchor_) *tableSelectionAnchor_ = clamp(*tableSelectionAnchor_);
+            } else keepTable = false;
+        }
+        if (keepTable && tableCellSelection_) {
+            const auto anchor = mapCell(tableCellSelection_->anchorRow, tableCellSelection_->anchorColumn);
+            const auto focus = mapCell(tableCellSelection_->focusRow, tableCellSelection_->focusColumn);
+            if (anchor && focus) {
+                tableCellSelection_->anchorRow = anchor->first; tableCellSelection_->anchorColumn = anchor->second;
+                tableCellSelection_->focusRow = focus->first; tableCellSelection_->focusColumn = focus->second;
+            } else tableCellSelection_.reset();
+        }
+        if (!keepTable) {
+            tableCursor_.reset(); tableSelectionAnchor_.reset(); tableCellSelection_.reset();
+            tableMouseSelectionAnchor_.reset(); selectedTable_.reset();
+        }
+    }
+    if (proposedLayout) {
+        previewOriginalLayout_ = renderedPageLayout();
+        useRenderedPageLayout(*proposedLayout);
     }
     previewId_ = created.value().id;
     previewRevision_ = applied.value().revision;
     previewOperations_ = operations;
     previewCursor_.reset();
-    previewHasNonTextChanges_ = operationsHaveNonTextChanges(
+    previewHasNonTextChanges_ = proposedLayout.has_value() || operationsHaveNonTextChanges(
         live.document, operations);
     const auto proposed = session_->previewSnapshot(*previewId_);
     std::size_t changedParagraphs = 0;
@@ -10851,7 +13592,16 @@ bool DocumentCanvas::acceptPreview(QString& error) {
         return false;
     }
     const auto live = session_->snapshot();
-    const CursorState before = captureEditorState();
+    CursorState before = previewOriginalCursorState_.value_or(captureEditorState());
+    const bool acceptedLayoutChange = previewOriginalLayout_.has_value();
+    if (previewOriginalLayout_) {
+        before.pageWidthPoints = previewOriginalLayout_->widthPoints;
+        before.pageHeightPoints = previewOriginalLayout_->heightPoints;
+        before.marginTopPoints = previewOriginalLayout_->marginTopPoints;
+        before.marginRightPoints = previewOriginalLayout_->marginRightPoints;
+        before.marginBottomPoints = previewOriginalLayout_->marginBottomPoints;
+        before.marginLeftPoints = previewOriginalLayout_->marginLeftPoints;
+    }
     const auto accepted = session_->acceptPreview(*previewId_, live.revision, previewRevision_);
     if (!accepted) {
         error = errorText(accepted.error());
@@ -10889,20 +13639,23 @@ bool DocumentCanvas::acceptPreview(QString& error) {
         ? currentCharacterFormat()
         : selectedCharacterFormat();
     typingOverrideMask_ = selectedCharacterOverrideMask();
+    previewOriginalLayout_.reset();
+    previewOriginalCursorState_.reset();
     previewId_.reset();
     previewRevision_ = {};
     previewCursor_.reset();
     previewOperations_.clear();
     previewHasNonTextChanges_ = false;
-    if (accepted.value().changed) {
+    if (accepted.value().changed || acceptedLayoutChange) {
         reconcileDecodedImageCache();
         currentStateId_ = nextStateId_++;
         if (acceptedNonTextChanges) {
             currentNonTextStateId_ = nextNonTextStateId_++;
         }
+        if (acceptedLayoutChange) currentPageLayoutStateId_ = nextPageLayoutStateId_++;
         updateDirtyFlags();
         undoCursorHistory_.push_back(
-            CursorHistoryEntry{before, captureEditorState(), true});
+            CursorHistoryEntry{before, captureEditorState(), accepted.value().changed});
         redoCursorHistory_.clear();
         synchronizeCursorHistory();
         invalidateLayout();
@@ -10918,6 +13671,7 @@ bool DocumentCanvas::acceptPreview(QString& error) {
 }
 
 void DocumentCanvas::discardPreview() {
+    previewOriginalCursorState_.reset();
     endTypingGroup();
     resetVerticalNavigation();
     clearPendingSpellingWord();
@@ -10930,6 +13684,10 @@ void DocumentCanvas::discardPreview() {
             ? table->cell(tableCursor_->row, tableCursor_->column)
             : nullptr;
         if (cell) visibleCellId = cell->id;
+    }
+    if (previewOriginalLayout_) {
+        useRenderedPageLayout(*previewOriginalLayout_);
+        previewOriginalLayout_.reset();
     }
     if (previewId_) {
         static_cast<void>(session_->discardPreview(*previewId_));
@@ -11147,6 +13905,21 @@ QRectF DocumentCanvas::caretRectInContent() const {
 }
 
 void DocumentCanvas::revealCursor() {
+    if (headerFooterEditing_) {
+        auto& editors = activeStoryIsFooter_ ? footerEditors_ : headerEditors_;
+        auto* target = static_cast<StoryTextEdit*>(editors[static_cast<std::size_t>(activeStoryRegion_)]);
+        if (!target || !target->cursorRectAt) return;
+        const auto caret = target->cursorRectAt(target->visualCursorPosition()).translated(target->pos());
+        const QRectF horizontal = target->width() <= viewport()->width() - 24 ? QRectF(target->geometry()) : caret;
+        if (horizontal.left() < 12) horizontalScrollBar()->setValue(horizontalScrollBar()->value() + static_cast<int>(std::floor(horizontal.left())) - 12);
+        else if (horizontal.right() > viewport()->width() - 12)
+            horizontalScrollBar()->setValue(horizontalScrollBar()->value() + static_cast<int>(std::ceil(horizontal.right())) - viewport()->width() + 12);
+        const QRectF vertical = target->height() <= viewport()->height() - 68 ? QRectF(target->geometry()) : caret;
+        if (vertical.top() < 48) verticalScrollBar()->setValue(verticalScrollBar()->value() + static_cast<int>(std::floor(vertical.top())) - 48);
+        else if (vertical.bottom() > viewport()->height() - 20)
+            verticalScrollBar()->setValue(verticalScrollBar()->value() + static_cast<int>(std::ceil(vertical.bottom())) - viewport()->height() + 20);
+        return;
+    }
     const auto rect = caretRectInContent();
     if (rect.top() < 0) verticalScrollBar()->setValue(verticalScrollBar()->value() + static_cast<int>(rect.top()) - 12);
     else if (rect.bottom() > viewport()->height())

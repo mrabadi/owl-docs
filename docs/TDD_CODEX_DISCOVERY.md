@@ -1,0 +1,19 @@
+# Codex capability discovery and turn routing
+
+The built-in catalog is the authority for available document operations. Discovery does not require a skill install or activation. The installed Codex 0.159.2 experimental JSON schema was inspected in a temporary directory: thread/start supports typed dynamic function tools; thread/resume does not accept dynamicTools. Catalog migration therefore continues to invalidate only saved server thread bindings and retains local chat messages.
+
+## Evidence so far
+
+- Controller routing RED: `QT_QPA_PLATFORM=offscreen build-release/codex_controller_tests` failed for stale known-thread calls during another document turn, stale turn IDs, non-object arguments, foreign namespaces and calls after completion. Valid calls remain bound to host-selected documentId.
+- Discovery API RED: `cmake --build build-release --target codex_tests -j2` under the shared lock failed at the deliberately new `editorV1Capabilities` symbol before production declarations were added.
+- Minimal routing implementation records the active turn ID, rejects stale/malformed requests, and preserves legitimate background-document routing when the UI tab changes. `QT_QPA_PLATFORM=offscreen build-release/codex_controller_tests routing` passed after the root-granted build.
+- Discovery now merges authoring operation schemas/definitions with the existing catalog and publishes groups, bounds, units, preview/revision workflow and figure/table examples. Catalog version advances once from 9 to 10. Runtime state is supplied by the document bridge.
+- `codex_controller_tests guidance` failed because the built-in instructions omitted discovery and no-skill activation. The discovery paragraph was restored after that executed RED.
+- `codex_controller_tests completion` failed because failed/interrupted turns ended without an error or server detail. Completion now examines server status, preserves error detail, and clears the active turn.
+- `ulimit -c 0; QT_QPA_PLATFORM=offscreen build-release/codex_controller_tests disconnect-tool` crashed with exit 139 when a tool callback shut down its controller. The repair retains the client/transport through the outer JSONL frame loop and checks owner/session/turn identity after callbacks. The test also covers controller destruction, completion during a callback, and multiple frames after teardown.
+- `codex_tests figure-patch` failed because no bounded native-scene patch operation was advertised. The schema now describes scalar/point edits to existing IDs without creation, deletion or asset replacement.
+- `codex_tests capabilities` failed on the old desktop-sized raster limits, missing paginated/stories/tables/metadata scopes, the absent story figure target, and a malformed table example. The tool now distinguishes 4 MiB agent input from 16 MiB desktop input and retains the 8 MiB JSONL limit.
+- A public-manifest assertion failed because new sessions advertised `editor_v1_file_capability_read` despite there being no file grant UI. That tool is removed from new registration; the legacy name remains recognized for explicit unavailability. File open/save/export and other system commands remain desktop actions.
+- The granted retry build passed, followed by GREEN routing/guidance/completion/disconnect selectors and full Codex/controller suites. The published-manifest consistency test executed RED, the static JSON was synchronized, and the same test passed. Later shared formatting, optional declared cell IDs and compound native/recovery workflow checks are tracked in [the 0.6.5 controller evidence](TDD_CODEX_CONTROLLER_0.6.5.md).
+
+No inference request, network login or real document mutation is needed for these tests. All controller tests use an in-memory process. Build scheduling is coordinated by root in addition to the shared flock.

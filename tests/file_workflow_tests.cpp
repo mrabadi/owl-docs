@@ -1,8 +1,10 @@
 #include "docxstudio/app/DocumentCanvas.h"
+#include "docxstudio/app/ChatStore.h"
 #include "docxstudio/app/MainWindow.h"
 #include "docxstudio/ooxml/docx_document.h"
 
 #include <QAction>
+#include <QAbstractButton>
 #include <QApplication>
 #include <QCoreApplication>
 #include <QDir>
@@ -17,10 +19,12 @@
 #include <QRegularExpression>
 #include <QSet>
 #include <QSettings>
+#include <QStandardPaths>
 #include <QTabWidget>
 #include <QTemporaryDir>
 #include <QTimer>
 #include <QUrl>
+#include <zip.h>
 
 #include <cstdlib>
 #include <filesystem>
@@ -597,6 +601,94 @@ void testRecentMenuPresentationAndMaintenance(
           "tenth recent entry reuses the first entry's mnemonic");
 }
 
+void testCheckpointRetainsOriginalPackage(const QTemporaryDir& temporary) {
+    resetSettings();
+    const auto path = temporary.filePath(QStringLiteral("source-checkpoint.docx"));
+    createDocx(path, "Original source");
+    int zipError = 0;
+    auto* archive = zip_open(QFile::encodeName(path).constData(), 0, &zipError);
+    check(archive, "could not open opaque checkpoint fixture");
+    constexpr char opaque[] = "original opaque source";
+    auto* opaqueSource = zip_source_buffer(archive, opaque, sizeof(opaque) - 1U, 0);
+    check(opaqueSource && zip_file_add(archive, "customXml/source.bin", opaqueSource, 0) >= 0 &&
+              zip_close(archive) == 0, "could not add opaque checkpoint data");
+    QFile source(path);
+    check(source.open(QIODevice::ReadOnly), "could not read checkpoint source");
+    const auto bytes = source.readAll();
+    source.close();
+    {
+    MainWindow window;
+    check(window.openPath(path), "could not open source checkpoint fixture");
+    auto* tabs = documentTabs(window);
+    auto* canvas = tabs ? qobject_cast<DocumentCanvas*>(tabs->currentWidget()) : nullptr;
+    check(canvas, "could not reach source checkpoint canvas");
+    check(canvas->replaceAllMatches(QStringLiteral("Original"), QStringLiteral("Recovered")) == 1,
+          "could not prepare a text-only recovery edit");
+    check(!canvas->hasNonTextChanges(), "source recovery fixture unexpectedly changed formatting");
+    bool checkpointed = false;
+    for (auto* timer : window.findChildren<QTimer*>()) {
+        if (timer->interval() == 1500) {
+            checkpointed = QMetaObject::invokeMethod(timer, "timeout", Qt::DirectConnection);
+        }
+    }
+    check(checkpointed, "could not trigger recovery checkpoint");
+    docxstudio::app::ChatStore store;
+    std::string error;
+    const auto database = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) +
+                          QStringLiteral("/state.sqlite3");
+    check(store.open(QFile::encodeName(database).toStdString(), error),
+          "could not inspect recovery checkpoint");
+    const auto records = store.recoveryRecords();
+    check(records.size() == 1 && records.front().source &&
+              records.front().source->packageBytes == bytes.toStdString() &&
+              !records.front().source->context.empty(),
+          "checkpoint discarded original DOCX bytes or save context");
+    }
+    check(QFile::remove(path), "could not remove original recovery source");
+    MainWindow recovered;
+    bool conversionWarning = false;
+    const auto destination = temporary.filePath(QStringLiteral("recovered-source.docx"));
+    QTimer monitor;
+    monitor.setInterval(1);
+    QObject::connect(&monitor, &QTimer::timeout, &recovered, [&] {
+        for (auto* widget : QApplication::topLevelWidgets()) {
+            if (auto* dialog = qobject_cast<QFileDialog*>(widget); dialog && dialog->isVisible()) {
+                dialog->selectFile(destination);
+                QMetaObject::invokeMethod(dialog, "accept", Qt::DirectConnection);
+            }
+            if (auto* message = qobject_cast<QMessageBox*>(widget); message && message->isVisible()) {
+                if (message->windowTitle() == QStringLiteral("Recover documents?")) {
+                    for (auto* button : message->buttons()) {
+                        if (button->text() == QStringLiteral("Restore")) button->click();
+                    }
+                } else {
+                    std::cerr << "Unexpected recovery dialog: " << message->windowTitle().toStdString()
+                              << ": " << message->text().toStdString() << '\n'
+                              << message->detailedText().toStdString() << '\n';
+                    conversionWarning = true;
+                    message->reject();
+                }
+            }
+        }
+    });
+    monitor.start();
+    QApplication::processEvents();
+    auto* recoveredTabs = documentTabs(recovered);
+    auto* recoveredCanvas = recoveredTabs ? qobject_cast<DocumentCanvas*>(recoveredTabs->currentWidget()) : nullptr;
+    check(recoveredCanvas && canvasText(*recoveredCanvas) == QStringLiteral("Recovered source"),
+          "could not restore source recovery document");
+    auto* saveAs = recovered.findChild<QAction*>(QStringLiteral("file.saveAs"));
+    check(saveAs, "recovered document has no Save As action");
+    saveAs->trigger();
+    monitor.stop();
+    check(!conversionWarning && !recoveredCanvas->isModified(),
+          "text-only source recovery incorrectly required destructive conversion");
+    archive = zip_open(QFile::encodeName(destination).constData(), ZIP_RDONLY, &zipError);
+    check(archive && zip_name_locate(archive, "customXml/source.bin", 0) >= 0,
+          "recovered save discarded original opaque package data");
+    zip_discard(archive);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -628,6 +720,7 @@ int main(int argc, char** argv) {
     testSymlinkFirstOpenSavesTheTarget(fixtures);
     QApplication::processEvents();
     testRecentMenuPresentationAndMaintenance(fixtures);
+    testCheckpointRetainsOriginalPackage(fixtures);
 
     std::cout << "file workflow tests passed\n";
     return 0;

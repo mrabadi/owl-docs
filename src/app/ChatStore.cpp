@@ -3,6 +3,7 @@
 #include "docxstudio/codex/editor_tools.hpp"
 
 #include <sqlite3.h>
+#include <QCryptographicHash>
 
 #include <algorithm>
 #include <cerrno>
@@ -38,6 +39,15 @@ void bindBlob(sqlite3_stmt* statement, int index, const std::string& value) {
                       SQLITE_TRANSIENT);
 }
 
+constexpr std::size_t kMaximumSourcePackageBytes = 512U * 1024U * 1024U;
+constexpr std::size_t kMaximumSourceContextBytes = 64U * 1024U * 1024U;
+
+std::string sourceHash(const std::string& bytes) {
+    return QCryptographicHash::hash(
+        QByteArray::fromRawData(bytes.data(), static_cast<int>(bytes.size())),
+        QCryptographicHash::Sha256).toHex().toStdString();
+}
+
 RecoveryRecord readRecovery(sqlite3_stmt* statement) {
     const auto textColumn = [statement](int column) {
         const auto* value = sqlite3_column_text(statement, column);
@@ -45,11 +55,33 @@ RecoveryRecord readRecovery(sqlite3_stmt* statement) {
     };
     const auto* payload = static_cast<const char*>(sqlite3_column_blob(statement, 3));
     const int payloadSize = sqlite3_column_bytes(statement, 3);
-    return {textColumn(0), textColumn(1), textColumn(2),
+    RecoveryRecord record{textColumn(0), textColumn(1), textColumn(2),
             payload && payloadSize > 0
                 ? std::string(payload, static_cast<std::size_t>(payloadSize))
                 : std::string{},
             sqlite3_column_int64(statement, 4)};
+    if (sqlite3_column_type(statement, 5) != SQLITE_NULL) {
+        const auto blobColumn = [statement](int column, std::size_t maximum) {
+            const int size = sqlite3_column_bytes(statement, column);
+            const auto* bytes = static_cast<const char*>(sqlite3_column_blob(statement, column));
+            return bytes && size > 0 && static_cast<std::size_t>(size) <= maximum
+                ? std::string(bytes, static_cast<std::size_t>(size)) : std::string{};
+        };
+        record.source = RecoverySource{
+            blobColumn(6, kMaximumSourcePackageBytes),
+            blobColumn(7, kMaximumSourceContextBytes + 65U)};
+        const auto contextEnvelope = std::move(record.source->context);
+        if (contextEnvelope.size() > 65U && contextEnvelope[64] == '\n') {
+            record.source->context = contextEnvelope.substr(65U);
+        }
+        if (record.source->packageBytes.empty() || record.source->context.empty() ||
+            sourceHash(record.source->packageBytes) != textColumn(5) ||
+            contextEnvelope.size() <= 65U || contextEnvelope[64] != '\n' ||
+            sourceHash(record.source->context) != contextEnvelope.substr(0, 64U)) {
+            record.source->error = "Retained source package or context is missing, corrupt, or exceeds its limit";
+        }
+    }
+    return record;
 }
 
 bool preparePrivateDatabaseFile(const std::string& path, std::string& error) {
@@ -169,8 +201,8 @@ bool ChatStore::open(const std::string& path, std::string& error) {
     }
     if (!exec(
         "CREATE TABLE IF NOT EXISTS app_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);"
-        "INSERT OR IGNORE INTO app_meta(key,value) VALUES('schema_version','2');"
-        "UPDATE app_meta SET value='2' WHERE key='schema_version';"
+        "INSERT OR IGNORE INTO app_meta(key,value) VALUES('schema_version','3');"
+        "UPDATE app_meta SET value='3' WHERE key='schema_version';"
         "CREATE TABLE IF NOT EXISTS document_threads ("
         " document_key TEXT PRIMARY KEY, thread_id TEXT NOT NULL, updated_at INTEGER NOT NULL"
         ");"
@@ -187,7 +219,11 @@ bool ChatStore::open(const std::string& path, std::string& error) {
         " updated_at INTEGER NOT NULL"
         ");"
         "CREATE INDEX IF NOT EXISTS recovery_journals_updated_idx "
-        "ON recovery_journals(updated_at);",
+        "ON recovery_journals(updated_at);"
+        "CREATE TABLE IF NOT EXISTS recovery_packages ("
+        " hash TEXT PRIMARY KEY, bytes BLOB NOT NULL);"
+        "CREATE TABLE IF NOT EXISTS recovery_sources ("
+        " journal_key TEXT PRIMARY KEY, package_hash TEXT NOT NULL, context BLOB NOT NULL);",
         error)) {
         close();
         return false;
@@ -320,8 +356,10 @@ std::optional<RecoveryRecord> ChatStore::recoveryRecord(
     if (!database_) return std::nullopt;
     Statement statement(
         database_,
-        "SELECT journal_key,source_path,display_name,payload,updated_at "
-        "FROM recovery_journals WHERE journal_key=?1;");
+        "SELECT j.journal_key,j.source_path,j.display_name,j.payload,j.updated_at,"
+        "s.package_hash,p.bytes,s.context FROM recovery_journals j "
+        "LEFT JOIN recovery_sources s ON s.journal_key=j.journal_key "
+        "LEFT JOIN recovery_packages p ON p.hash=s.package_hash WHERE j.journal_key=?1;");
     if (!statement.get()) return std::nullopt;
     bindText(statement.get(), 1, journalKey);
     if (sqlite3_step(statement.get()) != SQLITE_ROW) return std::nullopt;
@@ -333,8 +371,10 @@ std::vector<RecoveryRecord> ChatStore::recoveryRecords() const {
     if (!database_) return result;
     Statement statement(
         database_,
-        "SELECT journal_key,source_path,display_name,payload,updated_at "
-        "FROM recovery_journals ORDER BY updated_at,journal_key;");
+        "SELECT j.journal_key,j.source_path,j.display_name,j.payload,j.updated_at,"
+        "s.package_hash,p.bytes,s.context FROM recovery_journals j "
+        "LEFT JOIN recovery_sources s ON s.journal_key=j.journal_key "
+        "LEFT JOIN recovery_packages p ON p.hash=s.package_hash ORDER BY j.updated_at,j.journal_key;");
     if (!statement.get()) return result;
     while (sqlite3_step(statement.get()) == SQLITE_ROW)
         result.push_back(readRecovery(statement.get()));
@@ -350,6 +390,19 @@ bool ChatStore::upsertRecovery(const RecoveryRecord& record, std::string& error)
         error = "recovery journal key and payload must not be empty";
         return false;
     }
+    if (record.source && (record.source->packageBytes.empty() ||
+        record.source->packageBytes.size() > kMaximumSourcePackageBytes ||
+        record.source->context.empty() || record.source->context.size() > kMaximumSourceContextBytes ||
+        !record.source->error.empty())) {
+        error = "Recovery source package or context is invalid or exceeds its limit";
+        return false;
+    }
+    if (!exec("BEGIN IMMEDIATE;", error)) return false;
+    const auto fail = [&]() {
+        std::string ignored;
+        exec("ROLLBACK;", ignored);
+        return false;
+    };
     Statement statement(
         database_,
         "INSERT INTO recovery_journals("
@@ -360,7 +413,7 @@ bool ChatStore::upsertRecovery(const RecoveryRecord& record, std::string& error)
         "payload=excluded.payload,updated_at=excluded.updated_at;");
     if (!statement.get()) {
         error = sqlite3_errmsg(database_);
-        return false;
+        return fail();
     }
     bindText(statement.get(), 1, record.journalKey);
     bindText(statement.get(), 2, record.sourcePath);
@@ -368,8 +421,31 @@ bool ChatStore::upsertRecovery(const RecoveryRecord& record, std::string& error)
     bindBlob(statement.get(), 4, record.payload);
     if (sqlite3_step(statement.get()) != SQLITE_DONE) {
         error = sqlite3_errmsg(database_);
-        return false;
+        return fail();
     }
+    if (record.source) {
+        const auto hash = sourceHash(record.source->packageBytes);
+        Statement package(database_, "INSERT INTO recovery_packages(hash,bytes) VALUES(?1,?2) "
+            "ON CONFLICT(hash) DO UPDATE SET bytes=excluded.bytes;");
+        Statement source(database_, "INSERT INTO recovery_sources(journal_key,package_hash,context) VALUES(?1,?2,?3) "
+            "ON CONFLICT(journal_key) DO UPDATE SET package_hash=excluded.package_hash,context=excluded.context;");
+        if (!package.get() || !source.get()) { error = sqlite3_errmsg(database_); return fail(); }
+        bindText(package.get(), 1, hash);
+        bindBlob(package.get(), 2, record.source->packageBytes);
+        bindText(source.get(), 1, record.journalKey);
+        bindText(source.get(), 2, hash);
+        bindBlob(source.get(), 3, sourceHash(record.source->context) + "\n" + record.source->context);
+        if (sqlite3_step(package.get()) != SQLITE_DONE || sqlite3_step(source.get()) != SQLITE_DONE) {
+            error = sqlite3_errmsg(database_); return fail();
+        }
+    } else {
+        Statement remove(database_, "DELETE FROM recovery_sources WHERE journal_key=?1;");
+        if (!remove.get()) { error = sqlite3_errmsg(database_); return fail(); }
+        bindText(remove.get(), 1, record.journalKey);
+        if (sqlite3_step(remove.get()) != SQLITE_DONE) { error = sqlite3_errmsg(database_); return fail(); }
+    }
+    if (!exec("DELETE FROM recovery_packages WHERE hash NOT IN (SELECT package_hash FROM recovery_sources);", error) ||
+        !exec("COMMIT;", error)) return fail();
     return true;
 }
 
@@ -378,17 +454,25 @@ bool ChatStore::deleteRecovery(const std::string& journalKey, std::string& error
         error = "local state store is not open";
         return false;
     }
+    if (!exec("BEGIN IMMEDIATE;", error)) return false;
+    const auto fail = [&]() { std::string ignored; exec("ROLLBACK;", ignored); return false; };
+    Statement source(database_, "DELETE FROM recovery_sources WHERE journal_key=?1;");
+    if (!source.get()) { error = sqlite3_errmsg(database_); return fail(); }
+    bindText(source.get(), 1, journalKey);
+    if (sqlite3_step(source.get()) != SQLITE_DONE) { error = sqlite3_errmsg(database_); return fail(); }
     Statement statement(database_,
                         "DELETE FROM recovery_journals WHERE journal_key=?1;");
     if (!statement.get()) {
         error = sqlite3_errmsg(database_);
-        return false;
+        return fail();
     }
     bindText(statement.get(), 1, journalKey);
     if (sqlite3_step(statement.get()) != SQLITE_DONE) {
         error = sqlite3_errmsg(database_);
-        return false;
+        return fail();
     }
+    if (!exec("DELETE FROM recovery_packages WHERE hash NOT IN (SELECT package_hash FROM recovery_sources);", error) ||
+        !exec("COMMIT;", error)) return fail();
     return true;
 }
 

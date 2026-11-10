@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.22)
 
-project(OwlDocs VERSION 0.5.15 LANGUAGES CXX)
+project(OwlDocs VERSION 0.6.5 LANGUAGES CXX)
 
 include(GNUInstallDirs)
 include(CTest)
@@ -12,7 +12,7 @@ option(OWL_DOCS_REQUIRE_FIGURE_EDITOR_BUNDLE
        "Fail configuration unless the bundled Excalidraw runtime is built"
        OFF)
 set(OWL_DOCS_ICON_GENERATOR_PYTHON "" CACHE FILEPATH
-    "Optional Python interpreter with the pinned Pillow version for icon-generation tests")
+    "Optional Python interpreter with a reviewed Pillow version for icon-generation tests")
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -32,6 +32,7 @@ add_library(docxstudio_core
     src/core/types.cpp
     src/core/formatting.cpp
     src/core/document.cpp
+    src/core/academic.cpp
     src/core/document_session.cpp
 )
 target_include_directories(docxstudio_core PUBLIC include)
@@ -106,6 +107,7 @@ add_library(docxstudio_codex
     src/codex/transport.cpp
     src/codex/client.cpp
     src/codex/editor_tools.cpp
+    src/codex/authoring_tools.cpp
     src/codex/redaction.cpp
 )
 target_include_directories(docxstudio_codex PUBLIC include)
@@ -143,13 +145,22 @@ if(DOCXSTUDIO_BUILD_APP)
         src/app/RecoveryCodec.cpp
         src/app/SpellChecker.cpp
         src/app/DocumentCanvas.cpp
+        src/app/DocumentCanvasTableEditing.cpp
+        src/app/DocumentCanvasListPlanning.cpp
         src/app/QtDisplayListRenderer.cpp
         src/app/QtProcess.cpp
         src/app/CodexController.cpp
         src/app/EditorToolBridge.cpp
+        src/app/EditorSemanticOperations.cpp
         src/app/ExcalidrawFigure.cpp
+        src/app/ExcalidrawScene.cpp
         src/app/OwlDocsIcon.cpp
         src/app/MathLayout.cpp
+        src/app/EquationEditorDialog.cpp
+        src/app/ColorPaletteWidget.cpp
+        src/app/TableInsertDialog.cpp
+        include/docxstudio/app/TableInsertDialog.h
+        include/docxstudio/app/ColorPaletteWidget.h
         include/docxstudio/app/MainWindow.h
         include/docxstudio/app/RasterDecoder.h
         include/docxstudio/app/EditorPreferences.h
@@ -164,7 +175,9 @@ if(DOCXSTUDIO_BUILD_APP)
         include/docxstudio/app/CodexController.h
         include/docxstudio/app/QtProcess.h
         include/docxstudio/app/EditorToolBridge.h
+        include/docxstudio/app/EditorSemanticOperations.h
         include/docxstudio/app/ExcalidrawFigure.h
+        include/docxstudio/app/ExcalidrawScene.h
         include/docxstudio/app/RecoveryCodec.h
         include/docxstudio/app/OwlDocsIcon.h
         include/docxstudio/app/MathLayout.h
@@ -234,7 +247,44 @@ install(FILES
         docs/IMPLEMENTATION_STATUS.md
         docs/M0_CORPUS_EVIDENCE.md
         docs/PRIVACY.md
+        docs/RELEASE_NOTES_0.6.0.md
+        docs/RELEASE_NOTES_0.6.1.md
+        docs/RELEASE_NOTES_0.6.2.md
+        docs/RELEASE_NOTES_0.6.3.md
+        docs/RELEASE_NOTES_0.6.4.md
+        docs/RELEASE_NOTES_0.6.5.md
+        docs/CODEX_AUTHORING.md
+        docs/TDD_CODEX_AUTHORING_0.6.5.md
+        docs/TDD_CODEX_CONTROLLER_0.6.5.md
+        docs/TDD_CODEX_FIGURES_0.6.5.md
+        docs/RELEASE_VALIDATION_0.6.0.md
+        docs/RELEASE_VALIDATION_0.6.1.md
+        docs/RELEASE_VALIDATION_0.6.2.md
+        docs/RELEASE_VALIDATION_0.6.3.md
+        docs/RELEASE_VALIDATION_0.6.4.md
+        docs/RELEASE_VALIDATION_0.6.5.md
         docs/ROADMAP.md
+        docs/TDD_ACADEMIC_EVIDENCE.md
+        docs/TDD_FEEDBACK_0.6.1.md
+        docs/TDD_FEEDBACK_0.6.2.md
+        docs/TDD_COLORS_0.6.2.md
+        docs/TDD_MARGINS_0.6.2.md
+        docs/TDD_TABLE_IMAGES_0.6.2.md
+        docs/TDD_TABLE_PICKER_0.6.2.md
+        docs/TDD_TABLE_MODEL_0.6.3.md
+        docs/TDD_TABLE_LAYOUT_0.6.3.md
+        docs/TDD_TABLE_EDITING_UI_0.6.3.md
+        docs/TDD_TABLE_RIBBON.md
+        docs/TDD_TABLE_RIBBON_0.6.4.md
+        docs/TDD_HEADER_RIBBON_0.6.3.md
+        docs/TDD_WORKSPACE_0.6.2.md
+        docs/CLICK_AUDIT_0.6.2.md
+        docs/TDD_HEADER_FOOTER_EVIDENCE.md
+        docs/TDD_WORKSPACE_FEEDBACK_EVIDENCE.md
+        docs/TDD_LAYOUT_EVIDENCE.md
+        docs/TDD_MATH_EVIDENCE.md
+        docs/TDD_SAVE_EVIDENCE.md
+        docs/TDD_WORKSPACE_EVIDENCE.md
         DESTINATION "${CMAKE_INSTALL_DATAROOTDIR}/doc/owl-docs")
 install(FILES
         third_party/excalidraw-figure-editor/THIRD_PARTY_NOTICES.md
@@ -252,6 +302,22 @@ if(BUILD_TESTING)
     docxstudio_warnings(core_tests)
     add_test(NAME core_tests COMMAND core_tests)
 
+    add_executable(academic_core_tests tests/academic_core_tests.cpp)
+    target_link_libraries(academic_core_tests PRIVATE docxstudio_core)
+    docxstudio_warnings(academic_core_tests)
+    add_test(NAME academic_core_tests COMMAND academic_core_tests)
+
+    add_executable(academic_recovery_tests tests/academic_recovery_tests.cpp src/app/RecoveryCodec.cpp)
+    target_compile_definitions(academic_recovery_tests PRIVATE OWL_DOCS_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+    target_link_libraries(academic_recovery_tests PRIVATE docxstudio_core nlohmann_json::nlohmann_json)
+    docxstudio_warnings(academic_recovery_tests)
+    add_test(NAME academic_recovery_tests COMMAND academic_recovery_tests)
+
+    add_executable(academic_ooxml_tests tests/academic_ooxml_tests.cpp)
+    target_link_libraries(academic_ooxml_tests PRIVATE docxstudio_ooxml)
+    docxstudio_warnings(academic_ooxml_tests)
+    add_test(NAME academic_ooxml_tests COMMAND academic_ooxml_tests)
+
     add_executable(codex_tests tests/codex_tests.cpp)
     target_link_libraries(codex_tests PRIVATE docxstudio_codex)
     docxstudio_warnings(codex_tests)
@@ -262,7 +328,169 @@ if(BUILD_TESTING)
     docxstudio_warnings(math_tests)
     add_test(NAME math_tests COMMAND math_tests)
 
+    add_executable(math_roundtrip_tests tests/math_roundtrip_tests.cpp)
+    target_link_libraries(math_roundtrip_tests PRIVATE docxstudio_ooxml)
+    docxstudio_warnings(math_roundtrip_tests)
+    add_test(NAME math_roundtrip_tests COMMAND math_roundtrip_tests)
+
+    if(DOCXSTUDIO_BUILD_APP)
+        add_executable(table_insert_picker_tests tests/table_insert_picker_tests.cpp)
+        target_sources(table_insert_picker_tests PRIVATE src/app/TableInsertDialog.cpp include/docxstudio/app/TableInsertDialog.h)
+        target_include_directories(table_insert_picker_tests PRIVATE include)
+        target_link_libraries(table_insert_picker_tests PRIVATE Qt6::Widgets Qt6::Test)
+        docxstudio_warnings(table_insert_picker_tests)
+        add_test(NAME table_insert_picker_tests COMMAND table_insert_picker_tests)
+        set_tests_properties(table_insert_picker_tests PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+        add_executable(color_palette_tests tests/color_palette_tests.cpp)
+        target_sources(color_palette_tests PRIVATE src/app/ColorPaletteWidget.cpp include/docxstudio/app/ColorPaletteWidget.h)
+        set_target_properties(color_palette_tests PROPERTIES AUTOMOC ON)
+        target_include_directories(color_palette_tests PRIVATE include)
+        target_link_libraries(color_palette_tests PRIVATE Qt6::Widgets Qt6::Test)
+        docxstudio_warnings(color_palette_tests)
+        add_test(NAME color_palette_tests COMMAND color_palette_tests)
+        set_tests_properties(color_palette_tests PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+        add_executable(header_margin_tests tests/header_margin_tests.cpp)
+        target_link_libraries(header_margin_tests PRIVATE docxstudio_app Qt6::Test)
+        docxstudio_warnings(header_margin_tests)
+        add_test(NAME header_margin_tests COMMAND header_margin_tests)
+        set_tests_properties(header_margin_tests PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+        add_executable(feedback_workflow_tests tests/feedback_workflow_tests.cpp)
+        target_link_libraries(feedback_workflow_tests PRIVATE docxstudio_app Qt6::Test)
+        docxstudio_warnings(feedback_workflow_tests)
+        add_test(NAME feedback_workflow_tests COMMAND feedback_workflow_tests)
+        set_tests_properties(feedback_workflow_tests PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+        add_executable(table_image_ooxml_tests tests/table_image_ooxml_tests.cpp)
+        target_link_libraries(table_image_ooxml_tests PRIVATE docxstudio_ooxml Qt6::Gui)
+        docxstudio_warnings(table_image_ooxml_tests)
+        add_test(NAME table_image_ooxml_tests COMMAND table_image_ooxml_tests)
+        add_executable(table_format_ooxml_tests tests/table_format_ooxml_tests.cpp)
+        target_link_libraries(table_format_ooxml_tests PRIVATE docxstudio_ooxml)
+        docxstudio_warnings(table_format_ooxml_tests)
+        add_test(NAME table_format_ooxml_tests COMMAND table_format_ooxml_tests)
+        add_executable(table_layout_core_tests tests/table_layout_core_tests.cpp)
+        target_link_libraries(table_layout_core_tests PRIVATE docxstudio_core)
+        docxstudio_warnings(table_layout_core_tests)
+        add_test(NAME table_layout_core_tests COMMAND table_layout_core_tests)
+        add_executable(table_layout_recovery_tests tests/table_layout_recovery_tests.cpp src/app/RecoveryCodec.cpp)
+        target_link_libraries(table_layout_recovery_tests PRIVATE docxstudio_core docxstudio_raster Qt6::Core)
+        docxstudio_warnings(table_layout_recovery_tests)
+        add_test(NAME table_layout_recovery_tests COMMAND table_layout_recovery_tests)
+        add_executable(table_image_core_tests tests/table_image_core_tests.cpp)
+        target_link_libraries(table_image_core_tests PRIVATE docxstudio_core)
+        docxstudio_warnings(table_image_core_tests)
+        add_test(NAME table_image_core_tests COMMAND table_image_core_tests)
+        add_executable(table_image_ui_tests tests/table_image_ui_tests.cpp)
+        target_link_libraries(table_image_ui_tests PRIVATE docxstudio_app Qt6::Test)
+        target_compile_definitions(table_image_ui_tests PRIVATE DOCXSTUDIO_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+        docxstudio_warnings(table_image_ui_tests)
+        add_test(NAME table_image_ui_tests COMMAND table_image_ui_tests)
+        set_tests_properties(table_image_ui_tests PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+        foreach(OWL_DOCS_CELL_IMAGE_CASE recovery selection clipboard docx codex)
+            add_test(NAME table_image_${OWL_DOCS_CELL_IMAGE_CASE}_tests
+                COMMAND table_image_ui_tests --${OWL_DOCS_CELL_IMAGE_CASE}-only)
+            set_tests_properties(table_image_${OWL_DOCS_CELL_IMAGE_CASE}_tests PROPERTIES
+                ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 60)
+        endforeach()
+        add_executable(academic_layout_tests tests/academic_layout_tests.cpp)
+        target_link_libraries(academic_layout_tests PRIVATE docxstudio_app)
+        docxstudio_warnings(academic_layout_tests)
+        add_test(NAME academic_layout_tests COMMAND academic_layout_tests)
+        set_tests_properties(academic_layout_tests PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+        add_executable(academic_ui_tests tests/academic_ui_tests.cpp)
+        target_link_libraries(academic_ui_tests PRIVATE docxstudio_app)
+        docxstudio_warnings(academic_ui_tests)
+        add_test(NAME academic_ui_tests COMMAND academic_ui_tests)
+        set_tests_properties(academic_ui_tests PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+        add_executable(academic_clipboard_tests tests/academic_clipboard_tests.cpp)
+        target_link_libraries(academic_clipboard_tests PRIVATE docxstudio_app)
+        docxstudio_warnings(academic_clipboard_tests)
+        add_test(NAME academic_clipboard_tests COMMAND academic_clipboard_tests)
+        set_tests_properties(academic_clipboard_tests PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+        add_executable(header_footer_ui_tests tests/header_footer_ui_tests.cpp)
+        target_link_libraries(header_footer_ui_tests PRIVATE docxstudio_app)
+        docxstudio_warnings(header_footer_ui_tests)
+        add_test(NAME header_footer_ui_tests COMMAND header_footer_ui_tests)
+        set_tests_properties(header_footer_ui_tests PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+        add_executable(header_footer_clipboard_tests tests/header_footer_clipboard_tests.cpp)
+        target_link_libraries(header_footer_clipboard_tests PRIVATE docxstudio_app)
+        docxstudio_warnings(header_footer_clipboard_tests)
+        add_test(NAME header_footer_clipboard_tests COMMAND header_footer_clipboard_tests)
+        set_tests_properties(header_footer_clipboard_tests PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+        add_test(NAME header_footer_keyboard_tests COMMAND header_footer_clipboard_tests --keyboard-only)
+        set_tests_properties(header_footer_keyboard_tests PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+        add_executable(header_footer_toolbar_tests tests/header_footer_toolbar_tests.cpp resources/owl-docs.qrc)
+        set_target_properties(header_footer_toolbar_tests PROPERTIES AUTORCC ON)
+        target_link_libraries(header_footer_toolbar_tests PRIVATE docxstudio_app Qt6::Test)
+        docxstudio_warnings(header_footer_toolbar_tests)
+        add_test(NAME header_footer_toolbar_tests COMMAND header_footer_toolbar_tests)
+        set_tests_properties(header_footer_toolbar_tests PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+        add_executable(table_editing_ui_tests tests/table_editing_ui_tests.cpp)
+        target_link_libraries(table_editing_ui_tests PRIVATE docxstudio_app Qt6::Test)
+        docxstudio_warnings(table_editing_ui_tests)
+        add_test(NAME table_editing_ui_tests COMMAND table_editing_ui_tests)
+        set_tests_properties(table_editing_ui_tests PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+        add_executable(table_layout_clipboard_tests tests/table_layout_clipboard_tests.cpp)
+        target_link_libraries(table_layout_clipboard_tests PRIVATE docxstudio_app)
+        docxstudio_warnings(table_layout_clipboard_tests)
+        add_test(NAME table_layout_clipboard_tests COMMAND table_layout_clipboard_tests)
+        set_tests_properties(table_layout_clipboard_tests PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+        add_executable(table_format_workflow_tests tests/table_format_workflow_tests.cpp)
+        target_link_libraries(table_format_workflow_tests PRIVATE docxstudio_app Qt6::Test)
+        docxstudio_warnings(table_format_workflow_tests)
+        add_test(NAME table_format_workflow_tests COMMAND table_format_workflow_tests)
+        set_tests_properties(table_format_workflow_tests PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+        add_executable(table_cell_formatting_tests tests/table_cell_formatting_tests.cpp)
+        target_link_libraries(table_cell_formatting_tests PRIVATE docxstudio_app)
+        docxstudio_warnings(table_cell_formatting_tests)
+        add_test(NAME table_cell_formatting_tests COMMAND table_cell_formatting_tests)
+        set_tests_properties(table_cell_formatting_tests PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+        add_executable(table_cell_render_tests tests/table_cell_render_tests.cpp)
+        target_link_libraries(table_cell_render_tests PRIVATE docxstudio_app)
+        docxstudio_warnings(table_cell_render_tests)
+        add_test(NAME table_cell_render_tests COMMAND table_cell_render_tests)
+        set_tests_properties(table_cell_render_tests PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+        add_executable(story_wrap_workflow_tests tests/story_wrap_workflow_tests.cpp)
+        target_link_libraries(story_wrap_workflow_tests PRIVATE docxstudio_app)
+        docxstudio_warnings(story_wrap_workflow_tests)
+        add_test(NAME story_wrap_workflow_tests COMMAND story_wrap_workflow_tests)
+        set_tests_properties(story_wrap_workflow_tests PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+        add_executable(header_footer_ime_tests tests/header_footer_ime_tests.cpp)
+        target_link_libraries(header_footer_ime_tests PRIVATE docxstudio_app)
+        docxstudio_warnings(header_footer_ime_tests)
+        add_test(NAME header_footer_ime_tests COMMAND header_footer_ime_tests)
+        set_tests_properties(header_footer_ime_tests PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+        add_executable(equation_editor_tests tests/equation_editor_tests.cpp
+            src/app/EquationEditorDialog.cpp src/app/MathLayout.cpp)
+        target_link_libraries(equation_editor_tests PRIVATE docxstudio_math Qt6::Widgets)
+        docxstudio_warnings(equation_editor_tests)
+        add_test(NAME equation_editor_tests COMMAND equation_editor_tests)
+        set_tests_properties(equation_editor_tests PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+    endif()
+
     if(TARGET docxstudio_app)
+        add_executable(application_identity_tests tests/application_identity_tests.cpp)
+        target_link_libraries(application_identity_tests PRIVATE Qt6::Widgets)
+        target_include_directories(application_identity_tests PRIVATE include)
+        target_compile_definitions(application_identity_tests PRIVATE OWL_DOCS_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+        docxstudio_warnings(application_identity_tests)
+        add_test(NAME application_identity_tests COMMAND application_identity_tests)
+        set_tests_properties(application_identity_tests PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+        add_executable(legacy_style_workflow_tests tests/legacy_style_workflow_tests.cpp)
+        target_link_libraries(legacy_style_workflow_tests PRIVATE docxstudio_app)
+        target_compile_definitions(legacy_style_workflow_tests PRIVATE OWL_DOCS_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+        docxstudio_warnings(legacy_style_workflow_tests)
+        add_test(NAME legacy_style_workflow_tests COMMAND legacy_style_workflow_tests)
+        set_tests_properties(legacy_style_workflow_tests PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen;XDG_DATA_HOME=/tmp/owl-docs-legacy-style-workflow-tests")
+        add_executable(academic_document_workflow_tests tests/academic_document_workflow_tests.cpp)
+        target_link_libraries(academic_document_workflow_tests PRIVATE docxstudio_app)
+        docxstudio_warnings(academic_document_workflow_tests)
+        add_test(NAME academic_document_workflow_tests COMMAND academic_document_workflow_tests)
+        set_tests_properties(academic_document_workflow_tests PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen;XDG_DATA_HOME=/tmp/owl-docs-academic-workflow-tests")
+        add_executable(academic_tool_tests tests/academic_tool_tests.cpp)
+        target_link_libraries(academic_tool_tests PRIVATE docxstudio_app)
+        docxstudio_warnings(academic_tool_tests)
+        add_test(NAME academic_tool_tests COMMAND academic_tool_tests)
+        set_tests_properties(academic_tool_tests PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen;XDG_DATA_HOME=/tmp/owl-docs-academic-tool-tests")
         add_executable(math_layout_tests tests/math_layout_tests.cpp)
         target_link_libraries(math_layout_tests PRIVATE docxstudio_app)
         docxstudio_warnings(math_layout_tests)
@@ -272,6 +500,16 @@ if(BUILD_TESTING)
     endif()
 
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/ooxml_tests.cpp")
+        add_executable(story_ooxml_tests tests/story_ooxml_tests.cpp)
+        target_link_libraries(story_ooxml_tests PRIVATE docxstudio_ooxml)
+        target_compile_definitions(story_ooxml_tests PRIVATE OWL_DOCS_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+        docxstudio_warnings(story_ooxml_tests)
+        add_test(NAME story_ooxml_tests COMMAND story_ooxml_tests)
+        add_executable(legacy_style_profile_tests tests/legacy_style_profile_tests.cpp)
+        target_link_libraries(legacy_style_profile_tests PRIVATE docxstudio_ooxml)
+        target_compile_definitions(legacy_style_profile_tests PRIVATE OWL_DOCS_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+        docxstudio_warnings(legacy_style_profile_tests)
+        add_test(NAME legacy_style_profile_tests COMMAND legacy_style_profile_tests)
         add_executable(ooxml_tests tests/ooxml_tests.cpp)
         target_link_libraries(ooxml_tests PRIVATE docxstudio_ooxml)
         docxstudio_warnings(ooxml_tests)
@@ -398,6 +636,12 @@ if(BUILD_TESTING)
         set_tests_properties(image_ui_tests PROPERTIES
             ENVIRONMENT "QT_QPA_PLATFORM=offscreen;XDG_DATA_HOME=/tmp/owl-docs-image-ui-tests")
 
+        add_executable(excalidraw_scene_tests tests/excalidraw_scene_tests.cpp src/app/ExcalidrawScene.cpp)
+        target_include_directories(excalidraw_scene_tests PRIVATE include)
+        target_link_libraries(excalidraw_scene_tests PRIVATE Qt6::Core)
+        docxstudio_warnings(excalidraw_scene_tests)
+        add_test(NAME excalidraw_scene_tests COMMAND excalidraw_scene_tests)
+
         add_executable(excalidraw_figure_tests
             tests/excalidraw_figure_tests.cpp)
         target_link_libraries(excalidraw_figure_tests PRIVATE docxstudio_app)
@@ -405,6 +649,37 @@ if(BUILD_TESTING)
         add_test(NAME excalidraw_figure_tests COMMAND excalidraw_figure_tests)
         set_tests_properties(excalidraw_figure_tests PROPERTIES
             ENVIRONMENT "QT_QPA_PLATFORM=offscreen;XDG_DATA_HOME=/tmp/owl-docs-excalidraw-figure-tests")
+
+        add_executable(codex_figure_patch_tests tests/codex_figure_patch_tests.cpp)
+        target_link_libraries(codex_figure_patch_tests PRIVATE docxstudio_app Qt6::Test)
+        docxstudio_warnings(codex_figure_patch_tests)
+        add_test(NAME codex_figure_patch_tests COMMAND codex_figure_patch_tests)
+        add_test(NAME codex_figure_reconstruction_tests COMMAND codex_figure_patch_tests --reconstruction)
+        set_tests_properties(codex_figure_patch_tests codex_figure_reconstruction_tests PROPERTIES
+            ENVIRONMENT "QT_QPA_PLATFORM=offscreen;XDG_DATA_HOME=/tmp/owl-docs-codex-figure-patch-tests")
+
+        add_executable(codex_figure_geometry_tests tests/codex_figure_geometry_tests.cpp)
+        target_link_libraries(codex_figure_geometry_tests PRIVATE docxstudio_app Qt6::Test)
+        docxstudio_warnings(codex_figure_geometry_tests)
+        add_test(NAME codex_figure_geometry_tests COMMAND codex_figure_geometry_tests)
+        set_tests_properties(codex_figure_geometry_tests PROPERTIES
+            ENVIRONMENT "QT_QPA_PLATFORM=offscreen;XDG_DATA_HOME=/tmp/owl-docs-codex-figure-geometry-tests")
+
+        add_executable(image_payload_preview_tests tests/image_payload_preview_tests.cpp)
+        target_link_libraries(image_payload_preview_tests PRIVATE docxstudio_app Qt6::Test)
+        docxstudio_warnings(image_payload_preview_tests)
+        add_test(NAME image_payload_preview_tests COMMAND image_payload_preview_tests)
+        set_tests_properties(image_payload_preview_tests PROPERTIES
+            ENVIRONMENT "QT_QPA_PLATFORM=offscreen;XDG_DATA_HOME=/tmp/owl-docs-image-payload-preview-tests")
+
+        add_executable(excalidraw_process_tests tests/excalidraw_process_tests.cpp)
+        target_link_libraries(excalidraw_process_tests PRIVATE docxstudio_app Qt6::Test)
+        docxstudio_warnings(excalidraw_process_tests)
+        add_test(NAME excalidraw_process_tests COMMAND excalidraw_process_tests)
+        add_test(NAME excalidraw_process_timeout_tests COMMAND excalidraw_process_tests --timeout)
+        set_tests_properties(excalidraw_process_tests excalidraw_process_timeout_tests PROPERTIES
+            ENVIRONMENT "QT_QPA_PLATFORM=offscreen;XDG_DATA_HOME=/tmp/owl-docs-excalidraw-process-tests"
+            TIMEOUT 60)
 
         add_executable(picture_dialog_tests tests/picture_dialog_tests.cpp)
         target_link_libraries(picture_dialog_tests PRIVATE docxstudio_app)
@@ -433,6 +708,27 @@ if(BUILD_TESTING)
         add_test(NAME editor_tool_bridge_tests COMMAND editor_tool_bridge_tests)
         set_tests_properties(editor_tool_bridge_tests PROPERTIES
             ENVIRONMENT "QT_QPA_PLATFORM=offscreen;XDG_DATA_HOME=/tmp/owl-docs-tests")
+
+        add_executable(codex_preview_state_tests tests/codex_preview_state_tests.cpp)
+        target_link_libraries(codex_preview_state_tests PRIVATE docxstudio_app)
+        docxstudio_warnings(codex_preview_state_tests)
+        add_test(NAME codex_preview_state_tests COMMAND codex_preview_state_tests)
+        set_tests_properties(codex_preview_state_tests PROPERTIES
+            ENVIRONMENT "QT_QPA_PLATFORM=offscreen;XDG_DATA_HOME=/tmp/owl-docs-codex-preview-tests")
+
+        add_executable(codex_numbering_refresh_tests tests/codex_numbering_refresh_tests.cpp)
+        target_link_libraries(codex_numbering_refresh_tests PRIVATE docxstudio_app)
+        docxstudio_warnings(codex_numbering_refresh_tests)
+        add_test(NAME codex_numbering_refresh_tests COMMAND codex_numbering_refresh_tests)
+        set_tests_properties(codex_numbering_refresh_tests PROPERTIES
+            ENVIRONMENT "QT_QPA_PLATFORM=offscreen;XDG_DATA_HOME=/tmp/owl-docs-codex-numbering-tests")
+
+        add_executable(codex_authoring_workflow_tests tests/codex_authoring_workflow_tests.cpp)
+        target_link_libraries(codex_authoring_workflow_tests PRIVATE docxstudio_app Qt6::Test)
+        docxstudio_warnings(codex_authoring_workflow_tests)
+        add_test(NAME codex_authoring_workflow_tests COMMAND codex_authoring_workflow_tests)
+        set_tests_properties(codex_authoring_workflow_tests PROPERTIES
+            ENVIRONMENT "QT_QPA_PLATFORM=offscreen;XDG_DATA_HOME=/tmp/owl-docs-codex-authoring-tests")
 
         add_executable(codex_controller_tests tests/codex_controller_tests.cpp)
         target_link_libraries(codex_controller_tests PRIVATE docxstudio_app)
@@ -498,7 +794,7 @@ if(BUILD_TESTING AND OWL_DOCS_ICON_GENERATOR_PYTHON)
 endif()
 
 # When a Codex runtime and Python are present on the build host, verify the
-# exact experimental fields used by Owl Docs against app-server's generated
+# exact experimental fields used by OwlDocs against app-server's generated
 # protocol schema. Builds remain possible on fully offline hosts without Codex.
 if(BUILD_TESTING)
     find_program(OWL_DOCS_CODEX_SCHEMA_EXECUTABLE NAMES codex
@@ -514,13 +810,30 @@ if(BUILD_TESTING)
     endif()
 endif()
 
+if(BUILD_TESTING)
+    find_program(OWL_DOCS_FIGURE_TEST_NODE NAMES node nodejs)
+    if(OWL_DOCS_FIGURE_TEST_NODE)
+        add_test(NAME excalidraw_figure_protocol_tests
+            COMMAND "${OWL_DOCS_FIGURE_TEST_NODE}"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/excalidraw-figure-editor/scripts/figure-protocol.test.mjs")
+        add_test(NAME excalidraw_native_scene_patch_tests
+            COMMAND "${OWL_DOCS_FIGURE_TEST_NODE}"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/excalidraw-figure-editor/scripts/native-scene-patch.test.mjs")
+        add_test(NAME excalidraw_figure_export_options_tests
+            COMMAND "${OWL_DOCS_FIGURE_TEST_NODE}"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/excalidraw-figure-editor/scripts/figure-export-options.test.mjs")
+        set_tests_properties(excalidraw_figure_protocol_tests excalidraw_native_scene_patch_tests excalidraw_figure_export_options_tests
+            PROPERTIES LABELS "excalidraw;protocol" TIMEOUT 30)
+    endif()
+endif()
+
 set(CPACK_GENERATOR "DEB")
 set(CPACK_PACKAGE_NAME "owl-docs")
-set(CPACK_PACKAGE_VENDOR "Owl Docs")
+set(CPACK_PACKAGE_VENDOR "OwlDocs")
 set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "Offline word processor with optional Codex assistance")
 set(CPACK_DEBIAN_PACKAGE_DESCRIPTION
-    "Offline DOCX word processor with optional Codex assistance.\n Owl Docs provides local document editing, PDF export, and an optional\n user-enabled Codex chat experience.")
-set(CPACK_DEBIAN_PACKAGE_MAINTAINER "Owl Docs")
+    "Offline DOCX word processor with optional Codex assistance.\n OwlDocs provides local document editing, PDF export, and an optional\n user-enabled Codex chat experience.")
+set(CPACK_DEBIAN_PACKAGE_MAINTAINER "OwlDocs")
 set(CPACK_DEBIAN_PACKAGE_REPLACES "docx-studio")
 set(CPACK_DEBIAN_PACKAGE_CONFLICTS "docx-studio")
 set(CPACK_DEBIAN_FILE_NAME DEB-DEFAULT)
@@ -537,3 +850,75 @@ set(CPACK_INSTALL_DEFAULT_DIRECTORY_PERMISSIONS
     GROUP_READ GROUP_EXECUTE
     WORLD_READ WORLD_EXECUTE)
 include(CPack)
+
+# Workspace UI acceptance tests and the shared desktop visual system.
+if(TARGET docxstudio_app AND BUILD_TESTING)
+    add_executable(workspace_ui_tests tests/workspace_ui_tests.cpp)
+    target_link_libraries(workspace_ui_tests PRIVATE docxstudio_app Qt6::Test)
+    docxstudio_warnings(workspace_ui_tests)
+    add_test(NAME workspace_ui_tests COMMAND workspace_ui_tests)
+    set_tests_properties(workspace_ui_tests PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen;XDG_DATA_HOME=/tmp/owl-docs-workspace-tests")
+endif()
+
+if(TARGET docxstudio_app AND BUILD_TESTING)
+    add_executable(command_registry_tests tests/command_registry_tests.cpp
+        src/app/CommandRegistry.cpp include/docxstudio/app/CommandRegistry.h)
+    set_target_properties(command_registry_tests PROPERTIES AUTOMOC ON)
+    target_include_directories(command_registry_tests PRIVATE include)
+    target_link_libraries(command_registry_tests PRIVATE Qt6::Widgets Qt6::Test)
+    docxstudio_warnings(command_registry_tests)
+    add_test(NAME command_registry_tests COMMAND command_registry_tests)
+    set_tests_properties(command_registry_tests PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
+    add_executable(editor_semantic_operations_tests tests/editor_semantic_operations_tests.cpp
+        src/app/EditorSemanticOperations.cpp src/app/RasterDecoder.cpp)
+    target_include_directories(editor_semantic_operations_tests PRIVATE include)
+    target_link_libraries(editor_semantic_operations_tests PRIVATE docxstudio_core docxstudio_codex Qt6::Gui)
+    docxstudio_warnings(editor_semantic_operations_tests)
+    add_test(NAME editor_semantic_operations_tests COMMAND editor_semantic_operations_tests)
+    set_tests_properties(editor_semantic_operations_tests PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
+    add_executable(list_operation_planning_tests tests/list_operation_planning_tests.cpp)
+    target_link_libraries(list_operation_planning_tests PRIVATE docxstudio_app)
+    docxstudio_warnings(list_operation_planning_tests)
+    add_test(NAME list_operation_planning_tests COMMAND list_operation_planning_tests)
+    set_tests_properties(list_operation_planning_tests PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen;XDG_CONFIG_HOME=/tmp/owl-docs-list-planning-tests")
+endif()
+
+if(TARGET docxstudio_app AND BUILD_TESTING)
+    add_executable(workspace_controls_tests tests/workspace_controls_tests.cpp
+        src/app/CommandRegistry.cpp src/app/RibbonWidget.cpp
+        src/app/ColorPaletteWidget.cpp include/docxstudio/app/ColorPaletteWidget.h
+        src/app/FontFamilyPicker.cpp src/app/NavigationDock.cpp src/app/ChatDock.cpp
+        include/docxstudio/app/CommandRegistry.h include/docxstudio/app/RibbonWidget.h
+        include/docxstudio/app/NavigationDock.h include/docxstudio/app/ChatDock.h)
+    set_target_properties(workspace_controls_tests PROPERTIES AUTOMOC ON)
+    target_include_directories(workspace_controls_tests PRIVATE include)
+    target_link_libraries(workspace_controls_tests PRIVATE docxstudio_core Qt6::Widgets Qt6::Test)
+    docxstudio_warnings(workspace_controls_tests)
+    add_test(NAME workspace_controls_tests COMMAND workspace_controls_tests)
+    set_tests_properties(workspace_controls_tests PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+endif()
+
+if(TARGET docxstudio_app)
+    target_sources(docxstudio_app PRIVATE src/app/AppTheme.cpp)
+endif()
+if(TARGET workspace_controls_tests)
+    target_sources(workspace_controls_tests PRIVATE src/app/AppTheme.cpp)
+endif()
+
+if(BUILD_TESTING AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(save_outcome_tests tests/save_outcome_tests.cpp)
+    target_link_libraries(save_outcome_tests PRIVATE docxstudio_ooxml)
+    target_link_options(save_outcome_tests PRIVATE "-Wl,--wrap=fsync")
+    docxstudio_warnings(save_outcome_tests)
+    add_test(NAME save_outcome_tests COMMAND save_outcome_tests)
+endif()
+
+if(TARGET workspace_ui_tests)
+    target_sources(workspace_ui_tests PRIVATE resources/owl-docs.qrc)
+    set_target_properties(workspace_ui_tests PROPERTIES AUTORCC ON)
+endif()

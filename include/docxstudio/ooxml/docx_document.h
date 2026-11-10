@@ -6,6 +6,7 @@
 #include <compare>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <span>
@@ -129,6 +130,42 @@ struct EquationPayload {
     bool display{false};
 
     auto operator<=>(const EquationPayload&) const = default;
+};
+
+enum class AcademicFieldKind { note_reference, caption_number, bibliography_number,
+                               cross_reference, citation };
+struct AcademicFieldPayload {
+    AcademicFieldKind kind{AcademicFieldKind::cross_reference};
+    std::string id{};
+    std::string target_id{};
+    std::string cached_text{};
+    std::string locator{};
+    bool full_text{false};
+    std::uint32_t note_number{0};
+    bool endnote{false};
+    bool target_is_caption{true};
+    std::uint32_t bookmark_number{0};
+    auto operator<=>(const AcademicFieldPayload&) const = default;
+};
+struct AcademicNotePayload {
+    std::string id{};
+    bool endnote{false};
+    std::uint32_t number{1};
+    std::string text{};
+    auto operator<=>(const AcademicNotePayload&) const = default;
+};
+struct TocEntryPayload {
+    std::string target_id{};
+    std::string text{};
+    std::uint8_t level{1};
+    std::uint32_t page{1};
+    auto operator<=>(const TocEntryPayload&) const = default;
+};
+struct TocPayload {
+    std::string id{};
+    std::uint8_t max_level{3};
+    std::vector<TocEntryPayload> entries{};
+    auto operator<=>(const TocPayload&) const = default;
 };
 
 inline constexpr std::int64_t kMaximumImageWrapDistanceEmu = 254000000;
@@ -389,10 +426,13 @@ enum class BasicTableStyle {
     dark_header,
 };
 
+enum class BasicTableBorderStyle { none, single };
+
 struct ImportedTableBorder {
     std::uint32_t rgb{0};
     // OOXML w:sz is measured in eighths of a point.
     std::uint16_t width_eighth_points{0};
+    BasicTableBorderStyle style{BasicTableBorderStyle::single};
 
     auto operator<=>(const ImportedTableBorder&) const = default;
 };
@@ -436,6 +476,8 @@ struct ImportedTableBlock {
     // exact w:tblStyle value even when the style is unknown to Owl Docs.
     std::optional<BasicTableStyle> style;
     std::optional<std::string> source_style_id;
+    // Empty means automatic; otherwise one at-least height per row, 0 = auto.
+    std::vector<std::uint32_t> row_minimum_heights_twips;
 
     auto operator<=>(const ImportedTableBlock&) const = default;
 };
@@ -531,6 +573,7 @@ struct NewRun {
     // When present this run represents exactly one bounded internal raster
     // picture. It is mutually exclusive with both text and equation.
     std::optional<NewInlineImage> inline_image;
+    std::optional<AcademicFieldPayload> field;
 
     auto operator<=>(const NewRun&) const = default;
 };
@@ -562,6 +605,14 @@ struct NewParagraph {
         : runs(std::move(new_runs)), alignment(new_alignment) {}
 
     std::vector<NewRun> runs;
+    // Native bookmark target and a bounded generated TOC field. Exact academic
+    // editor semantics are retained in a verified, inert package snapshot.
+    std::string stable_id{};
+    std::uint32_t bookmark_number{0};
+    std::optional<TocPayload> table_of_contents;
+    // A semantic caption/source can outlive deletion of its visible prefix.
+    // Keep a hidden numbered native target so existing REF fields stay valid.
+    std::optional<AcademicFieldPayload> hidden_sequence_target{};
     // WordprocessingML paragraph style ID (w:pPr/w:pStyle). New documents
     // accept only Owl Docs' deterministic built-in paragraph styles; imported
     // custom IDs remain visible on Paragraph but are never fabricated here.
@@ -584,6 +635,16 @@ struct NewParagraph {
     std::optional<BasicRunFormat> paragraph_mark_format;
 
     auto operator<=>(const NewParagraph&) const = default;
+};
+
+struct NewTableCellLayout {
+    std::optional<BasicVerticalAlignment> vertical_alignment;
+    std::optional<ImportedTableBorder> border_top;
+    std::optional<ImportedTableBorder> border_right;
+    std::optional<ImportedTableBorder> border_bottom;
+    std::optional<ImportedTableBorder> border_left;
+
+    auto operator<=>(const NewTableCellLayout&) const = default;
 };
 
 struct NewTable {
@@ -616,6 +677,11 @@ struct NewTable {
     // package because this API does not also generate its style definition.
     // Unchanged imported packages still preserve unknown IDs byte-for-byte.
     std::optional<std::string> source_style_id;
+    // Empty vectors retain the byte-stable automatic table representation.
+    std::vector<std::uint32_t> column_widths_twips;
+    std::vector<std::uint32_t> row_minimum_heights_twips;
+    // When present, exactly rows * columns direct cell overrides.
+    std::vector<NewTableCellLayout> cell_layouts;
 
     auto operator<=>(const NewTable&) const = default;
 };
@@ -632,6 +698,12 @@ struct NewDocumentBody {
     std::optional<std::string> footer_text;
     std::vector<NewStoryImage> header_images;
     std::vector<NewStoryImage> footer_images;
+    std::vector<AcademicNotePayload> notes{};
+    std::optional<std::string> academic_recovery;
+    // Authoring-only layout decisions from the shared story measurement.
+    // Explicit multiline regions also select this native representation.
+    bool header_regional_layout{false};
+    bool footer_regional_layout{false};
 };
 
 struct PageSettings {
@@ -679,6 +751,12 @@ struct DocumentDefaults {
     std::string font_family{"Carlito"};
     std::int32_t font_size_half_points{22};
     std::uint32_t default_tab_stop_twips{240};
+    // Preserve the deterministic paragraph-style catalog used by 0.6.0 files.
+    // Import selects this only after exact styles-part reproduction; complete
+    // package coverage is still required before a document can regenerate.
+    bool legacy_style_defaults{false};
+    // Exact frozen 0.6.1 neutral catalog; mutually exclusive with legacy.
+    bool neutral_style_defaults{false};
 
     auto operator<=>(const DocumentDefaults&) const = default;
 };
@@ -722,9 +800,21 @@ struct SaveResult {
     std::size_t preserved_member_count{0};
     LossReport loss_report;
     std::optional<Error> error;
+    // The target was committed, but its directory durability sync failed.
+    // This is a successful save with a warning, never a precommit failure.
+    std::optional<Error> durability_warning;
+    // Exact precommit-validated bytes, avoiding a postcommit pathname reopen.
+    std::shared_ptr<const std::vector<std::uint8_t>> validated_package_bytes;
 
     [[nodiscard]] explicit operator bool() const noexcept { return saved; }
 };
+
+struct RegenerationAssessment {
+    bool lossless{false};
+    LossReport loss_report;
+};
+
+using SaveCommitGuard = std::function<bool(Error&)>;
 
 class DocxDocument {
 public:
@@ -734,6 +824,9 @@ public:
     [[nodiscard]] static std::unique_ptr<DocxDocument> open(
         const std::filesystem::path& path,
         Error* error = nullptr,
+        const OpenOptions& options = {});
+    [[nodiscard]] static std::unique_ptr<DocxDocument> openBytes(
+        std::span<const std::uint8_t> bytes, Error* error = nullptr,
         const OpenOptions& options = {});
 
     // Creates a conservative, macro-free DOCX with one body section. Run
@@ -752,7 +845,8 @@ public:
         const std::filesystem::path& target,
         const NewDocumentBody& body,
         const PageSettings& page = {},
-        const DocumentDefaults& defaults = {});
+        const DocumentDefaults& defaults = {},
+        const SaveCommitGuard& before_commit = {});
 
     // Ordered multi-section authoring. Non-final section properties are
     // written on the terminating paragraph and final properties on w:body,
@@ -776,9 +870,21 @@ public:
     [[nodiscard]] const std::vector<ImportedSection>& sections() const noexcept;
     [[nodiscard]] const std::optional<std::string>& headerText() const noexcept;
     [[nodiscard]] const std::optional<std::string>& footerText() const noexcept;
+    // Returned only when every native package member exactly matches the
+    // current-snapshot registry. External edits invalidate this shortcut.
+    // Callers must additionally prove that projecting the decoded semantics
+    // reproduces the complete package before using this candidate snapshot.
+    [[nodiscard]] const std::optional<std::string>& academicRecovery() const noexcept;
     [[nodiscard]] const std::vector<ImportedStoryImage>& headerImages() const noexcept;
     [[nodiscard]] const std::vector<ImportedStoryImage>& footerImages() const noexcept;
     [[nodiscard]] const CompatibilityReport& compatibility() const noexcept;
+    [[nodiscard]] std::span<const std::uint8_t> sourceBytes() const noexcept;
+    [[nodiscard]] const DocumentDefaults& sourceDefaults() const noexcept;
+    // Full member-by-member proof using the same serializer as writeNew.
+    // Producer markers and package origin never authorize regeneration.
+    [[nodiscard]] RegenerationAssessment assessRegeneration(
+        const NewDocumentBody& body, const PageSettings& page,
+        const DocumentDefaults& defaults) const;
     // True only for the deliberately narrow, text-only package shape emitted
     // by this writer when every package part and document structure is covered
     // by the current semantic regeneration path. This is stricter than
@@ -805,7 +911,8 @@ public:
     // Writes to a unique temporary file in the target directory, fsyncs it,
     // reopens and validates the DOCX, then atomically renames it over target.
     // On success the saved file becomes this object's new clean baseline.
-    [[nodiscard]] SaveResult saveAs(const std::filesystem::path& target);
+    [[nodiscard]] SaveResult saveAs(const std::filesystem::path& target,
+                                    const SaveCommitGuard& before_commit = {});
 
 private:
     struct Impl;

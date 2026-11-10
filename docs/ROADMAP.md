@@ -1,4 +1,4 @@
-# Owl Docs roadmap
+# OwlDocs roadmap
 
 This roadmap is a sequence of evidence gates, not a claim of Microsoft Word
 parity. A feature moves into the compatibility matrix only after its editing,
@@ -21,23 +21,13 @@ complete only when the features below work together in normal keyboard- and
 mouse-driven workflows, survive save/reopen and recovery, and meet the stated
 performance and privacy gates.
 
-The 0.4.4 checkpoint adds native built-in paragraph-style identity and
-provenance-aware transitions to the 0.4.3 document-ingress/Recent Files slice.
-Normal, No Spacing, Title, Subtitle, Quote, and Heading 1–9 are available from
-the Home ribbon; heading Enter continuation, undo, recovery, supported DOCX
-save/reopen, and previewed Codex changes use the same direct-override
-preservation rules. Custom style-definition editing, styles inside table
-cells, and heading/page/object browsing remain later work. M1 as a whole
-remains active.
+The 0.6.0 checkpoint adds a compact ApeTek-inspired workspace and searchable commands while keeping the owl logo, supported academic writing objects, editable LaTeX-source equations, full source-package recovery, and normal rich-document saves after verified source coverage. Native fields/notes and safe math remain explicitly bounded; general foreign field editing, advanced note/citation layouts, custom styles and Word-class interoperability remain future gates. M1 as a whole remains active.
 
 - Finish remaining recovery/session edge cases around the implemented
   multi-document ingress, printing, shared-layout PDF export, recent files,
   and multi-file desktop association workflows.
 - Complete the everyday editing surface around the implemented page view,
-  zoom, and initial text Navigation/Find-Replace slice: add rulers,
-  heading/page/object navigation, remaining standard shortcuts, and
-  finish the clipboard, command palette, and Home, Insert, Layout, Review, and
-  View ribbon surfaces.
+  zoom, and initial text Navigation/Find-Replace slice: add rulers, broader page/object navigation, remaining standard shortcuts, and finish clipboard and accessibility coverage around the compact toolbar, command palette and initial heading outline.
 - Complete direct character and paragraph formatting, styles, tabs, borders,
   page breaks, sections, page geometry, columns, lists, and the daily-use table
   subset.
@@ -46,7 +36,7 @@ remains active.
   square/top-and-bottom anchors: add crop, rotation, z-order, arbitrary
   positioning, and the remaining wrap modes without losing unsupported
   imported drawing data.
-- Add text boxes, captions, and the initial simple-shape subset.
+- Add text boxes and the initial simple-shape subset; extend the implemented caption/reference workflow as corpus evidence grows.
 - Finish local English spelling behavior and personal-dictionary workflows.
 - Keep safe LaTeX equations as native editable math atoms and native OMML.
 - Complete the M1 Codex editor contract: bounded reads, isolated previews,
@@ -68,7 +58,7 @@ Excalidraw build. Excalidraw is an optional authoring surface; the DOCX remains
 readable and visually useful when that surface is unavailable.
 
 Version 0.5.0 implements the first end-to-end slice. It bundles the figure
-editor in Owl Docs, supports insert/edit/cancel, one-transaction updates,
+editor in OwlDocs, supports insert/edit/cancel, one-transaction updates,
 ordinary picture layout, recovery, and native DOCX save/reopen. This checkpoint
 stores bounded inert scene JSON in a private PNG iTXt chunk so the preview and
 source share one byte-owned image atom. The private OPC index/relationship,
@@ -78,13 +68,13 @@ planned before M2 is declared complete.
 ### User experience
 
 - **Insert > Figure > Excalidraw** opens a document-scoped local figure editor.
-  Saving returns to Owl Docs and replaces the placeholder with the rendered
+  Saving returns to OwlDocs and replaces the placeholder with the rendered
   figure. Canceling leaves the document unchanged.
 - A single click selects the figure like any other drawing. Double-clicking, or
   choosing **Edit Figure** from its context menu, reopens the editable scene.
   This preserves ordinary image selection, resizing, wrapping, and keyboard
   behavior.
-- Each create or update action is one normal undoable Owl Docs transaction that
+- Each create or update action is one normal undoable OwlDocs transaction that
   includes both the editable source and its rendered preview. Undo, redo,
   recovery, duplication, copy/paste, and save/reopen cannot separate the pair.
 - The contextual Figure ribbon and context menu provide Edit, Wrap Text,
@@ -97,19 +87,19 @@ planned before M2 is declared complete.
 
 - Store a normal DrawingML picture and a bounded PNG fallback in `word/media`
   so Word, LibreOffice, Google Docs, and other DOCX consumers can display the
-  figure without Excalidraw or Owl Docs.
+  figure without Excalidraw or OwlDocs.
 - Where the validated export permits it, retain a sanitized vector preview for
-  Owl Docs screen/PDF rendering while keeping the PNG fallback authoritative
+  OwlDocs screen/PDF rendering while keeping the PNG fallback authoritative
   for broad interoperability.
 - Migrate the editable, size-bounded Excalidraw scene from the 0.5.0 private
   PNG metadata checkpoint to a private optional OPC
   part related to the drawing by a stable figure identifier and versioned
   source/preview hashes. The custom part must never be required to render the
-  document. Until that migration, Owl Docs recognizes its namespaced inert iTXt
+  document. Until that migration, OwlDocs recognizes its namespaced inert iTXt
   chunk and treats a stripped chunk as a flattened ordinary picture.
 - Before embedding, remove deleted elements, unreferenced binary files, local
   history, and other hidden scene state that is unnecessary for future edits.
-  Owl Docs undo history, not undisclosed content inside the scene, owns prior
+  OwlDocs undo history, not undisclosed content inside the scene, owns prior
   figure versions.
 - Preserve unknown scene fields and unrelated OOXML members on eligible save
   paths. If another editor strips the optional scene part, show the surviving
@@ -139,7 +129,7 @@ planned before M2 is declared complete.
   restrictive Content Security Policy, denied navigation/popups/permissions,
   ephemeral browser storage, bounded memory/CPU, and cleanup on parent exit.
 - The helper has no file dialogs. If a figure needs an imported image, it asks
-  Owl Docs to obtain and validate the asset and receives bounded bytes rather
+  OwlDocs to obtain and validate the asset and receives bounded bytes rather
   than a host path.
 - Return validated scene JSON plus a newly rendered preview over the capability
   channel. Reject stale sessions, token replay, malformed/oversized results,
@@ -155,7 +145,7 @@ planned before M2 is declared complete.
   normal preservation rules apply.
 - Removing the optional editable part in an external-editor fixture retains a
   visible flattened picture and produces an accurate compatibility report.
-- Cancel, editor crash, Owl Docs crash, disk-full, stale-session, and malformed
+- Cancel, editor crash, OwlDocs crash, disk-full, stale-session, and malformed
   return paths never partially mutate the document.
 - Automated tests prove no outbound networking, no general filesystem access,
   origin/capability enforcement, deterministic cleanup, and bounded handling of
@@ -183,8 +173,7 @@ arbitrary file.
 
 - Broader OMML and safe LaTeX editing, equation numbering, and long-document
   mathematical typography.
-- Footnotes, endnotes, citations, bibliographies, captions, cross-references,
-  tables of contents/figures, and indexes.
+- Extend the implemented plain notes, captions, cross-references, manual numeric citations/bibliographies and TOC with rich/per-section notes, citation-style engines, reference-manager integrations, page references, tables of figures and indexes.
 - Advanced figures, anchored groups, wrap-boundary editing, multi-column
   layout, hyphenation, and long-document navigation.
 - Additional chart types and Codex tools for structured technical, citation,

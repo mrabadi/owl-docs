@@ -1,6 +1,7 @@
 #include "docxstudio/app/FileFingerprint.h"
 
 #include <QCoreApplication>
+#include <QDateTime>
 #include <QFile>
 #include <QTemporaryDir>
 
@@ -49,6 +50,18 @@ int main(int argc, char** argv) {
     check(docxstudio::app::compareFileFingerprint(path, *original, error) ==
               docxstudio::app::FileFingerprintComparison::matches,
           "unchanged file did not match its fingerprint");
+
+    QFile metadataOnly(path);
+    check(metadataOnly.open(QIODevice::ReadWrite) &&
+              metadataOnly.setFileTime(
+                  QDateTime::fromMSecsSinceEpoch(
+                      original->modified_msecs_since_epoch + 60'000),
+                  QFileDevice::FileModificationTime),
+          "could not change the fixture timestamp");
+    metadataOnly.close();
+    check(docxstudio::app::compareFileFingerprint(path, *original, error) ==
+              docxstudio::app::FileFingerprintComparison::matches,
+          "unchanged bytes with a changed timestamp caused a save conflict");
 
     // Prove that comparison does not trust size and modification time alone:
     // use the replacement's exact metadata with the original content hash.

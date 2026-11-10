@@ -1,4 +1,4 @@
-# Owl Docs application icon
+# OwlDocs application icon
 
 The project owner supplied and approved this artwork on 2026-09-12. The
 canonical, unmodified source is `owl-docs-master.png`:
@@ -9,7 +9,8 @@ canonical, unmodified source is `owl-docs-master.png`:
 
 The eight checked-in hicolor PNGs are deterministic derivatives of that
 master. They are generated at 16, 24, 32, 48, 64, 128, 256, and 512 pixels by
-`tools/generate_app_icons.py`. The generator uses Pillow 12.3.0 and zlib 1.3.2,
+`tools/generate_app_icons.py`. The generator accepts reviewed Pillow 12.3.0 or
+13.0.0 with zlib 1.3.2; both reproduce the eight assets byte for byte. It
 resizes premultiplied RGBA data with the Lanczos filter and a reducing gap of
 3.0, then converts back to straight RGBA before deterministic PNG encoding.
 Premultiplication preserves clean translucent edges during downsampling.
@@ -22,8 +23,8 @@ python3 tools/generate_app_icons.py --check
 
 CI or a maintainer build can register the same byte-for-byte check with CTest
 by setting `OWL_DOCS_ICON_GENERATOR_PYTHON` to a Python interpreter containing
-the pinned dependencies. The test is optional because Pillow is an artwork
-maintenance dependency, not an Owl Docs build or runtime dependency.
+the reviewed dependencies. The test is optional because Pillow is an artwork
+maintenance dependency, not an OwlDocs build or runtime dependency.
 
 Regenerate them after an intentional master-artwork change:
 
@@ -31,5 +32,5 @@ Regenerate them after an intentional master-artwork change:
 python3 tools/generate_app_icons.py --write
 ```
 
-The generator intentionally rejects other Pillow or zlib versions because
+The generator intentionally rejects unreviewed Pillow or zlib versions because
 encoder changes can alter bytes even when decoded pixels appear identical.

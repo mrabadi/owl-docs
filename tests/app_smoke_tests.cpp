@@ -1,3 +1,5 @@
+#include <QMenu>
+#include <QAbstractButton>
 #include "docxstudio/app/DocumentCanvas.h"
 #include "docxstudio/app/ChatDock.h"
 #include "docxstudio/app/CommandRegistry.h"
@@ -28,6 +30,12 @@
 #include <vector>
 
 namespace {
+QAbstractButton* paletteChoice(QMenu* menu,const QColor& color) {
+    if (!menu) return nullptr;
+    for (auto* button:menu->findChildren<QAbstractButton*>())
+        if (button->property("paletteColor").value<QColor>()==color) return button;
+    return nullptr;
+}
 
 void check(bool condition, const char* message) {
     if (!condition) {
@@ -142,14 +150,14 @@ int main(int argc, char** argv) {
               "Heading 1 did not set native paragraph-style identity");
         const auto headingFormat =
             snapshot.document.paragraphs().front().characterFormatAt(1);
-        check(headingFormat.font_size_half_points == 32 &&
+        check(headingFormat.font_size_half_points == 40 &&
                   headingFormat.bold == true &&
-                  headingFormat.foreground_argb == 0xffe95420U,
+                  headingFormat.foreground_argb == 0xff173b32U,
               "Heading 1 did not apply its visible catalog baseline");
         check(snapshot.document.paragraphs().front().format().keep_with_next ==
                   true &&
                   snapshot.document.paragraphs().front().format()
-                          .space_before_emu == 12 * 12700,
+                          .space_before_emu == 18 * 12700,
               "Heading 1 did not apply its paragraph baseline");
 
         const auto beforeEnterRevision = snapshot.revision;
@@ -308,7 +316,7 @@ int main(int argc, char** argv) {
         const auto format = paragraph.characterFormatAt(1);
         check(paragraph.styleId() ==
                   std::optional<std::string>{"Heading2"} &&
-                  format.font_size_half_points == 26 &&
+                  format.font_size_half_points == 32 &&
                   format.bold == true &&
                   format.foreground_argb == 0xffcc0000U,
               "style application erased a direct text-color override");
@@ -612,8 +620,10 @@ int main(int argc, char** argv) {
 
     {
         using namespace docxstudio::core;
-        const auto* headingOne = findBuiltInParagraphStyle("Heading1");
-        const auto* headingTwo = findBuiltInParagraphStyle("Heading2");
+        // Frozen imported styles keep color and directness coverage distinct
+        // from the new neutral style catalog.
+        const auto* headingOne = findLegacyBuiltInParagraphStyle("Heading1");
+        const auto* headingTwo = findLegacyBuiltInParagraphStyle("Heading2");
         check(headingOne && headingTwo,
               "paragraph-style merge fixture lacks built-in styles");
         const auto firstId = NodeId::generate();
@@ -776,8 +786,10 @@ int main(int argc, char** argv) {
 
     {
         using namespace docxstudio::core;
-        const auto* headingOne = findBuiltInParagraphStyle("Heading1");
-        const auto* headingTwo = findBuiltInParagraphStyle("Heading2");
+        // Frozen imported styles keep color and directness coverage distinct
+        // from the new neutral style catalog.
+        const auto* headingOne = findLegacyBuiltInParagraphStyle("Heading1");
+        const auto* headingTwo = findLegacyBuiltInParagraphStyle("Heading2");
         check(headingOne && headingTwo,
               "empty-mark style fixture lacks built-in styles");
         const auto retainedId = NodeId::generate();
@@ -1213,9 +1225,12 @@ int main(int argc, char** argv) {
 
     docxstudio::app::ChatDock chat;
     chat.setModels({QStringLiteral("gpt-default"),
-                    QStringLiteral("gpt-5.6-luna")});
-    check(chat.selectedModel() == QStringLiteral("gpt-5.6-luna"),
-          "Codex chat did not prefer gpt-5.6-luna when advertised");
+                    QStringLiteral("gpt-5.6-luna"), QStringLiteral("gpt-6.1-sol")});
+    check(chat.selectedModel() == QStringLiteral("gpt-6.1-sol"),
+          "Codex chat did not prefer advertised GPT-6.1 Sol");
+    chat.setModels({QStringLiteral("gpt-default"), QStringLiteral("gpt-5.6-luna")});
+    check(chat.selectedModel() == QStringLiteral("gpt-default"),
+          "Codex chat did not retain server order when Sol was unavailable");
     chat.setEfforts({QStringLiteral("medium"), QStringLiteral("low")});
     check(chat.selectedEffort() == QStringLiteral("low"),
           "Codex chat did not prefer low reasoning when advertised");
@@ -1336,17 +1351,16 @@ int main(int argc, char** argv) {
     QObject::connect(&iconRibbon,
                      &docxstudio::app::RibbonWidget::clearHighlightRequested,
                      [&clearHighlightRequested] { clearHighlightRequested = true; });
-    auto* textPaletteChoice = iconRibbon.findChild<QAction*>(
-        QStringLiteral("ribbonColor.text.16"));
-    auto* highlightPaletteChoice = iconRibbon.findChild<QAction*>(
-        QStringLiteral("ribbonColor.highlight.0"));
-    auto* noHighlightChoice = iconRibbon.findChild<QAction*>(
-        QStringLiteral("ribbonColor.highlight.none"));
+    auto* textMenu=iconRibbon.findChild<QMenu*>(QStringLiteral("ribbonMenu.textColor"));
+    auto* highlightMenu=iconRibbon.findChild<QMenu*>(QStringLiteral("ribbonMenu.highlightColor"));
+    auto* textPaletteChoice=paletteChoice(textMenu,QColor(QStringLiteral("#994a55")));
+    auto* highlightPaletteChoice=paletteChoice(highlightMenu,QColor(QStringLiteral("#fff200")));
+    auto* noHighlightChoice=highlightMenu ? highlightMenu->findChild<QAbstractButton*>(QStringLiteral("palette.default")) : nullptr;
     check(textPaletteChoice && highlightPaletteChoice && noHighlightChoice,
           "color palettes are missing immediate or No Highlight choices");
-    textPaletteChoice->trigger();
-    highlightPaletteChoice->trigger();
-    noHighlightChoice->trigger();
+    textPaletteChoice->click();
+    highlightPaletteChoice->click();
+    noHighlightChoice->click();
     check(selectedTextColor == QColor(QStringLiteral("#994a55")) &&
               selectedHighlightColor == QColor(QStringLiteral("#fff200")) &&
               clearHighlightRequested,

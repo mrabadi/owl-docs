@@ -152,7 +152,7 @@ bool EditorPreferences::save(QSettings& settings, QString* error) const {
 
     if (error) {
         *error = settings.status() == QSettings::AccessError
-            ? QStringLiteral("Owl Docs could not write the editor preferences.")
+            ? QStringLiteral("OwlDocs could not write the editor preferences.")
             : QStringLiteral("The editor preferences have an invalid storage format.");
     }
     return false;

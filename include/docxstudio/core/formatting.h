@@ -218,5 +218,11 @@ struct ParagraphStyleDefinition {
 builtInParagraphStyles() noexcept;
 [[nodiscard]] const ParagraphStyleDefinition* findBuiltInParagraphStyle(
     std::string_view style_id) noexcept;
+// Frozen 0.6.0 defaults for exact reproduction of existing native packages.
+[[nodiscard]] const ParagraphStyleDefinition* findLegacyBuiltInParagraphStyle(
+    std::string_view style_id) noexcept;
+// Frozen 0.6.1 neutral catalog for exact source reproduction.
+[[nodiscard]] const ParagraphStyleDefinition* findNeutralBuiltInParagraphStyle(
+    std::string_view style_id) noexcept;
 
 }  // namespace docxstudio::core

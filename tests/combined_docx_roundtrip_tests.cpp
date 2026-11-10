@@ -9,6 +9,7 @@
 #include <QFile>
 #include <QFileDialog>
 #include <QKeyEvent>
+#include <QMessageBox>
 #include <QTemporaryDir>
 #include <QTimer>
 
@@ -88,6 +89,31 @@ void sendKey(DocumentCanvas& canvas, Qt::Key key,
              Qt::KeyboardModifiers modifiers = Qt::NoModifier) {
     QKeyEvent event(QEvent::KeyPress, key, modifiers);
     QApplication::sendEvent(&canvas, &event);
+}
+
+void saveReopenedRichDocument(docxstudio::app::MainWindow& window,
+                              DocumentCanvas& canvas) {
+    canvas.setMarginsPoints(canvas.marginTopPoints() + 1.0,
+        canvas.marginRightPoints(), canvas.marginBottomPoints(), canvas.marginLeftPoints());
+    bool warned = false;
+    QTimer monitor;
+    monitor.setInterval(1);
+    QObject::connect(&monitor, &QTimer::timeout, &window, [&] {
+        for (auto* widget : QApplication::topLevelWidgets()) {
+            if (auto* message = qobject_cast<QMessageBox*>(widget); message && message->isVisible()) {
+                std::cerr << message->windowTitle().toStdString() << ": "
+                          << message->detailedText().toStdString() << '\n';
+                warned = true;
+                message->reject();
+            }
+        }
+    });
+    auto* save = window.findChild<QAction*>(QStringLiteral("file.save"));
+    check(save, "reopened rich document has no Save action");
+    monitor.start();
+    save->trigger();
+    monitor.stop();
+    check(!warned && !canvas.isModified(), "reopened authored rich content unnecessarily required conversion");
 }
 
 DocumentCanvas* listCanvas(docxstudio::app::MainWindow& window,
@@ -566,6 +592,7 @@ void testEditedTableFormattingSurvivesSaveAndReopen() {
               typedCell->characterFormatAt(1).font_size_half_points ==
                   kRequestedHalfPoints,
           "the reopened empty cell did not retain formatting for later typing");
+    saveReopenedRichDocument(reopened, *reopenedCanvas);
 }
 
 void testNativeListGeometrySurvivesSaveAndReopen() {
@@ -695,6 +722,7 @@ void testNativeListGeometrySurvivesSaveAndReopen() {
           "DOCX hanging geometry was applied twice inside Owl Docs");
     check(!imported->isModified(),
           "reopening list geometry incorrectly marked the document modified");
+    saveReopenedRichDocument(reopened, *imported);
 }
 
 void testNumberedLevelStylesSurviveSaveAndReopen() {
@@ -879,6 +907,7 @@ void testNumberedLevelStylesSurviveSaveAndReopen() {
     }
     check(!imported->isModified(),
           "reopening numbered-level markers incorrectly marked the document modified");
+    saveReopenedRichDocument(reopened, *imported);
 }
 
 }  // namespace

@@ -24,6 +24,11 @@ struct NavigationResult {
     bool operator==(const NavigationResult&) const = default;
 };
 
+struct NavigationHeading {
+    QString title;
+    int level{1};
+};
+
 // Modeless Find/Replace surface. This widget deliberately knows nothing about
 // DocumentCanvas or core positions, so MainWindow can bind it to whichever
 // document tab is active without introducing document state into the shell.
@@ -34,6 +39,7 @@ public:
     enum class Mode {
         find,
         replace,
+        outline,
     };
     Q_ENUM(Mode)
 
@@ -58,6 +64,7 @@ public:
     void setCurrentResultIndex(int index);
     void clearSearchResults();
     void focusQuery(bool selectAll = true);
+    void setHeadings(const QList<NavigationHeading>& headings);
 
 signals:
     // Emitted for both query edits and option changes. Consumers can debounce
@@ -76,6 +83,7 @@ signals:
                              bool matchCase, bool wholeWords);
     void modeChanged(docxstudio::app::NavigationDock::Mode mode);
     void dismissRequested();
+    void headingActivated(int index);
 
 private:
     void emitQueryChanged();
@@ -85,6 +93,9 @@ private:
 
     Mode mode_{Mode::find};
     QTabBar* modes_{};
+    QWidget* searchBody_{};
+    QListWidget* outline_{};
+    QLabel* outlineHint_{};
     QLineEdit* query_{};
     QWidget* replacementRow_{};
     QLineEdit* replacement_{};

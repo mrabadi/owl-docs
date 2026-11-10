@@ -6,8 +6,11 @@
 #include <QColor>
 #include <QElapsedTimer>
 #include <QImage>
+#include <QMarginsF>
+#include <QSizeF>
 #include <QPoint>
 #include <QPointF>
+#include <QPointer>
 #include <QRectF>
 #include <QString>
 
@@ -16,6 +19,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <string>
 #include <utility>
 #include <variant>
@@ -144,6 +148,39 @@ struct DocumentSearchMatch {
     auto operator<=>(const DocumentSearchMatch&) const = default;
 };
 
+struct PageLayoutSettings {
+    double widthPoints{612.0};
+    double heightPoints{792.0};
+    double marginTopPoints{72.0};
+    double marginRightPoints{72.0};
+    double marginBottomPoints{72.0};
+    double marginLeftPoints{72.0};
+    auto operator<=>(const PageLayoutSettings&) const = default;
+};
+
+struct ListEditRequest {
+    enum class Kind { set_kind, set_level, set_layout, refresh_numbering };
+    Kind kind{Kind::set_kind};
+    std::vector<core::NodeId> blockIds;
+    QString listKind{QStringLiteral("numbered")};
+    int level{1};
+    core::ListLayout layout;
+    // Borrowed only for this synchronous plan; retains authored starting
+    // counters when a structural edit changes the first list item.
+    const core::Document* numberingBaseline{nullptr};
+};
+struct TableCellRange {
+    core::NodeId tableId;
+    core::NodeId cellId;
+    std::size_t row{0}, column{0}, start{0}, end{0};
+};
+struct StorySelection {
+    bool footer{false};
+    int region{0};
+    // UTF-16 offsets within the active left/center/right region.
+    std::size_t start{0}, end{0};
+};
+
 class DocumentCanvas final : public QAbstractScrollArea {
     Q_OBJECT
 
@@ -178,20 +215,27 @@ public:
     bool hasNonTextChanges() const noexcept { return nonTextModified_; }
     bool hasPageLayoutChanges() const noexcept { return pageLayoutModified_; }
     void markSaved() noexcept;
-    void markRecovered();
+    void markRecovered(bool nonTextChanged = true, bool pageLayoutChanged = true);
     void setZoomPercent(int percent);
+    void fitToWidth();
     int zoomPercent() const noexcept { return zoomPercent_; }
-    double pageWidthPoints() const noexcept { return pageWidthPoints_; }
-    double pageHeightPoints() const noexcept { return pageHeightPoints_; }
-    double marginTopPoints() const noexcept { return marginTopPoints_; }
-    double marginRightPoints() const noexcept { return marginRightPoints_; }
-    double marginBottomPoints() const noexcept { return marginBottomPoints_; }
-    double marginLeftPoints() const noexcept { return marginLeftPoints_; }
+    double pageWidthPoints() const noexcept { return previewOriginalLayout_ ? previewOriginalLayout_->widthPoints : pageWidthPoints_; }
+    double pageHeightPoints() const noexcept { return previewOriginalLayout_ ? previewOriginalLayout_->heightPoints : pageHeightPoints_; }
+    double marginTopPoints() const noexcept { return previewOriginalLayout_ ? previewOriginalLayout_->marginTopPoints : marginTopPoints_; }
+    double marginRightPoints() const noexcept { return previewOriginalLayout_ ? previewOriginalLayout_->marginRightPoints : marginRightPoints_; }
+    double marginBottomPoints() const noexcept { return previewOriginalLayout_ ? previewOriginalLayout_->marginBottomPoints : marginBottomPoints_; }
+    double marginLeftPoints() const noexcept { return previewOriginalLayout_ ? previewOriginalLayout_->marginLeftPoints : marginLeftPoints_; }
     int pageCount() const;
+    // Maximum rendered line count per story region across the document pages.
+    static std::array<int, 3> measureStoryLines(
+        const core::Document& document, bool footer,
+        const QSizeF& pageSizePoints, const QMarginsF& marginsPoints,
+        const QString& fontFamily, double fontPointSize, int pageCount = 1);
     // Monotonic diagnostic for proving that screen, print, and PDF consume
     // an already-computed pagination result instead of silently repaginating.
     std::uint64_t layoutGeneration() const;
     int currentPageNumber() const;
+    int paragraphPageNumber(core::NodeId paragraphId) const;
 
     void undo();
     void redo();
@@ -225,6 +269,20 @@ public:
     void showSelectedImageAltTextDialog();
     void showSelectedImageLayoutDialog();
     bool insertEquation(const QString& latex, bool display = false);
+    bool selectEquation(core::NodeId equationId);
+    std::optional<core::NodeId> selectedEquationId() const;
+    bool replaceSelectedEquation(const QString& latex, bool display);
+    void showEquationEditor();
+    QRectF equationBounds(core::NodeId equationId) const;
+    bool navigateToParagraph(core::NodeId paragraphId);
+    bool insertNote(const QString& text, core::NoteKind kind);
+    bool updateNote(core::NodeId id, const QString& text);
+    bool insertCaption(core::CaptionLabel label, const QString& text);
+    bool insertBibliographyEntry(const QString& text);
+    bool insertCitation(core::NodeId entryId, const QString& locator = {});
+    bool insertCrossReference(core::NodeId targetId, bool fullText = false);
+    bool insertTableOfContents(int maximumLevel = 3);
+    void showReferencesEditor(const QString& kind);
     bool insertTable(std::size_t rows, std::size_t columns, bool headerRow);
     bool insertTableRow(bool after);
     bool insertTableColumn(bool after);
@@ -239,10 +297,28 @@ public:
                           std::size_t anchorRow, std::size_t anchorColumn,
                           std::size_t focusRow, std::size_t focusColumn);
     bool selectTable(core::NodeId tableId);
+    std::vector<core::NodeId> selectedTableCellIds() const;
+    std::optional<TableCellRange> selectedTableCellRange() const;
     bool moveSelectedTable(bool forward);
     std::optional<core::NodeId> selectedTableId() const noexcept {
         return selectedTable_;
     }
+    QRectF tableCellViewportRect(core::NodeId tableId, std::size_t row, std::size_t column) const;
+    // Fits to the candidate's actual cell writing area without changing the
+    // live canvas. Invalid dimensions, layout or stable targets return nullopt.
+    std::optional<QSizeF> fitTableCellImageSize(
+        const core::Document& document, core::NodeId tableId,
+        core::NodeId cellId, QSizeF desiredPoints,
+        std::optional<PageLayoutSettings> proposedLayout = std::nullopt) const;
+    bool setSelectedTableCellAlignment(core::ParagraphAlignment horizontal, core::TableCellVerticalAlignment vertical);
+    std::optional<std::pair<core::ParagraphAlignment, core::TableCellVerticalAlignment>> selectedTableCellAlignment() const;
+    bool setSelectedTableBorders(const QString& preset, double widthPoints, const QColor& color);
+    bool setSelectedTableColumnWidth(double points);
+    bool setSelectedTableRowMinimumHeight(double points);
+    bool distributeSelectedTableColumns();
+    bool distributeSelectedTableRows();
+    double selectedTableColumnWidthPoints() const;
+    double selectedTableRowMinimumHeightPoints() const;
     void toggleBullets();
     void toggleNumbering();
     bool hasActiveList() const;
@@ -262,6 +338,10 @@ public:
     bool isHeaderFooterEditing() const noexcept {
         return headerFooterEditing_;
     }
+    std::optional<StorySelection> activeStorySelection() const;
+    // The canvas owns these controls even when the workspace hosts them in
+    // its contextual ribbon. Editing itself remains in the page viewport.
+    QWidget* headerFooterControls();
     void applyCharacterFormat(const core::CharacterFormatDelta& delta);
     void applyParagraphFormat(const core::ParagraphFormatDelta& delta);
     void applyParagraphStyle(const QString& styleId);
@@ -274,6 +354,11 @@ public:
         const std::vector<core::NodeId>& paragraphIds,
         const core::ParagraphStyleDefinition& target,
         bool ensureTargetProvenance = false) const;
+    // Plans through the actual UI list implementation on a private canvas;
+    // the supplied document and this visible canvas are never changed.
+    [[nodiscard]] bool planListOperations(
+        const core::Document& document, const ListEditRequest& request,
+        std::vector<core::Operation>& operations, QString& error) const;
     QString currentParagraphStyleId() const;
     bool paragraphStylesAvailable() const noexcept;
     void toggleBold();
@@ -344,7 +429,8 @@ public:
                                  const std::vector<core::Operation>& operations,
                                  const QString& label,
                                  QString& summary,
-                                 QString& error);
+                                 QString& error,
+                                 std::optional<PageLayoutSettings> proposedLayout = std::nullopt);
     bool createReplacementPreview(const QString& replacement, QString& summary, QString& error);
     bool acceptPreview(QString& error);
     void discardPreview();
@@ -396,6 +482,8 @@ private:
     struct VisualLine;
     struct ParagraphVisual;
     struct EquationVisual;
+    struct NoteVisual;
+    struct TocVisual;
     struct TableCellVisual;
     struct TableRowVisual;
     struct TableVisual;
@@ -423,6 +511,18 @@ private:
         std::size_t utf16Offset{};
 
         auto operator<=>(const TableCursor&) const = default;
+    };
+    struct TableBoundary {
+        core::NodeId tableId;
+        bool column{true};
+        std::size_t index{};
+    };
+    struct TableResizeDrag {
+        TableBoundary boundary;
+        QPointF startViewportPoint;
+        core::TableGeometry original;
+        core::TableGeometry resolved;
+        core::TableGeometry preview;
     };
     struct PendingSpellingWord {
         enum class Container { bodyParagraph, tableCell };
@@ -501,6 +601,8 @@ private:
     std::optional<std::pair<core::Position, core::ImageAtom>>
     selectedInlineImage() const;
     bool rejectLiveEditDuringPreview();
+    bool insertAcademicField(core::FieldKind kind, core::NodeId target,
+                             const QString& locator = {}, bool fullText = false);
     void endTypingGroup() noexcept;
     void resetVerticalNavigation() noexcept;
     void clearPendingSpellingWord() noexcept;
@@ -543,7 +645,9 @@ private:
         std::optional<std::string> resultingParagraphStyle = std::nullopt);
     bool continuePlainTextList();
     bool resequenceNumberedList(core::NodeId paragraphId,
-                                bool coalesceWithPrevious);
+                                bool coalesceWithPrevious,
+                                const core::Document* numberingBaseline = nullptr,
+                                std::set<core::NodeId>* visitedRun = nullptr);
     void togglePlainTextList(bool numbered);
     bool handlePlainTextListBackspace();
     void deleteBackward(bool byWord = false);
@@ -551,6 +655,8 @@ private:
     void moveHorizontal(bool forward, bool extend, bool byWord = false);
     void moveVertical(bool down, bool extend);
     Hit hitTest(const QPoint& viewportPoint) const;
+    core::TableGeometry resolvedTableGeometry(core::NodeId tableId) const;
+    void cancelTableResize();
     const VisualLine* visualLineForCaret() const;
     QRectF caretRectInContent() const;
     std::vector<core::NodeId> selectedParagraphIds() const;
@@ -573,6 +679,8 @@ private:
     };
     std::optional<StoryRegionHit> storyRegionAt(
         const QPoint& viewportPoint) const;
+    std::pair<double, double> storyBodyMargins(const core::Document& document, int pages) const;
+    QRectF storyRegion(bool footer, int region) const;
     void ensureStoryEditors();
     void loadStoryEditors(bool footer);
     void updateStoryEditorGeometry();
@@ -585,6 +693,7 @@ private:
 
     SpellChecker& spelling_;
     std::unique_ptr<core::DocumentSession> session_;
+    std::vector<core::Operation>* plannedOperations_{nullptr};
     core::Range selection_;
     core::CharacterFormat typingFormat_;
     core::CharacterFormatMask typingOverrideMask_;
@@ -607,6 +716,7 @@ private:
     core::ListLayout defaultListLayout_;
     std::array<QPlainTextEdit*, 3> headerEditors_{};
     std::array<QPlainTextEdit*, 3> footerEditors_{};
+    QPointer<QWidget> storyTools_;
     bool headerFooterEditing_{false};
     bool activeStoryIsFooter_{false};
     int activeStoryRegion_{0};
@@ -616,13 +726,19 @@ private:
 
     mutable core::Revision layoutRevision_;
     mutable bool layoutValid_{false};
+    mutable std::vector<std::unique_ptr<NoteVisual>> noteVisuals_;
+    mutable std::vector<std::unique_ptr<TocVisual>> tocVisuals_;
     mutable bool layoutIsPreview_{false};
     mutable int pageCount_{1};
+    mutable double bodyMarginTopPoints_{72.0};
+    mutable double bodyMarginBottomPoints_{72.0};
+    mutable int storyPaginationPass_{0};
     mutable std::uint64_t layoutGeneration_{0};
     mutable std::vector<std::unique_ptr<ParagraphVisual>> visuals_;
     mutable std::vector<std::unique_ptr<TableVisual>> tableVisuals_;
     mutable std::vector<BlockPlacement> blockPlacements_;
     mutable std::map<core::NodeId, QImage> decodedImages_;
+    mutable std::map<core::NodeId, core::EncodedImagePayload> decodedImagePayloads_;
     mutable std::int64_t decodedImageBytes_{0};
     std::vector<ImportedTablePresentation> importedTables_;
     std::optional<core::PreviewId> previewId_;
@@ -630,6 +746,10 @@ private:
     std::optional<core::Position> previewCursor_;
     std::vector<core::Operation> previewOperations_;
     bool previewHasNonTextChanges_{false};
+    std::optional<PageLayoutSettings> previewOriginalLayout_;
+    std::optional<CursorState> previewOriginalCursorState_;
+    PageLayoutSettings renderedPageLayout() const noexcept;
+    void useRenderedPageLayout(const PageLayoutSettings& layout) noexcept;
     QTimer* typingGroupTimer_{nullptr};
     bool typingGroupActive_{false};
     bool colorAdjustmentActive_{false};
@@ -647,6 +767,7 @@ private:
     bool tableDropTargetValid_{false};
     std::optional<core::NodeId> tableDropBefore_;
     std::optional<ImageResizeDrag> imageResizeDrag_;
+    std::optional<TableResizeDrag> tableResizeDrag_;
     std::optional<LineAffinity> lineAffinity_;
     std::optional<double> preferredVerticalX_;
     std::vector<CursorHistoryEntry> undoCursorHistory_;

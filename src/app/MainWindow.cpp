@@ -1,4 +1,5 @@
 #include "docxstudio/app/MainWindow.h"
+#include "docxstudio/app/AppTheme.h"
 
 #include "docxstudio/app/ChatDock.h"
 #include "docxstudio/app/CodexController.h"
@@ -13,8 +14,10 @@
 #include "docxstudio/app/RasterDecoder.h"
 #include "docxstudio/app/RecoveryCodec.h"
 #include "docxstudio/app/RibbonWidget.h"
+#include "docxstudio/app/TableInsertDialog.h"
 #include "docxstudio/codex/editor_tools.hpp"
 #include "docxstudio/core/document.h"
+#include "docxstudio/core/academic.h"
 #include "docxstudio/math/latex_parser.h"
 #include "docxstudio/ooxml/docx_document.h"
 #include "docxstudio/worker/client.h"
@@ -26,6 +29,7 @@
 #include <QCloseEvent>
 #include <QColorDialog>
 #include <QCoreApplication>
+#include <QCryptographicHash>
 #include <QDialog>
 #include <QDialogButtonBox>
 #include <QDir>
@@ -54,6 +58,7 @@
 #include <QPrintPreviewDialog>
 #include <QPushButton>
 #include <QRegularExpression>
+#include <QResizeEvent>
 #include <QSettings>
 #include <QSignalBlocker>
 #include <QSlider>
@@ -62,6 +67,7 @@
 #include <QSpinBox>
 #include <QStyle>
 #include <QTabWidget>
+#include <QTemporaryFile>
 #include <QTimer>
 #include <QToolBar>
 #include <QToolButton>
@@ -186,7 +192,7 @@ struct LiteralListMarker {
     qsizetype prefixLength{};
 };
 
-// WordprocessingML native numbering is limited to ilvl 0 through 8. Owl Docs
+// WordprocessingML native numbering is limited to ilvl 0 through 8. OwlDocs
 // keeps its tenth editor level, but exports that level as literal marker text
 // with standard hanging-indent/tab geometry.
 constexpr std::size_t kNativeOoxmlListLevelCount = 9;
@@ -194,7 +200,7 @@ constexpr std::size_t kNativeOoxmlListLevelCount = 9;
 std::optional<LiteralListMarker> literalListMarker(const QString& text) {
     static const QRegularExpression bulletPattern(
         QStringLiteral(R"(^([ \t]*)([\x{2022}\x{25E6}\x{25AA}\x{2023}*-])([ \t]+))"));
-    // Owl Docs stores its currently supported lists as literal marker text plus
+    // OwlDocs stores its currently supported lists as literal marker text plus
     // DOCX tab/hanging-indent geometry.  Numbered levels cycle through decimal,
     // upper-alpha, upper-Roman, lower-alpha, and lower-Roman markers, so the
     // package mapper must recognize all five forms when regenerating or
@@ -313,16 +319,6 @@ qreal listTextAdvance(const core::Paragraph& paragraph, std::size_t start,
         result += QFontMetricsF(font).horizontalAdvance(text[index]);
     }
     return result;
-}
-
-math::ParseLimits editorEquationLimits() {
-    math::ParseLimits limits;
-    limits.max_input_bytes = 8U * 1024U;
-    limits.max_depth = 32;
-    limits.max_nodes = 2'048;
-    limits.max_matrix_rows = 32;
-    limits.max_matrix_columns = 32;
-    return limits;
 }
 
 core::Document documentFromText(const QStringList& paragraphs) {
@@ -586,6 +582,39 @@ std::optional<ImportedCellBorderPresentation> importedBorder(
     return ImportedCellBorderPresentation{
         0xff000000U | source->rgb,
         static_cast<double>(source->width_eighth_points) / 8.0};
+}
+
+core::TableCellLayout importedSemanticTableCellLayout(
+    const ooxml::ImportedTableCell& cell) {
+    core::TableCellLayout result;
+    if (cell.vertical_alignment) {
+        switch (*cell.vertical_alignment) {
+            case ooxml::BasicVerticalAlignment::top:
+                result.vertical_alignment = core::TableCellVerticalAlignment::top;
+                break;
+            case ooxml::BasicVerticalAlignment::center:
+                result.vertical_alignment = core::TableCellVerticalAlignment::center;
+                break;
+            case ooxml::BasicVerticalAlignment::bottom:
+                result.vertical_alignment = core::TableCellVerticalAlignment::bottom;
+                break;
+        }
+    }
+    const auto border = [](const std::optional<ooxml::ImportedTableBorder>& source)
+        -> std::optional<core::TableBorder> {
+        if (!source) return std::nullopt;
+        if (source->style == ooxml::BasicTableBorderStyle::none)
+            return core::TableBorder{core::TableBorderStyle::none, 0, 0xff000000U};
+        if (source->width_eighth_points == 0 || source->width_eighth_points > 96)
+            return std::nullopt;
+        return core::TableBorder{core::TableBorderStyle::single,
+            source->width_eighth_points, 0xff000000U | source->rgb};
+    };
+    result.border_top = border(cell.border_top);
+    result.border_right = border(cell.border_right);
+    result.border_bottom = border(cell.border_bottom);
+    result.border_left = border(cell.border_left);
+    return result;
 }
 
 ImportedTableCellPresentation importedTableCellPresentation(
@@ -1195,12 +1224,51 @@ struct ImportedSemanticDocument {
     QStringList sourceTextPrefixes;
     std::vector<ImportedInlineImagePresentation> images;
     std::vector<ImportedTablePresentation> tables;
+    QStringList diagnostics{};
 };
+
+ooxml::NewDocumentBody toOoxmlBody(
+    const core::DocumentSnapshot& snapshot, QStringList& losses,
+    const QString& defaultFontFamily, double defaultFontPointSize,
+    const ImportedTableStyleSources& importedTableStyleSources,
+    const ooxml::PageSettings& page, const DocumentCanvas* layoutCanvas,
+    int tabWidthSpaces, bool legacyStyleDefaults, bool neutralStyleDefaults);
 
 core::Result<ImportedSemanticDocument> documentFromOoxml(
     const ooxml::DocxDocument& package,
     const QString& defaultFontFamily, double defaultFontPointSize,
     int tabWidthSpaces) {
+    QStringList academicDiagnostics;
+    if (package.academicRecovery()) {
+        std::string error;
+        auto restored = RecoveryCodec::decode(*package.academicRecovery(), error);
+        if (restored) {
+            QStringList losses;
+            const auto projected = toOoxmlBody({core::Revision{}, restored->document}, losses,
+                defaultFontFamily, defaultFontPointSize, {},
+                package.bodyPageSettings().value_or(ooxml::PageSettings{}), nullptr, tabWidthSpaces,
+                package.sourceDefaults().legacy_style_defaults, package.sourceDefaults().neutral_style_defaults);
+            const auto proof = package.assessRegeneration(projected,
+                package.bodyPageSettings().value_or(ooxml::PageSettings{}), package.sourceDefaults());
+            if (proof.lossless) {
+            // The package reader proved every native member unchanged before
+            // exposing this current snapshot. Never text-patch its synthetic
+            // semantic offsets into the native fields' cached result runs.
+            std::vector<std::size_t> indices(restored->document.paragraphs().size(),
+                std::numeric_limits<std::size_t>::max());
+            QStringList prefixes;
+            for (std::size_t index = 0; index < indices.size(); ++index) prefixes.push_back(QString{});
+            return ImportedSemanticDocument{std::move(restored->document), std::move(indices),
+                std::move(prefixes), {}, {}};
+            }
+            academicDiagnostics.push_back(QObject::tr(
+                "The academic snapshot does not reproduce the native DOCX package; native content was preserved instead."));
+            for (const auto& issue : proof.loss_report.issues)
+                academicDiagnostics.push_back(QString::fromStdString(issue.part_name + ": " + issue.detail));
+        } else {
+            academicDiagnostics.push_back(QObject::tr("The academic snapshot is invalid: %1").arg(QString::fromStdString(error)));
+        }
+    }
     const auto& sourceParagraphs = package.paragraphs();
     const auto& sourceBlocks = package.bodyBlocks();
     std::vector<std::size_t> sourceIndices;
@@ -1338,7 +1406,7 @@ core::Result<ImportedSemanticDocument> documentFromOoxml(
                                         core::kMaximumDocumentEncodedImageBytes)) {
                             return core::Error{
                                 core::ErrorCode::invalid_operation,
-                                "Imported document exceeds Owl Docs' bounded inline-picture budget"};
+                                "Imported document exceeds OwlDocs' bounded inline-picture budget"};
                         }
                         auto decoded = imageCache.decode(
                             sourceImage.package_member,
@@ -1487,6 +1555,54 @@ core::Result<ImportedSemanticDocument> documentFromOoxml(
             text.replace(QLatin1Char('\n'), QChar::LineSeparator);
             auto presentation = importedTableCellPresentation(
                 imported->cells[cellIndex], sourceParagraphs[sourceIndex]);
+            std::vector<core::ImageAtom> cellImages;
+            const bool hasImages = std::any_of(sourceParagraphs[sourceIndex].runs.begin(), sourceParagraphs[sourceIndex].runs.end(),
+                [](const auto& run) { return std::any_of(run.fragments.begin(), run.fragments.end(),
+                    [](const auto& fragment) { return fragment.kind == ooxml::FragmentKind::inline_image; }); });
+            if (hasImages) {
+                text.clear(); presentation.formats.clear();
+                for (const auto& run : sourceParagraphs[sourceIndex].runs) {
+                    const auto runStart = static_cast<std::size_t>(text.size());
+                    for (const auto& fragment : run.fragments) {
+                        if (fragment.kind == ooxml::FragmentKind::inline_image) {
+                            if (!fragment.inline_image || !fragment.inline_image->renderable() ||
+                                fragment.inline_image->layout.placement != ooxml::ImagePlacement::inline_with_text)
+                                return core::Error{core::ErrorCode::invalid_operation, "Imported cell picture is outside the bounded inline subset"};
+                            const auto& sourceImage = *fragment.inline_image;
+                            const auto inspection = raster::inspect(sourceImage.bytes.view(), raster::Format::unknown, imageLimits.per_image);
+                            if (!inspection.ok() || importedImageCount >= core::kMaximumInlineImagesPerDocument ||
+                                sourceImage.bytes.size() > core::kMaximumDocumentEncodedImageBytes -
+                                    std::min(importedEncodedImageBytes, core::kMaximumDocumentEncodedImageBytes))
+                                return core::Error{core::ErrorCode::invalid_operation, "Imported cell pictures exceed the bounded document image budget"};
+                            auto decodedImage = imageCache.decode(sourceImage.package_member, sourceImage.bytes.view());
+                            if (!decodedImage.ok()) return core::Error{core::ErrorCode::invalid_operation, "Imported cell picture exceeds the decoded image budget"};
+                            auto encodedImage = encodedImageCache.find(sourceImage.package_member);
+                            if (encodedImage == encodedImageCache.end())
+                                encodedImage = encodedImageCache.emplace(sourceImage.package_member,
+                                    core::EncodedImagePayload(std::vector<std::uint8_t>(sourceImage.bytes.view().begin(), sourceImage.bytes.view().end()))).first;
+                            const auto imageId = core::NodeId::generate();
+                            cellImages.push_back({imageId, static_cast<std::size_t>(text.size()), encodedImage->second,
+                                inspection.format == raster::Format::png ? core::ImageFormat::png : core::ImageFormat::jpeg,
+                                sourceImage.accessible_name.empty() ? sourceImage.name : sourceImage.accessible_name,
+                                sourceImage.width_emu, sourceImage.height_emu, {}});
+                            imagePresentations.emplace_back(imageId, std::move(decodedImage.image));
+                            ++importedImageCount; importedEncodedImageBytes += sourceImage.bytes.size();
+                            text += QChar(core::kInlineObjectReplacementCharacter);
+                        } else if (fragment.kind == ooxml::FragmentKind::text) {
+                            auto fragmentText = fromUtf8(fragment.text);
+                            fragmentText.replace(QStringLiteral("\r\n"), QString(QChar::LineSeparator));
+                            fragmentText.replace(QLatin1Char('\r'), QChar::LineSeparator);
+                            fragmentText.replace(QLatin1Char('\n'), QChar::LineSeparator);
+                            text += fragmentText;
+                        } else if (fragment.kind == ooxml::FragmentKind::tab) text += QLatin1Char('\t');
+                        else if (fragment.kind == ooxml::FragmentKind::line_break) text += QChar::LineSeparator;
+                        else return core::Error{core::ErrorCode::invalid_operation, "Imported cell contains an unsupported inline object"};
+                    }
+                    const auto runEnd = static_cast<std::size_t>(text.size());
+                    if (runStart < runEnd) presentation.formats.push_back({runStart, runEnd, importedCharacterFormat(run.format)});
+                }
+                presentation.sourceText = text;
+            }
             auto cellId = core::NodeId::generate();
             while (!tableNodeIds.insert(cellId).second) {
                 cellId = core::NodeId::generate();
@@ -1505,14 +1621,29 @@ core::Result<ImportedSemanticDocument> documentFromOoxml(
                 cellId, text.toStdU16String(), presentation.formats,
                 importedTableCellParagraphFormat(
                     sourceParagraphs[sourceIndex]),
-                std::move(defaultCellFormat));
+                std::move(defaultCellFormat), std::move(cellImages),
+                importedSemanticTableCellLayout(imported->cells[cellIndex]));
             tablePresentation.cellIds.push_back(cellId);
             tablePresentation.cells.push_back(std::move(presentation));
+        }
+        core::TableGeometry geometry;
+        geometry.row_minimum_heights_twips = imported->row_minimum_heights_twips;
+        const auto sourcePage = package.bodyPageSettings().value_or(ooxml::PageSettings{});
+        const auto availableWidth = static_cast<std::uint64_t>(sourcePage.width_twips) -
+            std::min<std::uint64_t>(sourcePage.width_twips,
+                static_cast<std::uint64_t>(sourcePage.margin_left_twips) + sourcePage.margin_right_twips);
+        const auto automaticWidth = std::max<std::uint64_t>(1, availableWidth / imported->columns);
+        if (!imported->column_widths_twips.empty() &&
+            !std::all_of(imported->column_widths_twips.begin(), imported->column_widths_twips.end(),
+                         [automaticWidth](std::uint32_t width) { return width == automaticWidth; })) {
+            auto candidate = geometry;
+            candidate.column_widths_twips = imported->column_widths_twips;
+            if (candidate.validate(imported->rows, imported->columns)) geometry = std::move(candidate);
         }
         auto tableResult = core::Table::restore(
             imported->rows, imported->columns, imported->header_row,
             tableId, std::move(semanticCells),
-            importedTableStyle(imported->style));
+            importedTableStyle(imported->style), std::move(geometry));
         if (!tableResult) return tableResult.error();
         const auto inserted = document.insertTable(
             nextParagraphAfter(blockIndex), std::move(tableResult.value()));
@@ -1552,7 +1683,7 @@ core::Result<ImportedSemanticDocument> documentFromOoxml(
                                  core::kMaximumDocumentEncodedImageBytes)) {
                 return core::Error{
                     core::ErrorCode::invalid_operation,
-                    "Imported document exceeds Owl Docs' bounded inline-picture budget"};
+                    "Imported document exceeds OwlDocs' bounded inline-picture budget"};
             }
             auto decoded = imageCache.decode(
                 sourceImage.package_member, sourceImage.bytes.view());
@@ -1597,7 +1728,8 @@ core::Result<ImportedSemanticDocument> documentFromOoxml(
                                     std::move(sourceIndices),
                                     std::move(sourceTextPrefixes),
                                     std::move(imagePresentations),
-                                    std::move(tablePresentations)};
+                                    std::move(tablePresentations),
+                                    std::move(academicDiagnostics)};
 }
 
 QStringList currentTexts(const core::DocumentSnapshot& snapshot) {
@@ -1884,10 +2016,28 @@ ooxml::NewParagraph toOoxmlTableCellParagraph(
     std::size_t cursor = 0;
     while (cursor < cell.text.size()) {
         const auto characterFormat = cell.characterFormatAt(cursor + 1U);
+        if (const auto* image = cell.imageAt(cursor)) {
+            ooxml::NewInlineImage serialized;
+            serialized.format = image->format == core::ImageFormat::png ? raster::Format::png : raster::Format::jpeg;
+            auto name = QString::fromStdString(image->accessible_name);
+            name.remove(QRegularExpression(QStringLiteral("[\\x00-\\x1f\\x7f/\\\\]")));
+            if (name.trimmed().isEmpty()) name = QObject::tr("Picture");
+            name.truncate(120);
+            serialized.name = name.toUtf8().toStdString();
+            serialized.accessible_name = image->accessible_name;
+            serialized.width_emu = image->width_emu; serialized.height_emu = image->height_emu;
+            const auto bytes = image->encoded_payload.bytes();
+            serialized.bytes.assign(bytes.begin(), bytes.end());
+            ooxml::NewRun imageRun;
+            imageRun.format = exportCharacterFormat(characterFormat);
+            imageRun.inline_image = std::move(serialized);
+            output.runs.push_back(std::move(imageRun));
+            ++cursor; continue;
+        }
         const auto start = cursor;
         do {
             ++cursor;
-        } while (cursor < cell.text.size() &&
+        } while (cursor < cell.text.size() && !cell.imageAt(cursor) &&
                  cell.characterFormatAt(cursor + 1U) == characterFormat);
         output.runs.push_back({
             text.mid(static_cast<qsizetype>(start),
@@ -2016,9 +2166,88 @@ std::optional<std::int32_t> listMarkerStart(
     return static_cast<std::int32_t>(ordinal);
 }
 
+bool hasAcademicContent(const core::Document& document) {
+    return !document.notes().empty() || !document.tablesOfContents().empty() ||
+        std::any_of(document.paragraphs().begin(), document.paragraphs().end(), [](const auto& paragraph) {
+            return !paragraph.fields().empty() || paragraph.caption() || paragraph.isBibliographyEntry();
+        });
+}
+
+bool hasTableImages(const core::Document& document) {
+    return std::any_of(document.tables().begin(), document.tables().end(), [](const auto& table) {
+        return std::any_of(table.cells().begin(), table.cells().end(), [](const auto& cell) { return !cell.images.empty(); });
+    });
+}
+
+bool hasTableLayout(const core::Document& document) {
+    return std::any_of(document.tables().begin(), document.tables().end(), [](const auto& table) {
+        return !table.geometry().empty() || std::any_of(table.cells().begin(), table.cells().end(),
+            [](const auto& cell) { return !cell.layout.empty(); });
+    });
+}
+
+ooxml::NewTableCellLayout toOoxmlTableCellLayout(const core::TableCellLayout& source) {
+    ooxml::NewTableCellLayout result;
+    if (source.vertical_alignment) {
+        switch (*source.vertical_alignment) {
+            case core::TableCellVerticalAlignment::top:
+                result.vertical_alignment = ooxml::BasicVerticalAlignment::top;
+                break;
+            case core::TableCellVerticalAlignment::center:
+                result.vertical_alignment = ooxml::BasicVerticalAlignment::center;
+                break;
+            case core::TableCellVerticalAlignment::bottom:
+                result.vertical_alignment = ooxml::BasicVerticalAlignment::bottom;
+                break;
+        }
+    }
+    const auto border = [](const std::optional<core::TableBorder>& value)
+        -> std::optional<ooxml::ImportedTableBorder> {
+        if (!value) return std::nullopt;
+        const bool none = value->style == core::TableBorderStyle::none;
+        return ooxml::ImportedTableBorder{none ? 0U : value->argb & 0xffffffU,
+            value->width_eighth_points,
+            none ? ooxml::BasicTableBorderStyle::none : ooxml::BasicTableBorderStyle::single};
+    };
+    result.border_top = border(source.border_top);
+    result.border_right = border(source.border_right);
+    result.border_bottom = border(source.border_bottom);
+    result.border_left = border(source.border_left);
+    return result;
+}
+
+std::string academicUtf8(const std::u16string& text) {
+    return QString::fromUtf16(text.data(), static_cast<qsizetype>(text.size())).toUtf8().toStdString();
+}
+
+ooxml::AcademicFieldPayload exportAcademicField(
+    const core::FieldAtom& field, const core::Document& document,
+    const core::AcademicResolution& resolution) {
+    ooxml::AcademicFieldPayload result;
+    result.kind = static_cast<ooxml::AcademicFieldKind>(field.kind);
+    result.id = field.id.toString();
+    result.target_id = field.target_id.toString();
+    result.cached_text = academicUtf8(resolution.fieldText(field.id));
+    result.locator = academicUtf8(field.locator);
+    result.full_text = field.reference_format == core::CrossReferenceFormat::full_text;
+    const auto* target = document.findParagraph(field.target_id);
+    result.target_is_caption = target && target->caption().has_value();
+    if (field.kind == core::FieldKind::note_reference) {
+        for (const auto& note : resolution.notes) if (note.id == field.target_id) {
+            result.note_number = static_cast<std::uint32_t>(note.number);
+            result.endnote = note.kind == core::NoteKind::endnote;
+            break;
+        }
+    }
+    return result;
+}
+
 std::vector<ooxml::NewParagraph> toOoxmlParagraphs(
     const core::DocumentSnapshot& snapshot, QStringList& losses,
-    const QString& defaultFontFamily, double defaultFontPointSize) {
+    const QString& defaultFontFamily, double defaultFontPointSize,
+    bool legacyStyleDefaults, bool neutralStyleDefaults) {
+    const auto academic = core::resolveAcademic(snapshot.document);
+    const bool includeAcademic = hasAcademicContent(snapshot.document);
     struct ExportListMetrics {
         qreal maximumMarkerWidth{};
         qreal spaceAdvance{};
@@ -2068,10 +2297,32 @@ std::vector<ooxml::NewParagraph> toOoxmlParagraphs(
     std::vector<ooxml::NewParagraph> output;
     for (const auto& paragraph : snapshot.document.paragraphs()) {
         ooxml::NewParagraph out;
+        if (includeAcademic) out.stable_id = paragraph.id().toString();
+        const auto prefixKind = paragraph.caption() ? core::FieldKind::caption_number : core::FieldKind::bibliography_number;
+        if ((paragraph.caption() || paragraph.isBibliographyEntry()) &&
+            std::none_of(paragraph.fields().begin(), paragraph.fields().end(), [&paragraph, prefixKind](const auto& field) {
+                return field.kind == prefixKind && field.target_id == paragraph.id();
+            })) {
+            ooxml::AcademicFieldPayload target;
+            target.id = paragraph.id().toString();
+            target.target_id = target.id;
+            if (paragraph.caption()) {
+                target.kind = ooxml::AcademicFieldKind::caption_number;
+                target.cached_text = academicUtf8(core::captionLabelText(paragraph.caption()->label)) + " " +
+                    std::to_string(academic.caption_numbers.at(paragraph.id()));
+            } else {
+                target.kind = ooxml::AcademicFieldKind::bibliography_number;
+                target.cached_text = std::to_string(academic.bibliography_numbers.at(paragraph.id()));
+            }
+            out.hidden_sequence_target = std::move(target);
+        }
         const core::ParagraphStyleDefinition* builtInStyle = nullptr;
         if (paragraph.styleId()) {
-            builtInStyle =
-                core::findBuiltInParagraphStyle(*paragraph.styleId());
+            builtInStyle = legacyStyleDefaults
+                ? core::findLegacyBuiltInParagraphStyle(*paragraph.styleId())
+                : neutralStyleDefaults
+                    ? core::findNeutralBuiltInParagraphStyle(*paragraph.styleId())
+                    : core::findBuiltInParagraphStyle(*paragraph.styleId());
             if (builtInStyle) {
                 out.style_id = *paragraph.styleId();
             } else {
@@ -2445,6 +2696,15 @@ std::vector<ooxml::NewParagraph> toOoxmlParagraphs(
         std::size_t cursor = 0;
         while (cursor < sourceOffsets.size()) {
             const std::size_t sourceOffset = sourceOffsets[cursor];
+            if (const auto* field = paragraph.fieldAt(sourceOffset)) {
+                ooxml::NewRun run;
+                run.format = exportCharacterFormat(paragraph.characterFormatAt(sourceOffset + 1),
+                    paragraph.styleOverrideMaskAt(sourceOffset + 1));
+                run.field = exportAcademicField(*field, snapshot.document, academic);
+                out.runs.push_back(std::move(run));
+                ++cursor;
+                continue;
+            }
             if (const auto* equation = paragraph.equationAt(sourceOffset)) {
                 out.runs.push_back({
                     {}, exportCharacterFormat(
@@ -2469,6 +2729,7 @@ std::vector<ooxml::NewParagraph> toOoxmlParagraphs(
             do {
                 ++cursor;
             } while (cursor < sourceOffsets.size() &&
+                     paragraph.fieldAt(sourceOffsets[cursor]) == nullptr &&
                      paragraph.equationAt(sourceOffsets[cursor]) == nullptr &&
                      paragraph.imageAt(sourceOffsets[cursor]) == nullptr &&
                      exportCharacterFormat(
@@ -2503,10 +2764,29 @@ std::vector<ooxml::NewParagraph> toOoxmlParagraphs(
 ooxml::NewDocumentBody toOoxmlBody(
     const core::DocumentSnapshot& snapshot, QStringList& losses,
     const QString& defaultFontFamily, double defaultFontPointSize,
-    const ImportedTableStyleSources& importedTableStyleSources) {
+    const ImportedTableStyleSources& importedTableStyleSources,
+    const ooxml::PageSettings& page = {},
+    const DocumentCanvas* layoutCanvas = nullptr, int tabWidthSpaces = 4,
+    bool legacyStyleDefaults = false, bool neutralStyleDefaults = false) {
     auto paragraphs = toOoxmlParagraphs(
-        snapshot, losses, defaultFontFamily, defaultFontPointSize);
+        snapshot, losses, defaultFontFamily, defaultFontPointSize, legacyStyleDefaults, neutralStyleDefaults);
     ooxml::NewDocumentBody output;
+    const auto academic = core::resolveAcademic(snapshot.document);
+    std::unique_ptr<SpellChecker> layoutSpelling;
+    std::unique_ptr<DocumentCanvas> baselineLayout;
+    const bool hasStories = !snapshot.document.headerText().empty() || !snapshot.document.footerText().empty();
+    if ((!snapshot.document.tablesOfContents().empty() || hasStories) && !layoutCanvas) {
+        layoutSpelling = std::make_unique<SpellChecker>();
+        baselineLayout = std::make_unique<DocumentCanvas>(*layoutSpelling);
+        baselineLayout->setEditorDefaults(defaultFontFamily, defaultFontPointSize, tabWidthSpaces);
+        baselineLayout->setDocument(snapshot.document);
+        baselineLayout->setImportedPageLayout(page.width_twips / 20.0, page.height_twips / 20.0,
+            page.margin_top_twips / 20.0, page.margin_right_twips / 20.0,
+            page.margin_bottom_twips / 20.0, page.margin_left_twips / 20.0);
+        layoutCanvas = baselineLayout.get();
+    }
+    for (const auto& note : academic.notes) output.notes.push_back({note.id.toString(),
+        note.kind == core::NoteKind::endnote, static_cast<std::uint32_t>(note.number), academicUtf8(note.text)});
     if (!snapshot.document.headerText().empty()) {
         output.header_text = QString::fromUtf16(
             snapshot.document.headerText().data(),
@@ -2519,6 +2799,19 @@ ooxml::NewDocumentBody toOoxmlBody(
             static_cast<qsizetype>(snapshot.document.footerText().size()))
                                  .toUtf8().toStdString();
     }
+    const int storyPages = hasStories && layoutCanvas ? layoutCanvas->pageCount() : 1;
+    const auto needsRegionalLayout = [&](bool footer) {
+        const auto& text = footer ? snapshot.document.footerText() : snapshot.document.headerText();
+        if (std::count(text.begin(), text.end(), u'\t') != 2) return false;
+        const auto lines = DocumentCanvas::measureStoryLines(snapshot.document, footer,
+            QSizeF(page.width_twips / 20.0, page.height_twips / 20.0),
+            QMarginsF(page.margin_left_twips / 20.0, page.margin_top_twips / 20.0,
+                page.margin_right_twips / 20.0, page.margin_bottom_twips / 20.0),
+            defaultFontFamily, defaultFontPointSize, storyPages);
+        return std::any_of(lines.begin(), lines.end(), [](int count) { return count > 1; });
+    };
+    output.header_regional_layout = needsRegionalLayout(false);
+    output.footer_regional_layout = needsRegionalLayout(true);
     const auto appendStoryImages = [&losses](
         const std::u16string& text,
         const std::vector<core::ImageAtom>& images,
@@ -2567,6 +2860,23 @@ ooxml::NewDocumentBody toOoxmlBody(
                       output.footer_images);
     output.blocks.reserve(snapshot.document.bodyBlocks().size());
     for (const auto& block : snapshot.document.bodyBlocks()) {
+        if (block.kind == core::BodyBlockKind::table_of_contents) {
+            const auto* toc = snapshot.document.findToc(block.id);
+            if (!toc) { losses.push_back(QObject::tr("A table of contents could not be serialized")); continue; }
+            ooxml::NewParagraph serialized;
+            serialized.stable_id = toc->id.toString();
+            ooxml::TocPayload contents;
+            contents.id = toc->id.toString();
+            contents.max_level = toc->max_level;
+            for (const auto& entry : academic.toc_entries) {
+                if (entry.level > toc->max_level) continue;
+                contents.entries.push_back({entry.paragraph_id.toString(), academicUtf8(entry.text), entry.level,
+                    static_cast<std::uint32_t>(layoutCanvas ? std::max(1, layoutCanvas->paragraphPageNumber(entry.paragraph_id)) : 1)});
+            }
+            serialized.table_of_contents = std::move(contents);
+            output.blocks.emplace_back(std::move(serialized));
+            continue;
+        }
         if (block.kind == core::BodyBlockKind::paragraph) {
             const auto index = snapshot.document.paragraphIndex(block.id);
             if (!index || *index >= paragraphs.size()) {
@@ -2587,6 +2897,8 @@ ooxml::NewDocumentBody toOoxmlBody(
         serialized.rows = table->rowCount();
         serialized.columns = table->columnCount();
         serialized.header_row = table->hasHeaderRow();
+        serialized.column_widths_twips = table->geometry().column_widths_twips;
+        serialized.row_minimum_heights_twips = table->geometry().row_minimum_heights_twips;
         serialized.style = table->style()
             ? std::optional<ooxml::BasicTableStyle>(
                   toOoxmlTableStyle(*table->style()))
@@ -2602,8 +2914,12 @@ ooxml::NewDocumentBody toOoxmlBody(
                 .arg(fromUtf8(sourceStyle->second.second), action));
         }
         serialized.cell_paragraphs.reserve(table->cells().size());
+        const bool hasCellLayout = std::any_of(table->cells().begin(), table->cells().end(),
+            [](const auto& cell) { return !cell.layout.empty(); });
+        if (hasCellLayout) serialized.cell_layouts.reserve(table->cells().size());
         std::size_t cellIndex = 0;
         for (const auto& cell : table->cells()) {
+            if (hasCellLayout) serialized.cell_layouts.push_back(toOoxmlTableCellLayout(cell.layout));
             serialized.cell_paragraphs.push_back(
                 toOoxmlTableCellParagraph(
                     cell, losses, defaultFontFamily,
@@ -2613,6 +2929,14 @@ ooxml::NewDocumentBody toOoxmlBody(
             ++cellIndex;
         }
         output.blocks.emplace_back(std::move(serialized));
+    }
+    if (hasAcademicContent(snapshot.document) || hasTableImages(snapshot.document) || hasTableLayout(snapshot.document)) {
+        std::string error;
+        const RecoveryPageLayout geometry{page.width_twips / 20.0, page.height_twips / 20.0,
+            page.margin_top_twips / 20.0, page.margin_right_twips / 20.0,
+            page.margin_bottom_twips / 20.0, page.margin_left_twips / 20.0};
+        output.academic_recovery = RecoveryCodec::encode({snapshot.document, geometry}, error);
+        if (!output.academic_recovery) losses.push_back(QString::fromStdString(error));
     }
     losses.removeDuplicates();
     return output;
@@ -2779,6 +3103,28 @@ QString compatibilityClassName(ooxml::CompatibilityClass value) {
     return QObject::tr("Unknown");
 }
 
+void refreshObjectContexts(RibbonWidget& ribbon, DocumentCanvas* canvas) {
+    ribbon.setHeaderFooterContext(canvas && canvas->isHeaderFooterEditing()
+        ? canvas->headerFooterControls() : nullptr);
+    const bool editable = canvas && !canvas->isHeaderFooterEditing() && !canvas->hasPreview();
+    ribbon.setTableContext(editable && canvas->selectedTableId().has_value());
+    if (editable && canvas->selectedTableId()) {
+        ribbon.setTableDimensions(canvas->selectedTableColumnWidthPoints(), canvas->selectedTableRowMinimumHeightPoints());
+        ribbon.setTableCellAlignment(canvas->selectedTableCellAlignment());
+    }
+    const auto layout = editable ? canvas->selectedImageLayout() : std::nullopt;
+    ribbon.setPictureContext(layout.has_value(), layout.value_or(core::ImageLayout{}).placement,
+        editable && canvas->selectedExcalidrawScene().has_value(),
+        editable && !canvas->selectedTableId().has_value());
+    const auto equationId = editable ? canvas->selectedEquationId() : std::nullopt;
+    bool display = false;
+    if (equationId) {
+        const auto snapshot = canvas->snapshot();
+        if (const auto* equation = snapshot.document.findEquation(*equationId)) display = equation->display;
+    }
+    ribbon.setEquationContext(equationId.has_value(), display);
+}
+
 }  // namespace
 
 struct MainWindow::TabState {
@@ -2800,6 +3146,7 @@ struct MainWindow::TabState {
     // must not silently rewrite an already-open document's Normal style or
     // default tab stop on the next formatting/structural save.
     std::optional<ooxml::DocumentDefaults> regenerationDefaults;
+    QStringList regenerationLosses;
     QString navigationQuery;
     QString navigationReplacement;
     bool navigationMatchCase{false};
@@ -2808,12 +3155,15 @@ struct MainWindow::TabState {
     std::vector<DocumentSearchHit> navigationHits;
     bool recovered{false};
     bool replaceOnSuccessfulOpen{false};
-    bool simplificationWarningAcknowledged{false};
+    bool recoverySourceUnavailable{false};
 };
 
-MainWindow::MainWindow(QWidget* parent)
+MainWindow::MainWindow(QWidget* parent) : MainWindow(parent, {}) {}
+
+MainWindow::MainWindow(QWidget* parent, CodexController::ProcessFactory processFactory)
     : QMainWindow(parent), commands_(this) {
-    setWindowTitle(tr("Owl Docs"));
+    applyAppTheme(this);
+    setWindowTitle(tr("OwlDocs"));
     setWindowIcon(owlDocsApplicationIcon());
     resize(1280, 860);
     setMinimumSize(820, 600);
@@ -2830,7 +3180,68 @@ MainWindow::MainWindow(QWidget* parent)
     auto* layout = new QVBoxLayout(central);
     layout->setContentsMargins(0, 0, 0, 0);
     layout->setSpacing(0);
+    auto* menus = menuBar();
+    menus->setNativeMenuBar(false);
+    menus->setObjectName(QStringLiteral("workspace.menubar"));
+    auto* identity = new QWidget(menus);
+    identity->setObjectName(QStringLiteral("workspace.identity"));
+    auto* identityLayout = new QHBoxLayout(identity);
+    identityLayout->setContentsMargins(10, 5, 10, 5);
+    identityLayout->setSpacing(7);
+    auto* mark = new QLabel(identity);
+    mark->setObjectName(QStringLiteral("workspace.logo"));
+    mark->setPixmap(owlDocsApplicationIcon().pixmap(28, 28));
+    mark->setAccessibleName(tr("OwlDocs"));
+    identityLayout->addWidget(mark);
+    auto* brand = new QLabel(tr("OwlDocs"), identity);
+    brand->setObjectName(QStringLiteral("workspace.brand"));
+    identityLayout->addWidget(brand);
+    menus->setCornerWidget(identity, Qt::TopLeftCorner);
+
+    auto* header = new QWidget(menus);
+    header->setObjectName(QStringLiteral("workspace.header"));
+    header->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Fixed);
+    auto* headerLayout = new QHBoxLayout(header);
+    headerLayout->setSizeConstraint(QLayout::SetNoConstraint);
+    headerLayout->setContentsMargins(4, 4, 8, 4);
+    headerLayout->setSpacing(4);
+    auto* name = new QLabel(tr("Untitled"), header);
+    name->setObjectName(QStringLiteral("workspace.documentName"));
+    name->setTextFormat(Qt::PlainText);
+    name->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
+    name->setMaximumWidth(150);
+    headerLayout->addWidget(name, 1);
+    const auto headerAction = [&](const char* id, const char* objectName,
+                                  bool iconOnly) {
+        auto* button = new QToolButton(header);
+        button->setObjectName(QString::fromLatin1(objectName));
+        if (auto* action = commands_.action(QString::fromLatin1(id))) {
+            button->setDefaultAction(action);
+            button->setAccessibleName(action->text());
+            QString tip = action->text();
+            if (!action->shortcut().isEmpty())
+                tip += QStringLiteral(" (%1)").arg(action->shortcut().toString());
+            button->setToolTip(tip);
+        }
+        button->setToolButtonStyle(iconOnly ? Qt::ToolButtonIconOnly
+                                            : Qt::ToolButtonTextBesideIcon);
+        button->setAutoRaise(iconOnly);
+        headerLayout->addWidget(button);
+        return button;
+    };
+    headerAction("file.open", "workspace.open", true);
+    headerAction("edit.undo", "workspace.undo", true);
+    headerAction("edit.redo", "workspace.redo", true);
+    auto* save = headerAction("file.save", "workspace.save", false);
+    save->setProperty("role", QStringLiteral("primary"));
+    headerAction("edit.find", "workspace.find", false);
+    headerAction("codex.toggle", "workspace.codex", false)->setText(tr("Codex"));
+    menus->setCornerWidget(header, Qt::TopRightCorner);
     ribbon_ = new RibbonWidget(commands_, central);
+    if (auto* menu = findChild<QMenu*>(QStringLiteral("menu.layout"))) {
+        if (auto* page = ribbon_->findChild<QToolButton*>(QStringLiteral("workspace.page"));
+            page && page->menu()) menu->addActions(page->menu()->actions());
+    }
     tabs_ = new QTabWidget(central);
     tabs_->setObjectName(QStringLiteral("documentTabs"));
     tabs_->setDocumentMode(true);
@@ -2856,6 +3267,13 @@ MainWindow::MainWindow(QWidget* parent)
         const QSignalBlocker blocker(navigationAction);
         navigationAction->setChecked(visible);
     });
+    connect(navigation_, &QDockWidget::visibilityChanged, this, [this](bool visible) {
+        if (visible) {
+            lastAuxiliaryWasChat_ = false;
+            if (width() <= 1100 && chat_) chat_->hide();
+        }
+        QTimer::singleShot(0, this, &MainWindow::updateWorkspaceLayout);
+    });
     connect(navigation_, &NavigationDock::queryChanged, this,
             [this](const QString& query, bool matchCase, bool wholeWords) {
         if (auto* state = activeState()) {
@@ -2877,6 +3295,16 @@ MainWindow::MainWindow(QWidget* parent)
         if (auto* state = activeState()) {
             state->navigationReplaceMode = mode == NavigationDock::Mode::replace;
         }
+        if (auto* canvas = activeCanvas())
+            canvas->setProperty("navigation.outlineMode", mode == NavigationDock::Mode::outline);
+        refreshNavigationResults();
+    });
+    connect(navigation_, &NavigationDock::headingActivated, this, [this](int index) {
+        auto* canvas = activeCanvas();
+        if (!canvas || index < 0 ||
+            static_cast<std::size_t>(index) >= outlineParagraphIds_.size()) return;
+        if (!canvas->navigateToParagraph(outlineParagraphIds_[static_cast<std::size_t>(index)]))
+            refreshOutline();
     });
     connect(navigation_, &NavigationDock::nextRequested, this,
             [this] { navigateSearchResult(true); });
@@ -2942,13 +3370,29 @@ MainWindow::MainWindow(QWidget* parent)
     chat_ = new ChatDock(this);
     addDockWidget(Qt::RightDockWidgetArea, chat_);
     chat_->hide();
-    codex_ = new CodexController(this);
+    connect(chat_, &QDockWidget::visibilityChanged, this, [this](bool visible) {
+        if (auto* action = commands_.action(QStringLiteral("codex.toggle"))) {
+            const QSignalBlocker blocker(action);
+            action->setChecked(visible);
+        }
+        if (visible) {
+            lastAuxiliaryWasChat_ = true;
+            if (width() <= 1100 && navigation_) navigation_->hide();
+        }
+        QTimer::singleShot(0, this, &MainWindow::updateWorkspaceLayout);
+    });
+    codex_ = new CodexController(this, std::move(processFactory));
     codex_->setEditorToolHandler(
         [this](const QString& key, const QString& tool,
                const codex::Json& arguments, QString& error) {
             return handleEditorTool(key, tool, arguments, error);
         });
     connect(chat_, &ChatDock::enableRequested, codex_, &CodexController::enable);
+    connect(chat_, &ChatDock::disconnectRequested, this, [this] {
+        codex_->shutdown();
+        chat_->setConnected(false, tr("Disconnected"));
+        chat_->setBusy(false);
+    });
     connect(chat_, &ChatDock::modelChanged, codex_, &CodexController::selectModel);
     connect(chat_, &ChatDock::sendRequested, this,
             [this](const QString& text, const QString& model, const QString& effort, const QString& tier) {
@@ -3039,7 +3483,11 @@ MainWindow::MainWindow(QWidget* parent)
     });
 
     pageStatus_ = new QLabel(this);
-    saveStatus_ = new QLabel(tr("Ready"), this);
+    saveStatus_ = new QLabel(tr("New document"), this);
+    saveStatus_->setObjectName(QStringLiteral("status.saveState"));
+    saveStatus_->setAccessibleName(tr("Document save status"));
+    saveStatus_->setToolTip(tr("Save document changes with Ctrl+S"));
+    pageStatus_->setObjectName(QStringLiteral("status.pageAndWords"));
     statusBar()->addPermanentWidget(saveStatus_);
     statusBar()->addPermanentWidget(pageStatus_);
 
@@ -3122,7 +3570,7 @@ MainWindow::MainWindow(QWidget* parent)
         statusBar()->showMessage(tr("Local chat history disabled: %1").arg(fromUtf8(storeError)), 8000);
     } else if (!recoveryOwner_) {
         statusBar()->showMessage(
-            tr("Autosave recovery is owned by another running Owl Docs instance."),
+            tr("Autosave recovery is owned by another running OwlDocs instance."),
             8000);
     }
 
@@ -3154,19 +3602,14 @@ MainWindow::MainWindow(QWidget* parent)
             ribbon_->setFontFamily(canvas->currentFontFamily());
             ribbon_->setFontPointSize(canvas->currentFontPointSize());
             ribbon_->setTextColor(canvas->currentTextColor());
-            ribbon_->setTableContext(canvas->selectedTableId().has_value());
-            const auto pictureLayout = canvas->selectedImageLayout();
-            ribbon_->setPictureContext(
-                pictureLayout.has_value(),
-                pictureLayout.value_or(core::ImageLayout{}).placement);
+            refreshObjectContexts(*ribbon_, canvas);
             canvas->refreshCursorFormat();
         } else {
             synchronizeZoomControls(nullptr);
             ribbon_->setParagraphStyle({});
             synchronizeParagraphStyleAvailability(nullptr);
             ribbon_->setListContext(false, 1);
-            ribbon_->setTableContext(false);
-            ribbon_->setPictureContext(false);
+            refreshObjectContexts(*ribbon_, nullptr);
         }
     });
     newDocument(true);
@@ -3175,11 +3618,43 @@ MainWindow::MainWindow(QWidget* parent)
 }
 
 MainWindow::~MainWindow() {
+    // Base QWidget teardown hides docks after our command members are gone.
+    // Stop their view callbacks while those members are still alive.
+    if (chat_) disconnect(chat_, nullptr, this, nullptr);
+    if (navigation_) disconnect(navigation_, nullptr, this, nullptr);
     // QColorDialog is a window child, so Qt may otherwise destroy it after the
     // central widget and tab bar. Its cleanup callback needs those objects
     // while ending the originating canvas's color adjustment.
     if (textColorPicker_) delete textColorPicker_.data();
     if (highlightColorPicker_) delete highlightColorPicker_.data();
+}
+
+void MainWindow::resizeEvent(QResizeEvent* event) {
+    QMainWindow::resizeEvent(event);
+    if (width() <= 1100 && chat_ && navigation_ &&
+        chat_->isVisible() && navigation_->isVisible()) {
+        if (lastAuxiliaryWasChat_) navigation_->hide();
+        else chat_->hide();
+    }
+    QTimer::singleShot(0, this, &MainWindow::updateWorkspaceLayout);
+}
+
+void MainWindow::updateWorkspaceLayout() {
+    if (!centralWidget()) return;
+    const bool spacious = width() >= 1180;
+    for (const auto* name : {"workspace.documentName", "workspace.open",
+                              "workspace.undo", "workspace.redo"}) {
+        if (auto* widget = findChild<QWidget*>(QString::fromLatin1(name)))
+            widget->setVisible(spacious);
+    }
+    if (auto* find = findChild<QToolButton*>(QStringLiteral("workspace.find")))
+        find->setToolButtonStyle(spacious ? Qt::ToolButtonTextBesideIcon
+                                          : Qt::ToolButtonIconOnly);
+    if (auto* controls = findChild<QWidget*>(QStringLiteral("workspace.header"))) {
+        controls->setFixedWidth(controls->layout()->sizeHint().width());
+        controls->updateGeometry();
+        menuBar()->setCornerWidget(controls, Qt::TopRightCorner);
+    }
 }
 
 void MainWindow::registerCommands() {
@@ -3340,6 +3815,53 @@ void MainWindow::registerCommands() {
             static_cast<void>(canvas->deleteSelectedTableColumns());
         }
     });
+    auto* tableAlignmentGroup = new QActionGroup(this);
+    tableAlignmentGroup->setExclusive(true);
+    const char* tablePositions[] = {"topLeft", "topCenter", "topRight", "middleLeft", "middleCenter", "middleRight", "bottomLeft", "bottomCenter", "bottomRight"};
+    const char* tablePositionLabels[] = {"Align Top Left", "Align Top Center", "Align Top Right", "Align Middle Left", "Align Middle Center", "Align Middle Right", "Align Bottom Left", "Align Bottom Center", "Align Bottom Right"};
+    for (int index = 0; index < 9; ++index) {
+        const auto horizontal = index % 3 == 0 ? core::ParagraphAlignment::left
+            : index % 3 == 1 ? core::ParagraphAlignment::center : core::ParagraphAlignment::right;
+        const auto vertical = index / 3 == 0 ? core::TableCellVerticalAlignment::top
+            : index / 3 == 1 ? core::TableCellVerticalAlignment::center : core::TableCellVerticalAlignment::bottom;
+        auto* action = add(QStringLiteral("table.align.%1").arg(tablePositions[index]), tr(tablePositionLabels[index]), QKeySequence(),
+            [this, horizontal, vertical] {
+                if (auto* canvas = activeCanvas()) {
+                    static_cast<void>(canvas->setSelectedTableCellAlignment(horizontal, vertical));
+                    restoreCanvasFocus(canvas);
+                }
+            }, true);
+        tableAlignmentGroup->addAction(action);
+    }
+    add("table.selectAll", tr("Select Table"), QKeySequence(), [this] {
+        if (auto* canvas = activeCanvas()) {
+            if (const auto tableId = canvas->selectedTableId()) static_cast<void>(canvas->selectTable(*tableId));
+            restoreCanvasFocus(canvas);
+        }
+    });
+    add("table.distributeColumns", tr("Distribute Columns Evenly"), QKeySequence(), [this] {
+        if (auto* canvas = activeCanvas()) {
+            static_cast<void>(canvas->distributeSelectedTableColumns());
+            restoreCanvasFocus(canvas);
+        }
+    });
+    add("table.distributeRows", tr("Distribute Row Heights Evenly"), QKeySequence(), [this] {
+        if (auto* canvas = activeCanvas()) {
+            static_cast<void>(canvas->distributeSelectedTableRows());
+            restoreCanvasFocus(canvas);
+        }
+    });
+    const char* borderPresets[] = {"all", "outside", "inside", "none", "top", "bottom", "left", "right"};
+    const char* borderLabels[] = {"All Borders", "Outside Borders", "Inside Borders", "No Borders", "Top Border", "Bottom Border", "Left Border", "Right Border"};
+    for (int index = 0; index < 8; ++index) {
+        const auto preset = QString::fromLatin1(borderPresets[index]);
+        add(QStringLiteral("table.borders.%1").arg(preset), tr(borderLabels[index]), QKeySequence(), [this, preset] {
+            if (auto* canvas = activeCanvas()) {
+                static_cast<void>(canvas->setSelectedTableBorders(preset, ribbon_->tableBorderWidthPoints(), ribbon_->tableBorderColor()));
+                restoreCanvasFocus(canvas);
+            }
+        });
+    }
     add("insert.image", tr("Picture"), QKeySequence(), [this] { insertImage(); });
     add("insert.excalidraw", tr("Excalidraw Figure"), QKeySequence(),
         [this] { insertExcalidrawFigure(); });
@@ -3401,10 +3923,61 @@ void MainWindow::registerCommands() {
             }
         });
     add("insert.equation", tr("Equation"), QKeySequence(QStringLiteral("Alt+=")), [this] { insertEquation(); });
-    add("insert.textBox", tr("Text Box"), QKeySequence(), [this] { statusBar()->showMessage(tr("Text boxes are preserved on import; editing is not in this build."), 5000); });
-    add("insert.comment", tr("Comment"), QKeySequence(QStringLiteral("Ctrl+Alt+M")), [this] { statusBar()->showMessage(tr("Comments are scheduled for the business/legal milestone."), 5000); });
+    add("equation.edit", tr("Edit Equation"), QKeySequence(), [this] {
+        if (auto* canvas = activeCanvas(); canvas && canvas->selectedEquationId()) canvas->showEquationEditor();
+    });
+    for (const bool display : {false, true}) {
+        add(display ? QStringLiteral("equation.display") : QStringLiteral("equation.inline"),
+            display ? tr("Display") : tr("Inline"), QKeySequence(), [this, display] {
+                auto* canvas = activeCanvas();
+                if (!canvas) return;
+                const auto id = canvas->selectedEquationId();
+                const auto snapshot = canvas->snapshot();
+                const auto* equation = id ? snapshot.document.findEquation(*id) : nullptr;
+                if (equation) canvas->replaceSelectedEquation(QString::fromStdString(equation->canonical_latex), display);
+                refreshObjectContexts(*ribbon_, canvas);
+                restoreCanvasFocus(canvas);
+            }, true);
+    }
+    add("equation.delete", tr("Delete Equation"), QKeySequence(), [this] {
+        if (auto* canvas = activeCanvas(); canvas && canvas->selectedEquationId()) {
+            canvas->insertText(QString());
+            restoreCanvasFocus(canvas);
+        }
+    });
+    const auto addReference = [this, &add](const QString& id, const QString& text, const QString& kind) {
+        add(id, text, QKeySequence(), [this, kind] { if (auto* canvas = activeCanvas()) canvas->showReferencesEditor(kind); });
+        commands_.describe(id, tr("References"), {text});
+    };
+    addReference("references.footnote", tr("Insert Footnote…"), "footnote");
+    addReference("references.endnote", tr("Insert Endnote…"), "endnote");
+    addReference("references.editNote", tr("Edit Notes…"), "editNote");
+    addReference("references.caption", tr("Insert Caption…"), "caption");
+    addReference("references.crossReference", tr("Cross-reference…"), "crossReference");
+    addReference("references.bibliography", tr("Add Bibliography Entry…"), "bibliography");
+    addReference("references.citation", tr("Insert Citation…"), "citation");
+    addReference("references.toc", tr("Insert Table of Contents…"), "toc");
+    addReference("references.manageToc", tr("Manage Tables of Contents…"), "manageToc");
+    for (const auto& choice : {std::pair{"normal", "Normal (1\" all)"},
+             std::pair{"narrow", "Narrow (0.5\" all)"}, std::pair{"moderate", "Moderate (1\" × 0.75\")"},
+             std::pair{"wide", "Wide (1\" × 2\")"}, std::pair{"office2003", "Office 2003 (1\" × 1.25\")"},
+             std::pair{"custom", "Custom Margins…"}}) {
+        const QString key = QString::fromLatin1(choice.first);
+        const QString id = QStringLiteral("layout.margin.%1").arg(key);
+        add(id, tr(choice.second), QKeySequence(), [this, key] {
+            if (ribbon_) ribbon_->marginPresetRequested(key);
+        });
+        commands_.describe(id, tr("Layout"), {tr("page margins")});
+    }
+    for (const auto& choice : {std::pair{"letter", "Letter"}, std::pair{"a4", "A4"}, std::pair{"legal", "Legal"}}) {
+        const QString id = QStringLiteral("layout.paper.%1").arg(QString::fromLatin1(choice.first));
+        const QString label = tr(choice.second);
+        add(id, label, QKeySequence(), [this, label] {
+            if (ribbon_) ribbon_->pageSizeRequested(label);
+        });
+        commands_.describe(id, tr("Layout"), {tr("paper size")});
+    }
     add("layout.orientation", tr("Orientation"), QKeySequence(), [this] { if (activeCanvas()) activeCanvas()->toggleOrientation(); });
-    add("layout.columns", tr("Columns"), QKeySequence(), [this] { statusBar()->showMessage(tr("Multi-column authoring is not in this build."), 5000); });
     add("layout.lineSpacing", tr("Line Spacing"), QKeySequence(), [this] {
         if (!activeCanvas()) return;
         bool ok = false;
@@ -3426,23 +3999,36 @@ void MainWindow::registerCommands() {
         if (ok) { core::ParagraphFormatDelta d; d.space_after_emu = core::PropertyDelta<std::int64_t>::set(static_cast<std::int64_t>(value * 12700.0)); activeCanvas()->applyParagraphFormat(d); }
     });
     add("review.spelling", tr("Spelling"), QKeySequence(QStringLiteral("F7")), [this] { statusBar()->showMessage(tr("Misspellings are underlined; right-click one for suggestions."), 5000); });
-    add("review.comment", tr("New Comment"), QKeySequence(), [this] { statusBar()->showMessage(tr("Comments are not editable in this build."), 5000); });
-    add("review.trackChanges", tr("Track Changes"), QKeySequence(), [this] { statusBar()->showMessage(tr("Tracked changes are preserved but not editable in this build."), 5000); }, true);
-    add("review.acceptChange", tr("Accept"), QKeySequence(), [] {});
-    add("review.rejectChange", tr("Reject"), QKeySequence(), [] {});
     add("review.compatibility", tr("Compatibility Report"), QKeySequence(), [this] { showCompatibilityReport(); });
     add("view.navigation", tr("Navigation"), QKeySequence(), [this] {
         if (!navigation_) return;
         const auto* action = commands_.action(QStringLiteral("view.navigation"));
         navigation_->setVisible(action && action->isChecked());
         if (navigation_->isVisible()) {
+            if (auto* canvas = activeCanvas();
+                canvas && !canvas->property("navigation.outlineMode").isValid())
+                navigation_->setMode(NavigationDock::Mode::outline);
             refreshNavigationResults();
             navigation_->focusQuery(false);
         }
     }, true);
-    add("view.ruler", tr("Ruler"), QKeySequence(), [] {}, true);
-    add("view.pageWidth", tr("Page Width"), QKeySequence(), [this] { if (activeCanvas()) activeCanvas()->setZoomPercent(125); });
-    add("codex.toggle", tr("Codex Chat"), QKeySequence(QStringLiteral("Ctrl+Alt+C")), [this] { chat_->setVisible(!chat_->isVisible()); }, true);
+    add("view.pageWidth", tr("Fit Page Width"), QKeySequence(), [this] {
+        if (auto* canvas = activeCanvas()) canvas->fitToWidth();
+    });
+    add("codex.toggle", tr("Codex"), QKeySequence(QStringLiteral("Ctrl+Alt+C")), [this] {
+        if (chat_->isVisible()) {
+            chat_->hide();
+        } else {
+            if (!codex_->connected()) codex_->enable();
+            chat_->show();
+        }
+    }, true);
+    commands_.describe("insert.equation", tr("Insert"),
+                       {tr("LaTeX"), tr("math"), tr("formula")});
+    commands_.describe("insert.excalidraw", tr("Insert"),
+                       {tr("drawing"), tr("diagram"), tr("local figure")});
+    commands_.describe("file.exportPdf", tr("File"), {tr("publish"), tr("share")});
+    commands_.describe("edit.commandPalette", tr("Edit"), {tr("search commands")});
 
     // Commands that mutate or inspect the document should only own their
     // shortcuts while a document canvas (or one of its children) has focus.
@@ -3482,6 +4068,7 @@ void MainWindow::registerCommands() {
     setThemedIcon("file.print", "document-print", QStyle::SP_FileDialogDetailedView);
     setThemedIcon("edit.undo", "edit-undo", QStyle::SP_ArrowBack);
     setThemedIcon("edit.redo", "edit-redo", QStyle::SP_ArrowForward);
+    setThemedIcon("edit.find", "edit-find", QStyle::SP_FileDialogContentsView);
 
     // Ribbon document commands must return keyboard ownership to the page.
     // This matters when the user previously typed in an editable combo box or
@@ -3523,7 +4110,9 @@ void MainWindow::registerCommands() {
         connect(action, &QAction::triggered, this, [this] {
             auto* canvas = activeCanvas();
             if (!canvas) return;
-            QTimer::singleShot(0, canvas, [canvas] { canvas->setFocus(); });
+            QTimer::singleShot(0, canvas, [canvas] {
+                if (!canvas->isHeaderFooterEditing()) canvas->setFocus();
+            });
         });
     }
 }
@@ -3559,6 +4148,50 @@ void MainWindow::buildMenus() {
                            "insert.excalidraw", "insert.equation",
                            "insert.pageBreak", "insert.headerFooter"})
         insert->addAction(commands_.action(QString::fromLatin1(id)));
+    auto* format = menuBar()->addMenu(tr("F&ormat"));
+    format->setObjectName(QStringLiteral("menu.format"));
+    for (const auto* id : {"format.bold", "format.italic", "format.underline",
+                           "format.strike", "format.superscript", "format.subscript"})
+        format->addAction(commands_.action(QString::fromLatin1(id)));
+    auto* styles = format->addMenu(tr("Paragraph style"));
+    for (const auto* id : {"style.normal", "style.noSpacing", "style.title",
+                           "style.subtitle", "style.quote", "style.heading1",
+                           "style.heading2", "style.heading3", "style.heading4",
+                           "style.heading5", "style.heading6", "style.heading7",
+                           "style.heading8", "style.heading9"})
+        styles->addAction(commands_.action(QString::fromLatin1(id)));
+    format->addSeparator();
+    for (const auto* id : {"paragraph.alignLeft", "paragraph.alignCenter",
+                           "paragraph.alignRight", "paragraph.justify",
+                           "paragraph.bullets", "paragraph.numbering",
+                           "paragraph.listProperties", "paragraph.increaseIndent",
+                           "paragraph.decreaseIndent", "layout.lineSpacing",
+                           "layout.paragraphSpacing"})
+        format->addAction(commands_.action(QString::fromLatin1(id)));
+    auto* pageLayout = menuBar()->addMenu(tr("&Layout"));
+    pageLayout->setObjectName(QStringLiteral("menu.layout"));
+    auto* margins = pageLayout->addMenu(tr("Margins"));
+    margins->setObjectName(QStringLiteral("menu.layout.margins"));
+    for (const auto* key : {"normal", "narrow", "moderate", "wide", "office2003"})
+        margins->addAction(commands_.action(QStringLiteral("layout.margin.%1").arg(key)));
+    margins->addSeparator();
+    margins->addAction(commands_.action("layout.margin.custom"));
+    auto* paper = pageLayout->addMenu(tr("Paper Size"));
+    paper->setObjectName(QStringLiteral("menu.layout.paper"));
+    for (const auto* key : {"letter", "a4", "legal"})
+        paper->addAction(commands_.action(QStringLiteral("layout.paper.%1").arg(key)));
+    pageLayout->addSeparator();
+    pageLayout->addAction(commands_.action("layout.orientation"));
+    auto* references = menuBar()->addMenu(tr("Reference&s"));
+    references->setObjectName(QStringLiteral("menu.references"));
+    for (const auto* id : {"references.footnote", "references.endnote",
+                           "references.editNote", "references.caption",
+                           "references.crossReference", "references.bibliography",
+                           "references.citation", "references.toc",
+                           "references.manageToc"}) {
+        if (auto* action = commands_.action(QString::fromLatin1(id)))
+            references->addAction(action);
+    }
     auto* review = menuBar()->addMenu(tr("&Review"));
     review->addAction(commands_.action("review.spelling"));
     review->addAction(commands_.action("review.compatibility"));
@@ -3639,6 +4272,20 @@ void MainWindow::connectRibbon() {
     });
     connect(ribbon_, &RibbonWidget::listPropertiesRequested,
             this, &MainWindow::showListProperties);
+    connect(ribbon_, &RibbonWidget::tableColumnWidthRequested, this, [this](double points) {
+        if (auto* canvas = activeCanvas()) {
+            static_cast<void>(canvas->setSelectedTableColumnWidth(points));
+            ribbon_->setTableDimensions(canvas->selectedTableColumnWidthPoints(), canvas->selectedTableRowMinimumHeightPoints());
+            restoreCanvasFocus(canvas);
+        }
+    });
+    connect(ribbon_, &RibbonWidget::tableRowMinimumHeightRequested, this, [this](double points) {
+        if (auto* canvas = activeCanvas()) {
+            static_cast<void>(canvas->setSelectedTableRowMinimumHeight(points));
+            ribbon_->setTableDimensions(canvas->selectedTableColumnWidthPoints(), canvas->selectedTableRowMinimumHeightPoints());
+            restoreCanvasFocus(canvas);
+        }
+    });
     connect(ribbon_, &RibbonWidget::tableStyleRequested, this,
             [this](const QString& styleKey) {
         auto* canvas = activeCanvas();
@@ -3689,9 +4336,27 @@ void MainWindow::synchronizeZoomControls(DocumentCanvas* canvas) {
 void MainWindow::synchronizeParagraphStyleAvailability(
     DocumentCanvas* canvas) {
     if (!ribbon_) return;
+    const bool story = canvas && canvas->isHeaderFooterEditing();
+    const bool body = canvas && !story;
+    ribbon_->setEnabled(canvas != nullptr);
+    ribbon_->setBodyFormattingEnabled(body);
+    for (auto* action : commands_.actions()) {
+        const QString id = action->objectName();
+        if (id.startsWith(QStringLiteral("format.")) ||
+            id.startsWith(QStringLiteral("paragraph.")) ||
+            id.startsWith(QStringLiteral("references.")) ||
+            id == QStringLiteral("insert.table") || id == QStringLiteral("insert.equation") ||
+            id == QStringLiteral("insert.pageBreak") || id == QStringLiteral("insert.excalidraw"))
+            action->setEnabled(body);
+        else if (id.startsWith(QStringLiteral("style.")))
+            action->setEnabled(body && !canvas->hasPreview() && canvas->paragraphStylesAvailable());
+    }
     if (!canvas) {
         ribbon_->setParagraphStyleAvailable(
             false, tr("Paragraph styles unavailable without a document"));
+    } else if (story) {
+        ribbon_->setParagraphStyleAvailable(
+            false, tr("Paragraph styles unavailable in headers and footers"));
     } else if (canvas->hasPreview()) {
         ribbon_->setParagraphStyleAvailable(
             false, tr("Paragraph styles unavailable during preview"));
@@ -3705,11 +4370,11 @@ void MainWindow::synchronizeParagraphStyleAvailability(
 
 void MainWindow::applyTextColor(const QColor& color) {
     auto* canvas = activeCanvas();
-    if (!canvas || !color.isValid()) return;
+    if (!canvas) return;
     if (textColorPicker_) delete textColorPicker_.data();
     if (highlightColorPicker_) delete highlightColorPicker_.data();
     canvas->setForeground(color);
-    ribbon_->setTextColor(color);
+    ribbon_->setTextColor(canvas->currentTextColor());
     restoreCanvasFocus(canvas);
 }
 
@@ -3763,10 +4428,12 @@ void MainWindow::showLiveColorPicker(bool highlight) {
     picker->setWindowModality(Qt::NonModal);
     picker->setAttribute(Qt::WA_DeleteOnClose, true);
     existing = picker;
+    const auto committedColor = std::make_shared<QColor>();
 
     connect(picker, &QColorDialog::currentColorChanged, this,
-            [this, highlight, target](const QColor& color) {
+            [this, highlight, target, committedColor](const QColor& color) {
         if (!target || !color.isValid()) return;
+        *committedColor = color;
         if (highlight) {
             target->setHighlight(color);
             ribbon_->setHighlightColor(color);
@@ -3775,7 +4442,11 @@ void MainWindow::showLiveColorPicker(bool highlight) {
             ribbon_->setTextColor(color);
         }
     });
-    connect(picker, &QObject::destroyed, this, [this, highlight, target] {
+    connect(picker, &QObject::destroyed, this, [this, highlight, target, committedColor] {
+        if (committedColor->isValid()) {
+            if (highlight) ribbon_->rememberHighlightColor(*committedColor);
+            else ribbon_->rememberTextColor(*committedColor);
+        }
         if (target) target->endColorAdjustment();
         if (highlight) highlightColorPicker_.clear();
         else textColorPicker_.clear();
@@ -3796,9 +4467,16 @@ DocumentCanvas* MainWindow::createDocumentTab(core::Document document,
     if (state->documentKey.isEmpty())
         state->documentKey = QStringLiteral("document:%1").arg(state->journalKey);
     auto* canvas = new DocumentCanvas(spelling_, tabs_);
-    canvas->setEditorDefaults(editorPreferences_.defaultFontFamily(),
-                              editorPreferences_.defaultFontPointSize(),
-                              editorPreferences_.tabWidthSpaces());
+    if (state->regenerationDefaults) {
+        const auto& source = *state->regenerationDefaults;
+        canvas->setEditorDefaults(fromUtf8(source.font_family),
+                                  source.font_size_half_points / 2.0,
+                                  editorPreferences_.tabWidthSpaces());
+    } else {
+        canvas->setEditorDefaults(editorPreferences_.defaultFontFamily(),
+                                  editorPreferences_.defaultFontPointSize(),
+                                  editorPreferences_.tabWidthSpaces());
+    }
     canvas->setDefaultListLayout(editorPreferences_.defaultListLayout());
     canvas->setDocument(std::move(document));
     for (auto* action : commands_.actions()) {
@@ -3836,18 +4514,21 @@ DocumentCanvas* MainWindow::createDocumentTab(core::Document document,
         refreshNavigationResults();
     });
     connect(canvas, &DocumentCanvas::cursorFormatChanged, this,
-            [this](const QString& family, double points, const QColor& textColor) {
+            [this, canvas](const QString& family, double points, const QColor& textColor) {
+        if (canvas != activeCanvas()) return;
         ribbon_->setFontFamily(family);
         ribbon_->setFontPointSize(points);
         ribbon_->setTextColor(textColor);
     });
     connect(canvas, &DocumentCanvas::cursorHighlightChanged, this,
-            [this](const QColor& highlightColor) {
+            [this, canvas](const QColor& highlightColor) {
+        if (canvas != activeCanvas()) return;
         ribbon_->setHighlightColor(highlightColor);
     });
     connect(canvas, &DocumentCanvas::cursorStyleChanged, this,
-            [this](bool bold, bool italic, bool underline, bool strike,
+            [this, canvas](bool bold, bool italic, bool underline, bool strike,
                    bool superscript, bool subscript) {
+        if (canvas != activeCanvas()) return;
         commands_.action(QStringLiteral("format.bold"))->setChecked(bold);
         commands_.action(QStringLiteral("format.italic"))->setChecked(italic);
         commands_.action(QStringLiteral("format.underline"))->setChecked(underline);
@@ -3860,23 +4541,20 @@ DocumentCanvas* MainWindow::createDocumentTab(core::Document document,
         if (canvas == activeCanvas()) ribbon_->setParagraphStyle(styleId);
     });
     connect(canvas, &DocumentCanvas::cursorListStateChanged, this,
-            [this](bool bullets, bool numbering) {
+            [this, canvas](bool bullets, bool numbering) {
+        if (canvas != activeCanvas()) return;
         commands_.action(QStringLiteral("paragraph.bullets"))->setChecked(bullets);
         commands_.action(QStringLiteral("paragraph.numbering"))->setChecked(numbering);
     });
     connect(canvas, &DocumentCanvas::cursorListContextChanged, this,
-            [this](bool active, int level) {
-        ribbon_->setListContext(active, level);
+            [this, canvas](bool active, int level) {
+        if (canvas != activeCanvas()) return;
+        ribbon_->setListContext(active && !canvas->isHeaderFooterEditing(), level);
     });
     connect(canvas, &DocumentCanvas::selectionChanged, this, [this, canvas] {
         if (canvas == activeCanvas()) {
-            ribbon_->setTableContext(canvas->selectedTableId().has_value());
             synchronizeParagraphStyleAvailability(canvas);
-            const auto pictureLayout = canvas->selectedImageLayout();
-            ribbon_->setPictureContext(
-                pictureLayout.has_value(),
-                pictureLayout.value_or(core::ImageLayout{}).placement,
-                canvas->selectedExcalidrawScene().has_value());
+            refreshObjectContexts(*ribbon_, canvas);
             synchronizeNavigationSelection();
         }
     });
@@ -3886,15 +4564,17 @@ DocumentCanvas* MainWindow::createDocumentTab(core::Document document,
             this, [this, canvas] {
                 editSelectedExcalidrawFigure(canvas);
             });
-    connect(canvas, &DocumentCanvas::pageStatusChanged, this, [this](int page, int count, int words) {
+    connect(canvas, &DocumentCanvas::pageStatusChanged, this, [this, canvas](int page, int count, int words) {
+        if (canvas != activeCanvas()) return;
         pageStatus_->setText(tr("Page %1 of %2   %3 words").arg(page).arg(count).arg(words));
     });
     connect(canvas, &DocumentCanvas::zoomChanged, this,
             [this, canvas](int) {
         if (canvas == activeCanvas()) synchronizeZoomControls(canvas);
     });
-    connect(canvas, &DocumentCanvas::operationFailed, this, [this](const QString& message) {
-        QMessageBox::warning(this, tr("Edit could not be applied"), message);
+    connect(canvas, &DocumentCanvas::operationFailed, this, [this, canvas](const QString& message) {
+        if (canvas != activeCanvas()) return;
+        statusBar()->showMessage(tr("Edit could not be applied: %1").arg(message), 8000);
     });
     ribbon_->setParagraphStyle(canvas->currentParagraphStyleId());
     synchronizeParagraphStyleAvailability(canvas);
@@ -3902,11 +4582,7 @@ DocumentCanvas* MainWindow::createDocumentTab(core::Document document,
     ribbon_->setFontPointSize(canvas->currentFontPointSize());
     ribbon_->setTextColor(canvas->currentTextColor());
     ribbon_->setHighlightColor(canvas->currentHighlightColor());
-    ribbon_->setTableContext(canvas->selectedTableId().has_value());
-    const auto pictureLayout = canvas->selectedImageLayout();
-    ribbon_->setPictureContext(
-        pictureLayout.has_value(),
-        pictureLayout.value_or(core::ImageLayout{}).placement);
+    refreshObjectContexts(*ribbon_, canvas);
     synchronizeZoomControls(canvas);
     loadNavigationForActiveDocument();
     canvas->refreshCursorFormat();
@@ -3972,7 +4648,7 @@ bool MainWindow::openPath(const QString& path) {
     if (!diskFingerprint) {
         QMessageBox::critical(
             this, tr("Could not monitor document"),
-            tr("Owl Docs could not establish a safe on-disk fingerprint for "
+            tr("OwlDocs could not establish a safe on-disk fingerprint for "
                "this file: %1")
                 .arg(fingerprintError));
         return false;
@@ -4005,9 +4681,10 @@ bool MainWindow::openPath(const QString& path) {
     if (!package) {
         QMessageBox::critical(this, tr("Could not open document"), fromUtf8(error.message)); return false;
     }
+    const auto sourceDefaults = package->sourceDefaults();
     auto semantic = documentFromOoxml(
-        *package, editorPreferences_.defaultFontFamily(),
-        editorPreferences_.defaultFontPointSize(),
+        *package, fromUtf8(sourceDefaults.font_family),
+        sourceDefaults.font_size_half_points / 2.0,
         editorPreferences_.tabWidthSpaces());
     if (!semantic) {
         QMessageBox::critical(this, tr("Could not map document"),
@@ -4033,16 +4710,20 @@ bool MainWindow::openPath(const QString& path) {
         }
     }
     state->package = std::move(package);
-    const auto importedDefaults = toOoxmlDocumentDefaults(
-        editorPreferences_.defaultFontFamily(),
-        editorPreferences_.defaultFontPointSize(),
-        editorPreferences_.tabWidthSpaces());
-    state->regeneratable =
-        state->package->isCanonicalRegeneratableSimplePackage(
-            importedDefaults);
-    if (state->regeneratable) {
-        state->regenerationDefaults = importedDefaults;
+    state->regenerationDefaults = sourceDefaults;
+    const auto baselineBody = toOoxmlBody(
+        {core::Revision{}, semantic.value().document}, state->regenerationLosses,
+        fromUtf8(sourceDefaults.font_family), sourceDefaults.font_size_half_points / 2.0,
+        state->importedTableStyleSources,
+        state->package->bodyPageSettings().value_or(ooxml::PageSettings{}),
+        nullptr, editorPreferences_.tabWidthSpaces(), sourceDefaults.legacy_style_defaults, sourceDefaults.neutral_style_defaults);
+    const auto assessment = state->package->assessRegeneration(
+        baselineBody, state->package->bodyPageSettings().value_or(ooxml::PageSettings{}), sourceDefaults);
+    state->regeneratable = assessment.lossless && state->regenerationLosses.isEmpty();
+    for (const auto& issue : assessment.loss_report.issues) {
+        state->regenerationLosses.push_back(fromUtf8(issue.part_name + ": " + issue.detail));
     }
+    state->regenerationLosses.append(semantic.value().diagnostics);
     const auto page = state->package->bodyPageSettings();
     auto importedImages = std::move(semantic.value().images);
     auto importedTables = std::move(semantic.value().tables);
@@ -4070,6 +4751,9 @@ bool MainWindow::openPath(const QString& path) {
         }
     }
     addRecentFile(documentPath);
+    if (!semantic.value().diagnostics.isEmpty()) {
+        statusBar()->showMessage(semantic.value().diagnostics.join(QLatin1Char(' ')), 10000);
+    }
     return true;
 }
 
@@ -4114,6 +4798,27 @@ bool MainWindow::saveCanvas(DocumentCanvas* canvas, bool saveAs) {
         if (!target.endsWith(QStringLiteral(".docx"), Qt::CaseInsensitive)) target += QStringLiteral(".docx");
     }
     if (!canvas->isModified() && !saveAs && !state->path.isEmpty()) return true;
+    if (state->recovered && sameFileDestination(target, state->recoverySourcePath)) {
+        QMessageBox::information(this, tr("Choose a different name"),
+            tr("Save recovered changes to a different file to preserve the original document."));
+        return false;
+    }
+    QString selectedFingerprintError;
+    bool destinationExisted = QFileInfo::exists(target);
+    auto selectedFingerprint = destinationExisted ? fingerprintFile(target, selectedFingerprintError)
+                                                 : std::optional<FileFingerprint>{};
+    const auto beforeCommit = [&](ooxml::Error& error) {
+        QString detail;
+        const auto& expected = sameFileDestination(target, state->path)
+                                   ? state->diskFingerprint : selectedFingerprint;
+        if ((destinationExisted && (!expected || compareFileFingerprint(target, *expected, detail) != FileFingerprintComparison::matches)) ||
+            (!destinationExisted && QFileInfo::exists(target))) {
+            error = {ooxml::ErrorCode::unsafe_edit,
+                     "The destination changed while the document was being saved. Your changes are still open; choose another name or reload the destination."};
+            return false;
+        }
+        return true;
+    };
 
     if (!state->path.isEmpty() && sameFileDestination(target, state->path)) {
         QString fingerprintError;
@@ -4126,10 +4831,10 @@ bool MainWindow::saveCanvas(DocumentCanvas* canvas, bool saveAs) {
             QMessageBox box(
                 QMessageBox::Warning, tr("Save As required"),
                 comparison == FileFingerprintComparison::differs
-                    ? tr("The document on disk has changed since Owl Docs "
-                         "opened or last saved it. Owl Docs did not overwrite "
+                    ? tr("The document on disk has changed since OwlDocs "
+                         "opened or last saved it. OwlDocs did not overwrite "
                          "those changes. Use Save As with a different name.")
-                    : tr("Owl Docs could not verify that the document on disk "
+                    : tr("OwlDocs could not verify that the document on disk "
                          "is still the version that was opened or last saved. "
                          "It was not overwritten. Use Save As with a different "
                          "name."),
@@ -4147,52 +4852,50 @@ bool MainWindow::saveCanvas(DocumentCanvas* canvas, bool saveAs) {
     // An unchanged Save As must retain the original package byte-for-byte,
     // including for documents first created by this application. Regeneration
     // is reserved for an unsaved document or an actual semantic/layout edit.
-    const auto currentDefaults = toOoxmlDocumentDefaults(*canvas);
-    const bool regenerationDefaultsStillMatch =
-        !state->regenerationDefaults ||
-        *state->regenerationDefaults == currentDefaults;
+    const auto currentDefaults = state->regenerationDefaults.value_or(toOoxmlDocumentDefaults(*canvas));
     bool regenerate = state->regeneratable &&
-                      regenerationDefaultsStillMatch &&
                       (canvas->isModified() || !state->package);
-    bool simplificationConfirmed =
-        state->simplificationWarningAcknowledged;
+    bool simplificationConfirmed = false;
     const auto confirmSimplification = [&]() {
-        if (state->simplificationWarningAcknowledged) {
-            simplificationConfirmed = true;
-            return true;
-        }
         const QString protectedSource = !state->path.isEmpty()
                                             ? state->path
                                             : state->recoverySourcePath;
         const bool overwritingOriginal =
             sameFileDestination(target, protectedSource);
         QMessageBox box(
-            QMessageBox::Warning, tr("Compatibility warning"),
-            tr("This imported document contains content that this build "
-               "preserves but cannot safely rewrite after structural or "
-               "formatting changes. Saving anyway will rebuild the DOCX with "
-               "Owl Docs' supported content."),
+            QMessageBox::Warning, tr("Save an editable copy"),
+            tr("The original document contains content OwlDocs preserves but "
+               "cannot rewrite. Save a separate editable DOCX copy with the "
+               "supported content? The original will be preserved."),
             QMessageBox::Yes | QMessageBox::No, this);
         box.setDefaultButton(QMessageBox::No);
         if (auto* saveAnyway = box.button(QMessageBox::Yes)) {
-            saveAnyway->setText(tr("Save Anyway"));
+            saveAnyway->setText(tr("Save Copy"));
         }
         if (auto* cancel = box.button(QMessageBox::No)) {
             cancel->setText(tr("Cancel"));
         }
-        QString details = tr(
-            "Potential losses include advanced headers/footers, comments, tracked revisions, "
-            "fields, charts, SmartArt, text boxes, floating drawings, and custom XML. "
-            "Editable body text and supported formatting will be retained.");
-        details += QLatin1Char('\n');
-        details += overwritingOriginal
-            ? tr("Continuing will atomically replace the original file. Cancel if "
-                 "you want to use Save As and retain that original separately.")
-            : tr("Continuing will write the selected destination. The imported "
-                 "original will remain unchanged.");
-        box.setDetailedText(details);
+        box.setDetailedText(state->regenerationLosses.isEmpty()
+            ? tr("The recovery checkpoint contains editable content but no complete original package.")
+            : state->regenerationLosses.join(QLatin1Char('\n')));
         if (box.exec() != QMessageBox::Yes) return false;
-        state->simplificationWarningAcknowledged = true;
+        if (overwritingOriginal) {
+            const QFileInfo sourceInfo(protectedSource);
+            target = QFileDialog::getSaveFileName(
+                this, tr("Save editable DOCX copy"),
+                sourceInfo.dir().filePath(sourceInfo.completeBaseName() + tr(" - edited.docx")),
+                tr("Word documents (*.docx)"));
+            if (target.isEmpty()) return false;
+            if (!target.endsWith(QStringLiteral(".docx"), Qt::CaseInsensitive)) target += QStringLiteral(".docx");
+        }
+        if (sameFileDestination(target, protectedSource)) {
+            QMessageBox::information(this, tr("Choose a different name"),
+                tr("Choose a different file to preserve the imported original."));
+            return false;
+        }
+        destinationExisted = QFileInfo::exists(target);
+        selectedFingerprint = destinationExisted ? fingerprintFile(target, selectedFingerprintError)
+                                                 : std::optional<FileFingerprint>{};
         simplificationConfirmed = true;
         return true;
     };
@@ -4240,10 +4943,11 @@ bool MainWindow::saveCanvas(DocumentCanvas* canvas, bool saveAs) {
             }
         }
         if (!patchFailure.isEmpty()) {
+            state->package->discardEdits();
             regenerate = true;
             if (!simplificationConfirmed && !confirmSimplification()) return false;
         } else {
-            const auto result = state->package->saveAs(nativePath(target));
+            const auto result = state->package->saveAs(nativePath(target), beforeCommit);
             if (!result || result.error.has_value()) {
                 state->package->discardEdits();
                 QMessageBox::critical(this, tr("Save validation failed"),
@@ -4251,12 +4955,12 @@ bool MainWindow::saveCanvas(DocumentCanvas* canvas, bool saveAs) {
                 return false;
             }
             savedWithPackage = true;
+            if (result.durability_warning) statusBar()->showMessage(
+                tr("Saved; disk durability could not be confirmed: %1").arg(fromUtf8(result.durability_warning->message)), 10000);
         }
     }
-    // Recovery intentionally stores only the bounded semantic snapshot, never
-    // an imported package's opaque ZIP members. A restored imported document
-    // therefore cannot take the normal package-preserving save path and must
-    // be treated as an explicitly warned simplified save.
+    // Legacy semantic-only checkpoints cannot take a preservation save.
+    // New checkpoints restore their retained source package above.
     if (!savedWithPackage && !state->package && !state->regeneratable) {
         regenerate = true;
         if (!simplificationConfirmed && !confirmSimplification()) return false;
@@ -4264,9 +4968,10 @@ bool MainWindow::saveCanvas(DocumentCanvas* canvas, bool saveAs) {
     if (!savedWithPackage) {
         QStringList losses;
         auto output = toOoxmlBody(
-            snapshot, losses, canvas->defaultFontFamily(),
-            canvas->defaultFontPointSize(),
-            state->importedTableStyleSources);
+            snapshot, losses, fromUtf8(currentDefaults.font_family),
+            currentDefaults.font_size_half_points / 2.0,
+            state->importedTableStyleSources, toOoxmlPageSettings(*canvas),
+            canvas, canvas->tabWidthSpaces(), currentDefaults.legacy_style_defaults, currentDefaults.neutral_style_defaults);
         losses.removeDuplicates();
         if (!losses.isEmpty() && !simplificationConfirmed) {
             QMessageBox box(QMessageBox::Warning, tr("Some formatting is not serializable yet"),
@@ -4278,40 +4983,41 @@ bool MainWindow::saveCanvas(DocumentCanvas* canvas, bool saveAs) {
         }
         const auto result = ooxml::DocxDocument::writeNew(
             nativePath(target), output, toOoxmlPageSettings(*canvas),
-            currentDefaults);
+            currentDefaults, beforeCommit);
         if (!result) { QMessageBox::critical(this, tr("Save failed"), saveError(result.error)); return false; }
         ooxml::Error reopenError;
-        state->package = ooxml::DocxDocument::open(nativePath(target), &reopenError);
+        state->package = result.validated_package_bytes
+            ? ooxml::DocxDocument::openBytes(*result.validated_package_bytes, &reopenError)
+            : nullptr;
         if (!state->package) { QMessageBox::critical(this, tr("Save validation failed"), fromUtf8(reopenError.message)); return false; }
         state->regeneratable = true;
         state->regenerationDefaults = currentDefaults;
+        state->regenerationLosses.clear();
         state->sourceParagraphIndices.clear();
         state->sourceTextPrefixes.clear();
+        if (result.durability_warning) statusBar()->showMessage(
+            tr("Saved; disk durability could not be confirmed: %1").arg(fromUtf8(result.durability_warning->message)), 10000);
     }
-    QString savedFingerprintError;
-    auto savedFingerprint = fingerprintFile(target, savedFingerprintError);
+    const auto savedBytes = state->package->sourceBytes();
+    // Retain the exact bytes we committed as the conflict baseline. Hashing a
+    // reopened pathname here could accidentally trust another writer's later
+    // replacement and authorize overwriting it on the next Save.
+    const FileFingerprint savedFingerprint{
+        static_cast<qint64>(savedBytes.size()), 0,
+        QCryptographicHash::hash(QByteArray::fromRawData(
+            reinterpret_cast<const char*>(savedBytes.data()), static_cast<int>(savedBytes.size())),
+            QCryptographicHash::Sha256)};
     state->path = QFileInfo(target).absoluteFilePath();
     state->diskFingerprint = std::move(savedFingerprint);
     state->recoverySourcePath.clear();
     state->recoveryDisplayName.clear();
     state->recovered = false;
+    state->recoverySourceUnavailable = false;
     state->baselineTexts = texts;
     canvas->markSaved();
     deleteRecoveryFor(canvas);
     addRecentFile(target);
     updateTabTitle(canvas);
-    saveStatus_->setText(state->diskFingerprint
-                             ? tr("Saved")
-                             : tr("Saved — use Save As for the next change"));
-    if (!state->diskFingerprint) {
-        QMessageBox::warning(
-            this, tr("Saved, but monitoring is unavailable"),
-            tr("The document was saved, but Owl Docs could not fingerprint the "
-               "saved file (%1). To avoid overwriting another program's "
-               "changes, the next edit must be saved under a different name.")
-                .arg(savedFingerprintError));
-    }
-    QTimer::singleShot(1800, this, [this] { saveStatus_->setText(tr("Ready")); });
     return true;
 }
 
@@ -4381,7 +5087,7 @@ void MainWindow::printPreview() {
             ? QFileInfo(activeState()->path).fileName()
             : tabs_->tabText(tabs_->currentIndex());
     printer.setDocName(documentName);
-    printer.setCreator(QStringLiteral("Owl Docs"));
+    printer.setCreator(QStringLiteral("OwlDocs"));
 
     QPrintPreviewDialog dialog(&printer, this);
     dialog.setObjectName(QStringLiteral("printPreviewDialog"));
@@ -4424,7 +5130,7 @@ void MainWindow::printDocument() {
             ? QFileInfo(activeState()->path).fileName()
             : tabs_->tabText(tabs_->currentIndex());
     printer.setDocName(documentName);
-    printer.setCreator(QStringLiteral("Owl Docs"));
+    printer.setCreator(QStringLiteral("OwlDocs"));
 
     QPrintDialog dialog(&printer, this);
     dialog.setObjectName(QStringLiteral("printDialog"));
@@ -4450,6 +5156,7 @@ void MainWindow::showFindReplace(bool replaceMode) {
     if (auto* state = activeState()) {
         state->navigationReplaceMode = replaceMode;
     }
+    activeCanvas()->setProperty("navigation.outlineMode", false);
     navigation_->setMode(replaceMode ? NavigationDock::Mode::replace
                                      : NavigationDock::Mode::find);
     navigation_->show();
@@ -4463,8 +5170,10 @@ void MainWindow::loadNavigationForActiveDocument() {
     const QSignalBlocker blocker(navigation_);
     if (const auto* state = activeState()) {
         navigation_->setMode(
-            state->navigationReplaceMode ? NavigationDock::Mode::replace
-                                         : NavigationDock::Mode::find);
+            activeCanvas() && activeCanvas()->property("navigation.outlineMode").toBool()
+                ? NavigationDock::Mode::outline
+                : state->navigationReplaceMode ? NavigationDock::Mode::replace
+                                               : NavigationDock::Mode::find);
         navigation_->setQuery(state->navigationQuery);
         navigation_->setReplacement(state->navigationReplacement);
         navigation_->setMatchCase(state->navigationMatchCase);
@@ -4479,6 +5188,27 @@ void MainWindow::loadNavigationForActiveDocument() {
     refreshNavigationResults();
 }
 
+void MainWindow::refreshOutline() {
+    outlineParagraphIds_.clear();
+    QList<NavigationHeading> headings;
+    if (const auto* canvas = activeCanvas()) {
+        const auto snapshot = canvas->snapshot();
+        for (const auto& block : snapshot.document.bodyBlocks()) {
+            if (block.kind != core::BodyBlockKind::paragraph) continue;
+            const auto* paragraph = snapshot.document.findParagraph(block.id);
+            if (!paragraph || !paragraph->styleId()) continue;
+            const auto* style = core::findBuiltInParagraphStyle(*paragraph->styleId());
+            if (!style || !style->outline_level) continue;
+            QString title = QString::fromUtf16(paragraph->text().data(),
+                static_cast<qsizetype>(paragraph->text().size())).trimmed();
+            if (title.isEmpty()) title = tr("Untitled heading");
+            headings.push_back({title, static_cast<int>(*style->outline_level) + 1});
+            outlineParagraphIds_.push_back(paragraph->id());
+        }
+    }
+    if (navigation_) navigation_->setHeadings(headings);
+}
+
 void MainWindow::refreshNavigationResults() {
     if (navigationSearchDebounce_) navigationSearchDebounce_->stop();
     auto* canvas = activeCanvas();
@@ -4491,6 +5221,8 @@ void MainWindow::refreshNavigationResults() {
     // whole-document scan after the user closes the modeless pane. Reopening
     // it triggers a fresh search through visibilityChanged.
     if (!navigation_->isVisible()) return;
+    refreshOutline();
+    if (navigation_->mode() == NavigationDock::Mode::outline) return;
     const QString query = navigation_->query();
     if (query.isEmpty()) {
         if (auto* state = activeState()) state->navigationHits.clear();
@@ -4612,22 +5344,51 @@ void MainWindow::navigateSearchResult(bool forward) {
 }
 
 void MainWindow::showCommandPalette() {
-    QDialog dialog(this); dialog.setWindowTitle(tr("Command Palette")); dialog.resize(480, 420);
-    QVBoxLayout layout(&dialog); QLineEdit search; QListWidget list;
-    search.setPlaceholderText(tr("Type a command…")); layout.addWidget(&search); layout.addWidget(&list);
-    auto refill = [&] {
-        list.clear(); for (const auto& id : commands_.search(search.text())) {
-            auto* action = commands_.action(id); auto* item = new QListWidgetItem(action->text(), &list); item->setData(Qt::UserRole, id);
+    QDialog dialog(this);
+    dialog.setObjectName(QStringLiteral("commandPalette"));
+    dialog.setWindowTitle(tr("Search commands"));
+    dialog.resize(540, 440);
+    auto* layout = new QVBoxLayout(&dialog);
+    auto* search = new QLineEdit(&dialog);
+    search->setObjectName(QStringLiteral("commandPalette.search"));
+    search->setAccessibleName(tr("Search commands"));
+    search->setPlaceholderText(tr("Find an action, such as LaTeX, heading or PDF…"));
+    auto* list = new QListWidget(&dialog);
+    list->setAccessibleName(tr("Available commands"));
+    layout->addWidget(search);
+    layout->addWidget(list);
+    QString selectedId;
+    const auto refill = [&] {
+        list->clear();
+        for (const auto& id : commands_.search(search->text())) {
+            auto* action = commands_.action(id);
+            QString label = commands_.category(id) + QStringLiteral("  ·  ") + action->text();
+            if (!action->shortcut().isEmpty())
+                label += QStringLiteral("    %1").arg(action->shortcut().toString(QKeySequence::NativeText));
+            auto* item = new QListWidgetItem(action->icon(), label, list);
+            item->setData(Qt::UserRole, id);
+            item->setData(Qt::AccessibleTextRole, label);
         }
-        if (list.count()) list.setCurrentRow(0);
+        if (list->count()) list->setCurrentRow(0);
     };
-    connect(&search, &QLineEdit::textChanged, &dialog, refill);
-    connect(&list, &QListWidget::itemActivated, &dialog, [&](QListWidgetItem* item) {
-        if (auto* action = commands_.action(item->data(Qt::UserRole).toString()))
-            action->trigger();
+    const auto choose = [&] {
+        const auto* item = list->currentItem();
+        if (!item) return;
+        selectedId = item->data(Qt::UserRole).toString();
         dialog.accept();
-    });
-    refill(); search.setFocus(); dialog.exec();
+    };
+    connect(search, &QLineEdit::textChanged, &dialog, refill);
+    connect(search, &QLineEdit::returnPressed, &dialog, choose);
+    connect(list, &QListWidget::itemActivated, &dialog,
+            [&](QListWidgetItem*) { choose(); });
+    refill();
+    search->setFocus();
+    if (dialog.exec() == QDialog::Accepted) {
+        // Invoke after the modal search surface closes, so commands that open
+        // their own dialogs or transfer focus have normal keyboard ownership.
+        if (auto* action = commands_.action(selectedId);
+            action && action->isEnabled() && action->isVisible()) action->trigger();
+    }
 }
 
 void MainWindow::showEditorOptions() {
@@ -4640,7 +5401,7 @@ void MainWindow::showEditorOptions() {
         QMessageBox::warning(
             this, tr("Options could not be saved"),
             error.isEmpty()
-                ? tr("Owl Docs could not save the editor options.")
+                ? tr("OwlDocs could not save the editor options.")
                 : error);
         return;
     }
@@ -4692,7 +5453,7 @@ void MainWindow::showListProperties() {
                 QMessageBox::warning(
                     this, tr("Defaults could not be saved"),
                     error.isEmpty()
-                        ? tr("Owl Docs could not save the list defaults.")
+                        ? tr("OwlDocs could not save the list defaults.")
                         : error);
             } else {
                 editorPreferences_ = std::move(requestedPreferences);
@@ -4709,48 +5470,11 @@ void MainWindow::insertTable() {
     auto* canvas = activeCanvas();
     if (!canvas) return;
 
-    QDialog dialog(this);
-    dialog.setObjectName(QStringLiteral("insertTableDialog"));
-    dialog.setWindowTitle(tr("Insert Table"));
-    dialog.setModal(true);
-    auto* outer = new QVBoxLayout(&dialog);
-    auto* form = new QFormLayout;
-
-    auto* rows = new QSpinBox(&dialog);
-    rows->setObjectName(QStringLiteral("insertTable.rows"));
-    rows->setRange(1, static_cast<int>(core::Table::maximum_rows));
-    rows->setValue(2);
-    rows->setAccessibleName(tr("Table rows"));
-    form->addRow(tr("Rows:"), rows);
-
-    auto* columns = new QSpinBox(&dialog);
-    columns->setObjectName(QStringLiteral("insertTable.columns"));
-    columns->setRange(1, static_cast<int>(core::Table::maximum_columns));
-    columns->setValue(2);
-    columns->setAccessibleName(tr("Table columns"));
-    form->addRow(tr("Columns:"), columns);
-
-    auto* header = new QCheckBox(tr("Header row"), &dialog);
-    header->setObjectName(QStringLiteral("insertTable.header"));
-    header->setChecked(true);
-    form->addRow(QString(), header);
-    outer->addLayout(form);
-
-    auto* buttons = new QDialogButtonBox(
-        QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
-    buttons->setObjectName(QStringLiteral("insertTable.buttons"));
-    outer->addWidget(buttons);
-    connect(buttons, &QDialogButtonBox::accepted,
-            &dialog, &QDialog::accept);
-    connect(buttons, &QDialogButtonBox::rejected,
-            &dialog, &QDialog::reject);
-    rows->setFocus();
-    rows->selectAll();
+    TableInsertDialog dialog(this);
     if (dialog.exec() == QDialog::Accepted) {
         static_cast<void>(canvas->insertTable(
-            static_cast<std::size_t>(rows->value()),
-            static_cast<std::size_t>(columns->value()),
-            header->isChecked()));
+            static_cast<std::size_t>(dialog.rowCount()),
+            static_cast<std::size_t>(dialog.columnCount()), dialog.hasHeaderRow()));
     }
     canvas->setFocus();
 }
@@ -4758,55 +5482,11 @@ void MainWindow::insertTable() {
 void MainWindow::showHeaderFooterEditor() {
     auto* canvas = activeCanvas();
     if (!canvas) return;
-    canvas->beginHeaderFooterEditing(false, 0, 0);
+    canvas->beginHeaderFooterEditing(false, 0, canvas->currentPageNumber() - 1);
 }
 
 void MainWindow::insertEquation() {
-    auto* canvas = activeCanvas();
-    if (!canvas) return;
-    QDialog dialog(this);
-    dialog.setObjectName(QStringLiteral("insertEquationDialog"));
-    dialog.setWindowTitle(tr("Insert LaTeX Equation"));
-    auto* outer = new QVBoxLayout(&dialog);
-    auto* form = new QFormLayout;
-    auto* latexInput = new QLineEdit(QStringLiteral("\\frac{a}{b}"), &dialog);
-    latexInput->setObjectName(QStringLiteral("insertEquation.latex"));
-    latexInput->setAccessibleName(tr("LaTeX equation"));
-    form->addRow(tr("Safe LaTeX subset:"), latexInput);
-    auto* display = new QCheckBox(tr("Display equation"), &dialog);
-    display->setObjectName(QStringLiteral("insertEquation.display"));
-    form->addRow(QString(), display);
-    outer->addLayout(form);
-    auto* buttons = new QDialogButtonBox(
-        QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
-    buttons->setObjectName(QStringLiteral("insertEquation.buttons"));
-    outer->addWidget(buttons);
-    connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
-    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
-    latexInput->setFocus();
-    latexInput->selectAll();
-    if (dialog.exec() != QDialog::Accepted || latexInput->text().isEmpty()) {
-        canvas->setFocus();
-        return;
-    }
-    const auto latex = latexInput->text();
-    const QByteArray encoded = latex.toUtf8();
-    const auto parsed = math::parseLatex(std::string_view(
-        encoded.constData(), static_cast<std::size_t>(encoded.size())),
-        editorEquationLimits());
-    if (!parsed) {
-        QMessageBox::warning(
-            this, tr("Invalid equation"),
-            tr("%1 (at byte %2)\n\nOnly the built-in, non-executing LaTeX math subset is accepted.")
-                .arg(fromUtf8(parsed.error().message))
-                .arg(static_cast<qulonglong>(parsed.error().byte_offset)));
-        canvas->setFocus();
-        return;
-    }
-    static_cast<void>(canvas->insertEquation(
-        fromUtf8(math::toCanonicalLatex(parsed.value())),
-        display->isChecked()));
-    canvas->setFocus();
+    if (auto* canvas = activeCanvas()) canvas->showEquationEditor();
 }
 
 void MainWindow::insertImage() {
@@ -4922,7 +5602,7 @@ void MainWindow::editSelectedExcalidrawFigure(DocumentCanvas* canvas) {
 
 void MainWindow::showCompatibilityReport() {
     const auto* state = activeState();
-    if (!state || !state->package) { QMessageBox::information(this, tr("Compatibility Report"), tr("New Owl Docs document: supported body-text subset.")); return; }
+    if (!state || !state->package) { QMessageBox::information(this, tr("Compatibility Report"), tr("New OwlDocs document: supported body-text subset.")); return; }
     const auto& report = state->package->compatibility();
     QString detail;
     for (const auto& issue : report.issues) detail += fromUtf8(issue.part_name + ": " + issue.detail) + QLatin1Char('\n');
@@ -4957,7 +5637,17 @@ void MainWindow::updateWindowTitle() {
             state->recoveryDisplayName.isEmpty() ? tr("Untitled")
                                                  : state->recoveryDisplayName);
     }
-    setWindowTitle(QStringLiteral("%1 — Owl Docs").arg(base));
+    setWindowTitle(QStringLiteral("%1 — OwlDocs").arg(base));
+    if (auto* name = findChild<QLabel*>(QStringLiteral("workspace.documentName"))) {
+        name->setText(base);
+        name->setToolTip(base);
+    }
+    if (saveStatus_) {
+        const auto* canvas = activeCanvas();
+        saveStatus_->setText(canvas && canvas->isModified()
+            ? tr("Unsaved changes")
+            : state && !state->path.isEmpty() ? tr("Saved") : tr("New document"));
+    }
 }
 
 void MainWindow::addRecentFile(const QString& path) {
@@ -5204,8 +5894,19 @@ codex::Json MainWindow::handleEditorTool(const QString& key,
         return {};
     }
     QString previewSummary;
+    const QPointer<MainWindow> guardedWindow(this);
+    const QPointer<DocumentCanvas> guardedCanvas(canvas);
+    const void* sessionIdentity = codex_ ? codex_->documentToolSessionIdentity() : nullptr;
     auto result = invokeEditorTool(*canvas, key, tool, arguments,
-                                   previewSummary, error);
+        previewSummary, error, {}, [guardedWindow, guardedCanvas, sessionIdentity] {
+            return guardedWindow && guardedCanvas &&
+                (!sessionIdentity || (guardedWindow->codex_ &&
+                    guardedWindow->codex_->documentToolSessionIdentity() == sessionIdentity));
+        });
+    if (!guardedWindow || !guardedCanvas) {
+        error = QObject::tr("The document closed while its Codex tool was running.");
+        return {};
+    }
     if (error.isEmpty() && !previewSummary.isEmpty()) {
         previewDocumentKey_ = key;
         previewLabel_ = tr("Codex semantic edit preview");
@@ -5225,6 +5926,10 @@ codex::Json MainWindow::handleEditorTool(const QString& key,
 void MainWindow::checkpointCanvas(DocumentCanvas* canvas) {
     auto* state = stateFor(canvas);
     if (!recoveryOwner_ || !state || !canvas->isModified() || !chatStore_.isOpen()) return;
+    if (state->recoverySourceUnavailable) {
+        statusBar()->showMessage(tr("The existing recovery checkpoint is being retained because its original package could not be validated."), 7000);
+        return;
+    }
 
     const auto snapshot = canvas->snapshot();
     RecoveryDocument recovery{
@@ -5250,9 +5955,23 @@ void MainWindow::checkpointCanvas(DocumentCanvas* canvas) {
     } else {
         displayName = tr("Untitled document");
     }
-    const RecoveryRecord record{
+    RecoveryRecord record{
         state->journalKey.toStdString(), sourcePath.toUtf8().toStdString(),
         displayName.toUtf8().toStdString(), *payload, 0};
+    if (state->package) {
+        const auto bytes = state->package->sourceBytes();
+        codex::Json context{{"version", 1},
+            {"nontext_changed", canvas->hasNonTextChanges()},
+            {"page_changed", canvas->hasPageLayoutChanges()}};
+        context["table_sources"] = codex::Json::array();
+        for (const auto& [id, source] : state->importedTableStyleSources) {
+            codex::Json table{{"id", id.toString()}, {"source_style", source.second}};
+            if (source.first) table["semantic_style"] = static_cast<int>(*source.first);
+            context["table_sources"].push_back(std::move(table));
+        }
+        record.source = RecoverySource{
+            std::string(reinterpret_cast<const char*>(bytes.data()), bytes.size()), context.dump()};
+    }
     if (!chatStore_.upsertRecovery(record, error)) {
         statusBar()->showMessage(
             tr("Recovery checkpoint paused: %1").arg(fromUtf8(error)), 7000);
@@ -5288,7 +6007,7 @@ void MainWindow::restoreRecoveryJournals() {
         names.push_back(name.isEmpty() ? tr("Untitled document") : name);
     }
     QMessageBox prompt(QMessageBox::Warning, tr("Recover documents?"),
-                       tr("Owl Docs found %1 autosaved document(s) from an "
+                       tr("OwlDocs found %1 autosaved document(s) from an "
                           "earlier session.")
                            .arg(records.size()),
                        QMessageBox::NoButton, this);
@@ -5339,11 +6058,95 @@ void MainWindow::restoreRecoveryJournals() {
         state->journalKey = fromUtf8(record.journalKey);
         state->baselineTexts = currentTexts(
             {core::Revision{}, recovery->document});
-        // A recovery snapshot contains the editable semantic projection, not
-        // opaque package parts. Recovered imported documents therefore retain
-        // the guarded/simplified Save As policy instead of silently claiming a
-        // lossless native save.
         state->regeneratable = state->recoverySourcePath.isEmpty();
+        bool nonTextChanged = true;
+        bool pageChanged = true;
+        if (record.source) {
+            std::string sourceError = record.source->error;
+            try {
+                if (!sourceError.empty()) throw std::runtime_error(sourceError);
+                if (record.source->context.size() > 1024U * 1024U) {
+                    throw std::runtime_error("Source recovery context exceeds its size limit");
+                }
+                const auto context = codex::Json::parse(record.source->context, [](int depth, auto, auto&) {
+                    if (depth > 12) throw std::runtime_error("Source recovery context is too deeply nested");
+                    return true;
+                });
+                if (context.at("version").get<int>() != 1) throw std::runtime_error("Unsupported source recovery context version");
+                nonTextChanged = context.at("nontext_changed").get<bool>();
+                pageChanged = context.at("page_changed").get<bool>();
+                QTemporaryFile retained;
+                if (!retained.open() || retained.write(record.source->packageBytes.data(),
+                    static_cast<qint64>(record.source->packageBytes.size())) != static_cast<qint64>(record.source->packageBytes.size()) ||
+                    !retained.flush()) throw std::runtime_error("Could not stage the retained source for safe parsing");
+                worker::ParserClientOptions options;
+                options.helper_executable = parserWorkerPath();
+                QFile readOnlySource(QStringLiteral("/proc/self/fd/%1").arg(retained.handle()));
+                if (!readOnlySource.open(QIODevice::ReadOnly)) throw std::runtime_error("Could not open retained source read-only");
+                const auto preflight = worker::parseDocxDescriptorWithWorker(readOnlySource.handle(), options);
+                if (!preflight.transportOk()) throw std::runtime_error("Retained source parser failed: " + preflight.error);
+                if (!preflight.response.ok()) throw std::runtime_error("Retained source was rejected: " + preflight.response.error);
+                ooxml::Error parseError;
+                auto package = ooxml::DocxDocument::openBytes(
+                    std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(record.source->packageBytes.data()),
+                                                   record.source->packageBytes.size()), &parseError);
+                if (!package) throw std::runtime_error(parseError.message);
+                const auto defaults = package->sourceDefaults();
+                auto original = documentFromOoxml(*package, fromUtf8(defaults.font_family),
+                    defaults.font_size_half_points / 2.0, editorPreferences_.tabWidthSpaces());
+                if (!original) throw std::runtime_error(original.error().message);
+                state->baselineTexts = currentTexts({core::Revision{}, original.value().document});
+                state->sourceParagraphIndices = original.value().sourceParagraphIndices;
+                state->sourceTextPrefixes = original.value().sourceTextPrefixes;
+                if (context.contains("table_sources")) {
+                    if (!context["table_sources"].is_array() || context["table_sources"].size() > 512U) {
+                        throw std::runtime_error("Invalid table source recovery context");
+                    }
+                    for (const auto& table : context["table_sources"]) {
+                        const auto id = core::NodeId::parse(table.at("id").get<std::string>());
+                        if (!id || !recovery->document.findTable(*id)) continue;
+                        std::optional<core::TableStyle> style;
+                        if (table.contains("semantic_style")) {
+                            const auto value = table["semantic_style"].get<int>();
+                            if (value < 0 || value > static_cast<int>(core::TableStyle::dark_header)) {
+                                throw std::runtime_error("Invalid table style recovery context");
+                            }
+                            style = static_cast<core::TableStyle>(value);
+                        }
+                        state->importedTableStyleSources.emplace(*id, std::pair{style, table.at("source_style").get<std::string>()});
+                    }
+                }
+                ImportedTableStyleSources originalSources;
+                for (const auto& table : original.value().tables) {
+                    if (table.sourceStyleId) originalSources.emplace(table.tableId,
+                        std::pair{table.sourceSemanticStyle, *table.sourceStyleId});
+                }
+                QStringList losses;
+                const auto body = toOoxmlBody({core::Revision{}, original.value().document}, losses,
+                    fromUtf8(defaults.font_family), defaults.font_size_half_points / 2.0, originalSources,
+                    package->bodyPageSettings().value_or(ooxml::PageSettings{}),
+                    nullptr, editorPreferences_.tabWidthSpaces(), defaults.legacy_style_defaults, defaults.neutral_style_defaults);
+                const auto assessment = package->assessRegeneration(body,
+                    package->bodyPageSettings().value_or(ooxml::PageSettings{}), defaults);
+                state->regeneratable = assessment.lossless && losses.isEmpty();
+                state->regenerationDefaults = defaults;
+                state->regenerationLosses = losses;
+                for (const auto& issue : assessment.loss_report.issues) {
+                    state->regenerationLosses.push_back(fromUtf8(issue.part_name + ": " + issue.detail));
+                }
+                state->package = std::move(package);
+            } catch (const std::exception& exception) {
+                sourceError = exception.what();
+                state->package.reset();
+                state->recoverySourceUnavailable = true;
+                state->regeneratable = false;
+                state->regenerationLosses = {fromUtf8(sourceError)};
+                nonTextChanged = true;
+                pageChanged = true;
+                failures.push_back(tr("%1: the editable checkpoint was restored, but its original package was unavailable (%2)")
+                    .arg(fromUtf8(record.displayName), fromUtf8(sourceError)));
+            }
+        }
         state->recovered = true;
         const auto page = recovery->page;
         const auto title = tr("Recovered — %1").arg(
@@ -5359,7 +6162,7 @@ void MainWindow::restoreRecoveryJournals() {
             page.width_points, page.height_points, page.margin_top_points,
             page.margin_right_points, page.margin_bottom_points,
             page.margin_left_points);
-        canvas->markRecovered();
+        canvas->markRecovered(nonTextChanged, pageChanged);
         ++restoredCount;
     }
     if (restoredCount > 0 && placeholder) {

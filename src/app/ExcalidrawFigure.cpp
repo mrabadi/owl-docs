@@ -240,15 +240,24 @@ struct ExcalidrawFigureEditor::Session {
     QByteArray token;
     Completion completion;
     bool persistMode{true};
+    int protocolVersion{1};
 };
 
-ExcalidrawFigureEditor::ExcalidrawFigureEditor(QObject* parent)
-    : QObject(parent) {}
+ExcalidrawFigureEditor::ExcalidrawFigureEditor(
+    QObject* parent, QString executableOverride)
+    : QObject(parent), executableOverride_(std::move(executableOverride)) {}
 
 ExcalidrawFigureEditor::~ExcalidrawFigureEditor() {
-    if (session_ && session_->process->state() != QProcess::NotRunning) {
-        session_->process->kill();
-        session_->process->waitForFinished(1000);
+    if (session_) {
+        auto* process = session_->process.get();
+        // kill()/waitForFinished() may synchronously emit finished. Destruction
+        // cancels the operation; it must never deliver its completion.
+        QObject::disconnect(process, nullptr, this, nullptr);
+        session_->completion = {};
+        if (process->state() != QProcess::NotRunning) {
+            process->kill();
+            process->waitForFinished(1000);
+        }
     }
 }
 
@@ -266,19 +275,27 @@ void ExcalidrawFigureEditor::renderProfessional(
     start(std::nullopt, skeleton, true, std::move(completion));
 }
 
+void ExcalidrawFigureEditor::renderProfessionalScene(
+    const QByteArray& scene, const QStringList& patchElementIds,
+    Completion completion) {
+    start(scene, std::nullopt, true, std::move(completion), patchElementIds);
+}
+
 void ExcalidrawFigureEditor::start(
     std::optional<QByteArray> scene, std::optional<QJsonArray> skeleton,
-    const bool renderOnly, Completion completion) {
+    const bool renderOnly, Completion completion,
+    std::optional<QStringList> patchElementIds) {
     if (busy()) {
         completion(std::nullopt,
                    tr("A figure editor window is already open."));
         return;
     }
-    const QString executable = figureEditorExecutable();
+    const QString executable = executableOverride_.isEmpty()
+        ? figureEditorExecutable() : executableOverride_;
     if (executable.isEmpty()) {
         completion(
             std::nullopt,
-            tr("The bundled Excalidraw figure editor is unavailable. Reinstall Owl Docs using the complete package."));
+            tr("The bundled Excalidraw figure editor is unavailable. Reinstall OwlDocs using the complete package."));
         return;
     }
     if (scene && !validScene(*scene)) {
@@ -309,9 +326,9 @@ void ExcalidrawFigureEditor::start(
         ? QStringLiteral("sketch")
         : QStringLiteral("professional");
     QJsonObject request{
-        {QStringLiteral("version"), 1},
+        {QStringLiteral("version"), patchElementIds ? 2 : 1},
         {QStringLiteral("token"), QString::fromLatin1(session->token)},
-        {QStringLiteral("title"), tr("Excalidraw Figure — Owl Docs")},
+        {QStringLiteral("title"), tr("Excalidraw Figure — OwlDocs")},
         {QStringLiteral("mode"), mode},
         {QStringLiteral("renderOnly"), renderOnly}};
     request.insert(
@@ -319,6 +336,8 @@ void ExcalidrawFigureEditor::start(
         scene ? QJsonDocument::fromJson(*scene).object()
               : QJsonValue(QJsonValue::Null));
     if (skeleton) request.insert(QStringLiteral("skeleton"), *skeleton);
+    if (patchElementIds) request.insert(
+        QStringLiteral("patchElementIds"), QJsonArray::fromStringList(*patchElementIds));
     QSaveFile requestFile(
         session->directory->filePath(QStringLiteral("request.json")));
     if (!requestFile.open(QIODevice::WriteOnly) ||
@@ -331,7 +350,11 @@ void ExcalidrawFigureEditor::start(
     }
     session->completion = std::move(completion);
     session->persistMode = !renderOnly;
-    session->process = std::make_unique<QProcess>(this);
+    session->protocolVersion = patchElementIds ? 2 : 1;
+    // Session owns the process even while delivering a completion. A callback
+    // is allowed to delete the editor, so QObject parent ownership would race
+    // that session's unique_ptr during callback teardown.
+    session->process = std::make_unique<QProcess>();
     auto* process = session->process.get();
     connect(process, &QProcess::finished, this,
             [this](int exitCode, QProcess::ExitStatus) {
@@ -342,6 +365,11 @@ void ExcalidrawFigureEditor::start(
                 if (!session_ || error == QProcess::Crashed) return;
                 finishSession(-1);
             });
+    if (!executableOverride_.isEmpty()) {
+        process->setProgram(executable);
+        process->setArguments({QStringLiteral("--owl-docs-figure-session"),
+                               session->directory->path()});
+    } else {
 #ifdef Q_OS_LINUX
     const QString bubblewrap = QStringLiteral("/usr/bin/bwrap");
     if (!QFileInfo::exists(bubblewrap)) {
@@ -449,6 +477,7 @@ void ExcalidrawFigureEditor::start(
         QStringLiteral("--owl-docs-figure-session"),
         session->directory->path()});
 #endif
+    }
     session_ = std::move(session);
     process->start();
 }
@@ -475,7 +504,9 @@ void ExcalidrawFigureEditor::finishSession(int exitCode) {
     if (parseError.error != QJsonParseError::NoError ||
         !result.isObject() ||
         result.object().value(QStringLiteral("token")).toString().toLatin1() !=
-            session->token) {
+            session->token ||
+        (session->protocolVersion == 2 &&
+         result.object().value(QStringLiteral("version")) != QJsonValue(2))) {
         session->completion(
             std::nullopt,
             tr("The figure editor returned an invalid session result."));
@@ -523,22 +554,24 @@ void ExcalidrawFigureEditor::finishSession(int exitCode) {
     session->completion(Result{embedded, scene}, {});
 }
 
-std::optional<ExcalidrawFigureEditor::Result>
-renderProfessionalExcalidrawSkeleton(const QJsonArray& skeleton,
-                                     QString& error) {
+namespace {
+std::optional<ExcalidrawFigureEditor::Result> renderWithEventLoop(
+    QString& error, const QString& executableOverride,
+    const std::function<void(ExcalidrawFigureEditor&,
+                            ExcalidrawFigureEditor::Completion)>& start) {
     error.clear();
-    ExcalidrawFigureEditor editor;
     std::optional<ExcalidrawFigureEditor::Result> result;
     bool completed = false;
     QEventLoop loop;
     QTimer timeout;
     timeout.setSingleShot(true);
+    // The editor is destroyed before every local captured by its completion.
+    ExcalidrawFigureEditor editor(nullptr, executableOverride);
     QObject::connect(&timeout, &QTimer::timeout, &loop, [&] {
         error = QObject::tr("The local Excalidraw renderer timed out.");
         loop.quit();
     });
-    editor.renderProfessional(
-        skeleton,
+    start(editor,
         [&](std::optional<ExcalidrawFigureEditor::Result> rendered,
             const QString& renderError) {
             result = std::move(rendered);
@@ -551,6 +584,31 @@ renderProfessionalExcalidrawSkeleton(const QJsonArray& skeleton,
         loop.exec();
     }
     return result;
+}
+}  // namespace
+
+std::optional<ExcalidrawFigureEditor::Result>
+renderProfessionalExcalidrawSkeleton(const QJsonArray& skeleton,
+                                     QString& error,
+                                     const QString& executableOverride) {
+    return renderWithEventLoop(error, executableOverride,
+        [&](ExcalidrawFigureEditor& editor,
+            ExcalidrawFigureEditor::Completion completion) {
+            editor.renderProfessional(skeleton, std::move(completion));
+        });
+}
+
+std::optional<ExcalidrawFigureEditor::Result>
+renderProfessionalExcalidrawScene(const QByteArray& scene,
+                                const QStringList& patchElementIds,
+                                QString& error,
+                                const QString& executableOverride) {
+    return renderWithEventLoop(error, executableOverride,
+        [&](ExcalidrawFigureEditor& editor,
+            ExcalidrawFigureEditor::Completion completion) {
+            editor.renderProfessionalScene(scene, patchElementIds,
+                                           std::move(completion));
+        });
 }
 
 }  // namespace docxstudio::app

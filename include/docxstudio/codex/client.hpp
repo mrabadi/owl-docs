@@ -17,7 +17,7 @@ namespace docxstudio::codex {
 
 struct ClientInfo {
     std::string name = "owl_docs";
-    std::string title = "Owl Docs";
+    std::string title = "OwlDocs";
     std::string version = "0.3.0";
 };
 

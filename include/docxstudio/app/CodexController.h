@@ -35,6 +35,9 @@ public:
     void enable();
     void shutdown();
     bool connected() const noexcept { return connected_; }
+    // Opaque identity only. The in-flight tool keeps its old client alive, so
+    // a reconnect cannot recycle this address before its callback returns.
+    const void* documentToolSessionIdentity() const noexcept { return client_.get(); }
     void selectModel(const QString& wireModel);
     void setEditorToolHandler(EditorToolHandler handler);
     void restoreDocumentThread(const QString& documentKey,
@@ -91,7 +94,7 @@ private:
     QString resultError(const codex::RpcError& error) const;
 
     std::shared_ptr<codex::MessageTransport> transport_;
-    std::unique_ptr<codex::Client> client_;
+    std::shared_ptr<codex::Client> client_;
     std::unique_ptr<QTemporaryDir> documentSandbox_;
     ProcessFactory processFactory_;
     std::vector<codex::ModelInfo> models_;
@@ -101,6 +104,7 @@ private:
     codex::Json documentModeConfig_;
     QString turnDocumentKey_;
     QString turnThreadId_;
+    QString currentTurnId_;
     QString loginId_;
     bool connected_{false};
     bool enabling_{false};

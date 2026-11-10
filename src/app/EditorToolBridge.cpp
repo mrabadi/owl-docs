@@ -2,13 +2,19 @@
 
 #include "docxstudio/app/DocumentCanvas.h"
 #include "docxstudio/app/ExcalidrawFigure.h"
+#include "docxstudio/app/ExcalidrawScene.h"
+#include "docxstudio/app/EditorSemanticOperations.h"
 #include "docxstudio/codex/editor_tools.hpp"
+#include "docxstudio/core/academic.h"
 #include "docxstudio/math/latex_parser.h"
 
 #include <QRegularExpression>
+#include <QBuffer>
+#include <QCryptographicHash>
 #include <QImage>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QPointer>
 #include <QTextBoundaryFinder>
 
 #include <algorithm>
@@ -126,7 +132,7 @@ std::optional<std::uint64_t> unsignedValue(const codex::Json& object,
         !(found->is_number_unsigned() || found->is_number_integer())) {
         return std::nullopt;
     }
-    if (found->is_number_integer() && found->get<std::int64_t>() < 0) {
+    if (!found->is_number_unsigned() && found->is_number_integer() && found->get<std::int64_t>() < 0) {
         return std::nullopt;
     }
     try {
@@ -238,6 +244,10 @@ std::optional<codex::Json> normalizeExcalidrawElements(
                         .arg(QString::fromStdString(type));
             return std::nullopt;
         }
+        if (type == "line" && input.contains("label")) {
+            error = QObject::tr("A plain line cannot have a bound label; use an arrow or separate text.");
+            return std::nullopt;
+        }
         auto x = finiteNumber(input, "x");
         auto y = finiteNumber(input, "y");
         if (!x || !y || std::abs(*x) > 10000.0 ||
@@ -280,17 +290,6 @@ std::optional<codex::Json> normalizeExcalidrawElements(
             }
             element["width"] = *width;
             element["height"] = *height;
-            if (const auto label = input.find("label");
-                label != input.end() && label->is_object()) {
-                const auto text = label->find("text");
-                if (text != label->end() && text->is_string() &&
-                    !text->get<std::string>().empty()) {
-                    element["label"] = {{"text", text->get<std::string>()}};
-                    if (const auto size = finiteNumber(*label, "fontSize"))
-                        element["label"]["fontSize"] =
-                            std::clamp(*size, 8.0, 96.0);
-                }
-            }
         } else if (type == "text") {
             const auto text = input.find("text");
             if (text == input.end() || !text->is_string() ||
@@ -341,38 +340,46 @@ std::optional<codex::Json> normalizeExcalidrawElements(
             }
             element["points"] = std::move(points);
         }
+        if (const auto label = input.find("label");
+            label != input.end() && label->is_object() && type != "line" && type != "text") {
+            const auto text = label->find("text");
+            if (text != label->end() && text->is_string() &&
+                !text->get<std::string>().empty()) {
+                element["label"] = {{"text", text->get<std::string>()}};
+                if (const auto labelId = label->find("id"); labelId != label->end()) {
+                    static const QRegularExpression idPattern(QStringLiteral("^[A-Za-z0-9_-]{1,64}$"));
+                    if (!labelId->is_string() || !idPattern.match(QString::fromStdString(labelId->get<std::string>())).hasMatch()) {
+                        error = QObject::tr("An Excalidraw label has an invalid stable identity."); return std::nullopt;
+                    }
+                    element["label"]["id"] = *labelId;
+                }
+                if (const auto size = finiteNumber(*label, "fontSize"))
+                    element["label"]["fontSize"] = std::clamp(*size, 8.0, 96.0);
+            }
+        }
         result.push_back(std::move(element));
     }
+    std::set<std::string> bindable;
+    for (const auto& element : result) {
+        const auto type = element.at("type").get<std::string>();
+        if (type == "rectangle" || type == "ellipse" || type == "diamond") bindable.insert(element.at("id").get<std::string>());
+        if (element.contains("label") && element.at("label").contains("id") &&
+            !ids.insert(element.at("label").at("id").get<std::string>()).second) {
+            error = QObject::tr("Excalidraw element and label identities must be unique."); return std::nullopt;
+        }
+    }
+    for (std::size_t index = 0; index < source.size(); ++index) {
+        for (const auto* key : {"start", "end"}) {
+            const auto binding = source.at(index).find(key);
+            if (binding == source.at(index).end()) continue;
+            if (result.at(index).at("type") != "arrow" || !binding->is_object() || binding->size() != 1 ||
+                !binding->contains("id") || !binding->at("id").is_string() || !bindable.contains(binding->at("id").get<std::string>())) {
+                error = QObject::tr("An Excalidraw arrow binding must name an existing shape in its skeleton."); return std::nullopt;
+            }
+            result.at(index)[key] = *binding;
+        }
+    }
     return std::optional<codex::Json>(std::move(result));
-}
-
-std::optional<std::uint32_t> parseRgb(const codex::Json& style,
-                                      const char* name,
-                                      QString& error) {
-    const auto found = style.find(name);
-    if (found == style.end()) {
-        return std::nullopt;
-    }
-    if (!found->is_string()) {
-        error = QObject::tr("%1 must be a #RRGGBB color.")
-                    .arg(QString::fromLatin1(name));
-        return std::nullopt;
-    }
-    const QString encoded = QString::fromStdString(found->get<std::string>());
-    static const QRegularExpression pattern(QStringLiteral("^#[0-9A-Fa-f]{6}$"));
-    if (!pattern.match(encoded).hasMatch()) {
-        error = QObject::tr("%1 must be a #RRGGBB color.")
-                    .arg(QString::fromLatin1(name));
-        return std::nullopt;
-    }
-    bool valid = false;
-    const std::uint32_t rgb = encoded.mid(1).toUInt(&valid, 16);
-    if (!valid) {
-        error = QObject::tr("%1 contains an invalid color.")
-                    .arg(QString::fromLatin1(name));
-        return std::nullopt;
-    }
-    return 0xff000000U | rgb;
 }
 
 std::string alignmentName(const core::ParagraphFormat& format) {
@@ -443,8 +450,33 @@ codex::Json formattingFor(
                         {"end", end - returnedTextStart},
                         {"style", std::move(format)}});
     }
-    return {{"alignment", alignmentName(paragraphFormat)},
-            {"characterRuns", std::move(runs)}};
+    codex::Json result = {{"alignment", alignmentName(paragraphFormat)}, {"characterRuns", std::move(runs)}};
+    const auto measurement = [&](const char* name, const std::optional<std::int64_t>& value) {
+        if (value) result[name] = static_cast<double>(*value) / 12700.0;
+    };
+    measurement("leftIndentPoints", paragraphFormat.left_indent_emu);
+    measurement("rightIndentPoints", paragraphFormat.right_indent_emu);
+    measurement("firstLineIndentPoints", paragraphFormat.first_line_indent_emu);
+    measurement("spaceBeforePoints", paragraphFormat.space_before_emu);
+    measurement("spaceAfterPoints", paragraphFormat.space_after_emu);
+    measurement("lineSpacingPoints", paragraphFormat.line_spacing_emu);
+    if (paragraphFormat.line_spacing_rule) {
+        const auto rule = *paragraphFormat.line_spacing_rule;
+        result["lineSpacingRule"] = rule == core::LineSpacingRule::exact ? "exact" : rule == core::LineSpacingRule::at_least ? "atLeast" : "automatic";
+        if (rule == core::LineSpacingRule::automatic && paragraphFormat.line_spacing_emu)
+            result["lineSpacing"] = static_cast<double>(*paragraphFormat.line_spacing_emu) / (12.0 * 12700.0);
+    }
+    if (paragraphFormat.keep_with_next) result["keepWithNext"] = *paragraphFormat.keep_with_next;
+    if (paragraphFormat.keep_lines) result["keepLines"] = *paragraphFormat.keep_lines;
+    if (paragraphFormat.page_break_before) result["pageBreakBefore"] = *paragraphFormat.page_break_before;
+    if (paragraphFormat.list_id) result["listId"] = paragraphFormat.list_id->toString();
+    if (paragraphFormat.list_level) result["listLevel"] = *paragraphFormat.list_level + 1;
+    if (paragraphFormat.list_layout) {
+        result["listLevels"] = codex::Json::array();
+        for (const auto& level : paragraphFormat.list_layout->levels) result["listLevels"].push_back({
+            {"bulletIndentSpaces", level.bullet_indent_spaces}, {"textIndentSpaces", level.text_indent_spaces}});
+    }
+    return result;
 }
 
 codex::Json formattingFor(const core::Paragraph& paragraph,
@@ -505,12 +537,47 @@ codex::Json equationsFor(const core::Paragraph& paragraph,
     return equations;
 }
 
-codex::Json imagesFor(const core::Paragraph& paragraph,
+const char* fieldKindName(core::FieldKind kind) {
+    switch (kind) {
+        case core::FieldKind::note_reference: return "note_reference";
+        case core::FieldKind::caption_number: return "caption_number";
+        case core::FieldKind::bibliography_number: return "bibliography_number";
+        case core::FieldKind::cross_reference: return "cross_reference";
+        case core::FieldKind::citation: return "citation";
+    }
+    return "unknown";
+}
+void appendAcademicMetadata(const core::Paragraph& paragraph, codex::Json& attributes,
+                            const core::AcademicResolution& resolution,
+                            std::size_t start, std::size_t length) {
+    attributes["fields"] = codex::Json::array();
+    for (const auto& field : paragraph.fields()) {
+        if (field.utf16_offset < start || field.utf16_offset >= start + length) continue;
+        const auto* resolved = resolution.findField(field.id);
+        attributes["fields"].push_back({{"id", field.id.toString()},
+            {"utf16Offset", field.utf16_offset - start}, {"kind", fieldKindName(field.kind)},
+            {"targetId", field.target_id.toString()}, {"text", toUtf8(fromUtf16(resolution.fieldText(field.id)))},
+            {"locator", toUtf8(fromUtf16(field.locator))}, {"unresolved", resolved && resolved->unresolved}});
+    }
+    if (paragraph.caption()) attributes["caption"] = {
+        {"label", toUtf8(fromUtf16(core::captionLabelText(paragraph.caption()->label)))},
+        {"targetId", paragraph.caption()->target_id.toString()}};
+    if (paragraph.isBibliographyEntry()) attributes["bibliographyEntry"] = true;
+}
+
+codex::Json imagesFor(const std::vector<core::ImageAtom>& sourceImages,
                       std::size_t returnedTextStart,
-                      std::size_t returnedTextLength) {
+                      std::size_t returnedTextLength,
+                      bool includeNativeScene = false,
+                      std::size_t* remainingContextBytes = nullptr) {
     codex::Json images = codex::Json::array();
+    std::size_t localContextBudget = 256U * 1024U;
+    auto& remaining = remainingContextBytes ? *remainingContextBytes : localContextBudget;
+    // Leave room for empty arrays if subsequent pictures exhaust their payload
+    // allowance. This applies across all calls sharing a document-read budget.
+    constexpr std::size_t arrayReserve = 4U * core::kMaximumInlineImagesPerDocument;
     const std::size_t returnedTextEnd = returnedTextStart + returnedTextLength;
-    for (const auto& image : paragraph.images()) {
+    for (const auto& image : sourceImages) {
         if (image.utf16_offset < returnedTextStart ||
             image.utf16_offset >= returnedTextEnd) {
             continue;
@@ -548,52 +615,44 @@ codex::Json imagesFor(const core::Paragraph& paragraph,
                 static_cast<qsizetype>(bytes.size()));
             if (const auto scene = excalidrawSceneFromPng(png)) {
                 encodedImage["kind"] = "excalidrawFigure";
-                encodedImage["authoringMode"] = "professional";
-                QJsonParseError parseError;
-                const auto sceneDocument =
-                    QJsonDocument::fromJson(*scene, &parseError);
-                if (parseError.error == QJsonParseError::NoError &&
-                    sceneDocument.isObject()) {
-                    const auto sourceElements =
-                        sceneDocument.object().value(
-                            QStringLiteral("elements")).toArray();
-                    codex::Json elements = codex::Json::array();
-                    const qsizetype maximum =
-                        std::min<qsizetype>(sourceElements.size(), 128);
-                    for (qsizetype index = 0; index < maximum; ++index) {
-                        const auto source = sourceElements.at(index).toObject();
-                        codex::Json element = codex::Json::object();
-                        const auto copyString = [&](const char* name) {
-                            const QString key = QString::fromLatin1(name);
-                            if (source.value(key).isString())
-                                element[name] = toUtf8(source.value(key).toString());
-                        };
-                        const auto copyNumber = [&](const char* name) {
-                            const QString key = QString::fromLatin1(name);
-                            if (source.value(key).isDouble())
-                                element[name] = source.value(key).toDouble();
-                        };
-                        copyString("id"); copyString("type");
-                        copyString("text"); copyString("strokeColor");
-                        copyString("backgroundColor");
-                        copyNumber("x"); copyNumber("y");
-                        copyNumber("width"); copyNumber("height");
-                        copyNumber("fontSize"); copyNumber("strokeWidth");
-                        copyNumber("opacity");
-                        if (source.value(QStringLiteral("points")).isArray()) {
-                            const QByteArray points = QJsonDocument(
-                                source.value(QStringLiteral("points")).toArray())
-                                                          .toJson(QJsonDocument::Compact);
-                            element["points"] = codex::Json::parse(
-                                points.constData(),
-                                points.constData() + points.size());
-                        }
-                        elements.push_back(std::move(element));
-                    }
-                    encodedImage["editableElements"] = std::move(elements);
-                    encodedImage["editableElementsTruncated"] =
-                        sourceElements.size() > maximum;
+                const auto inspected = inspectExcalidrawScene(*scene);
+                encodedImage["authoringMode"] = inspected.complete() ? "professional" : "preserved";
+                if (includeNativeScene) {
+                    const auto native = codex::Json::parse(scene->constData(), scene->constData() + scene->size());
+                    const auto contextBytes = native.dump().size();
+                    const bool fits = remaining >= arrayReserve && contextBytes <= remaining - arrayReserve;
+                    encodedImage["nativeScene"] = fits ? native : codex::Json(nullptr);
+                    encodedImage["nativeSceneTruncated"] = !fits;
+                    if (fits) remaining -= contextBytes;
                 }
+                codex::Json elements = codex::Json::array();
+                bool truncated = inspected.truncated;
+                remaining -= std::min<std::size_t>(remaining, 2);
+                for (const auto& value : inspected.elements) {
+                    const QByteArray json = QJsonDocument(value.toObject()).toJson(QJsonDocument::Compact);
+                    auto element = codex::Json::parse(json.constData(), json.constData() + json.size());
+                    const auto contextBytes = element.dump().size() + (elements.empty() ? 0U : 1U);
+                    if (remaining < arrayReserve || contextBytes > remaining - arrayReserve) { truncated = true; break; }
+                    remaining -= contextBytes;
+                    elements.push_back(std::move(element));
+                }
+                encodedImage["editableElements"] = std::move(elements);
+                encodedImage["editableElementsTruncated"] = truncated;
+                encodedImage["editableElementsComplete"] = inspected.complete() && !truncated;
+                auto reasons = inspected.unsupported;
+                if (truncated && !inspected.truncated) reasons.append(QStringLiteral("The shared figure read context budget was exhausted."));
+                codex::Json unsupported = codex::Json::array();
+                bool reasonsTruncated = false;
+                remaining -= std::min<std::size_t>(remaining, 2);
+                for (const auto& reason : reasons) {
+                    const auto encoded = codex::Json(toUtf8(reason));
+                    const auto contextBytes = encoded.dump().size() + (unsupported.empty() ? 0U : 1U);
+                    if (remaining < arrayReserve || contextBytes > remaining - arrayReserve) { reasonsTruncated = true; break; }
+                    remaining -= contextBytes;
+                    unsupported.push_back(encoded);
+                }
+                encodedImage["editableElementsUnsupported"] = std::move(unsupported);
+                encodedImage["editableElementsUnsupportedTruncated"] = reasonsTruncated;
             }
         }
         images.push_back(std::move(encodedImage));
@@ -611,6 +670,17 @@ bool validateDocumentId(const QString& documentId,
         return false;
     }
     return true;
+}
+
+codex::Json pageLayoutFor(const DocumentCanvas& canvas) {
+    codex::Json layout = {{"widthPoints", canvas.pageWidthPoints()}, {"heightPoints", canvas.pageHeightPoints()},
+        {"marginTopPoints", canvas.marginTopPoints()}, {"marginRightPoints", canvas.marginRightPoints()},
+        {"marginBottomPoints", canvas.marginBottomPoints()}, {"marginLeftPoints", canvas.marginLeftPoints()}};
+    const auto fingerprint = QCryptographicHash::hash(QByteArray::fromStdString(layout.dump()), QCryptographicHash::Sha256);
+    std::uint64_t state = 0;
+    for (int index = 0; index < 8; ++index) state = (state << 8U) | static_cast<unsigned char>(fingerprint[index]);
+    layout["stateId"] = state & ((std::uint64_t{1} << 53U) - 1U);
+    return layout;
 }
 
 codex::Json readDocument(DocumentCanvas& canvas,
@@ -645,9 +715,9 @@ codex::Json readDocument(DocumentCanvas& canvas,
         scope = found->get<std::string>();
     }
     static const std::set<std::string> supportedScopes = {
-        "selection", "document", "outline", "blocks"};
+        "selection", "document", "outline", "blocks", "tables", "stories", "images", "metadata"};
     if (!supportedScopes.contains(scope)) {
-        error = QObject::tr("Unsupported editor read scope: %1. Supported scopes are selection, document, outline, and blocks.")
+        error = QObject::tr("Unsupported editor read scope: %1. Supported scopes are selection, document, outline, blocks, tables, stories, images and metadata.")
                     .arg(QString::fromStdString(scope));
         return {};
     }
@@ -740,159 +810,220 @@ codex::Json readDocument(DocumentCanvas& canvas,
 
     codex::Json blocks = codex::Json::array();
     std::size_t characters = 0;
+    std::size_t remainingFigureContextBytes = 256U * 1024U;
     bool truncated = false;
-    if (scope == "blocks") {
+    const auto academic = core::resolveAcademic(snapshot.document);
+    const auto activeStory = scope == "selection" ? canvas.activeStorySelection() : std::nullopt;
+    const auto selectedCells = scope == "selection" && !activeStory ? canvas.selectedTableCellIds() : std::vector<core::NodeId>{};
+    const auto cellRange = scope == "selection" && !activeStory ? canvas.selectedTableCellRange() : std::nullopt;
+    const bool selectedTable = !selectedCells.empty();
+    if (selectedTable) {
+        requestedIds.clear();
+        requestedIds.insert(selectedCells.begin(), selectedCells.end());
+    }
+    std::set<core::NodeId> selectionParagraphIds;
+    if (scope == "selection" && !activeStory && !selectedTable && selected) {
+        for (std::size_t index = selected->start_paragraph_index; index <= selected->end_paragraph_index; ++index)
+            selectionParagraphIds.insert(snapshot.document.paragraphs()[index].id());
+    }
+    {
+        const auto requestedMaximum = unsignedValue(arguments, "maxBlocks");
+        const auto requestedOffset = unsignedValue(arguments, "blockOffset");
+        if ((arguments.contains("maxBlocks") && (!requestedMaximum || *requestedMaximum < 1 || *requestedMaximum > 2048)) ||
+            (arguments.contains("blockOffset") && !requestedOffset)) {
+            error = QObject::tr("maxBlocks must be 1–2048 and blockOffset a nonnegative integer.");
+            return {};
+        }
+        const auto maximumBlocks = requestedMaximum.value_or(512);
+        const auto offset = requestedOffset.value_or(0);
+        std::uint64_t ordinal = 0;
+        std::optional<std::uint64_t> nextOffset;
+        std::size_t metadataBytes = 0;
+        const auto appendBlock = [&](const std::string& id, const char* type, const std::u16string& sourceText,
+                                     const auto& attributes) {
+            const auto current = ordinal++;
+            if (current < offset) return true;
+            if (blocks.size() >= maximumBlocks || (characters >= maximum && !sourceText.empty())) {
+                truncated = true;
+                nextOffset = current;
+                return false;
+            }
+            QString boundedText = fromUtf16(sourceText);
+            if (static_cast<std::size_t>(boundedText.size()) > maximum - characters) {
+                truncateUtf16Safely(boundedText, static_cast<qsizetype>(maximum - characters));
+                truncated = true;
+            }
+            const auto length = static_cast<std::size_t>(boundedText.size());
+            codex::Json entry = {{"id", id}, {"type", type}, {"text", toUtf8(boundedText)}, {"attributes", attributes(length)}};
+            const auto encodedSize = entry.dump().size();
+            if (metadataBytes + encodedSize > 4U * 1024U * 1024U) {
+                if (blocks.empty()) error = QObject::tr("READ_LIMIT: narrow this read with the images scope or explicit stable targets.");
+                truncated = true;
+                nextOffset = current;
+                return false;
+            }
+            blocks.push_back(std::move(entry));
+            metadataBytes += encodedSize;
+            characters += length;
+            return true;
+        };
+        const auto tableAttributes = [](const core::Table& table) {
+            codex::Json widths = codex::Json::array(), heights = codex::Json::array();
+            for (auto value : table.geometry().column_widths_twips) widths.push_back(value / 20.0);
+            for (auto value : table.geometry().row_minimum_heights_twips) heights.push_back(value / 20.0);
+            const char* names[] = {"plain", "grid", "light-gray", "light-blue", "light-orange", "medium-blue", "medium-green",
+                "medium-orange", "aubergine", "orange-accent", "banded-blue", "banded-aubergine", "dark-header"};
+            codex::Json style = table.style() ? codex::Json(names[static_cast<std::size_t>(*table.style())]) : codex::Json(nullptr);
+            return codex::Json{{"rows", table.rowCount()}, {"columns", table.columnCount()}, {"headerRow", table.hasHeaderRow()},
+                {"style", std::move(style)}, {"columnWidthsPoints", std::move(widths)}, {"rowMinimumHeightsPoints", std::move(heights)}};
+        };
+        const auto cellAttributes = [&](const core::Table& table, std::size_t row, std::size_t column, const core::TableCell& cell, std::size_t length) {
+            auto attributes = includeFormatting ? formattingFor(cell, 0, length) : codex::Json::object();
+            attributes["tableId"] = table.id().toString(); attributes["row"] = row; attributes["column"] = column;
+            attributes["images"] = imagesFor(cell.images, 0, length, false, &remainingFigureContextBytes);
+            if (selectedTable) {
+                attributes["selectionStart"] = cellRange && cellRange->cellId == cell.id ? std::min(cellRange->start, length) : 0;
+                attributes["selectionEnd"] = cellRange && cellRange->cellId == cell.id ? std::min(cellRange->end, length) : length;
+            }
+            if (includeFormatting) {
+                const auto vertical = cell.layout.vertical_alignment;
+                attributes["verticalAlignment"] = !vertical ? codex::Json(nullptr)
+                    : codex::Json(*vertical == core::TableCellVerticalAlignment::top ? "top"
+                        : *vertical == core::TableCellVerticalAlignment::center ? "center" : "bottom");
+                const auto border = [](const std::optional<core::TableBorder>& edge) -> codex::Json {
+                    if (!edge) return nullptr;
+                    return {{"style", edge->style == core::TableBorderStyle::none ? "none" : "single"},
+                        {"widthPoints", edge->width_eighth_points / 8.0},
+                        {"color", QColor::fromRgba(edge->argb).name().toStdString()}};
+                };
+                attributes["borders"] = {{"top", border(cell.layout.border_top)}, {"right", border(cell.layout.border_right)},
+                    {"bottom", border(cell.layout.border_bottom)}, {"left", border(cell.layout.border_left)}};
+            }
+            return attributes;
+        };
         bool keepReading = true;
-        for (const core::BodyBlockRef& bodyBlock :
-             snapshot.document.bodyBlocks()) {
-            if (!keepReading) break;
-            if (bodyBlock.kind == core::BodyBlockKind::paragraph) {
-                const core::Paragraph* paragraph =
-                    snapshot.document.findParagraph(bodyBlock.id);
-                if (!paragraph || !requestedIds.contains(paragraph->id())) {
-                    continue;
+        if (!activeStory && scope != "stories" && scope != "images" && scope != "metadata") {
+            for (const auto& body : snapshot.document.bodyBlocks()) {
+                if (!keepReading) break;
+                if (body.kind == core::BodyBlockKind::paragraph) {
+                    if (scope == "tables" || selectedTable) continue;
+                    const auto* paragraph = snapshot.document.findParagraph(body.id);
+                    if (!paragraph || (scope == "blocks" && !requestedIds.contains(body.id)) ||
+                        (scope == "selection" && !selectionParagraphIds.contains(body.id))) continue;
+                    std::size_t returnedTextStart = 0;
+                    auto returnedText = paragraph->text();
+                    if (scope == "outline") {
+                        const auto original = fromUtf16(returnedText);
+                        qsizetype first = 0, last = original.size();
+                        while (first < last && original.at(first).isSpace()) ++first;
+                        while (last > first && original.at(last - 1).isSpace()) --last;
+                        auto trimmed = original.mid(first, last - first);
+                        truncateUtf16Safely(trimmed, 240);
+                        returnedTextStart = static_cast<std::size_t>(first);
+                        returnedText = trimmed.toStdU16String();
+                    }
+                    keepReading = appendBlock(body.id.toString(), "paragraph", returnedText, [&](std::size_t length) {
+                        auto attributes = includeFormatting ? formattingFor(*paragraph, returnedTextStart, length) : codex::Json::object();
+                        appendParagraphStyleMetadata(*paragraph, attributes);
+                        attributes["equations"] = equationsFor(*paragraph, returnedTextStart, length);
+                        attributes["images"] = imagesFor(paragraph->images(), returnedTextStart, length, false, &remainingFigureContextBytes);
+                        appendAcademicMetadata(*paragraph, attributes, academic, returnedTextStart, length);
+                        if (scope == "selection" && selected) {
+                            const auto begin = paragraph->id() == selected->start.paragraph_id ? selected->start.utf16_offset : 0;
+                            const auto finish = paragraph->id() == selected->end.paragraph_id ? selected->end.utf16_offset : paragraph->text().size();
+                            attributes["selectionStart"] = std::min(begin, length);
+                            attributes["selectionEnd"] = std::min(finish, length);
+                        }
+                        return attributes;
+                    });
+                } else if (body.kind == core::BodyBlockKind::table) {
+                    if (scope == "outline" || (scope == "selection" && !selectedTable)) continue;
+                    const auto* table = snapshot.document.findTable(body.id);
+                    if (!table) continue;
+                    const bool fullTable = !selectedTable && (scope != "blocks" || requestedIds.contains(body.id));
+                    if (fullTable) keepReading = appendBlock(body.id.toString(), "table", {}, [&](std::size_t) { return tableAttributes(*table); });
+                    for (std::size_t row = 0; keepReading && row < table->rowCount(); ++row)
+                        for (std::size_t column = 0; keepReading && column < table->columnCount(); ++column) {
+                            const auto* cell = table->cell(row, column);
+                            if (!cell || (!fullTable && !requestedTableCells.contains({table->id(), cell->id}) && !requestedIds.contains(cell->id))) continue;
+                            keepReading = appendBlock(cell->id.toString(), "tableCell", cell->text,
+                                [&](std::size_t length) { return cellAttributes(*table, row, column, *cell, length); });
+                        }
+                } else if (body.kind == core::BodyBlockKind::table_of_contents && scope != "tables" && scope != "selection" && !selectedTable) {
+                    if (scope == "blocks" && !requestedIds.contains(body.id)) continue;
+                    for (const auto& toc : snapshot.document.tablesOfContents()) if (toc.id == body.id)
+                        keepReading = appendBlock(toc.id.toString(), "tableOfContents", {}, [&](std::size_t) {
+                            return codex::Json{{"maxLevel", toc.max_level}};
+                        });
                 }
-                if (characters >= maximum) {
-                    truncated = true;
-                    break;
-                }
-                QString text = fromUtf16(paragraph->text());
-                const std::size_t remaining = maximum - characters;
-                if (static_cast<std::size_t>(text.size()) > remaining) {
-                    truncateUtf16Safely(
-                        text, static_cast<qsizetype>(remaining));
-                    truncated = true;
-                    keepReading = false;
-                }
-                const std::size_t textLength =
-                    static_cast<std::size_t>(text.size());
-                codex::Json attributes = includeFormatting
-                                             ? formattingFor(*paragraph, 0,
-                                                             textLength)
-                                             : codex::Json::object();
-                appendParagraphStyleMetadata(*paragraph, attributes);
-                attributes["equations"] =
-                    equationsFor(*paragraph, 0, textLength);
-                attributes["images"] = imagesFor(*paragraph, 0, textLength);
-                blocks.push_back({{"id", paragraph->id().toString()},
-                                  {"type", "paragraph"},
-                                  {"text", toUtf8(text)},
-                                  {"attributes", std::move(attributes)}});
-                characters += textLength;
-                continue;
             }
-
-            const core::Table* table =
-                snapshot.document.findTable(bodyBlock.id);
-            if (!table) continue;
-            for (std::size_t row = 0;
-                 keepReading && row < table->rowCount(); ++row) {
-                for (std::size_t column = 0;
-                     column < table->columnCount(); ++column) {
-                    const core::TableCell* cell = table->cell(row, column);
-                    if (!cell ||
-                        !requestedTableCells.contains(
-                            std::pair{table->id(), cell->id})) {
-                        continue;
+        }
+        if (keepReading && (scope == "document" || scope == "blocks" || scope == "outline")) {
+            for (const auto& note : snapshot.document.notes()) {
+                if (!keepReading) break;
+                if (scope == "blocks" && !requestedIds.contains(note.id)) continue;
+                std::size_t number = 0;
+                for (const auto& resolved : academic.notes) if (resolved.id == note.id) number = resolved.number;
+                keepReading = appendBlock(note.id.toString(), "note", note.text, [&](std::size_t) {
+                    return codex::Json{{"noteKind", note.kind == core::NoteKind::footnote ? "footnote" : "endnote"}, {"number", number}};
+                });
+            }
+        }
+        if (scope == "document" || scope == "stories" || activeStory) {
+            for (const bool footer : {false, true}) {
+                if (!keepReading) break;
+                if (activeStory && activeStory->footer != footer) continue;
+                const auto& story = footer ? snapshot.document.footerText() : snapshot.document.headerText();
+                const auto& pictures = footer ? snapshot.document.footerImages() : snapshot.document.headerImages();
+                if (story.empty() && pictures.empty() && scope != "stories" && !activeStory) continue;
+                const char* name = footer ? "footer" : "header";
+                keepReading = appendBlock(std::string("story:") + name, name, story, [&](std::size_t length) {
+                    codex::Json attributes = {{"story", name}, {"images", imagesFor(pictures, 0, length, false, &remainingFigureContextBytes)},
+                        {"regionSeparator", "\t"}, {"pageFields", codex::Json::array({"{PAGE}", "{PAGES}"})}};
+                    if (activeStory) {
+                        const char* regions[] = {"left", "center", "right"};
+                        attributes["activeRegion"] = regions[activeStory->region];
+                        attributes["regionSelectionStart"] = activeStory->start;
+                        attributes["regionSelectionEnd"] = activeStory->end;
+                        attributes["selectionOffsetUnit"] = "UTF-16 within activeRegion";
                     }
-                    if (characters >= maximum) {
-                        truncated = true;
-                        keepReading = false;
-                        break;
-                    }
-                    QString text = fromUtf16(cell->text);
-                    const std::size_t remaining = maximum - characters;
-                    if (static_cast<std::size_t>(text.size()) > remaining) {
-                        truncateUtf16Safely(
-                            text, static_cast<qsizetype>(remaining));
-                        truncated = true;
-                        keepReading = false;
-                    }
-                    const std::size_t textLength =
-                        static_cast<std::size_t>(text.size());
-                    codex::Json attributes =
-                        includeFormatting
-                            ? formattingFor(*cell, 0, textLength)
-                            : codex::Json::object();
-                    attributes["tableId"] = table->id().toString();
-                    attributes["row"] = row;
-                    attributes["column"] = column;
-                    blocks.push_back({{"id", cell->id.toString()},
-                                      {"type", "tableCell"},
-                                      {"text", toUtf8(text)},
-                                      {"attributes", std::move(attributes)}});
-                    characters += textLength;
+                    return attributes;
+                });
+            }
+        }
+        if (scope == "images") {
+            std::set<std::string> imageIds;
+            if (const auto requestedImages = arguments.find("imageIds"); requestedImages != arguments.end()) {
+                if (!requestedImages->is_array() || requestedImages->size() > 64) { error = QObject::tr("imageIds must be an array of at most 64 stable IDs."); return {}; }
+                for (const auto& encodedId : *requestedImages) {
+                    if (!encodedId.is_string() || !core::NodeId::parse(encodedId.get<std::string>())) { error = QObject::tr("Invalid imageId."); return {}; }
+                    imageIds.insert(encodedId.get<std::string>());
+                }
+            }
+            const auto appendImages = [&](const std::vector<core::ImageAtom>& pictures, const std::string& owner, const char* story) {
+                for (const auto& picture : pictures) {
                     if (!keepReading) break;
+                    if (!imageIds.empty() && !imageIds.contains(picture.id.toString())) continue;
+                    keepReading = appendBlock(picture.id.toString(), "image", {}, [&](std::size_t) {
+                        auto attributes = imagesFor({picture}, 0, picture.utf16_offset + 1, !imageIds.empty(), &remainingFigureContextBytes).front();
+                        attributes["ownerBlockId"] = owner;
+                        if (story) attributes["story"] = story;
+                        return attributes;
+                    });
                 }
-            }
+            };
+            for (const auto& paragraph : snapshot.document.paragraphs()) appendImages(paragraph.images(), paragraph.id().toString(), nullptr);
+            for (const auto& table : snapshot.document.tables()) for (const auto& cell : table.cells()) appendImages(cell.images, cell.id.toString(), nullptr);
+            appendImages(snapshot.document.headerImages(), "story:header", "header");
+            appendImages(snapshot.document.footerImages(), "story:footer", "footer");
         }
-        return {{"documentId", toUtf8(documentId)},
-                {"revision", snapshot.revision.value()},
-                {"scope", scope},
-                {"truncated", truncated},
-                {"blocks", std::move(blocks)}};
+        if (!error.isEmpty()) return {};
+        codex::Json result = {{"documentId", toUtf8(documentId)}, {"revision", snapshot.revision.value()}, {"scope", scope},
+            {"truncated", truncated}, {"blocks", std::move(blocks)}, {"pageLayout", pageLayoutFor(canvas)}};
+        if (nextOffset) result["nextBlockOffset"] = *nextOffset;
+        return result;
     }
 
-    for (std::size_t index = 0; index < snapshot.document.paragraphs().size(); ++index) {
-        const auto& paragraph = snapshot.document.paragraphs()[index];
-        if (scope == "selection" && selected &&
-            (index < selected->start_paragraph_index || index > selected->end_paragraph_index)) {
-            continue;
-        }
-        QString text = fromUtf16(paragraph.text());
-        std::size_t returnedTextStart = 0;
-        if (scope == "outline") {
-            qsizetype first = 0;
-            while (first < text.size() && text.at(first).isSpace()) ++first;
-            qsizetype last = text.size();
-            while (last > first && text.at(last - 1).isSpace()) --last;
-            returnedTextStart = static_cast<std::size_t>(first);
-            text = text.mid(first, last - first);
-            truncateUtf16Safely(text, 240);
-        }
-        if (characters >= maximum) {
-            truncated = true;
-            break;
-        }
-        const std::size_t remaining = maximum - characters;
-        if (static_cast<std::size_t>(text.size()) > remaining) {
-            truncateUtf16Safely(text, static_cast<qsizetype>(remaining));
-            truncated = true;
-        }
-        codex::Json block = {{"id", paragraph.id().toString()},
-                             {"type", "paragraph"},
-                             {"text", toUtf8(text)}};
-        const std::size_t returnedTextLength = static_cast<std::size_t>(text.size());
-        if (includeFormatting) {
-            block["attributes"] = formattingFor(
-                paragraph, returnedTextStart, returnedTextLength);
-        }
-        else block["attributes"] = codex::Json::object();
-        appendParagraphStyleMetadata(paragraph, block["attributes"]);
-        block["attributes"]["equations"] = equationsFor(
-            paragraph, returnedTextStart, returnedTextLength);
-        block["attributes"]["images"] = imagesFor(
-            paragraph, returnedTextStart, returnedTextLength);
-        if (scope == "selection" && selected) {
-            const std::size_t start = index == selected->start_paragraph_index
-                                          ? selected->start.utf16_offset : 0;
-            const std::size_t end = index == selected->end_paragraph_index
-                                        ? selected->end.utf16_offset
-                                        : paragraph.text().size();
-            block["attributes"]["selectionStart"] =
-                std::min(start, returnedTextLength);
-            block["attributes"]["selectionEnd"] =
-                std::min(end, returnedTextLength);
-        }
-        blocks.push_back(std::move(block));
-        characters += static_cast<std::size_t>(text.size());
-        if (truncated) break;
-    }
-    return {{"documentId", toUtf8(documentId)},
-            {"revision", snapshot.revision.value()},
-            {"scope", scope},
-            {"truncated", truncated},
-            {"blocks", std::move(blocks)}};
 }
 
 codex::Json searchDocument(DocumentCanvas& canvas,
@@ -1090,44 +1221,7 @@ bool appendTextStyle(const codex::Json& operation, const Target& target,
         return false;
     }
     core::CharacterFormatDelta delta;
-    if (const auto value = style->find("fontFamily"); value != style->end() && value->is_string())
-        delta.font_family = core::PropertyDelta<std::string>::set(value->get<std::string>());
-    if (const auto value = style->find("fontSizePoints"); value != style->end() && value->is_number()) {
-        const double points = value->get<double>();
-        if (!(points > 0.0 && points <= 1000.0)) {
-            error = QObject::tr("fontSizePoints is outside the supported range.");
-            return false;
-        }
-        delta.font_size_half_points = core::PropertyDelta<std::int32_t>::set(
-            static_cast<std::int32_t>(std::llround(points * 2.0)));
-    }
-    if (const auto value = style->find("bold"); value != style->end() && value->is_boolean())
-        delta.bold = core::PropertyDelta<bool>::set(value->get<bool>());
-    if (const auto value = style->find("italic"); value != style->end() && value->is_boolean())
-        delta.italic = core::PropertyDelta<bool>::set(value->get<bool>());
-    if (const auto value = style->find("underline"); value != style->end() && value->is_boolean())
-        delta.underline = core::PropertyDelta<core::UnderlineStyle>::set(
-            value->get<bool>() ? core::UnderlineStyle::single : core::UnderlineStyle::none);
-    if (const auto value = style->find("strike"); value != style->end() && value->is_boolean())
-        delta.strike = core::PropertyDelta<bool>::set(value->get<bool>());
-    if (style->contains("foregroundColor")) {
-        const auto color = parseRgb(*style, "foregroundColor", error);
-        if (!color) return false;
-        delta.foreground_argb = core::PropertyDelta<std::uint32_t>::set(*color);
-    }
-    if (style->contains("highlightColor")) {
-        const auto color = parseRgb(*style, "highlightColor", error);
-        if (!color) return false;
-        delta.highlight_argb = core::PropertyDelta<std::uint32_t>::set(*color);
-    }
-    if (const auto value = style->find("verticalAlign");
-        value != style->end() && value->is_string()) {
-        const auto name = value->get<std::string>();
-        const auto baseline = name == "superscript" ? core::BaselinePosition::superscript
-                              : name == "subscript" ? core::BaselinePosition::subscript
-                                                     : core::BaselinePosition::normal;
-        delta.baseline = core::PropertyDelta<core::BaselinePosition>::set(baseline);
-    }
+    if (!parseEditorCharacterFormat(*style, delta, error)) return false;
     if (delta.empty()) {
         error = QObject::tr("set_text_style contains no supported style property.");
         return false;
@@ -1154,98 +1248,10 @@ bool appendParagraphStyle(const codex::Json& operation, const Target& target,
         return false;
     }
 
-    for (auto property = style->begin(); property != style->end(); ++property) {
-        const std::string& name = property.key();
-        if (name != "styleId" && name != "alignment" &&
-            name != "lineSpacing" && name != "spaceBeforePoints" &&
-            name != "spaceAfterPoints" && name != "keepWithNext") {
-            error = QObject::tr(
-                        "set_paragraph_style contains an unsupported property: %1")
-                        .arg(QString::fromStdString(name));
-            return false;
-        }
-    }
-
-    // Explicit tool properties are appended after the native style plan.
-    // They therefore override its inherited baseline and are recorded as
-    // direct properties by the attached target provenance.
+    // Body and cell formatting share one validated paragraph-format parser;
+    // the native style plan below retains body style identity/provenance.
     core::ParagraphFormatDelta delta;
-    if (const auto value = style->find("alignment"); value != style->end()) {
-        if (!value->is_string()) {
-            error = QObject::tr("alignment must be a string.");
-            return false;
-        }
-        const auto name = value->get<std::string>();
-        const auto alignment = name == "left"
-            ? std::optional{core::ParagraphAlignment::left}
-            : name == "center"
-            ? std::optional{core::ParagraphAlignment::center}
-            : name == "right"
-            ? std::optional{core::ParagraphAlignment::right}
-            : name == "justify"
-            ? std::optional{core::ParagraphAlignment::justified}
-            : std::nullopt;
-        if (!alignment) {
-            error = QObject::tr(
-                "alignment must be left, center, right, or justify.");
-            return false;
-        }
-        delta.alignment =
-            core::PropertyDelta<core::ParagraphAlignment>::set(*alignment);
-    }
-    if (const auto value = style->find("lineSpacing"); value != style->end()) {
-        if (!value->is_number()) {
-            error = QObject::tr("lineSpacing must be a number.");
-            return false;
-        }
-        const double multiple = value->get<double>();
-        if (!std::isfinite(multiple) || multiple <= 0.0 || multiple > 20.0) {
-            error = QObject::tr("lineSpacing is outside the supported range.");
-            return false;
-        }
-        delta.line_spacing_emu = core::PropertyDelta<std::int64_t>::set(
-            static_cast<std::int64_t>(std::llround(multiple * 12.0 * 12700.0)));
-        delta.line_spacing_rule = core::PropertyDelta<core::LineSpacingRule>::set(
-            core::LineSpacingRule::automatic);
-    }
-    if (const auto value = style->find("spaceBeforePoints");
-        value != style->end()) {
-        if (!value->is_number()) {
-            error = QObject::tr("spaceBeforePoints must be a number.");
-            return false;
-        }
-        const double points = value->get<double>();
-        if (!std::isfinite(points) || points < 0.0 || points > 10000.0) {
-            error = QObject::tr(
-                "spaceBeforePoints is outside the supported range.");
-            return false;
-        }
-        delta.space_before_emu = core::PropertyDelta<std::int64_t>::set(
-            static_cast<std::int64_t>(std::llround(points * 12700.0)));
-    }
-    if (const auto value = style->find("spaceAfterPoints");
-        value != style->end()) {
-        if (!value->is_number()) {
-            error = QObject::tr("spaceAfterPoints must be a number.");
-            return false;
-        }
-        const double points = value->get<double>();
-        if (!std::isfinite(points) || points < 0.0 || points > 10000.0) {
-            error = QObject::tr(
-                "spaceAfterPoints is outside the supported range.");
-            return false;
-        }
-        delta.space_after_emu = core::PropertyDelta<std::int64_t>::set(
-            static_cast<std::int64_t>(std::llround(points * 12700.0)));
-    }
-    if (const auto value = style->find("keepWithNext");
-        value != style->end()) {
-        if (!value->is_boolean()) {
-            error = QObject::tr("keepWithNext must be a boolean.");
-            return false;
-        }
-        delta.keep_with_next = core::PropertyDelta<bool>::set(value->get<bool>());
-    }
+    if (!parseEditorParagraphFormat(*style, delta, error)) return false;
 
     bool changesIdentity = false;
     std::optional<std::string> styleId;
@@ -1318,64 +1324,7 @@ bool appendWorkingOperation(core::Document& working,
                             std::vector<core::Operation>& operations,
                             core::Operation operation,
                             QString& error) {
-    const auto applied = std::visit(
-        [&working](const auto& typed) -> core::Result<void> {
-            using Type = std::decay_t<decltype(typed)>;
-            if constexpr (std::is_same_v<Type, core::InsertText>) {
-                return working.insertText(typed.position, typed.text, typed.format);
-            } else if constexpr (std::is_same_v<Type, core::InsertEquation>) {
-                return working.insertEquation(
-                    typed.position, typed.canonical_latex, typed.display,
-                    typed.equation_id, typed.format);
-            } else if constexpr (std::is_same_v<Type, core::InsertImage>) {
-                return working.insertImage(
-                    typed.position, typed.encoded_payload, typed.image_format,
-                    typed.accessible_name, typed.width_emu, typed.height_emu,
-                    typed.image_id, typed.character_format, typed.layout);
-            } else if constexpr (
-                std::is_same_v<Type, core::ReplaceImagePayload>) {
-                return working.replaceImagePayload(
-                    typed.image_id, typed.encoded_payload,
-                    typed.image_format, typed.width_emu, typed.height_emu);
-            } else if constexpr (
-                std::is_same_v<Type, core::SetImageAccessibleName>) {
-                return working.setImageAccessibleName(
-                    typed.image_id, typed.accessible_name);
-            } else if constexpr (std::is_same_v<Type, core::DeleteRange>) {
-                return working.deleteRange(
-                    typed.range, typed.empty_paragraph_format);
-            } else if constexpr (std::is_same_v<Type, core::ReplaceRange>) {
-                return working.replaceRange(typed.range, typed.text, typed.format);
-            } else if constexpr (std::is_same_v<Type, core::SetCharacterFormat>) {
-                return working.applyCharacterFormat(typed.range, typed.delta);
-            } else if constexpr (
-                std::is_same_v<Type,
-                               core::SetParagraphMarkCharacterFormat>) {
-                return working.applyParagraphMarkCharacterFormat(
-                    typed.paragraph_id, typed.delta);
-            } else if constexpr (std::is_same_v<Type, core::SetParagraphFormat>) {
-                return working.applyParagraphFormat(typed.paragraph_ids, typed.delta);
-            } else if constexpr (std::is_same_v<Type,
-                                                core::SetParagraphStyle>) {
-                return working.setParagraphStyle(
-                    typed.paragraph_ids, typed.style_id);
-            } else if constexpr (
-                std::is_same_v<Type,
-                               core::SetParagraphStyleProvenance>) {
-                return working.setParagraphStyleProvenance(
-                    typed.paragraph_id, typed.provenance);
-            } else if constexpr (std::is_same_v<Type, core::SplitParagraph>) {
-                return working.splitParagraph(typed.position, typed.new_paragraph_id);
-            } else if constexpr (std::is_same_v<Type,
-                                                core::MergeWithNextParagraph>) {
-                return working.mergeWithNext(typed.paragraph_id);
-            } else {
-                return core::Error{
-                    core::ErrorCode::invalid_operation,
-                    "This semantic operation is not exposed by the current Codex tool schema"};
-            }
-        },
-        operation);
+    const auto applied = core::applyDocumentOperation(working, operation);
     if (!applied) {
         error = QObject::tr("Editor operation %1 is invalid: %2")
                     .arg(operations.size() + 1)
@@ -1401,7 +1350,7 @@ std::optional<ExcalidrawFigureEditor::Result> renderFigure(
     const codex::Json& source, const QString& defaultAccessibleName,
     QString& accessibleName,
     std::optional<double>& widthPoints, std::optional<double>& heightPoints,
-    QString& error) {
+    QString& error, const ExcalidrawRenderer& figureRenderer) {
     codex::Json figure = codex::Json::object();
     if (const auto nested = source.find("figure");
         nested != source.end() && nested->is_object()) {
@@ -1482,7 +1431,8 @@ std::optional<ExcalidrawFigureEditor::Result> renderFigure(
         error = QObject::tr("The Excalidraw element request is invalid.");
         return std::nullopt;
     }
-    return renderProfessionalExcalidrawSkeleton(document.array(), error);
+    return figureRenderer ? figureRenderer(document.array(), error)
+                          : renderProfessionalExcalidrawSkeleton(document.array(), error);
 }
 
 core::EncodedImagePayload imagePayload(const QByteArray& bytes) {
@@ -1517,11 +1467,56 @@ bool appendCurrentBuiltInStyleProvenance(
     return true;
 }
 
+bool academicToolText(const codex::Json& source, const char* key, QString& text,
+                      QString& error, std::size_t limit, bool required = true) {
+    const auto value = source.find(key);
+    if (value == source.end()) {
+        if (!required) { text.clear(); return true; }
+        error = QObject::tr("The academic operation requires %1.").arg(QString::fromLatin1(key)); return false;
+    }
+    if (!value->is_string()) { error = QObject::tr("%1 must be text.").arg(QString::fromLatin1(key)); return false; }
+    const auto bytes = value->get<std::string>();
+    if (bytes.size() > limit * 4U) { error = QObject::tr("Academic text exceeds the size limit."); return false; }
+    text = QString::fromUtf8(bytes.data(), static_cast<qsizetype>(bytes.size()));
+    if (text.toUtf8().toStdString() != bytes || static_cast<std::size_t>(text.size()) > limit || text.contains(QChar(core::kInlineObjectReplacementCharacter))) {
+        error = QObject::tr("Academic text is invalid or exceeds the size limit."); return false;
+    }
+    return true;
+}
+std::optional<core::NodeId> academicToolId(const codex::Json& source, const char* key, QString& error) {
+    const auto value = source.find(key);
+    const auto id = value != source.end() && value->is_string() ? core::NodeId::parse(value->get<std::string>()) : std::nullopt;
+    if (!id) error = QObject::tr("%1 must be a valid stable identifier.").arg(QString::fromLatin1(key));
+    return id;
+}
+bool appendAcademicParagraph(core::Document& working, const DocumentCanvas& canvas,
+                             const Target& target, bool bibliography, core::CaptionLabel label,
+                             core::NodeId objectId, const QString& text,
+                             std::vector<core::Operation>& operations, QString& error) {
+    const auto paragraph = core::NodeId::generate();
+    const auto following = core::NodeId::generate();
+    if (!appendWorkingOperation(working, operations, core::SplitParagraph{{target.block, target.start}, paragraph}, error) ||
+        !appendWorkingOperation(working, operations, core::SplitParagraph{{paragraph, 0}, following}, error)) return false;
+    if (const auto* normal = core::findBuiltInParagraphStyle("Normal")) {
+        auto planned = canvas.planParagraphStyleOperations(working, {paragraph}, *normal, true);
+        for (auto& operation : planned) if (!appendWorkingOperation(working, operations, std::move(operation), error)) return false;
+    }
+    if (bibliography) {
+        if (!appendWorkingOperation(working, operations, core::SetBibliographyEntry{paragraph, true}, error)) return false;
+    } else if (!appendWorkingOperation(working, operations, core::SetCaption{paragraph, core::CaptionMetadata{label, objectId}}, error)) return false;
+    if (!appendWorkingOperation(working, operations, core::InsertField{{paragraph, 0},
+        {core::NodeId::generate(), 0, bibliography ? core::FieldKind::bibliography_number : core::FieldKind::caption_number, paragraph}, std::nullopt}, error)) return false;
+    return appendWorkingOperation(working, operations, core::InsertText{{paragraph, 1},
+        (bibliography ? QStringLiteral(". ") : QStringLiteral(": ")) .append(normalizeInlineText(text)).toStdU16String(), std::nullopt}, error);
+}
+
 codex::Json createPreview(DocumentCanvas& canvas,
                           const QString& documentId,
                           const codex::Json& arguments,
                           QString& previewSummary,
-                          QString& error) {
+                          QString& error, const ExcalidrawRenderer& figureRenderer,
+                          const std::function<bool()>& stillCurrent,
+                          const ExcalidrawSceneRenderer& nativeFigureRenderer) {
     if (!arguments.is_object() || !validateDocumentId(documentId, arguments, error)) {
         return {};
     }
@@ -1545,8 +1540,13 @@ codex::Json createPreview(DocumentCanvas& canvas,
     auto working = baseSnapshot.document;
     operations.reserve(sourceOperations->size());
     std::set<std::string> affected;
+    std::set<core::NodeId> touchedFigureIds;
     std::vector<std::string> warnings;
     std::size_t figureOperationCount = 0;
+    std::size_t rasterInputBytes = 0;
+    bool refreshNumbering = false;
+    std::optional<PageLayoutSettings> proposedLayout;
+    std::optional<std::uint64_t> expectedLayoutState;
     for (const auto& rawSource : *sourceOperations) {
         if (!rawSource.is_object()) {
             error = QObject::tr("Every preview operation must be an object.");
@@ -1555,6 +1555,94 @@ codex::Json createPreview(DocumentCanvas& canvas,
         codex::Json source = rawSource;
         const std::string kind = operationKind(source);
         source["kind"] = kind;
+        if (kind == "set_page_layout") {
+            const auto state = unsignedValue(source, "expectedLayoutStateId");
+            const auto layout = source.find("layout");
+            if (proposedLayout || !state || layout == source.end() || !layout->is_object() || layout->size() != 6) {
+                error = QObject::tr("A single page-layout proposal requires its complete geometry and read stateId.");
+                return {};
+            }
+            PageLayoutSettings candidate;
+            const std::array<std::pair<const char*, double*>, 6> fields{{
+                {"widthPoints", &candidate.widthPoints}, {"heightPoints", &candidate.heightPoints},
+                {"marginTopPoints", &candidate.marginTopPoints}, {"marginRightPoints", &candidate.marginRightPoints},
+                {"marginBottomPoints", &candidate.marginBottomPoints}, {"marginLeftPoints", &candidate.marginLeftPoints}}};
+            for (const auto& [key, value] : fields) {
+                const auto found = layout->find(key);
+                if (found == layout->end() || !found->is_number() || !std::isfinite(found->get<double>())) {
+                    error = QObject::tr("Page geometry must contain six finite point measurements.");
+                    return {};
+                }
+                *value = found->get<double>();
+            }
+            if (*state != pageLayoutFor(canvas).at("stateId").get<std::uint64_t>()) {
+                error = QObject::tr("LAYOUT_CONFLICT: Page settings changed. Read metadata and retry.");
+                return {};
+            }
+            expectedLayoutState = *state;
+            proposedLayout = candidate;
+            continue;
+        }
+        if (kind == "set_list" || kind == "set_list_level" || kind == "set_list_layout") {
+            const auto ids = source.find("blockIds");
+            ListEditRequest request;
+            if (ids == source.end() || !ids->is_array() || ids->empty() || ids->size() > 2048) {
+                error = QObject::tr("List edits require a bounded array of body paragraph identities.");
+                return {};
+            }
+            for (const auto& id : *ids) {
+                const auto parsed = id.is_string() ? core::NodeId::parse(id.get<std::string>()) : std::nullopt;
+                if (!parsed) { error = QObject::tr("A list paragraph identity is invalid."); return {}; }
+                request.blockIds.push_back(*parsed);
+                affected.insert(parsed->toString());
+            }
+            if (kind == "set_list") {
+                const auto value = source.find("listKind");
+                if (value == source.end() || !value->is_string()) { error = QObject::tr("A list kind is required."); return {}; }
+                request.listKind = QString::fromStdString(value->get<std::string>());
+            } else if (kind == "set_list_level") {
+                request.kind = ListEditRequest::Kind::set_level;
+                const auto value = unsignedValue(source, "level");
+                if (!value || *value < 1 || *value > 10) { error = QObject::tr("List levels run from 1 through 10."); return {}; }
+                request.level = static_cast<int>(*value);
+            } else {
+                request.kind = ListEditRequest::Kind::set_layout;
+                const auto levels = source.find("levels");
+                if (levels == source.end() || !levels->is_array() || levels->size() != core::kListLevelCount) {
+                    error = QObject::tr("List layout requires all ten level settings."); return {};
+                }
+                for (std::size_t index = 0; index < core::kListLevelCount; ++index) {
+                    const auto& level = levels->at(index);
+                    const auto bullet = unsignedValue(level, "bulletIndentSpaces"), text = unsignedValue(level, "textIndentSpaces");
+                    if (!bullet || *bullet > 400 || !text || *text > 64) { error = QObject::tr("List indentation is outside supported bounds."); return {}; }
+                    request.layout.levels[index].bullet_indent_spaces = static_cast<std::int32_t>(*bullet);
+                    request.layout.levels[index].text_indent_spaces = static_cast<std::int32_t>(*text);
+                }
+            }
+            std::vector<core::Operation> planned;
+            if (!canvas.planListOperations(working, request, planned, error)) return {};
+            for (auto& operation : planned) if (!appendWorkingOperation(working, operations, std::move(operation), error)) return {};
+            continue;
+        }
+        if (handlesSemanticOperation(kind)) {
+            refreshNumbering = refreshNumbering || kind == "move_block" || kind == "split_paragraph" || kind == "merge_paragraph" ||
+                kind == "insert_table" || kind == "delete_table";
+            const auto previousOperations = operations.size();
+            if (!appendSemanticOperation(working, source, operations, affected, error)) return {};
+            if (kind == "insert_raster_image") {
+                for (std::size_t index = previousOperations; index < operations.size(); ++index)
+                    std::visit([&](const auto& inserted) {
+                        using Inserted = std::decay_t<decltype(inserted)>;
+                        if constexpr (std::is_same_v<Inserted, core::InsertImage> || std::is_same_v<Inserted, core::InsertTableCellImage> ||
+                                      std::is_same_v<Inserted, core::InsertHeaderFooterImage>) rasterInputBytes += inserted.encoded_payload.size();
+                    }, operations[index]);
+                if (rasterInputBytes > 4U * 1024U * 1024U) {
+                    error = QObject::tr("Codex raster input is limited to 4 MiB per preview.");
+                    return {};
+                }
+            }
+            continue;
+        }
         if (kind == "insert_excalidraw_figure") {
             codex::Json target = codex::Json::object();
             if (const auto supplied = source.find("target");
@@ -1572,7 +1660,7 @@ codex::Json createPreview(DocumentCanvas& canvas,
                 }
             }
             const auto cursor = canvas.selection().focus;
-            if (!target.contains("blockId"))
+            if (!target.contains("story") && !target.contains("blockId"))
                 target["blockId"] = cursor.paragraph_id.toString();
             if (!target.contains("start")) {
                 const auto targetId = target.find("blockId");
@@ -1588,7 +1676,9 @@ codex::Json createPreview(DocumentCanvas& canvas,
         const bool needsEnd = kind == "replace_text" || kind == "delete_range" ||
                               kind == "set_text_style";
         Target target;
-        const bool needsTarget = kind != "replace_excalidraw_figure";
+        const bool storyFigure = kind == "insert_excalidraw_figure" && source.at("target").contains("story");
+        const bool needsTarget = !storyFigure && kind != "patch_excalidraw_figure" && kind != "replace_excalidraw_figure" && kind != "replace_equation" &&
+            kind != "set_note_text" && kind != "configure_toc" && kind != "delete_toc";
         if (needsTarget) {
             if (!parseTarget(source, target, error, needsEnd)) return {};
             affected.insert(target.block.toString());
@@ -1681,6 +1771,108 @@ codex::Json createPreview(DocumentCanvas& canvas,
                 return {};
             }
             affected.insert(newId.toString());
+        } else if (kind == "insert_note") {
+            QString text;
+            QString noteKind;
+            if (!academicToolText(source, "text", text, error, core::kMaximumNoteCodeUnits) ||
+                !academicToolText(source, "noteKind", noteKind, error, 16, false)) return {};
+            if (noteKind.isEmpty()) noteKind = QStringLiteral("footnote");
+            if (noteKind != QStringLiteral("footnote") && noteKind != QStringLiteral("endnote")) {
+                error = QObject::tr("Note kind must be footnote or endnote."); return {};
+            }
+            const auto note = core::NodeId::generate();
+            if (!appendWorkingOperation(working, operations,
+                core::SetNote{{note, noteKind == QStringLiteral("footnote") ? core::NoteKind::footnote : core::NoteKind::endnote, text.toStdU16String()}}, error) ||
+                !appendWorkingOperation(working, operations,
+                core::InsertField{{target.block, target.start}, {core::NodeId::generate(), 0, core::FieldKind::note_reference, note}, std::nullopt}, error)) return {};
+        } else if (kind == "set_note_text") {
+            const auto id = academicToolId(source, "noteId", error);
+            QString text;
+            if (!id || !academicToolText(source, "text", text, error, core::kMaximumNoteCodeUnits)) return {};
+            const auto* note = working.findNote(*id);
+            if (!note) { error = QObject::tr("The note does not exist."); return {}; }
+            if (!appendWorkingOperation(working, operations, core::SetNote{{*id, note->kind, text.toStdU16String()}}, error)) return {};
+            affected.insert(id->toString());
+        } else if (kind == "replace_equation") {
+            const auto id = academicToolId(source, "equationId", error);
+            QString latex;
+            if (!id || !academicToolText(source, "latex", latex, error, 8192)) return {};
+            const auto* equation = working.findEquation(*id);
+            if (!equation) { error = QObject::tr("The equation does not exist."); return {}; }
+            bool display = equation->display;
+            if (const auto value = source.find("display"); value != source.end()) {
+                if (!value->is_boolean()) { error = QObject::tr("display must be a boolean."); return {}; }
+                display = value->get<bool>();
+            }
+            math::ParseLimits limits;
+            limits.max_input_bytes = 8192; limits.max_depth = 32; limits.max_nodes = 2048;
+            limits.max_matrix_rows = 32; limits.max_matrix_columns = 32;
+            const auto parsed = math::parseLatex(latex.toUtf8().toStdString(), limits);
+            if (!parsed) { error = QString::fromStdString(parsed.error().message); return {}; }
+            for (const auto& paragraph : working.paragraphs()) if (paragraph.equationAt(equation->utf16_offset) &&
+                paragraph.equationAt(equation->utf16_offset)->id == *id) affected.insert(paragraph.id().toString());
+            if (!appendWorkingOperation(working, operations, core::ReplaceEquation{*id, math::toCanonicalLatex(parsed.value()), display}, error)) return {};
+        } else if (kind == "insert_cross_reference" || kind == "insert_citation") {
+            const bool citation = kind == "insert_citation";
+            const auto id = academicToolId(source, citation ? "entryId" : "targetId", error);
+            if (!id) return {};
+            const auto* paragraph = working.findParagraph(*id);
+            const auto* style = paragraph && paragraph->styleId() ? core::findBuiltInParagraphStyle(*paragraph->styleId()) : nullptr;
+            if (!paragraph || (citation ? !paragraph->isBibliographyEntry() : (!paragraph->caption() && !(style && style->outline_level)))) {
+                error = QObject::tr("The reference target is not a supported heading, caption, or bibliography entry."); return {};
+            }
+            QString locator, format;
+            if (!academicToolText(source, "locator", locator, error, 512, false) ||
+                !academicToolText(source, "format", format, error, 32, false)) return {};
+            if (!format.isEmpty() && format != QStringLiteral("label_number") && format != QStringLiteral("full_text")) {
+                error = QObject::tr("Cross-reference format is unsupported."); return {};
+            }
+            core::FieldAtom field{core::NodeId::generate(), 0, citation ? core::FieldKind::citation : core::FieldKind::cross_reference,
+                *id, locator.toStdU16String(), format == QStringLiteral("full_text") ? core::CrossReferenceFormat::full_text : core::CrossReferenceFormat::label_number};
+            if (!appendWorkingOperation(working, operations, core::InsertField{{target.block, target.start}, std::move(field), std::nullopt}, error)) return {};
+        } else if (kind == "insert_caption" || kind == "insert_bibliography_entry") {
+            QString text, label;
+            const bool bibliography = kind == "insert_bibliography_entry";
+            if (!academicToolText(source, "text", text, error, 32768) ||
+                !academicToolText(source, "label", label, error, 16, false)) return {};
+            core::CaptionLabel captionLabel = core::CaptionLabel::figure;
+            if (!label.isEmpty() && label != QStringLiteral("Figure") && label != QStringLiteral("Table") && label != QStringLiteral("Equation")) {
+                error = QObject::tr("Caption label is unsupported."); return {};
+            }
+            if (label == QStringLiteral("Table")) captionLabel = core::CaptionLabel::table;
+            else if (label == QStringLiteral("Equation")) captionLabel = core::CaptionLabel::equation;
+            auto objectId = target.block;
+            if (source.contains("objectId")) {
+                const auto parsed = academicToolId(source, "objectId", error);
+                if (!parsed) return {};
+                if (!working.findParagraph(*parsed) && !working.findTable(*parsed) && !working.findImage(*parsed) && !working.findEquation(*parsed)) {
+                    error = QObject::tr("Caption object does not exist."); return {};
+                }
+                objectId = *parsed;
+            }
+            if (!appendAcademicParagraph(working, canvas, target, bibliography, captionLabel, objectId, text, operations, error)) return {};
+        } else if (kind == "insert_toc" || kind == "configure_toc" || kind == "delete_toc") {
+            std::optional<core::NodeId> id;
+            if (kind != "insert_toc") { id = academicToolId(source, "tocId", error); if (!id) return {}; }
+            if (kind == "delete_toc") {
+                if (!appendWorkingOperation(working, operations, core::DeleteToc{*id}, error)) return {};
+            } else {
+                const auto requested = unsignedValue(source, "maxLevel");
+                if ((source.contains("maxLevel") && !requested) || (requested && (*requested < 1 || *requested > 9))) {
+                    error = QObject::tr("TOC maxLevel must be 1–9."); return {};
+                }
+                const auto level = static_cast<std::uint8_t>(requested.value_or(3));
+                if (kind == "configure_toc") {
+                    if (!appendWorkingOperation(working, operations, core::ConfigureToc{*id, level}, error)) return {};
+                } else {
+                    auto before = target.block;
+                    if (target.start != 0) {
+                        before = core::NodeId::generate();
+                        if (!appendWorkingOperation(working, operations, core::SplitParagraph{{target.block, target.start}, before}, error)) return {};
+                    }
+                    if (!appendWorkingOperation(working, operations, core::InsertToc{before, {core::NodeId::generate(), level}}, error)) return {};
+                }
+            }
         } else if (kind == "insert_equation") {
             const auto latex = source.find("latex");
             if (latex == source.end() || !latex->is_string()) {
@@ -1719,6 +1911,41 @@ codex::Json createPreview(DocumentCanvas& canvas,
                     error)) {
                 return {};
             }
+        } else if (kind == "patch_excalidraw_figure") {
+            if (++figureOperationCount > 8) { error = QObject::tr("A preview may create or revise at most eight Excalidraw figures."); return {}; }
+            const auto encodedId = source.find("imageId");
+            const auto imageId = encodedId != source.end() && encodedId->is_string() ? core::NodeId::parse(encodedId->get<std::string>()) : std::nullopt;
+            const auto* current = imageId ? working.findImage(*imageId) : nullptr;
+            if (!current) { error = QObject::tr("The editable Excalidraw image no longer exists."); return {}; }
+            const auto originalBytes = current->encoded_payload.bytes();
+            const QByteArray originalPng(reinterpret_cast<const char*>(originalBytes.data()), static_cast<qsizetype>(originalBytes.size()));
+            const auto scene = current->format == core::ImageFormat::png ? excalidrawSceneFromPng(originalPng) : std::nullopt;
+            if (!scene) { error = QObject::tr("A native patch requires an editable Excalidraw figure."); return {}; }
+            const auto edits = source.find("edits");
+            if (edits == source.end() || !edits->is_array()) { error = QObject::tr("A native figure patch requires an edits array."); return {}; }
+            const auto editBytes = QByteArray::fromStdString(edits->dump());
+            const auto patch = prepareExcalidrawScenePatch(*scene, QJsonDocument::fromJson(editBytes).array(), error);
+            if (!patch) return {};
+            const QPointer<DocumentCanvas> guardedCanvas(&canvas);
+            const auto rendered = nativeFigureRenderer ? nativeFigureRenderer(patch->scene, patch->renderElementIds, error)
+                : renderProfessionalExcalidrawScene(patch->scene, patch->renderElementIds, error);
+            if (!guardedCanvas) { error = QObject::tr("The document closed while its figure was rendering."); return {}; }
+            if (stillCurrent && !stillCurrent()) { error = QObject::tr("The Codex session changed; its figure preview was canceled."); return {}; }
+            if (!rendered) { if (error.isEmpty()) error = QObject::tr("The local Excalidraw renderer did not return a figure."); return {}; }
+            const auto authoritativeScene = finishExcalidrawScenePatch(*patch, rendered->scene, error);
+            if (authoritativeScene.isEmpty()) return {};
+            const auto authoritativePng = pngWithExcalidrawScene(rendered->png, authoritativeScene, error);
+            const auto image = QImage::fromData(authoritativePng, "PNG");
+            const auto display = fitExcalidrawFigureDisplaySize(image.size(), static_cast<double>(current->width_emu) / 12700.0, std::nullopt);
+            if (authoritativePng.isEmpty() || !display) { if (error.isEmpty()) error = QObject::tr("The native renderer returned an invalid figure preview."); return {}; }
+            if (const auto owner = paragraphContainingImage(working, *imageId)) affected.insert(owner->toString());
+            for (const auto& table : working.tables()) for (const auto& cell : table.cells())
+                for (const auto& picture : cell.images) if (picture.id == *imageId) affected.insert(cell.id.toString());
+            for (const auto& picture : working.headerImages()) if (picture.id == *imageId) affected.insert("story:header");
+            for (const auto& picture : working.footerImages()) if (picture.id == *imageId) affected.insert("story:footer");
+            if (!appendWorkingOperation(working, operations, core::ReplaceImagePayload{*imageId, imagePayload(authoritativePng),
+                core::ImageFormat::png, pointsToEmu(display->width()), pointsToEmu(display->height())}, error)) return {};
+            touchedFigureIds.insert(*imageId);
         } else if (kind == "insert_excalidraw_figure" ||
                    kind == "replace_excalidraw_figure") {
             if (++figureOperationCount > 8) {
@@ -1726,12 +1953,134 @@ codex::Json createPreview(DocumentCanvas& canvas,
                     "A preview may create or revise at most eight Excalidraw figures.");
                 return {};
             }
+            std::optional<core::NodeId> imageId;
+            const core::ImageAtom* current = nullptr;
+            std::optional<bool> footerStory;
+            std::optional<core::NodeId> targetTable;
+            std::size_t targetRow = 0;
+            std::size_t targetColumn = 0;
+            if (kind == "insert_excalidraw_figure") {
+                if (const auto suppliedId = source.find("imageId"); suppliedId != source.end()) {
+                    imageId = suppliedId->is_string() ? core::NodeId::parse(suppliedId->get<std::string>()) : std::nullopt;
+                    if (!imageId) { error = QObject::tr("An inserted figure requires a valid imageId."); return {}; }
+                } else imageId = core::NodeId::generate();
+                if (storyFigure) {
+                    const auto& storyTarget = source.at("target");
+                    const auto story = storyTarget.find("story");
+                    const auto start = unsignedValue(storyTarget, "start");
+                    if (story == storyTarget.end() || !story->is_string() ||
+                        (*story != "header" && *story != "footer") || !start) {
+                        error = QObject::tr("A figure story target requires header or footer and a valid UTF-16 start."); return {};
+                    }
+                    footerStory = *story == "footer";
+                    target.start = *start;
+                    affected.insert(*footerStory ? "story:footer" : "story:header");
+                } else {
+                    for (const auto& table : working.tables()) {
+                        for (std::size_t row = 0; row < table.rowCount(); ++row) {
+                            for (std::size_t column = 0; column < table.columnCount(); ++column) {
+                                if (table.cell(row, column)->id == target.block) {
+                                    targetTable = table.id(); targetRow = row; targetColumn = column;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            const auto insertion = [&](const QByteArray& png, const QString& name,
+                                       const std::int64_t width, const std::int64_t height) -> core::Operation {
+                if (footerStory) return core::InsertHeaderFooterImage{*footerStory, target.start,
+                    imagePayload(png), core::ImageFormat::png, toUtf8(name), width, height, *imageId};
+                if (targetTable) return core::InsertTableCellImage{*targetTable, targetRow, targetColumn, target.start,
+                    imagePayload(png), core::ImageFormat::png, toUtf8(name), width, height, *imageId};
+                return core::InsertImage{{target.block, target.start}, imagePayload(png), core::ImageFormat::png,
+                    toUtf8(name), width, height, *imageId};
+            };
+            if (kind == "insert_excalidraw_figure") {
+                // Exercise the same core insertion before starting a nested renderer:
+                // this checks stable identities, story/cell UTF-16 anchors and quotas.
+                QImage probeImage(1, 1, QImage::Format_ARGB32);
+                probeImage.fill(Qt::transparent);
+                QByteArray probePng;
+                QBuffer buffer(&probePng);
+                buffer.open(QIODevice::WriteOnly);
+                if (!probeImage.save(&buffer, "PNG")) { error = QObject::tr("Could not validate the figure destination."); return {}; }
+                auto probeDocument = working;
+                const auto valid = core::applyDocumentOperation(probeDocument, insertion(probePng, QStringLiteral("Figure"), 12700, 12700));
+                if (!valid) { error = QObject::tr("Invalid figure destination: %1").arg(QString::fromStdString(valid.error().message)); return {}; }
+            }
+            if (kind == "replace_excalidraw_figure") {
+                const auto encodedId = source.find("imageId");
+                if (encodedId == source.end() || !encodedId->is_string()) {
+                    error = QObject::tr("replace_excalidraw_figure requires an imageId.");
+                    return {};
+                }
+                imageId = core::NodeId::parse(encodedId->get<std::string>());
+                current = imageId ? working.findImage(*imageId) : nullptr;
+                if (!imageId || !current) {
+                    error = QObject::tr("The editable Excalidraw image no longer exists.");
+                    return {};
+                }
+                const auto currentBytes = current->encoded_payload.bytes();
+                const QByteArray currentPng(
+                    reinterpret_cast<const char*>(currentBytes.data()),
+                    static_cast<qsizetype>(currentBytes.size()));
+                const auto originalScene = current->format == core::ImageFormat::png ? excalidrawSceneFromPng(currentPng) : std::nullopt;
+                if (!originalScene) {
+                    error = QObject::tr(
+                        "replace_excalidraw_figure can only revise an editable Excalidraw figure.");
+                    return {};
+                }
+                const auto reconstruct = source.find("reconstructScene");
+                if (reconstruct != source.end() && !reconstruct->is_boolean()) { error = QObject::tr("reconstructScene must be true or false."); return {}; }
+                const bool reconstructScene = reconstruct != source.end() && reconstruct->get<bool>();
+                const auto inspected = inspectExcalidrawScene(*originalScene);
+                if (!reconstructScene && !inspected.complete()) {
+                    error = QObject::tr("This scene has native properties that a replacement cannot preserve. Use patch_excalidraw_figure, or explicitly reconstruct the scene."); return {};
+                }
+                const codex::Json* elements = nullptr;
+                if (const auto figure = source.find("figure"); figure != source.end() && figure->is_object() && figure->contains("elements")) elements = &figure->at("elements");
+                else if (source.contains("elements")) elements = &source.at("elements");
+                if (!elements) { error = QObject::tr("An Excalidraw operation requires an elements array."); return {}; }
+                const auto normalized = normalizeExcalidrawElements(*elements, error);
+                if (!normalized) return {};
+                std::set<std::string> incomingIds;
+                for (const auto& element : *normalized) {
+                    incomingIds.insert(element.at("id").get<std::string>());
+                    if (element.contains("label") && element.at("label").contains("id")) incomingIds.insert(element.at("label").at("id").get<std::string>());
+                }
+                QStringList omitted;
+                for (const auto& value : QJsonDocument::fromJson(*originalScene).object().value(QStringLiteral("elements")).toArray()) {
+                    const auto element = value.toObject(); const auto id = element.value(QStringLiteral("id")).toString();
+                    if (!element.value(QStringLiteral("isDeleted")).toBool() && !id.isEmpty() && !incomingIds.contains(toUtf8(id))) omitted.append(id);
+                }
+                if (!reconstructScene && !omitted.isEmpty()) {
+                    error = QObject::tr("Replacement must retain every original scene and label identity. Use a native patch or an explicit reconstruction. Missing: %1").arg(omitted.join(QStringLiteral(", "))); return {};
+                }
+                if (reconstructScene) {
+                    QString warning = QObject::tr("Explicit reconstruction recreates native scene structure and styling.");
+                    if (!omitted.isEmpty()) warning += QObject::tr(" Omitted identities: %1.").arg(omitted.mid(0, 16).join(QStringLiteral(", ")));
+                    if (omitted.size() > 16) warning += QObject::tr(" %1 additional identities are omitted.").arg(omitted.size() - 16);
+                    if (!inspected.complete()) warning += QObject::tr(" Native editing limits: %1").arg(inspected.unsupported.mid(0, 8).join(QStringLiteral("; ")));
+                    if (inspected.truncated) warning += QObject::tr(" The original source exceeds the canonical element limit.");
+                    warnings.push_back(toUtf8(warning));
+                }
+            }
             QString accessibleName;
             std::optional<double> widthPoints;
             std::optional<double> heightPoints;
+            const QPointer<DocumentCanvas> guardedCanvas(&canvas);
             const auto rendered = renderFigure(
-                source, QString::fromStdString(labelValue->get<std::string>()),
-                accessibleName, widthPoints, heightPoints, error);
+                source, current ? QString::fromStdString(current->accessible_name) : QString::fromStdString(labelValue->get<std::string>()),
+                accessibleName, widthPoints, heightPoints, error, figureRenderer);
+            if (!guardedCanvas) {
+                error = QObject::tr("The document closed while its figure was rendering.");
+                return {};
+            }
+            if (stillCurrent && !stillCurrent()) {
+                error = QObject::tr("The Codex session changed; its figure preview was canceled.");
+                return {};
+            }
             if (!rendered) {
                 if (error.isEmpty())
                     error = QObject::tr("The local Excalidraw renderer did not return a figure.");
@@ -1753,39 +2102,13 @@ codex::Json createPreview(DocumentCanvas& canvas,
                 }
                 if (!appendWorkingOperation(
                         working, operations,
-                        core::InsertImage{
-                            {target.block, target.start},
-                            imagePayload(rendered->png), core::ImageFormat::png,
-                            toUtf8(accessibleName),
+                        insertion(rendered->png, accessibleName,
                             pointsToEmu(displaySize->width()),
-                            pointsToEmu(displaySize->height())},
+                            pointsToEmu(displaySize->height())),
                         error)) {
                     return {};
                 }
             } else {
-                const auto encodedId = source.find("imageId");
-                if (encodedId == source.end() || !encodedId->is_string()) {
-                    error = QObject::tr("replace_excalidraw_figure requires an imageId.");
-                    return {};
-                }
-                const auto imageId = core::NodeId::parse(
-                    encodedId->get<std::string>());
-                const core::ImageAtom* current =
-                    imageId ? working.findImage(*imageId) : nullptr;
-                if (!imageId || !current) {
-                    error = QObject::tr("The editable Excalidraw image no longer exists.");
-                    return {};
-                }
-                const auto currentBytes = current->encoded_payload.bytes();
-                const QByteArray currentPng(
-                    reinterpret_cast<const char*>(currentBytes.data()),
-                    static_cast<qsizetype>(currentBytes.size()));
-                if (current->format != core::ImageFormat::png ||
-                    !excalidrawSceneFromPng(currentPng)) {
-                    error = QObject::tr(
-                        "replace_excalidraw_figure can only revise an editable Excalidraw figure.");
-                    return {};
-                }
                 std::int64_t width = current->width_emu;
                 std::int64_t height = current->height_emu;
                 const std::string previousAccessibleName =
@@ -1801,11 +2124,9 @@ codex::Json createPreview(DocumentCanvas& canvas,
                     width = pointsToEmu(displaySize->width());
                     height = pointsToEmu(displaySize->height());
                 } else {
-                    const double aspect =
-                        static_cast<double>(previewImage.height()) /
-                        static_cast<double>(previewImage.width());
-                    height = pointsToEmu(
-                        static_cast<double>(width) / 12700.0 * aspect);
+                    const auto displaySize = fitExcalidrawFigureDisplaySize(previewImage.size(), static_cast<double>(width) / 12700.0, std::nullopt);
+                    if (!displaySize) { error = QObject::tr("The rendered figure has invalid display dimensions."); return {}; }
+                    width = pointsToEmu(displaySize->width()); height = pointsToEmu(displaySize->height());
                 }
                 if (const auto owner = paragraphContainingImage(working, *imageId))
                     affected.insert(owner->toString());
@@ -1825,6 +2146,7 @@ codex::Json createPreview(DocumentCanvas& canvas,
                     return {};
                 }
             }
+            touchedFigureIds.insert(*imageId);
         } else if (kind == "insert_image") {
             error = QObject::tr("No user-granted image capability is attached to this request.");
             return {};
@@ -1834,11 +2156,54 @@ codex::Json createPreview(DocumentCanvas& canvas,
             return {};
         }
     }
-    const QString label = QString::fromStdString(labelValue->get<std::string>()).left(512);
-    if (!canvas.createOperationsPreview(core::Revision(*revision), operations,
-                                        label, previewSummary, error)) {
+    if (stillCurrent && !stillCurrent()) {
+        error = QObject::tr("The Codex session changed; its preview was canceled.");
         return {};
     }
+    // Several public routes (page breaks, captions, bibliography and TOCs)
+    // emit paragraph splits internally. Resequence their native list runs
+    // with the same baseline as explicit structural operations.
+    refreshNumbering = refreshNumbering || std::any_of(operations.begin(), operations.end(), [](const auto& operation) {
+        return std::holds_alternative<core::SplitParagraph>(operation);
+    });
+    if (refreshNumbering) {
+        ListEditRequest request;
+        request.kind = ListEditRequest::Kind::refresh_numbering;
+        request.numberingBaseline = &baseSnapshot.document;
+        std::vector<core::Operation> planned;
+        if (!canvas.planListOperations(working, request, planned, error)) return {};
+        for (auto& operation : planned) {
+            if (const auto* changed = std::get_if<core::ReplaceRange>(&operation)) affected.insert(changed->range.anchor.paragraph_id.toString());
+            if (!appendWorkingOperation(working, operations, std::move(operation), error)) return {};
+        }
+    }
+    // Fit only figures authored by this proposal, after all geometry and page
+    // operations have run. Later table resizing must not use an earlier cell
+    // width or leave oversized stored dimensions that Word renders differently.
+    std::vector<core::Operation> figureCellResizes;
+    for (const auto& table : working.tables()) for (const auto& cell : table.cells()) {
+        for (const auto& picture : cell.images) {
+            if (!touchedFigureIds.contains(picture.id)) continue;
+            const auto fitted = canvas.fitTableCellImageSize(working, table.id(), cell.id,
+                QSizeF(static_cast<double>(picture.width_emu) / 12700.0, static_cast<double>(picture.height_emu) / 12700.0), proposedLayout);
+            if (!fitted) { error = QObject::tr("The figure's table-cell writing area is unavailable."); return {}; }
+            const auto width = pointsToEmu(fitted->width()), height = pointsToEmu(fitted->height());
+            if (width != picture.width_emu || height != picture.height_emu)
+                figureCellResizes.emplace_back(core::ResizeImage{picture.id, width, height});
+            affected.insert(cell.id.toString());
+        }
+    }
+    for (auto& operation : figureCellResizes) if (!appendWorkingOperation(working, operations, std::move(operation), error)) return {};
+    if (expectedLayoutState && *expectedLayoutState != pageLayoutFor(canvas).at("stateId").get<std::uint64_t>()) {
+        error = QObject::tr("LAYOUT_CONFLICT: Page settings changed while preparing the proposal. Read metadata and retry.");
+        return {};
+    }
+    const QString label = QString::fromStdString(labelValue->get<std::string>()).left(512);
+    if (!canvas.createOperationsPreview(core::Revision(*revision), operations,
+                                        label, previewSummary, error, proposedLayout)) {
+        return {};
+    }
+    for (const auto& warning : warnings) previewSummary += QStringLiteral("\n\n") + QString::fromStdString(warning);
     codex::Json affectedIds = codex::Json::array();
     for (const auto& id : affected) affectedIds.push_back(id);
     return {{"previewId", canvas.previewIdString().toStdString()},
@@ -1857,9 +2222,40 @@ codex::Json invokeEditorTool(DocumentCanvas& canvas,
                              const QString& tool,
                              const codex::Json& arguments,
                              QString& previewSummary,
-                             QString& error) {
+                             QString& error,
+                             const ExcalidrawRenderer& figureRenderer,
+                             const std::function<bool()>& stillCurrent,
+                             const ExcalidrawSceneRenderer& nativeFigureRenderer) {
     previewSummary.clear();
     error.clear();
+    if (!arguments.is_object()) {
+        error = QObject::tr("Editor tool arguments must be an object.");
+        return {};
+    }
+    if (tool == QString::fromLatin1(codex::kEditorCapabilitiesTool.data(), static_cast<qsizetype>(codex::kEditorCapabilitiesTool.size()))) {
+        if (!validateDocumentId(documentId, arguments, error)) return {};
+        const auto snapshot = canvas.snapshot();
+        if (arguments.contains("expectedRevision")) {
+            const auto expected = unsignedValue(arguments, "expectedRevision");
+            if (!expected || *expected != snapshot.revision.value()) {
+                error = QObject::tr("REVISION_CONFLICT: Read capabilities for the current document revision.");
+                return {};
+            }
+        }
+        auto result = codex::editorV1Capabilities();
+        result["documentId"] = toUtf8(documentId);
+        result["revision"] = snapshot.revision.value();
+        codex::Json styles = codex::Json::array();
+        for (const auto& style : core::builtInParagraphStyles()) {
+            codex::Json encoded = {{"id", style.id}, {"name", style.display_name}};
+            if (style.outline_level) encoded["outlineLevel"] = *style.outline_level;
+            styles.push_back(std::move(encoded));
+        }
+        result["runtime"] = {{"previewPending", canvas.hasPreview()}, {"pageLayout", pageLayoutFor(canvas)},
+            {"editorDefaults", {{"fontFamily", toUtf8(canvas.defaultFontFamily())}, {"fontSizePoints", canvas.defaultFontPointSize()},
+                                {"tabWidthSpaces", canvas.tabWidthSpaces()}}}, {"paragraphStyles", std::move(styles)}};
+        return result;
+    }
     if (tool == QString::fromLatin1(codex::kEditorReadTool.data(),
                                     static_cast<qsizetype>(codex::kEditorReadTool.size()))) {
         return readDocument(canvas, documentId, arguments, error);
@@ -1871,7 +2267,7 @@ codex::Json invokeEditorTool(DocumentCanvas& canvas,
     }
     if (tool == QString::fromLatin1(codex::kEditorPreviewTool.data(),
                                     static_cast<qsizetype>(codex::kEditorPreviewTool.size()))) {
-        return createPreview(canvas, documentId, arguments, previewSummary, error);
+        return createPreview(canvas, documentId, arguments, previewSummary, error, figureRenderer, stillCurrent, nativeFigureRenderer);
     }
     if (tool == QString::fromLatin1(codex::kEditorFileCapabilityTool.data(),
                                     static_cast<qsizetype>(codex::kEditorFileCapabilityTool.size()))) {

@@ -1,7 +1,12 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { Excalidraw, convertToExcalidrawElements, exportToBlob, serializeAsJSON } from "@excalidraw/excalidraw";
+import { Excalidraw, convertToExcalidrawElements, exportToBlob, restoreElements, serializeAsJSON } from "@excalidraw/excalidraw";
 import { setLocalProfessionalPalette } from "@excalidraw/excalidraw/colors";
+import { updateBoundElements } from "@excalidraw/excalidraw/element/binding";
+import { redrawTextBoundingBox } from "@excalidraw/excalidraw/element/textElement";
+import { Fonts } from "@excalidraw/excalidraw/fonts/Fonts";
+import { prepareNativeScene } from "./nativeScenePatch.mjs";
+import { figureExportOptions } from "./figureExportOptions.mjs";
 import "../node_modules/@excalidraw/excalidraw/dist/prod/index.css";
 import "./style.css";
 
@@ -115,15 +120,23 @@ function App() {
     setSaving(true);
     setError("");
     try {
-      const elements = api.getSceneElementsIncludingDeleted();
-      const activeElements = api.getSceneElements();
+      let elements = api.getSceneElementsIncludingDeleted();
+      if (request?.version === 2) {
+        await Fonts.loadElementsFonts(request.scene.elements);
+        await document.fonts.ready;
+        elements = prepareNativeScene(request.scene, request.patchElementIds,
+          { restoreElements, redrawTextBoundingBox, updateBoundElements }).elements;
+      }
+      const activeElements = request?.version === 2 ? elements.filter((element) => !element.isDeleted) : api.getSceneElements();
       const appState = api.getAppState();
       const files = api.getFiles();
-      const scene = serializeAsJSON(elements, appState, files, "local");
+      const exportOptions = figureExportOptions(request, appState, files);
+      const scene = serializeAsJSON(elements,
+        request?.version === 2 ? exportOptions.appState : appState,
+        request?.version === 2 ? exportOptions.files : files, "local");
       const preview = await exportToBlob({
         elements: activeElements,
-        appState: { ...appState, exportBackground: true, viewBackgroundColor: "#ffffff" },
-        files,
+        ...exportOptions,
         mimeType: "image/png",
         exportPadding: 24,
         maxWidthOrHeight: 4096
@@ -135,7 +148,7 @@ function App() {
       setError(value instanceof Error ? value.message : String(value));
       setSaving(false);
     }
-  }, [saving]);
+  }, [saving, request]);
 
   useEffect(() => window.owlDocsFigure.onSaveRequest(save), [save]);
 
@@ -150,7 +163,7 @@ function App() {
 
   return <div className="owl-figure-shell">
     <div className="owl-figure-toolbar">
-      <div className="owl-figure-title">Excalidraw Figure <span>in Owl Docs</span></div>
+      <div className="owl-figure-title">Excalidraw Figure <span>in OwlDocs</span></div>
       <div className="owl-mode-switch" role="group" aria-label="Drawing mode">
         <button className={mode === "sketch" ? "active" : ""}
           aria-pressed={mode === "sketch"} disabled={saving || !request}

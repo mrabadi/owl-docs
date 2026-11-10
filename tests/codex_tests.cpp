@@ -1,5 +1,7 @@
 #include <algorithm>
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <memory>
 #include <optional>
@@ -509,14 +511,205 @@ void testDynamicToolRegistrationAndThreadResume() {
     CHECK(resumed);
 }
 
+void testIntegratedCapabilities() {
+    const auto capabilities = docxstudio::codex::editorV1Capabilities();
+    CHECK(capabilities.at("schemaVersion") == "editor.v1");
+    CHECK(capabilities.at("catalogVersion") == "editor.v1.catalog.10");
+    CHECK(capabilities.at("workflow").at("manualSkillActivationRequired") == false);
+    CHECK(capabilities.at("workflow").value("figureMode", std::string()).find("new figures and reconstructions") != std::string::npos);
+    CHECK(capabilities.at("workflow").value("figureEditing", std::string()).find("native patches retain source styling and background") != std::string::npos);
+    const auto tools = docxstudio::codex::editorV1ToolDefinitions();
+    const auto preview = std::find_if(tools.begin(), tools.end(), [](const auto& tool) {
+        return tool.name == docxstudio::codex::kEditorPreviewTool;
+    });
+    CHECK(preview != tools.end());
+    if (preview != tools.end()) CHECK(preview->description.find("native patches retain source styling and background") != std::string::npos);
+    CHECK(capabilities.at("units").at("textOffsets") == "UTF-16 code units");
+    CHECK(capabilities.at("bounds").at("previewOperations") == 256);
+    CHECK(capabilities.at("bounds").at("encodedImageBytes") == 4194304);
+    CHECK(capabilities.at("bounds").at("aggregateImageBytes") == 4194304);
+    CHECK(capabilities.at("bounds").value("desktopEncodedImageBytes", 0) == 16777216);
+    CHECK(capabilities.at("bounds").value("maxRequestJsonBytes", 0) == 8388608);
+    CHECK(capabilities.at("groups").contains("figures"));
+    CHECK(capabilities.at("examples").contains("insertFigure"));
+    CHECK(capabilities.at("examples").contains("replaceFigure"));
+    CHECK(capabilities.at("examples").contains("insertTable"));
+    const auto& exampleCells = capabilities.at("examples").at("insertTable").at("operations").at(0).at("cells");
+    CHECK(exampleCells.is_array());
+    if (exampleCells.is_array()) {
+        CHECK(exampleCells.size() == 2 && exampleCells.at(0).is_array() && exampleCells.at(1).is_array());
+    }
+    CHECK(capabilities.at("$defs").at("excalidrawLabel").at("properties").contains("id"));
+    CHECK(capabilities.at("$defs").contains("excalidrawTarget"));
+    const auto& elements = capabilities.at("$defs").at("excalidrawElement").at("oneOf");
+    const auto arrow = std::find_if(elements.begin(), elements.end(), [](const Json& element) {
+        return element.at("properties").at("type").value("const", std::string()) == "arrow";
+    });
+    CHECK(arrow != elements.end());
+    if (arrow != elements.end()) CHECK(arrow->at("properties").contains("start") && arrow->at("properties").contains("end"));
+    const auto& operations = capabilities.at("operationSchemas");
+    const auto page = std::find_if(operations.begin(), operations.end(), [](const Json& operation) {
+        return operation.at("properties").at("kind").value("const", std::string()) == "set_page_layout";
+    });
+    CHECK(page != operations.end());
+    if (page != operations.end()) {
+        CHECK(page->at("properties").contains("expectedLayoutStateId"));
+        CHECK(std::find(page->at("required").begin(), page->at("required").end(), "expectedLayoutStateId") != page->at("required").end());
+    }
+    const auto definitions = docxstudio::codex::editorV1ToolDefinitions();
+    const auto discovery = std::find_if(definitions.begin(), definitions.end(), [](const auto& definition) {
+        return definition.name == "editor_v1_capabilities";
+    });
+    CHECK(discovery != definitions.end());
+    if (discovery != definitions.end()) {
+        CHECK(discovery->annotations.at("readOnlyHint") == true);
+        CHECK(discovery->inputSchema.at("properties").contains("expectedRevision"));
+        CHECK(discovery->outputSchema.at("properties").contains("runtime"));
+    }
+    CHECK(docxstudio::codex::isEditorV1Tool("editor_v1_capabilities"));
+    CHECK(docxstudio::codex::editorV1ToolManifest().at("catalogVersion") == "editor.v1.catalog.10");
+    const auto& readInput = definitions.at(0).inputSchema;
+    for (const auto* scope : {"stories", "tables", "metadata", "images"})
+        CHECK(std::find(readInput.at("properties").at("scope").at("enum").begin(), readInput.at("properties").at("scope").at("enum").end(), scope) !=
+              readInput.at("properties").at("scope").at("enum").end());
+    CHECK(readInput.at("properties").contains("maxBlocks"));
+    CHECK(readInput.at("properties").contains("blockOffset"));
+    CHECK(readInput.at("properties").contains("imageIds"));
+    if (readInput.at("properties").contains("imageIds"))
+        CHECK(readInput.at("properties").at("imageIds").at("maxItems") == 64);
+    if (readInput.at("properties").contains("maxBlocks")) {
+        CHECK(readInput.at("properties").at("maxBlocks").at("maximum") == 2048);
+        CHECK(readInput.at("properties").at("maxBlocks").at("default") == 512);
+    }
+    const auto& readOutput = definitions.at(0).outputSchema;
+    CHECK(readOutput.at("properties").at("pageLayout").at("properties").contains("stateId"));
+    CHECK(readOutput.at("properties").contains("nextBlockOffset"));
+}
+
+void testNativeFigurePatchSchema() {
+    const auto capabilities = docxstudio::codex::editorV1Capabilities();
+    const auto& operations = capabilities.at("operationSchemas");
+    const auto patch = std::find_if(operations.begin(), operations.end(), [](const Json& operation) {
+        return operation.at("properties").at("kind").value("const", std::string()) == "patch_excalidraw_figure";
+    });
+    CHECK(patch != operations.end());
+    if (patch == operations.end()) return;
+    CHECK(patch->at("properties").at("edits").at("maxItems") == 128);
+    CHECK(patch->at("properties").at("edits").at("minItems") == 1);
+    CHECK(capabilities.at("$defs").at("excalidrawPatchChanges").at("properties").contains("points"));
+    CHECK(capabilities.at("$defs").at("excalidrawPatchChanges").at("properties").contains("angle"));
+    CHECK(!capabilities.at("$defs").at("excalidrawPatchChanges").at("properties").contains("files"));
+}
+
+void testListOperationSchemas() {
+    const auto capabilities = docxstudio::codex::editorV1Capabilities();
+    const auto& operations = capabilities.at("operationSchemas");
+    for (const auto* kind : {"set_list", "set_list_level", "set_list_layout"}) {
+        const auto entry = std::find_if(operations.begin(), operations.end(), [&](const Json& operation) {
+            return operation.at("properties").at("kind").value("const", std::string()) == kind;
+        });
+        CHECK(entry != operations.end());
+        if (entry == operations.end()) continue;
+        const auto& ids = entry->at("properties").at("blockIds");
+        CHECK(ids.at("minItems") == 1 && ids.at("maxItems") == 2048);
+        CHECK(ids.at("uniqueItems") == true);
+        if (std::string_view(kind) == "set_list")
+            CHECK(entry->at("properties").at("listKind").at("enum") == Json::array({"bullets", "numbered", "none"}));
+        if (std::string_view(kind) == "set_list_level")
+            CHECK(entry->at("properties").at("level").at("minimum") == 1 && entry->at("properties").at("level").at("maximum") == 10);
+        if (std::string_view(kind) == "set_list_layout") {
+            const auto& levels = entry->at("properties").at("levels");
+            CHECK(levels.at("minItems") == 10 && levels.at("maxItems") == 10);
+            CHECK(levels.at("items").at("properties").at("bulletIndentSpaces").at("maximum") == 400);
+            CHECK(levels.at("items").at("properties").at("textIndentSpaces").at("maximum") == 64);
+        }
+    }
+}
+
+void testSharedFormattingSchemas() {
+    const auto capabilities = docxstudio::codex::editorV1Capabilities();
+    const auto& definitions = capabilities.at("$defs");
+    const auto& paragraph = definitions.at("paragraphStyle");
+    for (const auto* name : {"leftIndentPoints", "rightIndentPoints", "firstLineIndentPoints", "keepLines", "pageBreakBefore", "lineSpacingPoints", "lineSpacingRule"})
+        CHECK(paragraph.at("properties").contains(name));
+    CHECK(paragraph.at("properties").at("styleId").at("oneOf").at(1).at("type") == "null");
+    const auto& semanticParagraph = definitions.at("semanticParagraphFormat");
+    for (const auto& [name, property] : semanticParagraph.at("properties").items()) {
+        CHECK(paragraph.at("properties").contains(name));
+        if (paragraph.at("properties").contains(name)) CHECK(paragraph.at("properties").at(name) == property);
+    }
+    CHECK(definitions.at("textStyle").at("properties").at("highlightColor") ==
+          definitions.at("semanticTextStyle").at("properties").at("highlightColor"));
+    CHECK(definitions.at("textStyle").at("properties").at("fontSizePoints") ==
+          definitions.at("semanticTextStyle").at("properties").at("fontSizePoints"));
+    const auto& operations = capabilities.at("operationSchemas");
+    const auto page = std::find_if(operations.begin(), operations.end(), [](const Json& operation) {
+        return operation.at("properties").at("kind").value("const", std::string()) == "set_page_layout";
+    });
+    CHECK(page != operations.end());
+    if (page != operations.end()) CHECK(page->at("properties").at("expectedLayoutStateId").value("maximum", std::uint64_t{0}) == 9007199254740991ULL);
+}
+
+void testFigureReconstructionSchema() {
+    const auto capabilities = docxstudio::codex::editorV1Capabilities();
+    const auto& operations = capabilities.at("operationSchemas");
+    const auto replace = std::find_if(operations.begin(), operations.end(), [](const Json& operation) {
+        return operation.at("properties").at("kind").value("const", std::string()) == "replace_excalidraw_figure";
+    });
+    CHECK(replace != operations.end());
+    if (replace == operations.end()) return;
+    CHECK(replace->at("properties").contains("reconstructScene"));
+    if (replace->at("properties").contains("reconstructScene")) {
+        CHECK(replace->at("properties").at("reconstructScene").at("type") == "boolean");
+        CHECK(replace->at("properties").at("reconstructScene").at("default") == false);
+    }
+    for (const auto& element : capabilities.at("examples").at("replaceFigure").at("operations").at(0).at("figure").at("elements"))
+        if (element.contains("label")) CHECK(element.at("label").contains("id"));
+}
+
+void testPublishedCatalogMatchesRegistration() {
+    const auto path = std::filesystem::path(__FILE__).parent_path().parent_path() / "schemas/editor.v1.json";
+    std::ifstream input(path);
+    CHECK(input.good());
+    if (!input.good()) return;
+    const auto published = Json::parse(input);
+    CHECK(published.value("catalogVersion", std::string()) == docxstudio::codex::kEditorToolCatalogVersion);
+    const auto definitions = docxstudio::codex::editorV1ToolDefinitions();
+    CHECK(published.at("tools").size() == definitions.size());
+    for (const auto& definition : definitions) {
+        const auto entry = std::find_if(published.at("tools").begin(), published.at("tools").end(), [&](const Json& tool) {
+            return tool.value("name", std::string()) == definition.name;
+        });
+        CHECK(entry != published.at("tools").end());
+        if (entry == published.at("tools").end()) continue;
+        CHECK(entry->value("description", std::string()) == definition.description);
+        auto expectedInput = definition.inputSchema;
+        if (expectedInput.contains("$defs")) {
+            for (const auto& [name, schema] : expectedInput.at("$defs").items()) {
+                CHECK(published.at("$defs").contains(name));
+                if (published.at("$defs").contains(name)) CHECK(published.at("$defs").at(name) == schema);
+            }
+            expectedInput.erase("$defs");
+        }
+        expectedInput["properties"]["documentId"] = {{"type", "string"}, {"minLength", 1}};
+        if (!expectedInput.contains("required")) expectedInput["required"] = Json::array();
+        expectedInput["required"].push_back("documentId");
+        CHECK(published.at(Json::json_pointer(entry->at("inputSchema").at("$ref").get<std::string>().substr(1))) == expectedInput);
+        CHECK(published.at(Json::json_pointer(entry->at("outputSchema").at("$ref").get<std::string>().substr(1))) == definition.outputSchema);
+        CHECK(entry->at("annotations") == definition.annotations);
+    }
+}
+
 void testEditorToolSchemas() {
     const auto definitions = docxstudio::codex::editorV1ToolDefinitions();
     CHECK(definitions.size() == 4);
     CHECK(definitions[0].name == docxstudio::codex::kEditorReadTool);
     CHECK(definitions[1].name == docxstudio::codex::kEditorSearchTool);
     CHECK(definitions[2].name == docxstudio::codex::kEditorPreviewTool);
-    CHECK(definitions[3].name ==
-          docxstudio::codex::kEditorFileCapabilityTool);
+    CHECK(definitions[3].name == docxstudio::codex::kEditorCapabilitiesTool);
+    CHECK(std::none_of(definitions.begin(), definitions.end(), [](const auto& definition) {
+        return definition.name == docxstudio::codex::kEditorFileCapabilityTool;
+    }));
     CHECK(definitions[0].annotations.at("readOnlyHint") == true);
     CHECK(definitions[1].annotations.at("readOnlyHint") == true);
     CHECK(definitions[2].annotations.at("readOnlyHint") == false);
@@ -546,10 +739,7 @@ void testEditorToolSchemas() {
     CHECK(definitions[2].inputSchema.dump().find("insert_image") ==
           std::string::npos);
     CHECK(!definitions[3].inputSchema.at("properties").contains("path"));
-    CHECK(definitions[3].inputSchema.at("properties")
-              .contains("capabilityId"));
-    CHECK(definitions[3].inputSchema.dump().find("filesystem path") !=
-          std::string::npos);
+    CHECK(definitions[3].annotations.at("readOnlyHint") == true);
 
     const Json dynamicSpec = definitions[0].toDynamicToolSpec();
     CHECK(dynamicSpec.at("type") == "function");
@@ -568,12 +758,50 @@ void testEditorToolSchemas() {
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc > 1 && std::string_view(argv[1]) == "capabilities") {
+        testIntegratedCapabilities();
+        return failures ? 1 : 0;
+    }
+    if (argc > 1 && std::string_view(argv[1]) == "figure-patch") {
+        testNativeFigurePatchSchema();
+        return failures ? 1 : 0;
+    }
+    if (argc > 1 && std::string_view(argv[1]) == "published-catalog") {
+        testPublishedCatalogMatchesRegistration();
+        return failures ? 1 : 0;
+    }
+    if (argc > 1 && std::string_view(argv[1]) == "list-schema") {
+        testListOperationSchemas();
+        return failures ? 1 : 0;
+    }
+    if (argc > 1 && std::string_view(argv[1]) == "format-schema") {
+        testSharedFormattingSchemas();
+        return failures ? 1 : 0;
+    }
+    if (argc > 1 && std::string_view(argv[1]) == "figure-reconstruct") {
+        testFigureReconstructionSchema();
+        return failures ? 1 : 0;
+    }
+    if (argc > 1 && std::string_view(argv[1]) == "--dump-editor-manifest") {
+        std::cout << docxstudio::codex::editorV1ToolManifest().dump(2) << '\n';
+        return 0;
+    }
+    if (argc > 1 && std::string_view(argv[1]) == "--dump-editor-capabilities") {
+        std::cout << docxstudio::codex::editorV1Capabilities().dump(2) << '\n';
+        return 0;
+    }
     testHandshakeAndJsonlFraming();
     testCorrelationAndDynamicCatalog();
     testThreadTurnEventsAndServerRequests();
     testErrorsExitAndRedaction();
     testDynamicToolRegistrationAndThreadResume();
+    testIntegratedCapabilities();
+    testNativeFigurePatchSchema();
+    testListOperationSchemas();
+    testSharedFormattingSchemas();
+    testFigureReconstructionSchema();
+    testPublishedCatalogMatchesRegistration();
     testEditorToolSchemas();
 
     if (failures != 0) {

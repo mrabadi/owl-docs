@@ -1,6 +1,6 @@
 [Desktop Entry]
 Type=Application
-Name=Owl Docs
+Name=OwlDocs
 GenericName=Word Processor
 Comment=Offline word processor with optional Codex assistance
 TryExec=owl-docs

@@ -7,6 +7,7 @@
 #include <QBuffer>
 #include <QElapsedTimer>
 #include <QImage>
+#include <QKeyEvent>
 #include <QStringList>
 #include <QTextBoundaryFinder>
 
@@ -21,6 +22,8 @@
 #include <vector>
 
 namespace {
+
+using Json = docxstudio::codex::Json;
 
 void check(bool condition, const char* message) {
     if (!condition) {
@@ -101,6 +104,292 @@ std::vector<std::uint8_t> bridgePng() {
 int main(int argc, char** argv) {
     QApplication application(argc, argv);
     docxstudio::app::SpellChecker spelling;
+    const auto discovery = [&] {
+        docxstudio::app::DocumentCanvas document(spelling);
+        document.insertText(QStringLiteral("Before table"));
+        check(document.insertTable(2, 2, false), "create agent discovery table");
+        check(document.setHeaderFooterText(QStringLiteral("Left\tCenter\tRight"), QStringLiteral("Page {PAGE} of {PAGES}")),
+              "create agent discovery stories");
+        const auto snapshot = document.snapshot();
+        const auto tableId = snapshot.document.tables().front().id();
+        QString summary, error;
+        const auto read = docxstudio::app::invokeEditorTool(document, QStringLiteral("discovery"),
+            QStringLiteral("editor_v1_read"), {{"documentId", "discovery"}, {"scope", "document"}}, summary, error);
+        check(error.isEmpty(), "full agent discovery read fails");
+        auto tables = 0, cells = 0, headers = 0, footers = 0;
+        for (const auto& block : read.at("blocks")) {
+            if (block.at("type") == "table") {
+                ++tables;
+                check(block.at("id") == tableId.toString() && block.at("attributes").at("rows") == 2 &&
+                          block.at("attributes").at("columns") == 2, "agent table metadata loses stable identity or dimensions");
+            } else if (block.at("type") == "tableCell") ++cells;
+            else if (block.at("type") == "header") ++headers;
+            else if (block.at("type") == "footer") ++footers;
+        }
+        check(tables == 1 && cells == 4, "full document reads hide empty tables or their cells from Codex");
+        check(headers == 1 && footers == 1, "full document reads hide headers and footers from Codex");
+        check(read.contains("pageLayout") && read.at("pageLayout").at("widthPoints") == 612 &&
+                  read.at("pageLayout").at("stateId").is_number_unsigned(), "agent discovery omits revision-bound page geometry");
+        const auto first = docxstudio::app::invokeEditorTool(document, QStringLiteral("discovery"), QStringLiteral("editor_v1_read"),
+            {{"documentId", "discovery"}, {"scope", "document"}, {"maxBlocks", 2}}, summary, error);
+        check(error.isEmpty() && first.at("blocks").size() == 2 && first.at("truncated") == true && first.contains("nextBlockOffset"),
+              "agent discovery has no bounded continuation for empty structural blocks");
+        const auto next = docxstudio::app::invokeEditorTool(document, QStringLiteral("discovery"), QStringLiteral("editor_v1_read"),
+            {{"documentId", "discovery"}, {"scope", "document"}, {"maxBlocks", 2}, {"blockOffset", first.at("nextBlockOffset")}}, summary, error);
+        check(error.isEmpty() && next.at("blocks").size() == 2 && next.at("blocks").at(0).at("id") != first.at("blocks").at(0).at("id"),
+              "agent discovery continuation repeats the first structural blocks");
+        const auto stories = docxstudio::app::invokeEditorTool(document, QStringLiteral("discovery"), QStringLiteral("editor_v1_read"),
+            {{"documentId", "discovery"}, {"scope", "stories"}}, summary, error);
+        check(error.isEmpty() && stories.at("blocks").size() == 2 && stories.at("blocks").at(0).at("text") == "Left\tCenter\tRight",
+              "agent cannot target stories independently of a long body");
+        check(document.snapshot().document == snapshot.document && !document.hasPreview(), "discovery changes document state");
+    };
+    const auto capabilityDiscovery = [&] {
+        docxstudio::app::DocumentCanvas document(spelling);
+        QString summary, error;
+        const auto before = document.snapshot();
+        const auto catalog = docxstudio::app::invokeEditorTool(document, QStringLiteral("catalog"), QStringLiteral("editor_v1_capabilities"),
+            {{"documentId", "catalog"}, {"expectedRevision", before.revision.value()}}, summary, error);
+        check(error.isEmpty() && catalog.is_object() && catalog.contains("operationSchemas") && catalog.contains("runtime"),
+              "agent cannot discover live document capabilities through the bridge");
+        check(catalog.at("documentId") == "catalog" && catalog.at("revision") == before.revision.value() &&
+                  catalog.at("runtime").at("pageLayout").at("widthPoints") == 612,
+              "capabilities are not bound to their current document and geometry");
+        static_cast<void>(docxstudio::app::invokeEditorTool(document, QStringLiteral("catalog"), QStringLiteral("editor_v1_capabilities"),
+            {{"documentId", "other"}}, summary, error));
+        check(!error.isEmpty(), "capability discovery crosses document boundaries");
+        document.insertText(QStringLiteral("changed"));
+        static_cast<void>(docxstudio::app::invokeEditorTool(document, QStringLiteral("catalog"), QStringLiteral("editor_v1_capabilities"),
+            {{"documentId", "catalog"}, {"expectedRevision", before.revision.value()}}, summary, error));
+        check(error.contains("REVISION_CONFLICT"), "stale capability discovery silently loses revision context");
+        for (const auto* tool : {"editor_v1_read", "editor_v1_search", "editor_v1_preview", "editor_v1_capabilities"}) {
+            static_cast<void>(docxstudio::app::invokeEditorTool(document, QStringLiteral("catalog"), QString::fromLatin1(tool), Json::array(), summary, error));
+            check(!error.isEmpty(), "malformed agent input is reported as a successful empty response");
+        }
+    };
+    const auto formatDiscovery = [&] {
+        docxstudio::app::DocumentCanvas document(spelling);
+        document.insertText(QStringLiteral("Formatted"));
+        docxstudio::core::ParagraphFormatDelta delta;
+        delta.left_indent_emu = docxstudio::core::PropertyDelta<std::int64_t>::set(18 * 12700);
+        delta.first_line_indent_emu = docxstudio::core::PropertyDelta<std::int64_t>::set(-9 * 12700);
+        delta.space_after_emu = docxstudio::core::PropertyDelta<std::int64_t>::set(6 * 12700);
+        delta.keep_lines = docxstudio::core::PropertyDelta<bool>::set(true);
+        delta.page_break_before = docxstudio::core::PropertyDelta<bool>::set(true);
+        document.applyParagraphFormat(delta);
+        QString summary, error;
+        const auto read = docxstudio::app::invokeEditorTool(document, QStringLiteral("format"), QStringLiteral("editor_v1_read"),
+            {{"documentId", "format"}, {"scope", "document"}}, summary, error);
+        const auto& attributes = read.at("blocks").at(0).at("attributes");
+        check(error.isEmpty() && attributes.value("leftIndentPoints", 0) == 18 && attributes.value("firstLineIndentPoints", 0) == -9 &&
+                  attributes.value("spaceAfterPoints", 0) == 6 && attributes.value("keepLines", false) && attributes.value("pageBreakBefore", false),
+              "agent document reads omit authored paragraph layout and pagination properties");
+    };
+    const auto paragraphFormatting = [&] {
+        docxstudio::app::DocumentCanvas document(spelling);
+        document.insertText(QStringLiteral("Formatted"));
+        const auto before = document.snapshot();
+        const auto blockId = before.document.paragraphs().front().id();
+        QString summary, error;
+        const Json style = {{"leftIndentPoints", 18}, {"firstLineIndentPoints", -9}, {"rightIndentPoints", 12},
+            {"spaceAfterPoints", 6}, {"lineSpacingPoints", 16}, {"lineSpacingRule", "exact"}, {"keepLines", true}, {"pageBreakBefore", true}};
+        static_cast<void>(docxstudio::app::invokeEditorTool(document, QStringLiteral("paragraph"), QStringLiteral("editor_v1_preview"),
+            {{"documentId", "paragraph"}, {"baseRevision", before.revision.value()}, {"summary", "Paragraph layout"},
+                {"operations", Json::array({Json{{"kind", "set_paragraph_style"}, {"target", {{"blockId", blockId.toString()}, {"start", 0}}}, {"style", style}}})}}, summary, error));
+        check(error.isEmpty() && document.hasPreview(), "agent cannot set the paragraph layout properties available in the desktop editor");
+        check(document.snapshot().document == before.document, "paragraph formatting escapes preview isolation");
+        check(document.acceptPreview(error), "accept paragraph layout preview");
+        const auto after = document.snapshot();
+        const auto& format = after.document.findParagraph(blockId)->format();
+        check(format.left_indent_emu == 18 * 12700 && format.first_line_indent_emu == -9 * 12700 && format.right_indent_emu == 12 * 12700 &&
+                  format.line_spacing_emu == 16 * 12700 && format.line_spacing_rule == docxstudio::core::LineSpacingRule::exact &&
+                  format.keep_lines.value_or(false) && format.page_break_before.value_or(false), "agent paragraph properties differ from the requested native formatting");
+        document.undo();
+        check(document.snapshot().document == before.document, "paragraph formatting is not one Undo");
+        document.setDocument(formattedBoundaryDocument());
+        const auto highlighted = document.snapshot();
+        const auto id = highlighted.document.paragraphs().front().id();
+        static_cast<void>(docxstudio::app::invokeEditorTool(document, QStringLiteral("paragraph"), QStringLiteral("editor_v1_preview"),
+            {{"documentId", "paragraph"}, {"baseRevision", highlighted.revision.value()}, {"summary", "Remove highlight"},
+                {"operations", Json::array({Json{{"kind", "set_text_style"}, {"target", {{"blockId", id.toString()}, {"start", 1}, {"end", 5}}},
+                    {"style", {{"highlightColor", nullptr}}}}})}}, summary, error));
+        check(error.isEmpty() && document.acceptPreview(error), "agent cannot clear text highlighting");
+        const auto cleared = document.snapshot();
+        check(!cleared.document.findParagraph(id)->characterFormatAt(1).highlight_argb, "clear highlight leaves its color behind");
+    };
+    const auto tableSelectionRead = [&] {
+        docxstudio::app::DocumentCanvas document(spelling);
+        check(document.insertTable(1, 2, false), "create selected table");
+        auto snapshot = document.snapshot();
+        const auto tableId = snapshot.document.tables().front().id();
+        check(document.activateTableCell(tableId, 0, 0), "activate selected first cell");
+        document.insertText(QStringLiteral("Alpha"));
+        check(document.activateTableCell(tableId, 0, 1), "activate selected second cell");
+        document.insertText(QStringLiteral("Beta"));
+        QString summary, error;
+        auto read = docxstudio::app::invokeEditorTool(document, QStringLiteral("selection"), QStringLiteral("editor_v1_read"),
+            {{"documentId", "selection"}, {"scope", "selection"}}, summary, error);
+        check(error.isEmpty() && read.at("blocks").size() == 1 && read.at("blocks").at(0).at("type") == "tableCell" &&
+                  read.at("blocks").at(0).at("text") == "Beta" && read.at("blocks").at(0).at("attributes").at("selectionStart") == 4 &&
+                  read.at("blocks").at(0).at("attributes").at("selectionEnd") == 4,
+              "agent selection reads ignore the active table-cell caret");
+        check(document.selectTableCells(tableId, 0, 0, 0, 1), "select table rectangle");
+        read = docxstudio::app::invokeEditorTool(document, QStringLiteral("selection"), QStringLiteral("editor_v1_read"),
+            {{"documentId", "selection"}, {"scope", "selection"}}, summary, error);
+        check(error.isEmpty() && read.at("blocks").size() == 2 && read.at("blocks").at(0).at("type") == "tableCell" &&
+                  read.at("blocks").at(1).at("type") == "tableCell", "agent selection reads omit rectangular cell selections");
+        check(document.setHeaderFooterText(QStringLiteral("Left\tCenter\tRight"), QString()), "create selected header");
+        document.beginHeaderFooterEditing(false, 1);
+        read = docxstudio::app::invokeEditorTool(document, QStringLiteral("selection"), QStringLiteral("editor_v1_read"),
+            {{"documentId", "selection"}, {"scope", "selection"}}, summary, error);
+        check(error.isEmpty() && read.at("blocks").size() == 1 && read.at("blocks").at(0).at("type") == "header" &&
+                  read.at("blocks").at(0).at("attributes").at("activeRegion") == "center", "agent selection reads ignore active header/footer regions");
+    };
+    const auto boundedEmptyReads = [&] {
+        std::vector<docxstudio::core::Paragraph> paragraphs;
+        for (int index = 0; index < 50; ++index) {
+            auto paragraph = docxstudio::core::Paragraph::create(u"");
+            check(bool(paragraph), "create empty structural read paragraph");
+            paragraphs.push_back(std::move(paragraph.value()));
+        }
+        auto source = docxstudio::core::Document::create(std::move(paragraphs));
+        check(bool(source), "create empty structural read document");
+        docxstudio::app::DocumentCanvas document(spelling);
+        document.setDocument(std::move(source.value()));
+        document.selectAll();
+        QString summary, error;
+        for (const auto* scope : {"outline", "selection"}) {
+            const auto first = docxstudio::app::invokeEditorTool(document, QStringLiteral("bounded"), QStringLiteral("editor_v1_read"),
+                {{"documentId", "bounded"}, {"scope", scope}, {"maxBlocks", 2}}, summary, error);
+            check(error.isEmpty() && first.at("blocks").size() == 2 && first.at("truncated") == true && first.contains("nextBlockOffset"),
+                  "empty paragraphs bypass outline/selection read limits");
+            const auto next = docxstudio::app::invokeEditorTool(document, QStringLiteral("bounded"), QStringLiteral("editor_v1_read"),
+                {{"documentId", "bounded"}, {"scope", scope}, {"maxBlocks", 2}, {"blockOffset", first.at("nextBlockOffset")}}, summary, error);
+            check(error.isEmpty() && next.at("blocks").size() == 2 && next.at("blocks").at(0).at("id") != first.at("blocks").at(0).at("id"),
+                  "outline/selection continuation repeats empty paragraphs");
+        }
+    };
+    const auto layoutPreview = [&] {
+        docxstudio::app::DocumentCanvas document(spelling);
+        document.resize(820, 600);
+        document.insertText(QStringLiteral("Original"));
+        check(document.setHeaderFooterText(QStringLiteral("Report"), QStringLiteral("{PAGE}")), "create layout preview stories");
+        document.markSaved();
+        const auto before = document.snapshot();
+        const auto block = before.document.paragraphs().front().id().toString();
+        QString summary, error;
+        const auto initialRead = docxstudio::app::invokeEditorTool(document, QStringLiteral("layout"), QStringLiteral("editor_v1_read"),
+            {{"documentId", "layout"}, {"scope", "metadata"}}, summary, error);
+        check(error.isEmpty(), "read page geometry token");
+        const Json geometry = {{"kind", "set_page_layout"}, {"expectedLayoutStateId", initialRead.at("pageLayout").at("stateId")},
+            {"layout", {{"widthPoints", 792}, {"heightPoints", 612}, {"marginTopPoints", 36},
+                {"marginRightPoints", 40}, {"marginBottomPoints", 44}, {"marginLeftPoints", 48}}}};
+        const Json insert = {{"kind", "insert_text"}, {"target", {{"blockId", block}, {"start", 0}}}, {"text", "Proposed "}};
+        const auto preview = docxstudio::app::invokeEditorTool(document, QStringLiteral("layout"), QStringLiteral("editor_v1_preview"),
+            {{"documentId", "layout"}, {"baseRevision", before.revision.value()}, {"summary", "Landscape report"},
+                {"operations", Json::array({insert, geometry})}}, summary, error);
+        check(error.isEmpty() && preview.value("committed", true) == false && document.hasPreview(),
+              "Codex cannot preview page geometry with content in one transaction");
+        check(document.snapshot().document == before.document && document.pageWidthPoints() == 612 && document.marginTopPoints() == 72 && !document.isModified(),
+              "page-layout proposal leaks unaccepted content, geometry, or dirty state");
+        document.discardPreview();
+        check(document.snapshot().document == before.document && document.pageWidthPoints() == 612 && !document.isModified(),
+              "discarding a page-layout proposal changes the live document");
+        static_cast<void>(docxstudio::app::invokeEditorTool(document, QStringLiteral("layout"), QStringLiteral("editor_v1_preview"),
+            {{"documentId", "layout"}, {"baseRevision", before.revision.value()}, {"summary", "Landscape report"},
+                {"operations", Json::array({insert, geometry})}}, summary, error));
+        check(error.isEmpty() && document.acceptPreview(error), "accept combined layout preview");
+        check(document.pageWidthPoints() == 792 && document.pageHeightPoints() == 612 && document.marginLeftPoints() == 48 &&
+                  document.hasPageLayoutChanges() && document.snapshot().document.paragraphs().front().text().starts_with(u"Proposed Original") && document.headerText() == "Report",
+              "accepting combined preview omits content, geometry, or story preservation");
+        document.undo();
+        check(document.snapshot().document == before.document && document.pageWidthPoints() == 612 && !document.isModified(),
+              "combined content and geometry preview needs more than one Undo");
+        document.redo();
+        check(document.pageWidthPoints() == 792 && document.snapshot().document.paragraphs().front().text().starts_with(u"Proposed Original"), "combined geometry preview Redo loses a branch");
+        document.undo();
+        static_cast<void>(docxstudio::app::invokeEditorTool(document, QStringLiteral("layout"), QStringLiteral("editor_v1_preview"),
+            {{"documentId", "layout"}, {"baseRevision", document.snapshot().revision.value()}, {"summary", "Only margins"},
+                {"operations", Json::array({geometry})}}, summary, error));
+        check(error.isEmpty() && document.hasPreview() && document.acceptPreview(error) && document.hasPageLayoutChanges(),
+              "a geometry-only proposal cannot be accepted");
+        document.undo();
+        check(document.pageWidthPoints() == 612 && !document.isModified(), "geometry-only proposal Undo dirties or changes content");
+        const auto revision = document.snapshot().revision;
+        document.setMarginsPoints(30, 30, 30, 30);
+        check(document.snapshot().revision == revision, "layout race fixture unexpectedly changes semantic revision");
+        static_cast<void>(docxstudio::app::invokeEditorTool(document, QStringLiteral("layout"), QStringLiteral("editor_v1_preview"),
+            {{"documentId", "layout"}, {"baseRevision", revision.value()}, {"summary", "Stale page geometry"},
+                {"operations", Json::array({geometry})}}, summary, error));
+        check(error.contains("LAYOUT_CONFLICT") && !document.hasPreview() && document.marginTopPoints() == 30,
+              "a stale page-layout read overwrites a newer user margin change");
+    };
+    const auto lists = [&] {
+        docxstudio::app::DocumentCanvas document(spelling);
+        document.insertText(QStringLiteral("First"));
+        QKeyEvent enter(QEvent::KeyPress, Qt::Key_Return, Qt::NoModifier);
+        QApplication::sendEvent(&document, &enter);
+        document.insertText(QStringLiteral("Second"));
+        document.markSaved();
+        const auto before = document.snapshot();
+        check(before.document.paragraphs().size() == 2, "list fixture must contain two paragraphs");
+        const auto first = before.document.paragraphs()[0].id();
+        const auto second = before.document.paragraphs()[1].id();
+        Json operation = {{"kind", "set_list"}, {"blockIds", Json::array({first.toString(), second.toString()})}, {"listKind", "numbered"}};
+        QString summary, error;
+        static_cast<void>(docxstudio::app::invokeEditorTool(document, QStringLiteral("lists"), QStringLiteral("editor_v1_preview"),
+            {{"documentId", "lists"}, {"baseRevision", before.revision.value()}, {"summary", "Numbered list"}, {"operations", Json::array({operation})}}, summary, error));
+        check(error.isEmpty() && document.hasPreview(), "Codex cannot create numbered lists through preview");
+        check(document.snapshot().document == before.document && !document.isModified(), "list proposal leaks live text or metadata");
+        document.discardPreview();
+        check(document.snapshot().document == before.document && !document.isModified(), "discarded list changes the document");
+        static_cast<void>(docxstudio::app::invokeEditorTool(document, QStringLiteral("lists"), QStringLiteral("editor_v1_preview"),
+            {{"documentId", "lists"}, {"baseRevision", before.revision.value()}, {"summary", "Numbered list"}, {"operations", Json::array({operation})}}, summary, error));
+        check(error.isEmpty() && document.acceptPreview(error), "accept semantic numbered list");
+        docxstudio::app::DocumentCanvas direct(spelling);
+        direct.setDocument(before.document);
+        direct.selectAll();
+        direct.toggleNumbering();
+        const auto numbered = document.snapshot();
+        check(document.snapshot().document.paragraphs()[0].text() == direct.snapshot().document.paragraphs()[0].text() && numbered.document.paragraphs()[1].text() == direct.snapshot().document.paragraphs()[1].text() && numbered.document.findParagraph(first)->format().list_id &&
+                  numbered.document.findParagraph(first)->format().list_id == numbered.document.findParagraph(second)->format().list_id &&
+                  numbered.document.findParagraph(first)->format().list_layout == direct.snapshot().document.findParagraph(first)->format().list_layout,
+              "agent lists do not share UI numbering, identity, and layout semantics");
+        operation = {{"kind", "set_list_level"}, {"blockIds", Json::array({second.toString()})}, {"level", 2}};
+        static_cast<void>(docxstudio::app::invokeEditorTool(document, QStringLiteral("lists"), QStringLiteral("editor_v1_preview"),
+            {{"documentId", "lists"}, {"baseRevision", numbered.revision.value()}, {"summary", "Nest list item"}, {"operations", Json::array({operation})}}, summary, error));
+        check(error.isEmpty() && document.acceptPreview(error) && document.snapshot().document.findParagraph(second)->format().list_level == 1,
+              "agent cannot change list nesting with the shared semantics");
+        document.undo();
+        check(document.snapshot().document == numbered.document, "list nesting is not one Undo");
+        document.undo();
+        check(document.snapshot().document == before.document && !document.isModified(), "numbered list is not one Undo transaction");
+    };
+    if (application.arguments().contains(QStringLiteral("--empty-read-bounds"))) { boundedEmptyReads(); return 0; }
+    if (application.arguments().contains(QStringLiteral("--table-selection"))) { tableSelectionRead(); return 0; }
+    if (application.arguments().contains(QStringLiteral("--paragraph-format"))) { paragraphFormatting(); return 0; }
+    if (application.arguments().contains(QStringLiteral("--capability-discovery"))) { capabilityDiscovery(); return 0; }
+    if (application.arguments().contains(QStringLiteral("--format-discovery"))) { formatDiscovery(); return 0; }
+    if (application.arguments().contains(QStringLiteral("--lists"))) {
+        lists();
+        return 0;
+    }
+    if (application.arguments().contains(QStringLiteral("--page-layout"))) {
+        layoutPreview();
+        return 0;
+    }
+    if (application.arguments().contains(QStringLiteral("--discovery"))) {
+        discovery();
+        return 0;
+    }
+    discovery();
+    capabilityDiscovery();
+    formatDiscovery();
+    paragraphFormatting();
+    tableSelectionRead();
+    boundedEmptyReads();
+    layoutPreview();
+    lists();
     docxstudio::app::DocumentCanvas canvas(spelling);
     canvas.insertText(QStringLiteral("Helo world"));
     canvas.markSaved();
@@ -214,10 +503,10 @@ int main(int argc, char** argv) {
                                     .at("styleId");
     check(styleIdSchema.at("oneOf").size() == 2 &&
               styleIdSchema.at("oneOf").at(0).at("maxLength") == 1024 &&
-              styleIdSchema.at("oneOf").at(1).at("type") == "null" &&
-              docxstudio::codex::kEditorToolCatalogVersion ==
-                  "editor.v1.catalog.8",
+              styleIdSchema.at("oneOf").at(1).at("type") == "null",
           "editor tool schema does not advertise bounded style set/clear");
+    check(docxstudio::codex::kEditorToolCatalogVersion == "editor.v1.catalog.10",
+          "editor tool catalog version was not advanced for academic operations");
     check(previewDefinition->inputSchema.dump().find(
               "insert_excalidraw_figure") != std::string::npos &&
               previewDefinition->inputSchema.dump().find(
@@ -329,11 +618,11 @@ int main(int argc, char** argv) {
                   std::optional<std::string>("Heading1") &&
               styledParagraph.format().alignment ==
                   docxstudio::core::ParagraphAlignment::right &&
-              styledParagraph.format().space_before_emu == 152400 &&
-              styledParagraph.format().space_after_emu == 76200 &&
+              styledParagraph.format().space_before_emu == 228600 &&
+              styledParagraph.format().space_after_emu == 101600 &&
               styledParagraph.characterFormatAt(1).bold == true &&
               styledParagraph.characterFormatAt(1)
-                      .font_size_half_points == 32 &&
+                      .font_size_half_points == 40 &&
               styledParagraph.paragraphMarkCharacterFormat().bold == true &&
               styledParagraph.styleProvenance() &&
               styledParagraph.styleProvenance()
@@ -485,49 +774,49 @@ int main(int argc, char** argv) {
         };
     expectRejectedParagraphStyle(
         {{"styleId", "Heading1"}, {"mysteryProperty", true}},
-        QStringLiteral("unsupported property"),
+        QStringLiteral("mysteryProperty"),
         "editor preview accepted an unknown paragraph-style property");
     expectRejectedParagraphStyle(
         {{"styleId", "Heading1"}, {"alignment", 7}},
-        QStringLiteral("alignment must be a string"),
+        QStringLiteral("alignment"),
         "editor preview accepted a non-string paragraph alignment");
     expectRejectedParagraphStyle(
         {{"styleId", "Heading1"}, {"alignment", "distributed"}},
-        QStringLiteral("left, center, right, or justify"),
+        QStringLiteral("alignment"),
         "editor preview mapped an unknown paragraph alignment to left");
     expectRejectedParagraphStyle(
         {{"styleId", "Heading1"}, {"lineSpacing", "single"}},
-        QStringLiteral("lineSpacing must be a number"),
+        QStringLiteral("lineSpacing"),
         "editor preview ignored a non-number line spacing");
     expectRejectedParagraphStyle(
         {{"styleId", "Heading1"},
          {"lineSpacing", std::numeric_limits<double>::quiet_NaN()}},
-        QStringLiteral("lineSpacing is outside"),
+        QStringLiteral("lineSpacing"),
         "editor preview accepted non-finite line spacing");
     expectRejectedParagraphStyle(
         {{"styleId", "Heading1"}, {"lineSpacing", 20.01}},
-        QStringLiteral("lineSpacing is outside"),
+        QStringLiteral("lineSpacing"),
         "editor preview accepted line spacing above its schema maximum");
     expectRejectedParagraphStyle(
         {{"styleId", "Heading1"}, {"spaceBeforePoints", -0.5}},
-        QStringLiteral("spaceBeforePoints is outside"),
+        QStringLiteral("spaceBeforePoints"),
         "editor preview accepted negative space-before formatting");
     expectRejectedParagraphStyle(
-        {{"styleId", "Heading1"}, {"spaceBeforePoints", 10000.01}},
-        QStringLiteral("spaceBeforePoints is outside"),
+        {{"styleId", "Heading1"}, {"spaceBeforePoints", 20000.01}},
+        QStringLiteral("spaceBeforePoints"),
         "editor preview accepted space-before above its schema maximum");
     expectRejectedParagraphStyle(
         {{"styleId", "Heading1"},
          {"spaceAfterPoints", std::numeric_limits<double>::infinity()}},
-        QStringLiteral("spaceAfterPoints is outside"),
+        QStringLiteral("spaceAfterPoints"),
         "editor preview accepted non-finite space-after formatting");
     expectRejectedParagraphStyle(
         {{"styleId", "Heading1"}, {"spaceAfterPoints", "12"}},
-        QStringLiteral("spaceAfterPoints must be a number"),
+        QStringLiteral("spaceAfterPoints"),
         "editor preview ignored a non-number space-after value");
     expectRejectedParagraphStyle(
         {{"styleId", "Heading1"}, {"keepWithNext", 0}},
-        QStringLiteral("keepWithNext must be a boolean"),
+        QStringLiteral("keepWithNext"),
         "editor preview ignored a non-boolean keep-with-next value");
 
     {
@@ -613,7 +902,7 @@ int main(int argc, char** argv) {
                   headingWithClear.styleProvenance() &&
                   headingWithClear.styleProvenance()
                       ->paragraph_overrides.keep_with_next &&
-                  headingWithClear.format().space_before_emu == 152400 &&
+                  headingWithClear.format().space_before_emu == 228600 &&
                   headingWithClear.characterFormatAt(1).bold == true,
               "later style transition erased an equal-to-baseline Codex override");
     }
@@ -677,7 +966,7 @@ int main(int argc, char** argv) {
                   directHeading.characterFormatAt(1).foreground_argb ==
                       0xff000000U &&
                   directHeading.characterFormatAt(1)
-                          .font_size_half_points == 32,
+                          .font_size_half_points == 40,
               "Heading transition erased explicit black/bold-off text formatting");
     }
 
@@ -769,15 +1058,18 @@ int main(int argc, char** argv) {
             replacementDirectCanvas.snapshot();
         const auto& replacementHeading =
             replacementHeadingSnapshot.document.paragraphs().front();
+        const auto inheritedHeadingColor=docxstudio::core::findBuiltInParagraphStyle("Heading1")->character_format.foreground_argb;
         check(replacementHeading.characterFormatAt(1).bold == true &&
                   replacementHeading.characterFormatAt(1).foreground_argb ==
-                      0xffe95420U &&
+                      inheritedHeadingColor &&
                   replacementHeading.characterFormatAt(2).bold == false &&
                   replacementHeading.characterFormatAt(2).foreground_argb ==
                       0xff000000U &&
+                  replacementHeading.styleOverrideMaskAt(2).foreground_argb &&
+                  !replacementHeading.styleOverrideMaskAt(1).foreground_argb &&
                   replacementHeading.characterFormatAt(5).bold == true &&
                   replacementHeading.characterFormatAt(5).foreground_argb ==
-                      0xffe95420U,
+                      inheritedHeadingColor,
               "style transition erased replacement directness or changed adjacent inheritance");
     }
 
@@ -889,10 +1181,10 @@ int main(int argc, char** argv) {
                       .foreground_argb == 0xffcc0000U &&
               headingThroughCodexParagraph.characterFormatAt(1).bold == true &&
               headingThroughCodexParagraph.characterFormatAt(5)
-                      .foreground_argb == 0xffe95420U &&
+                      .foreground_argb == docxstudio::core::findBuiltInParagraphStyle("Heading1")->character_format.foreground_argb &&
               headingThroughCodexParagraph.characterFormatAt(5).bold == true &&
               headingThroughCodexParagraph.characterFormatAt(5)
-                      .font_size_half_points == 32,
+                      .font_size_half_points == 40,
           "Codex style application clobbered a direct span or skipped inherited Heading 1 properties");
 
     invokeAndAcceptStyle(

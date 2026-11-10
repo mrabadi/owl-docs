@@ -1,513 +1,2986 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "urn:docxstudio:tools:editor.v1",
-  "title": "Owl Docs editor.v1 tool manifest",
-  "description": "Semantic, revision-checked document tools. File access is possible only through opaque capabilities minted after an explicit user grant.",
+  "title": "OwlDocs editor.v1 tool manifest",
+  "description": "Built-in, semantic, revision-checked document tools. The host injects documentId from its active document thread; models cannot supply a document path. Writes require preview and user acceptance. File open/save/export and other desktop system commands remain user actions.",
   "schemaVersion": "editor.v1",
+  "catalogVersion": "editor.v1.catalog.10",
   "$defs": {
-    "target": {
-      "type": "object",
+    "readInput": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
       "properties": {
-        "blockId": { "type": "string", "minLength": 1 },
-        "start": { "type": "integer", "minimum": 0 },
-        "end": { "type": "integer", "minimum": 0 }
-      },
-      "required": ["blockId", "start"]
-    },
-    "textStyle": {
-      "type": "object",
-      "additionalProperties": false,
-      "properties": {
-        "bold": { "type": "boolean" },
-        "italic": { "type": "boolean" },
-        "underline": { "type": "boolean" },
-        "strike": { "type": "boolean" },
-        "fontFamily": { "type": "string", "minLength": 1 },
-        "fontSizePoints": { "type": "number", "exclusiveMinimum": 0, "maximum": 1000 },
-        "foregroundColor": { "type": "string", "pattern": "^#[0-9A-Fa-f]{6}$" },
-        "highlightColor": { "type": "string", "pattern": "^#[0-9A-Fa-f]{6}$" },
-        "verticalAlign": {
+        "blockIds": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "maxItems": 256,
+          "type": "array",
+          "uniqueItems": true
+        },
+        "blockOffset": {
+          "default": 0,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "expectedRevision": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "imageIds": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "maxItems": 64,
+          "type": "array",
+          "uniqueItems": true
+        },
+        "includeFormatting": {
+          "default": true,
+          "type": "boolean"
+        },
+        "maxBlocks": {
+          "default": 512,
+          "maximum": 2048,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "maxCharacters": {
+          "default": 50000,
+          "maximum": 200000,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "scope": {
+          "default": "selection",
+          "enum": [
+            "selection",
+            "document",
+            "outline",
+            "blocks",
+            "stories",
+            "tables",
+            "metadata",
+            "images"
+          ],
+          "type": "string"
+        },
+        "tableCellTargets": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "cellId": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "tableId": {
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "required": [
+              "tableId",
+              "cellId"
+            ],
+            "type": "object"
+          },
+          "maxItems": 256,
+          "type": "array",
+          "uniqueItems": true
+        },
+        "documentId": {
           "type": "string",
-          "enum": ["baseline", "superscript", "subscript"]
+          "minLength": 1
         }
       },
-      "minProperties": 1
+      "required": [
+        "scope",
+        "documentId"
+      ],
+      "type": "object"
     },
-    "paragraphStyle": {
-      "type": "object",
+    "readOutput": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
       "properties": {
-        "styleId": {
-          "oneOf": [
-            {
-              "type": "string",
-              "minLength": 1,
-              "maxLength": 1024
+        "blocks": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "attributes": {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              "id": {
+                "type": "string"
+              },
+              "text": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string"
+              }
             },
-            { "type": "null" }
+            "required": [
+              "id",
+              "type",
+              "text"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "documentId": {
+          "type": "string"
+        },
+        "nextBlockOffset": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "pageLayout": {
+          "additionalProperties": false,
+          "properties": {
+            "heightPoints": {
+              "exclusiveMinimum": 0,
+              "maximum": 100000,
+              "minimum": 0,
+              "type": "number"
+            },
+            "marginBottomPoints": {
+              "maximum": 100000,
+              "minimum": 0,
+              "type": "number"
+            },
+            "marginLeftPoints": {
+              "maximum": 100000,
+              "minimum": 0,
+              "type": "number"
+            },
+            "marginRightPoints": {
+              "maximum": 100000,
+              "minimum": 0,
+              "type": "number"
+            },
+            "marginTopPoints": {
+              "maximum": 100000,
+              "minimum": 0,
+              "type": "number"
+            },
+            "stateId": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "widthPoints": {
+              "exclusiveMinimum": 0,
+              "maximum": 100000,
+              "minimum": 0,
+              "type": "number"
+            }
+          },
+          "required": [
+            "widthPoints",
+            "heightPoints",
+            "marginTopPoints",
+            "marginRightPoints",
+            "marginBottomPoints",
+            "marginLeftPoints",
+            "stateId"
           ],
-          "description": "Set a bounded semantic paragraph-style ID, or null to clear it. IDs are additionally limited to 1024 UTF-8 bytes. Recognized built-ins also apply their catalog baseline; unknown IDs retain identity without invented formatting."
+          "type": "object"
         },
-        "alignment": {
-          "type": "string",
-          "enum": ["left", "center", "right", "justify"]
+        "revision": {
+          "minimum": 0,
+          "type": "integer"
         },
-        "lineSpacing": { "type": "number", "exclusiveMinimum": 0, "maximum": 20 },
-        "spaceBeforePoints": { "type": "number", "minimum": 0, "maximum": 10000 },
-        "spaceAfterPoints": { "type": "number", "minimum": 0, "maximum": 10000 },
-        "keepWithNext": { "type": "boolean" }
+        "scope": {
+          "type": "string"
+        },
+        "truncated": {
+          "type": "boolean"
+        }
       },
-      "minProperties": 1
+      "required": [
+        "documentId",
+        "revision",
+        "scope",
+        "truncated",
+        "blocks"
+      ],
+      "type": "object"
+    },
+    "searchInput": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "caseSensitive": {
+          "default": false,
+          "type": "boolean"
+        },
+        "expectedRevision": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "maxResults": {
+          "default": 100,
+          "maximum": 500,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "query": {
+          "description": "Length is measured in Unicode code points; result offsets are UTF-16.",
+          "maxLength": 1024,
+          "minLength": 1,
+          "type": "string"
+        },
+        "wholeWord": {
+          "default": false,
+          "type": "boolean"
+        },
+        "documentId": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "query",
+        "documentId"
+      ],
+      "type": "object"
+    },
+    "searchOutput": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "caseSensitive": {
+          "type": "boolean"
+        },
+        "documentId": {
+          "type": "string"
+        },
+        "query": {
+          "type": "string"
+        },
+        "results": {
+          "items": {
+            "additionalProperties": false,
+            "allOf": [
+              {
+                "if": {
+                  "properties": {
+                    "blockType": {
+                      "const": "tableCell"
+                    }
+                  },
+                  "required": [
+                    "blockType"
+                  ]
+                },
+                "then": {
+                  "required": [
+                    "tableId",
+                    "cellId",
+                    "row",
+                    "column"
+                  ]
+                }
+              }
+            ],
+            "properties": {
+              "blockId": {
+                "description": "Paragraph ID or, for tableCell results, the cell ID.",
+                "minLength": 1,
+                "type": "string"
+              },
+              "blockType": {
+                "enum": [
+                  "paragraph",
+                  "tableCell"
+                ],
+                "type": "string"
+              },
+              "cellId": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "column": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "context": {
+                "maxLength": 1216,
+                "type": "string"
+              },
+              "contextEnd": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "contextStart": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "end": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "row": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "start": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "tableId": {
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "required": [
+              "blockId",
+              "blockType",
+              "start",
+              "end",
+              "context",
+              "contextStart",
+              "contextEnd"
+            ],
+            "type": "object"
+          },
+          "maxItems": 500,
+          "type": "array"
+        },
+        "revision": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "truncated": {
+          "type": "boolean"
+        },
+        "wholeWord": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "documentId",
+        "revision",
+        "query",
+        "caseSensitive",
+        "wholeWord",
+        "truncated",
+        "results"
+      ],
+      "type": "object"
+    },
+    "cellRangeTarget": {
+      "additionalProperties": false,
+      "properties": {
+        "cellId": {
+          "maxLength": 64,
+          "minLength": 1,
+          "type": "string"
+        },
+        "end": {
+          "maximum": 10000000,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "start": {
+          "maximum": 10000000,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "tableId": {
+          "maxLength": 64,
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "tableId",
+        "cellId",
+        "start",
+        "end"
+      ],
+      "type": "object"
+    },
+    "cellTarget": {
+      "additionalProperties": false,
+      "properties": {
+        "cellId": {
+          "maxLength": 64,
+          "minLength": 1,
+          "type": "string"
+        },
+        "end": {
+          "maximum": 10000000,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "start": {
+          "maximum": 10000000,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "tableId": {
+          "maxLength": 64,
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "tableId",
+        "cellId"
+      ],
+      "type": "object"
     },
     "excalidrawColor": {
-      "type": "string",
-      "pattern": "^#[0-9A-Fa-f]{6}$"
-    },
-    "excalidrawLabel": {
-      "type": "object",
-      "additionalProperties": false,
-      "properties": {
-        "text": { "type": "string", "minLength": 1, "maxLength": 2000 },
-        "fontSize": { "type": "number", "minimum": 8, "maximum": 96 }
-      },
-      "required": ["text"]
+      "pattern": "^#[0-9A-Fa-f]{6}$",
+      "type": "string"
     },
     "excalidrawElement": {
       "oneOf": [
         {
-          "type": "object",
           "additionalProperties": false,
           "properties": {
-            "id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{1,64}$" },
-            "type": { "enum": ["rectangle", "ellipse", "diamond"] },
-            "x": { "type": "number", "minimum": -10000, "maximum": 10000 },
-            "y": { "type": "number", "minimum": -10000, "maximum": 10000 },
-            "width": { "type": "number", "exclusiveMinimum": 0, "maximum": 10000 },
-            "height": { "type": "number", "exclusiveMinimum": 0, "maximum": 10000 },
-            "strokeColor": { "$ref": "#/$defs/excalidrawColor" },
-            "backgroundColor": { "$ref": "#/$defs/excalidrawColor" },
-            "strokeWidth": { "type": "number", "minimum": 1, "maximum": 4 },
-            "opacity": { "type": "integer", "minimum": 0, "maximum": 100 },
-            "label": { "$ref": "#/$defs/excalidrawLabel" }
-          },
-          "required": ["id", "type", "x", "y", "width", "height"]
-        },
-        {
-          "type": "object",
-          "additionalProperties": false,
-          "properties": {
-            "id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{1,64}$" },
-            "type": { "const": "text" },
-            "x": { "type": "number", "minimum": -10000, "maximum": 10000 },
-            "y": { "type": "number", "minimum": -10000, "maximum": 10000 },
-            "text": { "type": "string", "minLength": 1, "maxLength": 4000 },
-            "fontSize": { "type": "number", "minimum": 8, "maximum": 96 },
-            "strokeColor": { "$ref": "#/$defs/excalidrawColor" },
-            "opacity": { "type": "integer", "minimum": 0, "maximum": 100 }
-          },
-          "required": ["id", "type", "x", "y", "text"]
-        },
-        {
-          "type": "object",
-          "additionalProperties": false,
-          "properties": {
-            "id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{1,64}$" },
-            "type": { "enum": ["line", "arrow"] },
-            "x": { "type": "number", "minimum": -10000, "maximum": 10000 },
-            "y": { "type": "number", "minimum": -10000, "maximum": 10000 },
-            "points": {
-              "type": "array",
-              "minItems": 2,
-              "maxItems": 16,
-              "items": {
-                "type": "array",
-                "prefixItems": [
-                  { "type": "number", "minimum": -10000, "maximum": 10000 },
-                  { "type": "number", "minimum": -10000, "maximum": 10000 }
-                ],
-                "items": false
-              }
+            "backgroundColor": {
+              "$ref": "#/$defs/excalidrawColor"
             },
-            "strokeColor": { "$ref": "#/$defs/excalidrawColor" },
-            "strokeWidth": { "type": "number", "minimum": 1, "maximum": 4 },
-            "opacity": { "type": "integer", "minimum": 0, "maximum": 100 },
-            "label": { "$ref": "#/$defs/excalidrawLabel" }
+            "height": {
+              "exclusiveMinimum": 0,
+              "maximum": 10000,
+              "type": "number"
+            },
+            "id": {
+              "pattern": "^[A-Za-z0-9_-]{1,64}$",
+              "type": "string"
+            },
+            "label": {
+              "$ref": "#/$defs/excalidrawLabel"
+            },
+            "opacity": {
+              "maximum": 100,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "strokeColor": {
+              "$ref": "#/$defs/excalidrawColor"
+            },
+            "strokeWidth": {
+              "maximum": 4,
+              "minimum": 1,
+              "type": "number"
+            },
+            "type": {
+              "enum": [
+                "rectangle",
+                "ellipse",
+                "diamond"
+              ]
+            },
+            "width": {
+              "exclusiveMinimum": 0,
+              "maximum": 10000,
+              "type": "number"
+            },
+            "x": {
+              "maximum": 10000,
+              "minimum": -10000,
+              "type": "number"
+            },
+            "y": {
+              "maximum": 10000,
+              "minimum": -10000,
+              "type": "number"
+            }
           },
-          "required": ["id", "type", "x", "y", "points"]
+          "required": [
+            "id",
+            "type",
+            "x",
+            "y",
+            "width",
+            "height"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "fontSize": {
+              "maximum": 96,
+              "minimum": 8,
+              "type": "number"
+            },
+            "id": {
+              "pattern": "^[A-Za-z0-9_-]{1,64}$",
+              "type": "string"
+            },
+            "opacity": {
+              "maximum": 100,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "strokeColor": {
+              "$ref": "#/$defs/excalidrawColor"
+            },
+            "text": {
+              "maxLength": 4000,
+              "minLength": 1,
+              "type": "string"
+            },
+            "type": {
+              "const": "text"
+            },
+            "x": {
+              "maximum": 10000,
+              "minimum": -10000,
+              "type": "number"
+            },
+            "y": {
+              "maximum": 10000,
+              "minimum": -10000,
+              "type": "number"
+            }
+          },
+          "required": [
+            "id",
+            "type",
+            "x",
+            "y",
+            "text"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "pattern": "^[A-Za-z0-9_-]{1,64}$",
+              "type": "string"
+            },
+            "opacity": {
+              "maximum": 100,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "points": {
+              "items": {
+                "items": false,
+                "prefixItems": [
+                  {
+                    "maximum": 10000,
+                    "minimum": -10000,
+                    "type": "number"
+                  },
+                  {
+                    "maximum": 10000,
+                    "minimum": -10000,
+                    "type": "number"
+                  }
+                ],
+                "type": "array"
+              },
+              "maxItems": 16,
+              "minItems": 2,
+              "type": "array"
+            },
+            "strokeColor": {
+              "$ref": "#/$defs/excalidrawColor"
+            },
+            "strokeWidth": {
+              "maximum": 4,
+              "minimum": 1,
+              "type": "number"
+            },
+            "type": {
+              "const": "line"
+            },
+            "x": {
+              "maximum": 10000,
+              "minimum": -10000,
+              "type": "number"
+            },
+            "y": {
+              "maximum": 10000,
+              "minimum": -10000,
+              "type": "number"
+            }
+          },
+          "required": [
+            "id",
+            "type",
+            "x",
+            "y",
+            "points"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "end": {
+              "additionalProperties": false,
+              "properties": {
+                "id": {
+                  "pattern": "^[A-Za-z0-9_-]{1,64}$",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id"
+              ],
+              "type": "object"
+            },
+            "id": {
+              "pattern": "^[A-Za-z0-9_-]{1,64}$",
+              "type": "string"
+            },
+            "label": {
+              "$ref": "#/$defs/excalidrawLabel"
+            },
+            "opacity": {
+              "maximum": 100,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "points": {
+              "items": {
+                "items": false,
+                "prefixItems": [
+                  {
+                    "maximum": 10000,
+                    "minimum": -10000,
+                    "type": "number"
+                  },
+                  {
+                    "maximum": 10000,
+                    "minimum": -10000,
+                    "type": "number"
+                  }
+                ],
+                "type": "array"
+              },
+              "maxItems": 16,
+              "minItems": 2,
+              "type": "array"
+            },
+            "start": {
+              "additionalProperties": false,
+              "properties": {
+                "id": {
+                  "pattern": "^[A-Za-z0-9_-]{1,64}$",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id"
+              ],
+              "type": "object"
+            },
+            "strokeColor": {
+              "$ref": "#/$defs/excalidrawColor"
+            },
+            "strokeWidth": {
+              "maximum": 4,
+              "minimum": 1,
+              "type": "number"
+            },
+            "type": {
+              "const": "arrow"
+            },
+            "x": {
+              "maximum": 10000,
+              "minimum": -10000,
+              "type": "number"
+            },
+            "y": {
+              "maximum": 10000,
+              "minimum": -10000,
+              "type": "number"
+            }
+          },
+          "required": [
+            "id",
+            "type",
+            "x",
+            "y",
+            "points"
+          ],
+          "type": "object"
         }
       ]
     },
     "excalidrawFigure": {
-      "type": "object",
       "additionalProperties": false,
       "properties": {
-        "elements": {
-          "type": "array",
-          "minItems": 1,
-          "maxItems": 128,
-          "items": { "$ref": "#/$defs/excalidrawElement" }
+        "accessibleName": {
+          "maxLength": 500,
+          "minLength": 1,
+          "type": "string"
         },
-        "accessibleName": { "type": "string", "minLength": 1, "maxLength": 500 },
-        "widthPoints": { "type": "number", "minimum": 36, "maximum": 936 },
-        "heightPoints": { "type": "number", "minimum": 36, "maximum": 936 }
+        "elements": {
+          "items": {
+            "$ref": "#/$defs/excalidrawElement"
+          },
+          "maxItems": 128,
+          "minItems": 1,
+          "type": "array"
+        },
+        "heightPoints": {
+          "description": "Optional display height, or bounding-box height when widthPoints is also supplied. The rendered figure always keeps its aspect ratio.",
+          "maximum": 936,
+          "minimum": 36,
+          "type": "number"
+        },
+        "widthPoints": {
+          "description": "Optional display width, or bounding-box width when heightPoints is also supplied. The rendered figure always keeps its aspect ratio.",
+          "maximum": 936,
+          "minimum": 36,
+          "type": "number"
+        }
       },
-      "required": ["elements", "accessibleName"]
+      "required": [
+        "elements",
+        "accessibleName"
+      ],
+      "type": "object"
+    },
+    "excalidrawLabel": {
+      "additionalProperties": false,
+      "properties": {
+        "fontSize": {
+          "maximum": 96,
+          "minimum": 8,
+          "type": "number"
+        },
+        "id": {
+          "pattern": "^[A-Za-z0-9_-]{1,64}$",
+          "type": "string"
+        },
+        "text": {
+          "maxLength": 2000,
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "text"
+      ],
+      "type": "object"
+    },
+    "excalidrawPatchChanges": {
+      "additionalProperties": false,
+      "minProperties": 1,
+      "properties": {
+        "angle": {
+          "maximum": 6.283185307179586,
+          "minimum": -6.283185307179586,
+          "type": "number"
+        },
+        "backgroundColor": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/excalidrawColor"
+            },
+            {
+              "const": "transparent"
+            }
+          ]
+        },
+        "fontSize": {
+          "maximum": 96,
+          "minimum": 8,
+          "type": "number"
+        },
+        "height": {
+          "exclusiveMinimum": 0,
+          "maximum": 10000,
+          "type": "number"
+        },
+        "opacity": {
+          "maximum": 100,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "points": {
+          "items": {
+            "items": {
+              "maximum": 10000,
+              "minimum": -10000,
+              "type": "number"
+            },
+            "maxItems": 2,
+            "minItems": 2,
+            "type": "array"
+          },
+          "maxItems": 64,
+          "minItems": 2,
+          "type": "array"
+        },
+        "strokeColor": {
+          "$ref": "#/$defs/excalidrawColor"
+        },
+        "strokeWidth": {
+          "maximum": 4,
+          "minimum": 1,
+          "type": "number"
+        },
+        "text": {
+          "maxLength": 4000,
+          "minLength": 1,
+          "type": "string"
+        },
+        "width": {
+          "exclusiveMinimum": 0,
+          "maximum": 10000,
+          "type": "number"
+        },
+        "x": {
+          "maximum": 10000,
+          "minimum": -10000,
+          "type": "number"
+        },
+        "y": {
+          "maximum": 10000,
+          "minimum": -10000,
+          "type": "number"
+        }
+      },
+      "type": "object"
+    },
+    "excalidrawTarget": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/target"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "start": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "story": {
+              "enum": [
+                "header",
+                "footer"
+              ]
+            }
+          },
+          "required": [
+            "story",
+            "start"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "imageTarget": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/semanticTarget"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "cellId": {
+              "maxLength": 64,
+              "minLength": 1,
+              "type": "string"
+            },
+            "start": {
+              "maximum": 10000000,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "tableId": {
+              "maxLength": 64,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "tableId",
+            "cellId",
+            "start"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "start": {
+              "maximum": 32768,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "story": {
+              "enum": [
+                "header",
+                "footer"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "story",
+            "start"
+          ],
+          "type": "object"
+        }
+      ]
     },
     "operation": {
       "oneOf": [
         {
-          "type": "object",
           "additionalProperties": false,
           "properties": {
-            "kind": { "const": "replace_text" },
-            "target": { "$ref": "#/$defs/target" },
-            "text": { "type": "string" }
+            "display": {
+              "type": "boolean"
+            },
+            "equationId": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "kind": {
+              "const": "replace_equation"
+            },
+            "latex": {
+              "maxLength": 8192,
+              "minLength": 1,
+              "type": "string"
+            }
           },
-          "required": ["kind", "target", "text"]
+          "required": [
+            "kind",
+            "equationId",
+            "latex"
+          ],
+          "type": "object"
         },
         {
-          "type": "object",
           "additionalProperties": false,
           "properties": {
-            "kind": { "const": "insert_text" },
-            "target": { "$ref": "#/$defs/target" },
-            "text": { "type": "string" }
+            "kind": {
+              "const": "set_note_text"
+            },
+            "noteId": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "text": {
+              "maxLength": 32768,
+              "type": "string"
+            }
           },
-          "required": ["kind", "target", "text"]
+          "required": [
+            "kind",
+            "noteId",
+            "text"
+          ],
+          "type": "object"
         },
         {
-          "type": "object",
           "additionalProperties": false,
           "properties": {
-            "kind": { "const": "delete_range" },
-            "target": { "$ref": "#/$defs/target" }
+            "kind": {
+              "const": "insert_caption"
+            },
+            "label": {
+              "default": "Figure",
+              "enum": [
+                "Figure",
+                "Table",
+                "Equation"
+              ],
+              "type": "string"
+            },
+            "objectId": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "target": {
+              "$ref": "#/$defs/target"
+            },
+            "text": {
+              "maxLength": 32768,
+              "type": "string"
+            }
           },
-          "required": ["kind", "target"]
+          "required": [
+            "kind",
+            "target",
+            "text"
+          ],
+          "type": "object"
         },
         {
-          "type": "object",
           "additionalProperties": false,
           "properties": {
-            "kind": { "const": "set_text_style" },
-            "target": { "$ref": "#/$defs/target" },
-            "style": { "$ref": "#/$defs/textStyle" }
+            "kind": {
+              "const": "insert_bibliography_entry"
+            },
+            "target": {
+              "$ref": "#/$defs/target"
+            },
+            "text": {
+              "maxLength": 32768,
+              "type": "string"
+            }
           },
-          "required": ["kind", "target", "style"]
+          "required": [
+            "kind",
+            "target",
+            "text"
+          ],
+          "type": "object"
         },
         {
-          "type": "object",
           "additionalProperties": false,
           "properties": {
-            "kind": { "const": "set_paragraph_style" },
-            "target": { "$ref": "#/$defs/target" },
-            "style": { "$ref": "#/$defs/paragraphStyle" }
+            "format": {
+              "default": "label_number",
+              "enum": [
+                "label_number",
+                "full_text"
+              ],
+              "type": "string"
+            },
+            "kind": {
+              "const": "insert_cross_reference"
+            },
+            "target": {
+              "$ref": "#/$defs/target"
+            },
+            "targetId": {
+              "minLength": 1,
+              "type": "string"
+            }
           },
-          "required": ["kind", "target", "style"]
+          "required": [
+            "kind",
+            "target",
+            "targetId"
+          ],
+          "type": "object"
         },
         {
-          "type": "object",
           "additionalProperties": false,
           "properties": {
-            "kind": { "const": "insert_equation" },
-            "target": { "$ref": "#/$defs/target" },
-            "latex": { "type": "string", "minLength": 1 },
-            "display": { "type": "boolean", "default": false }
+            "entryId": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "kind": {
+              "const": "insert_citation"
+            },
+            "locator": {
+              "maxLength": 512,
+              "type": "string"
+            },
+            "target": {
+              "$ref": "#/$defs/target"
+            }
           },
-          "required": ["kind", "target", "latex"]
+          "required": [
+            "kind",
+            "target",
+            "entryId"
+          ],
+          "type": "object"
         },
         {
-          "type": "object",
           "additionalProperties": false,
           "properties": {
-            "kind": { "const": "insert_page_break" },
-            "target": { "$ref": "#/$defs/target" }
+            "kind": {
+              "const": "insert_toc"
+            },
+            "maxLevel": {
+              "default": 3,
+              "maximum": 9,
+              "minimum": 1,
+              "type": "integer"
+            },
+            "target": {
+              "$ref": "#/$defs/target"
+            }
           },
-          "required": ["kind", "target"]
+          "required": [
+            "kind",
+            "target"
+          ],
+          "type": "object"
         },
         {
-          "type": "object",
           "additionalProperties": false,
           "properties": {
-            "kind": { "const": "insert_excalidraw_figure" },
-            "target": { "$ref": "#/$defs/target" },
-            "figure": { "$ref": "#/$defs/excalidrawFigure" }
+            "kind": {
+              "const": "configure_toc"
+            },
+            "maxLevel": {
+              "maximum": 9,
+              "minimum": 1,
+              "type": "integer"
+            },
+            "tocId": {
+              "minLength": 1,
+              "type": "string"
+            }
           },
-          "required": ["kind", "target", "figure"]
+          "required": [
+            "kind",
+            "tocId",
+            "maxLevel"
+          ],
+          "type": "object"
         },
         {
-          "type": "object",
           "additionalProperties": false,
           "properties": {
-            "kind": { "const": "replace_excalidraw_figure" },
-            "imageId": { "type": "string", "minLength": 1 },
-            "figure": { "$ref": "#/$defs/excalidrawFigure" }
+            "kind": {
+              "const": "delete_toc"
+            },
+            "tocId": {
+              "minLength": 1,
+              "type": "string"
+            }
           },
-          "required": ["kind", "imageId", "figure"]
+          "required": [
+            "kind",
+            "tocId"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "insert_note"
+            },
+            "noteKind": {
+              "default": "footnote",
+              "enum": [
+                "footnote",
+                "endnote"
+              ],
+              "type": "string"
+            },
+            "target": {
+              "$ref": "#/$defs/target"
+            },
+            "text": {
+              "maxLength": 32768,
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "target",
+            "text"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "replace_text"
+            },
+            "target": {
+              "$ref": "#/$defs/target"
+            },
+            "text": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "target",
+            "text"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "insert_text"
+            },
+            "target": {
+              "$ref": "#/$defs/target"
+            },
+            "text": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "target",
+            "text"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "delete_range"
+            },
+            "target": {
+              "$ref": "#/$defs/target"
+            }
+          },
+          "required": [
+            "kind",
+            "target"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "set_text_style"
+            },
+            "style": {
+              "$ref": "#/$defs/textStyle"
+            },
+            "target": {
+              "$ref": "#/$defs/target"
+            }
+          },
+          "required": [
+            "kind",
+            "target",
+            "style"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "set_paragraph_style"
+            },
+            "style": {
+              "$ref": "#/$defs/paragraphStyle"
+            },
+            "target": {
+              "$ref": "#/$defs/target"
+            }
+          },
+          "required": [
+            "kind",
+            "target",
+            "style"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "display": {
+              "default": false,
+              "type": "boolean"
+            },
+            "kind": {
+              "const": "insert_equation"
+            },
+            "latex": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "target": {
+              "$ref": "#/$defs/target"
+            }
+          },
+          "required": [
+            "kind",
+            "target",
+            "latex"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "insert_page_break"
+            },
+            "target": {
+              "$ref": "#/$defs/target"
+            }
+          },
+          "required": [
+            "kind",
+            "target"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "figure": {
+              "$ref": "#/$defs/excalidrawFigure"
+            },
+            "imageId": {
+              "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+              "type": "string"
+            },
+            "kind": {
+              "const": "insert_excalidraw_figure"
+            },
+            "target": {
+              "$ref": "#/$defs/excalidrawTarget"
+            }
+          },
+          "required": [
+            "kind",
+            "target",
+            "figure"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "figure": {
+              "$ref": "#/$defs/excalidrawFigure"
+            },
+            "imageId": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "kind": {
+              "const": "replace_excalidraw_figure"
+            },
+            "reconstructScene": {
+              "default": false,
+              "description": "Use only when the user explicitly requests a full redraw/reconstruction. It permits replacing original scene/label IDs and unsupported objects, with a visible loss warning. Prefer native patches for partial edits.",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "kind",
+            "imageId",
+            "figure"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Insert a bounded rectangular table at a body paragraph position. Optional tableId and rectangular cellIds let later operations in the same preview address the new table/cells.",
+          "properties": {
+            "cellIds": {
+              "items": {
+                "items": {
+                  "maxLength": 64,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "maxItems": 20,
+                "type": "array"
+              },
+              "maxItems": 50,
+              "type": "array"
+            },
+            "cells": {
+              "items": {
+                "items": {
+                  "maxLength": 32768,
+                  "type": "string"
+                },
+                "maxItems": 20,
+                "type": "array"
+              },
+              "maxItems": 50,
+              "type": "array"
+            },
+            "columns": {
+              "maximum": 20,
+              "minimum": 1,
+              "type": "integer"
+            },
+            "headerRow": {
+              "type": "boolean"
+            },
+            "kind": {
+              "const": "insert_table"
+            },
+            "rows": {
+              "maximum": 50,
+              "minimum": 1,
+              "type": "integer"
+            },
+            "tableId": {
+              "maxLength": 64,
+              "minLength": 1,
+              "type": "string"
+            },
+            "target": {
+              "$ref": "#/$defs/semanticTarget"
+            }
+          },
+          "required": [
+            "target",
+            "rows",
+            "columns",
+            "kind"
+          ],
+          "type": "object",
+          "x-group": "tables"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Replace one UTF-16 range in a stable table cell, retaining unrelated content and formatting.",
+          "properties": {
+            "kind": {
+              "const": "replace_table_cell_range"
+            },
+            "target": {
+              "$ref": "#/$defs/cellRangeTarget"
+            },
+            "text": {
+              "maxLength": 32768,
+              "type": "string"
+            }
+          },
+          "required": [
+            "target",
+            "text",
+            "kind"
+          ],
+          "type": "object",
+          "x-group": "tables"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Replace the text of one stable cell; unrelated cells are retained.",
+          "properties": {
+            "kind": {
+              "const": "set_table_cell_text"
+            },
+            "target": {
+              "$ref": "#/$defs/cellTarget"
+            },
+            "text": {
+              "maxLength": 32768,
+              "type": "string"
+            }
+          },
+          "required": [
+            "target",
+            "text",
+            "kind"
+          ],
+          "type": "object",
+          "x-group": "tables"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Format a UTF-16 range within one stable cell.",
+          "properties": {
+            "kind": {
+              "const": "set_table_cell_style"
+            },
+            "style": {
+              "$ref": "#/$defs/semanticTextStyle"
+            },
+            "target": {
+              "$ref": "#/$defs/cellRangeTarget"
+            }
+          },
+          "required": [
+            "target",
+            "style",
+            "kind"
+          ],
+          "type": "object",
+          "x-group": "tables"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Set supported paragraph alignment, indents, line/paragraph spacing and keep flags in one stable cell.",
+          "properties": {
+            "kind": {
+              "const": "set_table_cell_paragraph_format"
+            },
+            "style": {
+              "$ref": "#/$defs/semanticParagraphFormat"
+            },
+            "target": {
+              "$ref": "#/$defs/cellTarget"
+            }
+          },
+          "required": [
+            "target",
+            "style",
+            "kind"
+          ],
+          "type": "object",
+          "x-group": "tables"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Set horizontal and vertical positioning of one stable cell.",
+          "properties": {
+            "horizontal": {
+              "enum": [
+                "left",
+                "center",
+                "right",
+                "justify"
+              ],
+              "type": "string"
+            },
+            "kind": {
+              "const": "set_table_cell_alignment"
+            },
+            "target": {
+              "$ref": "#/$defs/cellTarget"
+            },
+            "vertical": {
+              "enum": [
+                "top",
+                "center",
+                "bottom"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "target",
+            "horizontal",
+            "vertical",
+            "kind"
+          ],
+          "type": "object",
+          "x-group": "tables"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Apply one of OwlDocs's supported native table styles.",
+          "properties": {
+            "kind": {
+              "const": "set_table_style"
+            },
+            "style": {
+              "enum": [
+                "plain",
+                "grid",
+                "light-gray",
+                "light-blue",
+                "light-orange",
+                "medium-blue",
+                "medium-green",
+                "medium-orange",
+                "aubergine",
+                "orange-accent",
+                "banded-blue",
+                "banded-aubergine",
+                "dark-header"
+              ],
+              "type": "string"
+            },
+            "tableId": {
+              "maxLength": 64,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "tableId",
+            "style",
+            "kind"
+          ],
+          "type": "object",
+          "x-group": "tables"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Set point-based column widths and minimum row heights. Empty arrays restore automatic dimensions; row minimum zero is Auto.",
+          "properties": {
+            "columnWidthsPoints": {
+              "items": {
+                "maximum": 1584.0,
+                "minimum": 0.05,
+                "type": "number"
+              },
+              "maxItems": 20,
+              "type": "array"
+            },
+            "kind": {
+              "const": "set_table_geometry"
+            },
+            "rowMinimumHeightsPoints": {
+              "items": {
+                "maximum": 1584.0,
+                "minimum": 0.0,
+                "type": "number"
+              },
+              "maxItems": 50,
+              "type": "array"
+            },
+            "tableId": {
+              "maxLength": 64,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "tableId",
+            "kind"
+          ],
+          "type": "object",
+          "x-group": "tables"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Insert one table row or column, retaining stable identities and inheriting an adjacent row/column.",
+          "properties": {
+            "index": {
+              "maximum": 50,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "inheritFrom": {
+              "enum": [
+                "preceding",
+                "following"
+              ],
+              "type": "string"
+            },
+            "kind": {
+              "const": "insert_table_row"
+            },
+            "tableId": {
+              "maxLength": 64,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "tableId",
+            "index",
+            "kind"
+          ],
+          "type": "object",
+          "x-group": "tables"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Insert one table row or column, retaining stable identities and inheriting an adjacent row/column.",
+          "properties": {
+            "index": {
+              "maximum": 20,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "inheritFrom": {
+              "enum": [
+                "preceding",
+                "following"
+              ],
+              "type": "string"
+            },
+            "kind": {
+              "const": "insert_table_column"
+            },
+            "tableId": {
+              "maxLength": 64,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "tableId",
+            "index",
+            "kind"
+          ],
+          "type": "object",
+          "x-group": "tables"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Delete contiguous table rows or columns, retaining at least one.",
+          "properties": {
+            "count": {
+              "maximum": 49,
+              "minimum": 1,
+              "type": "integer"
+            },
+            "index": {
+              "maximum": 49,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "kind": {
+              "const": "delete_table_rows"
+            },
+            "tableId": {
+              "maxLength": 64,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "tableId",
+            "index",
+            "count",
+            "kind"
+          ],
+          "type": "object",
+          "x-group": "tables"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Delete contiguous table rows or columns, retaining at least one.",
+          "properties": {
+            "count": {
+              "maximum": 19,
+              "minimum": 1,
+              "type": "integer"
+            },
+            "index": {
+              "maximum": 19,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "kind": {
+              "const": "delete_table_columns"
+            },
+            "tableId": {
+              "maxLength": 64,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "tableId",
+            "index",
+            "count",
+            "kind"
+          ],
+          "type": "object",
+          "x-group": "tables"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Evenly distribute column widths. For an automatic grid, supply totalWidthPoints from the available page width.",
+          "properties": {
+            "kind": {
+              "const": "distribute_table_columns"
+            },
+            "tableId": {
+              "maxLength": 64,
+              "minLength": 1,
+              "type": "string"
+            },
+            "totalWidthPoints": {
+              "maximum": 1584.0,
+              "minimum": 1.0,
+              "type": "number"
+            }
+          },
+          "required": [
+            "tableId",
+            "kind"
+          ],
+          "type": "object",
+          "x-group": "tables"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Evenly distribute authored row minima; optional minimumHeightPoints sets their common minimum. Auto rows remain content-growing.",
+          "properties": {
+            "kind": {
+              "const": "distribute_table_rows"
+            },
+            "minimumHeightPoints": {
+              "maximum": 1584.0,
+              "minimum": 0.0,
+              "type": "number"
+            },
+            "tableId": {
+              "maxLength": 64,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "tableId",
+            "kind"
+          ],
+          "type": "object",
+          "x-group": "tables"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Apply solid/none borders to the whole table or a rectangular selection of stable cell IDs. Shared edges are updated together.",
+          "properties": {
+            "cellIds": {
+              "items": {
+                "maxLength": 64,
+                "minLength": 1,
+                "type": "string"
+              },
+              "maxItems": 1000,
+              "type": "array"
+            },
+            "color": {
+              "pattern": "^#[0-9A-Fa-f]{6}$",
+              "type": "string"
+            },
+            "kind": {
+              "const": "set_table_borders"
+            },
+            "preset": {
+              "enum": [
+                "all",
+                "outside",
+                "inside",
+                "none",
+                "top",
+                "bottom",
+                "left",
+                "right"
+              ],
+              "type": "string"
+            },
+            "tableId": {
+              "maxLength": 64,
+              "minLength": 1,
+              "type": "string"
+            },
+            "widthPoints": {
+              "maximum": 12.0,
+              "minimum": 0.125,
+              "type": "number"
+            }
+          },
+          "required": [
+            "tableId",
+            "preset",
+            "kind"
+          ],
+          "type": "object",
+          "x-group": "tables"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Delete one semantic table.",
+          "properties": {
+            "kind": {
+              "const": "delete_table"
+            },
+            "tableId": {
+              "maxLength": 64,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "tableId",
+            "kind"
+          ],
+          "type": "object",
+          "x-group": "tables"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Insert bounded base64 PNG/JPEG bytes at a body, stable-cell or header/footer story position. No file paths are accepted.",
+          "properties": {
+            "accessibleName": {
+              "maxLength": 4096,
+              "type": "string"
+            },
+            "base64Data": {
+              "maxLength": 5592408,
+              "type": "string"
+            },
+            "heightPoints": {
+              "maximum": 20000.0,
+              "minimum": 0.01,
+              "type": "number"
+            },
+            "imageId": {
+              "maxLength": 64,
+              "minLength": 1,
+              "type": "string"
+            },
+            "kind": {
+              "const": "insert_raster_image"
+            },
+            "mimeType": {
+              "enum": [
+                "image/png",
+                "image/jpeg"
+              ],
+              "type": "string"
+            },
+            "target": {
+              "$ref": "#/$defs/imageTarget"
+            },
+            "widthPoints": {
+              "maximum": 20000.0,
+              "minimum": 0.01,
+              "type": "number"
+            }
+          },
+          "required": [
+            "target",
+            "base64Data",
+            "mimeType",
+            "accessibleName",
+            "widthPoints",
+            "heightPoints",
+            "kind"
+          ],
+          "type": "object",
+          "x-group": "pictures"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Resize an existing native body, cell or story picture by stable identity.",
+          "properties": {
+            "heightPoints": {
+              "maximum": 20000.0,
+              "minimum": 0.01,
+              "type": "number"
+            },
+            "imageId": {
+              "maxLength": 64,
+              "minLength": 1,
+              "type": "string"
+            },
+            "kind": {
+              "const": "resize_image"
+            },
+            "widthPoints": {
+              "maximum": 20000.0,
+              "minimum": 0.01,
+              "type": "number"
+            }
+          },
+          "required": [
+            "imageId",
+            "widthPoints",
+            "heightPoints",
+            "kind"
+          ],
+          "type": "object",
+          "x-group": "pictures"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Set accessible text without changing picture identity or source bytes.",
+          "properties": {
+            "imageId": {
+              "maxLength": 64,
+              "minLength": 1,
+              "type": "string"
+            },
+            "kind": {
+              "const": "set_image_alt_text"
+            },
+            "text": {
+              "maxLength": 4096,
+              "type": "string"
+            }
+          },
+          "required": [
+            "imageId",
+            "text",
+            "kind"
+          ],
+          "type": "object",
+          "x-group": "pictures"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Set supported body picture wrapping. Cell and story pictures remain inline.",
+          "properties": {
+            "distanceBottomPoints": {
+              "maximum": 20000.0,
+              "minimum": 0.0,
+              "type": "number"
+            },
+            "distanceLeftPoints": {
+              "maximum": 20000.0,
+              "minimum": 0.0,
+              "type": "number"
+            },
+            "distanceRightPoints": {
+              "maximum": 20000.0,
+              "minimum": 0.0,
+              "type": "number"
+            },
+            "distanceTopPoints": {
+              "maximum": 20000.0,
+              "minimum": 0.0,
+              "type": "number"
+            },
+            "imageId": {
+              "maxLength": 64,
+              "minLength": 1,
+              "type": "string"
+            },
+            "kind": {
+              "const": "set_image_layout"
+            },
+            "moveWithText": {
+              "type": "boolean"
+            },
+            "placement": {
+              "enum": [
+                "inline",
+                "square",
+                "topBottom"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "imageId",
+            "placement",
+            "kind"
+          ],
+          "type": "object",
+          "x-group": "pictures"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Delete one native picture from its containing body, table cell, header or footer.",
+          "properties": {
+            "imageId": {
+              "maxLength": 64,
+              "minLength": 1,
+              "type": "string"
+            },
+            "kind": {
+              "const": "delete_image"
+            }
+          },
+          "required": [
+            "imageId",
+            "kind"
+          ],
+          "type": "object",
+          "x-group": "pictures"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Set default header/footer text, or one left/center/right region. PAGE and PAGES fields use {PAGE} and {PAGES}; other regions and their pictures retain identity.",
+          "properties": {
+            "kind": {
+              "const": "set_story_text"
+            },
+            "region": {
+              "enum": [
+                "left",
+                "center",
+                "right"
+              ],
+              "type": "string"
+            },
+            "story": {
+              "enum": [
+                "header",
+                "footer"
+              ],
+              "type": "string"
+            },
+            "text": {
+              "maxLength": 32768,
+              "type": "string"
+            }
+          },
+          "required": [
+            "story",
+            "text",
+            "kind"
+          ],
+          "type": "object",
+          "x-group": "stories"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Split a body paragraph at a UTF-16 boundary. Optional newParagraphId lets a later operation in the same preview address the new paragraph.",
+          "properties": {
+            "kind": {
+              "const": "split_paragraph"
+            },
+            "newParagraphId": {
+              "maxLength": 64,
+              "minLength": 1,
+              "type": "string"
+            },
+            "target": {
+              "$ref": "#/$defs/semanticTarget"
+            }
+          },
+          "required": [
+            "target",
+            "kind"
+          ],
+          "type": "object",
+          "x-group": "structure"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Merge a body paragraph with its immediately following paragraph, preserving supported atoms and formatting.",
+          "properties": {
+            "blockId": {
+              "maxLength": 64,
+              "minLength": 1,
+              "type": "string"
+            },
+            "kind": {
+              "const": "merge_paragraph"
+            }
+          },
+          "required": [
+            "blockId",
+            "kind"
+          ],
+          "type": "object",
+          "x-group": "structure"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Move a paragraph, table or TOC before another body block; omitted/null beforeBlockId appends.",
+          "properties": {
+            "beforeBlockId": {
+              "oneOf": [
+                {
+                  "maxLength": 64,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "blockId": {
+              "maxLength": 64,
+              "minLength": 1,
+              "type": "string"
+            },
+            "kind": {
+              "const": "move_block"
+            }
+          },
+          "required": [
+            "blockId",
+            "kind"
+          ],
+          "type": "object",
+          "x-group": "structure"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Edit an existing citation locator or reference target/format, retaining the field identity. Computed numbering cannot be assigned.",
+          "properties": {
+            "fieldId": {
+              "maxLength": 64,
+              "minLength": 1,
+              "type": "string"
+            },
+            "format": {
+              "enum": [
+                "label_number",
+                "full_text"
+              ],
+              "type": "string"
+            },
+            "kind": {
+              "const": "set_academic_field"
+            },
+            "locator": {
+              "maxLength": 512,
+              "type": "string"
+            },
+            "targetId": {
+              "maxLength": 64,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "fieldId",
+            "kind"
+          ],
+          "type": "object",
+          "x-group": "references"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Change an existing caption label or its pictured object while preserving its paragraph and numbering field identities.",
+          "properties": {
+            "blockId": {
+              "maxLength": 64,
+              "minLength": 1,
+              "type": "string"
+            },
+            "kind": {
+              "const": "set_caption_metadata"
+            },
+            "label": {
+              "enum": [
+                "Figure",
+                "Table",
+                "Equation"
+              ],
+              "type": "string"
+            },
+            "objectId": {
+              "maxLength": 64,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "blockId",
+            "kind"
+          ],
+          "type": "object",
+          "x-group": "references"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Enable or remove a paragraph's manual bibliography role and generated number prefix. Citations continue referring to its stable identity.",
+          "properties": {
+            "blockId": {
+              "maxLength": 64,
+              "minLength": 1,
+              "type": "string"
+            },
+            "enabled": {
+              "type": "boolean"
+            },
+            "kind": {
+              "const": "set_bibliography_entry"
+            }
+          },
+          "required": [
+            "blockId",
+            "enabled",
+            "kind"
+          ],
+          "type": "object",
+          "x-group": "references"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "expectedLayoutStateId": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "kind": {
+              "const": "set_page_layout"
+            },
+            "layout": {
+              "$ref": "#/$defs/pageLayout"
+            }
+          },
+          "required": [
+            "kind",
+            "layout",
+            "expectedLayoutStateId"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Patch existing native element IDs while preserving all unrelated objects, groups, bindings and assets. Width/height apply only to dimension-bearing objects; line/arrow geometry uses points. Text/fontSize target text elements. No creation, deletion or rebinding.",
+          "properties": {
+            "edits": {
+              "items": {
+                "additionalProperties": false,
+                "properties": {
+                  "changes": {
+                    "$ref": "#/$defs/excalidrawPatchChanges"
+                  },
+                  "id": {
+                    "pattern": "^[A-Za-z0-9_-]{1,64}$",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "id",
+                  "changes"
+                ],
+                "type": "object"
+              },
+              "maxItems": 128,
+              "minItems": 1,
+              "type": "array"
+            },
+            "imageId": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "kind": {
+              "const": "patch_excalidraw_figure"
+            }
+          },
+          "required": [
+            "kind",
+            "imageId",
+            "edits"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "blockIds": {
+              "items": {
+                "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+                "type": "string"
+              },
+              "maxItems": 2048,
+              "minItems": 1,
+              "type": "array",
+              "uniqueItems": true
+            },
+            "kind": {
+              "const": "set_list"
+            },
+            "listKind": {
+              "enum": [
+                "bullets",
+                "numbered",
+                "none"
+              ]
+            }
+          },
+          "required": [
+            "kind",
+            "blockIds",
+            "listKind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "blockIds": {
+              "items": {
+                "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+                "type": "string"
+              },
+              "maxItems": 2048,
+              "minItems": 1,
+              "type": "array",
+              "uniqueItems": true
+            },
+            "kind": {
+              "const": "set_list_level"
+            },
+            "level": {
+              "maximum": 10,
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "kind",
+            "blockIds",
+            "level"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "blockIds": {
+              "items": {
+                "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+                "type": "string"
+              },
+              "maxItems": 2048,
+              "minItems": 1,
+              "type": "array",
+              "uniqueItems": true
+            },
+            "kind": {
+              "const": "set_list_layout"
+            },
+            "levels": {
+              "items": {
+                "additionalProperties": false,
+                "properties": {
+                  "bulletIndentSpaces": {
+                    "maximum": 400,
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "textIndentSpaces": {
+                    "maximum": 64,
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "bulletIndentSpaces",
+                  "textIndentSpaces"
+                ],
+                "type": "object"
+              },
+              "maxItems": 10,
+              "minItems": 10,
+              "type": "array"
+            }
+          },
+          "required": [
+            "kind",
+            "blockIds",
+            "levels"
+          ],
+          "type": "object"
         }
       ]
     },
-    "readInput": {
-      "type": "object",
+    "pageLayout": {
       "additionalProperties": false,
       "properties": {
-        "documentId": { "type": "string", "minLength": 1 },
-        "expectedRevision": { "type": "integer", "minimum": 0 },
-        "scope": {
-          "type": "string",
-          "enum": ["selection", "document", "outline", "blocks"],
-          "default": "selection"
+        "heightPoints": {
+          "exclusiveMinimum": 0,
+          "maximum": 100000,
+          "minimum": 0,
+          "type": "number"
         },
-        "blockIds": {
-          "type": "array",
-          "items": { "type": "string", "minLength": 1 },
-          "maxItems": 256,
-          "uniqueItems": true
+        "marginBottomPoints": {
+          "maximum": 100000,
+          "minimum": 0,
+          "type": "number"
         },
-        "tableCellTargets": {
-          "type": "array",
-          "items": {
-            "type": "object",
-            "additionalProperties": false,
-            "properties": {
-              "tableId": { "type": "string", "minLength": 1 },
-              "cellId": { "type": "string", "minLength": 1 }
-            },
-            "required": ["tableId", "cellId"]
-          },
-          "maxItems": 256,
-          "uniqueItems": true
+        "marginLeftPoints": {
+          "maximum": 100000,
+          "minimum": 0,
+          "type": "number"
         },
-        "includeFormatting": { "type": "boolean", "default": true },
-        "maxCharacters": { "type": "integer", "minimum": 1, "maximum": 200000, "default": 50000 }
-      },
-      "required": ["documentId", "scope"]
-    },
-    "readOutput": {
-      "type": "object",
-      "additionalProperties": false,
-      "properties": {
-        "documentId": { "type": "string" },
-        "revision": { "type": "integer", "minimum": 0 },
-        "scope": { "type": "string" },
-        "truncated": { "type": "boolean" },
-        "blocks": {
-          "type": "array",
-          "items": {
-            "type": "object",
-            "additionalProperties": false,
-            "properties": {
-              "id": { "type": "string" },
-              "type": { "type": "string" },
-              "text": { "type": "string" },
-              "attributes": { "type": "object", "additionalProperties": true }
-            },
-            "required": ["id", "type", "text"]
-          }
+        "marginRightPoints": {
+          "maximum": 100000,
+          "minimum": 0,
+          "type": "number"
+        },
+        "marginTopPoints": {
+          "maximum": 100000,
+          "minimum": 0,
+          "type": "number"
+        },
+        "widthPoints": {
+          "exclusiveMinimum": 0,
+          "maximum": 100000,
+          "minimum": 0,
+          "type": "number"
         }
       },
-      "required": ["documentId", "revision", "scope", "truncated", "blocks"]
+      "required": [
+        "widthPoints",
+        "heightPoints",
+        "marginTopPoints",
+        "marginRightPoints",
+        "marginBottomPoints",
+        "marginLeftPoints"
+      ],
+      "type": "object"
     },
-    "searchInput": {
-      "type": "object",
+    "paragraphStyle": {
+      "additionalProperties": false,
+      "minProperties": 1,
+      "properties": {
+        "alignment": {
+          "enum": [
+            "left",
+            "center",
+            "right",
+            "justify"
+          ],
+          "type": "string"
+        },
+        "firstLineIndentPoints": {
+          "maximum": 20000.0,
+          "minimum": -20000.0,
+          "type": "number"
+        },
+        "keepLines": {
+          "type": "boolean"
+        },
+        "keepWithNext": {
+          "type": "boolean"
+        },
+        "leftIndentPoints": {
+          "maximum": 20000.0,
+          "minimum": -20000.0,
+          "type": "number"
+        },
+        "lineSpacing": {
+          "maximum": 20.0,
+          "minimum": 0.01,
+          "type": "number"
+        },
+        "lineSpacingPoints": {
+          "maximum": 20000.0,
+          "minimum": 0.01,
+          "type": "number"
+        },
+        "lineSpacingRule": {
+          "enum": [
+            "automatic",
+            "atLeast",
+            "exact"
+          ],
+          "type": "string"
+        },
+        "pageBreakBefore": {
+          "type": "boolean"
+        },
+        "rightIndentPoints": {
+          "maximum": 20000.0,
+          "minimum": -20000.0,
+          "type": "number"
+        },
+        "spaceAfterPoints": {
+          "maximum": 20000.0,
+          "minimum": 0.0,
+          "type": "number"
+        },
+        "spaceBeforePoints": {
+          "maximum": 20000.0,
+          "minimum": 0.0,
+          "type": "number"
+        },
+        "styleId": {
+          "description": "Set a bounded semantic paragraph-style ID, or null to clear it. IDs are additionally limited to 1024 UTF-8 bytes. Recognized built-ins also apply their catalog baseline; unknown IDs retain identity without invented formatting.",
+          "oneOf": [
+            {
+              "maxLength": 1024,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "semanticParagraphFormat": {
+      "additionalProperties": false,
+      "minProperties": 1,
+      "properties": {
+        "alignment": {
+          "enum": [
+            "left",
+            "center",
+            "right",
+            "justify"
+          ],
+          "type": "string"
+        },
+        "firstLineIndentPoints": {
+          "maximum": 20000.0,
+          "minimum": -20000.0,
+          "type": "number"
+        },
+        "keepLines": {
+          "type": "boolean"
+        },
+        "keepWithNext": {
+          "type": "boolean"
+        },
+        "leftIndentPoints": {
+          "maximum": 20000.0,
+          "minimum": -20000.0,
+          "type": "number"
+        },
+        "lineSpacing": {
+          "maximum": 20.0,
+          "minimum": 0.01,
+          "type": "number"
+        },
+        "lineSpacingPoints": {
+          "maximum": 20000.0,
+          "minimum": 0.01,
+          "type": "number"
+        },
+        "lineSpacingRule": {
+          "enum": [
+            "automatic",
+            "atLeast",
+            "exact"
+          ],
+          "type": "string"
+        },
+        "pageBreakBefore": {
+          "type": "boolean"
+        },
+        "rightIndentPoints": {
+          "maximum": 20000.0,
+          "minimum": -20000.0,
+          "type": "number"
+        },
+        "spaceAfterPoints": {
+          "maximum": 20000.0,
+          "minimum": 0.0,
+          "type": "number"
+        },
+        "spaceBeforePoints": {
+          "maximum": 20000.0,
+          "minimum": 0.0,
+          "type": "number"
+        }
+      },
+      "type": "object"
+    },
+    "semanticTarget": {
       "additionalProperties": false,
       "properties": {
-        "documentId": { "type": "string", "minLength": 1 },
-        "expectedRevision": { "type": "integer", "minimum": 0 },
-        "query": {
-          "type": "string",
+        "blockId": {
+          "maxLength": 64,
           "minLength": 1,
-          "maxLength": 1024,
-          "description": "Length is measured in Unicode code points; result offsets are UTF-16."
+          "type": "string"
         },
-        "caseSensitive": { "type": "boolean", "default": false },
-        "wholeWord": { "type": "boolean", "default": false },
-        "maxResults": { "type": "integer", "minimum": 1, "maximum": 500, "default": 100 }
-      },
-      "required": ["documentId", "query"]
-    },
-    "searchOutput": {
-      "type": "object",
-      "additionalProperties": false,
-      "properties": {
-        "documentId": { "type": "string" },
-        "revision": { "type": "integer", "minimum": 0 },
-        "query": { "type": "string" },
-        "caseSensitive": { "type": "boolean" },
-        "wholeWord": { "type": "boolean" },
-        "truncated": { "type": "boolean" },
-        "results": {
-          "type": "array",
-          "maxItems": 500,
-          "items": {
-            "type": "object",
-            "additionalProperties": false,
-            "properties": {
-              "blockId": {
-                "type": "string",
-                "minLength": 1,
-                "description": "Paragraph ID or, for tableCell results, the cell ID."
-              },
-              "blockType": { "type": "string", "enum": ["paragraph", "tableCell"] },
-              "tableId": { "type": "string", "minLength": 1 },
-              "cellId": { "type": "string", "minLength": 1 },
-              "row": { "type": "integer", "minimum": 0 },
-              "column": { "type": "integer", "minimum": 0 },
-              "start": { "type": "integer", "minimum": 0 },
-              "end": { "type": "integer", "minimum": 0 },
-              "context": { "type": "string", "maxLength": 1216 },
-              "contextStart": { "type": "integer", "minimum": 0 },
-              "contextEnd": { "type": "integer", "minimum": 0 }
-            },
-            "required": ["blockId", "blockType", "start", "end", "context", "contextStart", "contextEnd"],
-            "allOf": [
-              {
-                "if": {
-                  "properties": { "blockType": { "const": "tableCell" } },
-                  "required": ["blockType"]
-                },
-                "then": { "required": ["tableId", "cellId", "row", "column"] }
-              }
-            ]
-          }
+        "start": {
+          "maximum": 10000000,
+          "minimum": 0,
+          "type": "integer"
         }
       },
-      "required": ["documentId", "revision", "query", "caseSensitive", "wholeWord", "truncated", "results"]
+      "required": [
+        "blockId",
+        "start"
+      ],
+      "type": "object"
+    },
+    "semanticTextStyle": {
+      "additionalProperties": false,
+      "minProperties": 1,
+      "properties": {
+        "bold": {
+          "type": "boolean"
+        },
+        "fontFamily": {
+          "maxLength": 1024,
+          "type": "string"
+        },
+        "fontSizePoints": {
+          "maximum": 1000.0,
+          "minimum": 0.5,
+          "type": "number"
+        },
+        "foregroundColor": {
+          "pattern": "^#[0-9A-Fa-f]{6}$",
+          "type": "string"
+        },
+        "highlightColor": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "pattern": "^#[0-9A-Fa-f]{6}$",
+              "type": "string"
+            }
+          ]
+        },
+        "italic": {
+          "type": "boolean"
+        },
+        "strike": {
+          "type": "boolean"
+        },
+        "underline": {
+          "type": "boolean"
+        },
+        "verticalAlign": {
+          "enum": [
+            "baseline",
+            "superscript",
+            "subscript"
+          ],
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "target": {
+      "additionalProperties": false,
+      "properties": {
+        "blockId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "end": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "start": {
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "blockId",
+        "start"
+      ],
+      "type": "object"
+    },
+    "textStyle": {
+      "additionalProperties": false,
+      "minProperties": 1,
+      "properties": {
+        "bold": {
+          "type": "boolean"
+        },
+        "fontFamily": {
+          "maxLength": 1024,
+          "type": "string"
+        },
+        "fontSizePoints": {
+          "maximum": 1000.0,
+          "minimum": 0.5,
+          "type": "number"
+        },
+        "foregroundColor": {
+          "pattern": "^#[0-9A-Fa-f]{6}$",
+          "type": "string"
+        },
+        "highlightColor": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "pattern": "^#[0-9A-Fa-f]{6}$",
+              "type": "string"
+            }
+          ]
+        },
+        "italic": {
+          "type": "boolean"
+        },
+        "strike": {
+          "type": "boolean"
+        },
+        "underline": {
+          "type": "boolean"
+        },
+        "verticalAlign": {
+          "enum": [
+            "baseline",
+            "superscript",
+            "subscript"
+          ],
+          "type": "string"
+        }
+      },
+      "type": "object"
     },
     "previewInput": {
-      "type": "object",
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
       "properties": {
-        "documentId": { "type": "string", "minLength": 1 },
-        "baseRevision": { "type": "integer", "minimum": 0 },
-        "summary": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "baseRevision": {
+          "minimum": 0,
+          "type": "integer"
+        },
         "operations": {
-          "type": "array",
-          "items": { "$ref": "#/$defs/operation" },
+          "items": {
+            "$ref": "#/$defs/operation"
+          },
+          "maxItems": 256,
           "minItems": 1,
-          "maxItems": 256
+          "type": "array"
+        },
+        "summary": {
+          "maxLength": 512,
+          "minLength": 1,
+          "type": "string"
+        },
+        "documentId": {
+          "type": "string",
+          "minLength": 1
         }
       },
-      "required": ["documentId", "baseRevision", "summary", "operations"]
+      "required": [
+        "baseRevision",
+        "summary",
+        "operations",
+        "documentId"
+      ],
+      "type": "object"
     },
     "previewOutput": {
-      "type": "object",
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
       "properties": {
-        "previewId": { "type": "string", "minLength": 1 },
-        "documentId": { "type": "string", "minLength": 1 },
-        "baseRevision": { "type": "integer", "minimum": 0 },
-        "committed": { "const": false },
-        "summary": { "type": "string" },
-        "affectedBlockIds": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
-        "warnings": { "type": "array", "items": { "type": "string" } }
-      },
-      "required": ["previewId", "documentId", "baseRevision", "committed", "summary", "affectedBlockIds", "warnings"]
-    },
-    "fileCapability": {
-      "type": "object",
-      "additionalProperties": false,
-      "description": "A revocable read-only grant. Its opaque id is safe to pass to Codex; its backing path is not.",
-      "properties": {
-        "capabilityId": {
-          "type": "string",
-          "minLength": 16,
-          "maxLength": 128,
-          "pattern": "^[A-Za-z0-9_-]+$"
+        "affectedBlockIds": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
         },
-        "displayName": { "type": "string" },
-        "mimeType": { "type": "string" },
-        "sizeBytes": { "type": "integer", "minimum": 0 },
-        "sha256": { "type": "string", "pattern": "^[0-9A-Fa-f]{64}$" },
-        "expiresAt": { "type": ["string", "null"], "format": "date-time" }
-      },
-      "required": ["capabilityId", "displayName", "mimeType", "sizeBytes", "sha256", "expiresAt"]
-    },
-    "fileCapabilityReadInput": {
-      "type": "object",
-      "additionalProperties": false,
-      "properties": {
-        "capabilityId": {
-          "type": "string",
-          "minLength": 16,
-          "maxLength": 128,
-          "pattern": "^[A-Za-z0-9_-]+$",
-          "description": "Opaque, app-minted identifier; never a filesystem path."
+        "baseRevision": {
+          "minimum": 0,
+          "type": "integer"
         },
-        "offset": { "type": "integer", "minimum": 0, "default": 0 },
-        "maxBytes": { "type": "integer", "minimum": 1, "maximum": 1048576, "default": 262144 },
-        "expectedSha256": { "type": "string", "pattern": "^[0-9A-Fa-f]{64}$" }
+        "committed": {
+          "const": false
+        },
+        "documentId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "previewId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "summary": {
+          "type": "string"
+        },
+        "warnings": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
       },
-      "required": ["capabilityId"]
+      "required": [
+        "previewId",
+        "documentId",
+        "baseRevision",
+        "committed",
+        "summary",
+        "affectedBlockIds",
+        "warnings"
+      ],
+      "type": "object"
     },
-    "fileCapabilityReadOutput": {
-      "type": "object",
+    "capabilitiesInput": {
       "additionalProperties": false,
       "properties": {
-        "capabilityId": { "type": "string" },
-        "offset": { "type": "integer", "minimum": 0 },
-        "nextOffset": { "type": "integer", "minimum": 0 },
-        "eof": { "type": "boolean" },
-        "base64Data": { "type": "string", "contentEncoding": "base64" },
-        "mimeType": { "type": "string" },
-        "sizeBytes": { "type": "integer", "minimum": 0 },
-        "sha256": { "type": "string", "pattern": "^[0-9A-Fa-f]{64}$" }
+        "expectedRevision": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "documentId": {
+          "type": "string",
+          "minLength": 1
+        }
       },
-      "required": ["capabilityId", "offset", "nextOffset", "eof", "base64Data", "mimeType", "sizeBytes", "sha256"]
+      "type": "object",
+      "required": [
+        "documentId"
+      ]
+    },
+    "capabilitiesOutput": {
+      "additionalProperties": true,
+      "properties": {
+        "catalogVersion": {
+          "type": "string"
+        },
+        "documentId": {
+          "type": "string"
+        },
+        "revision": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "runtime": {
+          "additionalProperties": true,
+          "type": "object"
+        },
+        "schemaVersion": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "schemaVersion",
+        "catalogVersion"
+      ],
+      "type": "object"
     }
   },
   "tools": [
     {
-      "type": "function",
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "description": "Read a bounded snapshot of the active document, including explicit selection and table-cell targets returned by search. Academic reads include offset-safe field metadata, plain note stories, caption/source identities and TOC settings. Request includeFormatting when a user asks about or requests formatting. Use the returned revision, stable block identifiers, and UTF-16 offsets when preparing edits.",
+      "inputSchema": {
+        "$ref": "#/$defs/readInput"
+      },
       "name": "editor_v1_read",
-      "description": "Read a bounded snapshot of the active document, including explicit table-cell targets returned by search. Use its revision and stable block identifiers when preparing edits.",
-      "inputSchema": { "$ref": "#/$defs/readInput" },
-      "outputSchema": { "$ref": "#/$defs/readOutput" },
-      "annotations": {
-        "readOnlyHint": true,
-        "destructiveHint": false,
-        "idempotentHint": true,
-        "openWorldHint": false
-      }
+      "outputSchema": {
+        "$ref": "#/$defs/readOutput"
+      },
+      "type": "function"
     },
     {
-      "type": "function",
-      "name": "editor_v1_search",
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
       "description": "Search body paragraphs and table cells in deterministic document order. Results contain stable paragraph/cell identifiers, UTF-16 grapheme-aligned offsets, and bounded context without changing the document.",
-      "inputSchema": { "$ref": "#/$defs/searchInput" },
-      "outputSchema": { "$ref": "#/$defs/searchOutput" },
-      "annotations": {
-        "readOnlyHint": true,
-        "destructiveHint": false,
-        "idempotentHint": true,
-        "openWorldHint": false
-      }
+      "inputSchema": {
+        "$ref": "#/$defs/searchInput"
+      },
+      "name": "editor_v1_search",
+      "outputSchema": {
+        "$ref": "#/$defs/searchOutput"
+      },
+      "type": "function"
     },
     {
-      "type": "function",
-      "name": "editor_v1_preview",
-      "description": "Create an atomic, revision-checked preview of semantic document operations, including editable Professional-mode Excalidraw figure insertion and replacement. This never commits changes; the user reviews the preview before it enters the undo stack.",
-      "inputSchema": { "$ref": "#/$defs/previewInput" },
-      "outputSchema": { "$ref": "#/$defs/previewOutput" },
       "annotations": {
-        "readOnlyHint": false,
         "destructiveHint": false,
         "idempotentHint": false,
-        "openWorldHint": false
-      }
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "description": "Create an atomic, revision-checked preview of semantic document operations, including text replacement, character formatting with set_text_style (font, size, bold, italic, underline, colors, highlight, superscript/subscript), paragraph formatting with set_paragraph_style (style, alignment, line/paragraph spacing, keep-with-next), insert_equation/replace_equation, plain footnotes/endnotes, numbered captions, manual numeric bibliography entries/citations, heading/caption cross-references, heading TOCs, and page breaks. Use insert_caption and insert_bibliography_entry to create independent paragraphs, and use returned source IDs for insert_citation and target IDs for insert_cross_reference. TOCs include Heading 1\u20133 by default, configurable through level 9. When the user asks for a diagram, insert_excalidraw_figure and replace_excalidraw_figure create or revise a native editable scene using the bundled offline renderer: new figures and reconstructions use Professional mode with a white canvas; native patches retain source styling and background. When the user asks you to edit or format the document, use this tool instead of only describing the steps. This never commits changes; the user reviews the preview in OwlDocs before it enters the undo stack.",
+      "inputSchema": {
+        "$ref": "#/$defs/previewInput"
+      },
+      "name": "editor_v1_preview",
+      "outputSchema": {
+        "$ref": "#/$defs/previewOutput"
+      },
+      "type": "function"
     },
     {
-      "type": "function",
-      "name": "editor_v1_file_capability_read",
-      "description": "Read a bounded byte range from an opaque, user-granted file capability. Filesystem paths are never accepted.",
-      "inputSchema": { "$ref": "#/$defs/fileCapabilityReadInput" },
-      "outputSchema": { "$ref": "#/$defs/fileCapabilityReadOutput" },
       "annotations": {
-        "readOnlyHint": true,
         "destructiveHint": false,
         "idempotentHint": true,
-        "openWorldHint": false
-      }
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "description": "Discover built-in OwlDocs editing capabilities, exact operation schemas, grouped features, limits, units and examples. Call before planning an edit; the result also reports current document revision and runtime availability. No skill installation or activation is required. All document writes use editor_v1_preview and user acceptance.",
+      "inputSchema": {
+        "$ref": "#/$defs/capabilitiesInput"
+      },
+      "name": "editor_v1_capabilities",
+      "outputSchema": {
+        "$ref": "#/$defs/capabilitiesOutput"
+      },
+      "type": "function"
     }
   ]
 }

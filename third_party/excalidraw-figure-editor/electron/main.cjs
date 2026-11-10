@@ -1,6 +1,7 @@
 const { app, BrowserWindow, Menu, ipcMain, session } = require("electron");
 const fs = require("fs/promises");
 const path = require("path");
+const { validateFigureRequest, rendererRequest, figureResult } = require("./figureProtocol.cjs");
 
 const MAX_REQUEST_BYTES = 32 * 1024 * 1024;
 const MAX_SCENE_BYTES = 32 * 1024 * 1024;
@@ -23,7 +24,7 @@ function optionValue(name) {
 const sessionDirectory = optionValue("--owl-docs-figure-session");
 
 function sessionPath(name) {
-  if (!sessionDirectory) throw new Error("Missing Owl Docs figure session");
+  if (!sessionDirectory) throw new Error("Missing OwlDocs figure session");
   return path.join(sessionDirectory, name);
 }
 
@@ -37,12 +38,7 @@ async function writeAtomic(name, contents) {
 async function finish(result) {
   if (completed) return;
   completed = true;
-  await writeAtomic("result.json", JSON.stringify({
-    version: 1,
-    token: request.token,
-    mode,
-    ...result
-  }));
+  await writeAtomic("result.json", JSON.stringify(figureResult(request, mode, result)));
   app.quit();
 }
 
@@ -84,7 +80,7 @@ function createWindow() {
     height: 920,
     minWidth: 860,
     minHeight: 600,
-    title: request.title || "Excalidraw Figure — Owl Docs",
+    title: request.title || "Excalidraw Figure — OwlDocs",
     webPreferences: {
       preload: path.join(__dirname, "preload.cjs"),
       sandbox: true,
@@ -114,32 +110,22 @@ app.commandLine.appendSwitch("disable-gpu");
 
 app.whenReady().then(async () => {
   if (!sessionDirectory || !path.isAbsolute(sessionDirectory)) {
-    throw new Error("Owl Docs figure editor requires an absolute session directory");
+    throw new Error("OwlDocs figure editor requires an absolute session directory");
   }
   const requestBuffer = await fs.readFile(sessionPath("request.json"));
   if (requestBuffer.length === 0 || requestBuffer.length > MAX_REQUEST_BYTES) {
     throw new Error("Figure request is empty or too large");
   }
   request = JSON.parse(requestBuffer.toString("utf8"));
-  if (request.version !== 1 || typeof request.token !== "string" ||
-      !/^[a-f0-9]{64}$/.test(request.token) ||
-      (request.scene !== null && typeof request.scene !== "object") ||
-      (request.skeleton !== undefined && !Array.isArray(request.skeleton)) ||
-      (request.renderOnly !== undefined && typeof request.renderOnly !== "boolean")) {
-    throw new Error("Invalid Owl Docs figure request");
-  }
+  validateFigureRequest(request);
   mode = request.mode === "sketch" ? "sketch" : "professional";
 
   blockNetworkRequests();
   session.defaultSession.setPermissionRequestHandler((_, __, callback) => callback(false));
   session.defaultSession.setPermissionCheckHandler(() => false);
-  ipcMain.handle("figure:request", () => ({
-    scene: request.scene,
-    mode,
-    skeleton: request.skeleton || null,
-    renderOnly: request.renderOnly === true
-  }));
+  ipcMain.handle("figure:request", () => rendererRequest(request, mode));
   ipcMain.handle("figure:set-mode", (_, nextMode) => {
+    if (request.version === 2 && nextMode !== "professional") return { ok: false, error: "Native patch rendering uses Professional mode" };
     mode = nextMode === "sketch" ? "sketch" : "professional";
     installMenu();
     return { ok: true, mode };

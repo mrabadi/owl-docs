@@ -116,7 +116,7 @@ struct BuiltInParagraphStyleDescriptor {
 // Stable ordering is intentional: styles.xml must not depend on the order in
 // which paragraphs happen to use a style.
 constexpr std::array<BuiltInParagraphStyleDescriptor, 13>
-    kBuiltInParagraphStyles{{
+    kLegacyBuiltInParagraphStyles{{
         {"NoSpacing", "No Spacing", "NoSpacing", 1, 0, 0, 0, 0, 0, -1,
          false, false, false, false, std::nullopt,
          BasicParagraphAlignment::left},
@@ -157,6 +157,44 @@ constexpr std::array<BuiltInParagraphStyleDescriptor, 13>
          true, true, true, true, 0x002c001eU,
          BasicParagraphAlignment::left},
     }};
+
+constexpr auto kNeutralBuiltInParagraphStyles = [] {
+    auto styles = kLegacyBuiltInParagraphStyles;
+    for (auto& style : styles) {
+        if (style.id == "Title") style.foreground_rgb = 0U;
+        else if (style.id == "Subtitle") {
+            style.italic = false;
+            style.foreground_rgb = 0x00606060U;
+        } else if (style.id == "Quote") style.foreground_rgb = 0x00404040U;
+        else if (style.outline_level >= 0) {
+            constexpr std::array<std::int16_t, 9> sizes{40, 32, 28, 24, 22, 22, 22, 22, 22};
+            constexpr std::array<std::uint16_t, 9> before{360, 280, 240, 200, 160, 160, 120, 120, 120};
+            constexpr std::array<std::uint16_t, 9> after{160, 120, 80, 80, 60, 60, 40, 40, 40};
+            const auto level = static_cast<std::size_t>(style.outline_level);
+            style.font_size_half_points = sizes[level];
+            style.space_before_twips = before[level];
+            style.space_after_twips = after[level];
+            style.bold = level < 6U;
+            style.italic = level >= 5U && level <= 7U;
+            style.foreground_rgb = level >= 7U ? 0x00606060U : 0U;
+        }
+    }
+    return styles;
+}();
+
+constexpr auto kBuiltInParagraphStyles = [] {
+    auto styles=kNeutralBuiltInParagraphStyles;
+    constexpr std::array<std::uint32_t,9> colors{
+        0x173b32U,0x2f6b57U,0x356078U,0x66507aU,0x6f5747U,
+        0x2f6b57U,0x626a66U,0x626a66U,0x626a66U};
+    for (auto& style:styles) {
+        if (style.id=="Title") style.foreground_rgb=0x173b32U;
+        else if (style.id=="Subtitle") style.foreground_rgb=0x626a66U;
+        else if (style.outline_level>=0)
+            style.foreground_rgb=colors[static_cast<std::size_t>(style.outline_level)];
+    }
+    return styles;
+}();
 
 const BuiltInParagraphStyleDescriptor* builtInParagraphStyle(
     std::string_view style_id) noexcept {
@@ -327,12 +365,14 @@ struct ParsedPackage {
     std::vector<ImportedSection> sections;
     std::optional<std::string> header_text;
     std::optional<std::string> footer_text;
+    std::optional<std::string> academic_recovery;
     std::vector<ImportedStoryImage> header_images;
     std::vector<ImportedStoryImage> footer_images;
     std::string header_xml;
     std::string footer_xml;
     std::vector<SpanLocation> spans;
     CompatibilityReport compatibility;
+    DocumentDefaults document_defaults;
     std::optional<DocumentDefaults> canonical_simple_regeneration_defaults;
 };
 
@@ -352,7 +392,7 @@ std::string buildStoryXml(
     std::string_view text, const std::vector<NewStoryImage>& story_images,
     bool header, const PageSettings& page,
     const std::vector<struct AuthoredImagePart>* images = nullptr,
-    std::size_t first_image_index = 0);
+    std::size_t first_image_index = 0, bool regional_layout = false);
 std::string newStoryRelationships(
     ImagePartOwner owner,
     const std::vector<AuthoredImagePart>& images);
@@ -722,6 +762,19 @@ std::optional<std::string> parseOmmlMatrix(
     const pugi::xml_node& node,
     std::string_view environment) {
     std::vector<std::vector<std::string>> rows;
+    if (environment == "matrix") {
+        for (const auto property : node.children()) if (isMathElement(property, "mPr")) {
+            for (const auto columns_property : property.children()) if (isMathElement(columns_property, "mcs")) {
+                std::vector<std::string> alignments;
+                for (const auto column : columns_property.children()) {
+                    for (const auto settings : column.children()) for (const auto alignment : settings.children()) {
+                        if (isMathElement(alignment, "mcJc")) alignments.push_back(mathAttribute(alignment, "val").value_or(""));
+                    }
+                }
+                if (alignments == std::vector<std::string>{"right", "left"}) environment = "aligned";
+            }
+        }
+    }
     bool saw_properties = false;
     std::optional<std::size_t> columns;
     for (pugi::xml_node child : node.children()) {
@@ -779,6 +832,10 @@ std::optional<std::string> parseOmmlDelimiter(std::string_view glyph) {
 std::optional<std::string> parseOmmlNode(const pugi::xml_node& node) {
     if (isMathElement(node, "r")) {
         std::optional<std::string> text;
+        bool literal = false;
+        for (const auto property : node.children()) if (isMathElement(property, "rPr")) {
+            for (const auto item : property.children()) if (isMathElement(item, "nor")) literal = true;
+        }
         for (pugi::xml_node child : node.children()) {
             if (ignorableNode(child)) continue;
             if (isMathElement(child, "rPr") || isWordElement(child, "rPr")) continue;
@@ -786,7 +843,12 @@ std::optional<std::string> parseOmmlNode(const pugi::xml_node& node) {
             for (pugi::xml_node nested : child.children()) {
                 if (nested.type() == pugi::node_element) return std::nullopt;
             }
-            text = latexForOmmlToken(child.text().get());
+            const std::string contents = child.text().get();
+            const std::map<std::string, std::string> spaces{{"\u2009", "\\,"}, {"\u205f", "\\:"}, {"\u2004", "\\;"},
+                {"\u2003", "\\quad"}, {"\u2003\u2003", "\\qquad"}, {"\u200b", "\\!"}, {"\u00a0", "\\ "}};
+            if (!literal && spaces.contains(contents)) { text = spaces.at(contents); continue; }
+            text = literal ? std::optional<std::string>{"\\text{" + contents + "}"}
+                           : latexForOmmlToken(child.text().get());
         }
         return text;
     }
@@ -799,7 +861,52 @@ std::optional<std::string> parseOmmlNode(const pugi::xml_node& node) {
                 isMathElement(child, "e")) continue;
             return std::nullopt;
         }
+        std::optional<bool> bold;
+        std::optional<bool> italic;
+        for (const auto properties : node.children()) if (isMathElement(properties, "boxPr")) {
+            for (const auto control : properties.children()) if (isMathElement(control, "ctrlPr")) {
+                for (const auto run : control.children()) if (isWordElement(run, "rPr")) {
+                    for (const auto property : run.children()) {
+                        const bool on = wordAttribute(property, "val").value_or("1") != "0";
+                        if (isWordElement(property, "b")) bold = on;
+                        if (isWordElement(property, "i")) italic = on;
+                    }
+                }
+            }
+        }
+        if (bold || italic) {
+            const auto command = bold.value_or(false) ? "mathbf" : italic.value_or(false) ? "mathit" : "mathrm";
+            return "\\" + std::string(command) + "{" + *body + "}";
+        }
         return "{" + *body + "}";
+    }
+
+    if (isMathElement(node, "func")) {
+        auto name = parseOmmlArgument(node, "fName");
+        auto operand = parseOmmlArgument(node, "e");
+        if (!name || name->empty() || !operand || !operand->empty()) return std::nullopt;
+        return "\\operatorname{" + *name + "}";
+    }
+
+    if (isMathElement(node, "acc") || isMathElement(node, "bar")) {
+        auto body = parseOmmlArgument(node, "e");
+        if (!body || body->empty()) return std::nullopt;
+        std::string command;
+        for (const auto properties : node.children()) {
+            if (isMathElement(properties, "accPr")) for (const auto property : properties.children()) {
+                if (isMathElement(property, "chr")) {
+                    const auto glyph = mathAttribute(property, "val").value_or("");
+                    if (glyph == "\u0302") command = "hat";
+                    if (glyph == "\u20d7") command = "vec";
+                    if (glyph == "\u0304") command = "bar";
+                }
+            }
+            if (isMathElement(properties, "barPr")) for (const auto property : properties.children()) {
+                if (isMathElement(property, "pos")) command = mathAttribute(property, "val").value_or("top") == "bot" ? "underline" : "overline";
+            }
+        }
+        if (command.empty()) return std::nullopt;
+        return "\\" + command + "{" + *body + "}";
     }
 
     if (isMathElement(node, "f")) {
@@ -858,7 +965,7 @@ std::optional<std::string> parseOmmlNode(const pugi::xml_node& node) {
                 if (isMathElement(property, "chr")) operation = mathAttribute(property, "val");
             }
         }
-        if (!operation || (*operation != "∑" && *operation != "∫")) {
+        if (!operation || (*operation != "∑" && *operation != "∫" && *operation != "∏")) {
             return std::nullopt;
         }
         auto subscript = parseOmmlArgument(node, "sub");
@@ -867,7 +974,7 @@ std::optional<std::string> parseOmmlNode(const pugi::xml_node& node) {
         if (!subscript || !superscript || !operand || !operand->empty()) {
             return std::nullopt;
         }
-        std::string result = *operation == "∑" ? "\\sum" : "\\int";
+        std::string result = *operation == "∑" ? "\\sum" : *operation == "∏" ? "\\prod" : "\\int";
         if (!subscript->empty()) result += "_{" + *subscript + "}";
         if (!superscript->empty()) result += "^{" + *superscript + "}";
         return result;
@@ -908,10 +1015,55 @@ std::optional<std::string> parseOmmlNode(const pugi::xml_node& node) {
             only_child = child;
         }
         if (only_child && isMathElement(only_child, "m")) {
+            const auto has_cases_alignment = [&] {
+                pugi::xml_node properties;
+                for (const auto child : only_child.children()) {
+                    if (!isMathElement(child, "mPr")) continue;
+                    if (properties) return false;
+                    properties = child;
+                }
+                pugi::xml_node columns;
+                for (const auto child : properties.children()) {
+                    if (ignorableNode(child)) continue;
+                    if (!isMathElement(child, "mcs") || columns) return false;
+                    columns = child;
+                }
+                std::size_t column_count = 0;
+                for (const auto column : columns.children()) {
+                    if (ignorableNode(column)) continue;
+                    if (!isMathElement(column, "mc")) return false;
+                    pugi::xml_node settings;
+                    for (const auto child : column.children()) {
+                        if (ignorableNode(child)) continue;
+                        if (!isMathElement(child, "mcPr") || settings) return false;
+                        settings = child;
+                    }
+                    bool single_column = false;
+                    bool left_aligned = false;
+                    for (const auto setting : settings.children()) {
+                        if (ignorableNode(setting)) continue;
+                        if (isMathElement(setting, "count")) {
+                            if (single_column || mathAttribute(setting, "val") != "1") return false;
+                            single_column = true;
+                        } else if (isMathElement(setting, "mcJc")) {
+                            if (left_aligned || mathAttribute(setting, "val") != "left") return false;
+                            left_aligned = true;
+                        } else {
+                            return false;
+                        }
+                    }
+                    if (!single_column || !left_aligned) return false;
+                    ++column_count;
+                }
+                return column_count == 2;
+            };
             std::string_view environment;
             if (*begin_glyph == "(" && *end_glyph == ")") environment = "pmatrix";
             if (*begin_glyph == "[" && *end_glyph == "]") environment = "bmatrix";
             if (*begin_glyph == "{" && *end_glyph == "}") environment = "Bmatrix";
+            if (*begin_glyph == "{" && end_glyph->empty() && has_cases_alignment()) {
+                environment = "cases";
+            }
             if (*begin_glyph == "|" && *end_glyph == "|") environment = "vmatrix";
             if (*begin_glyph == "‖" && *end_glyph == "‖") environment = "Vmatrix";
             if (!environment.empty()) return parseOmmlMatrix(only_child, environment);
@@ -2073,7 +2225,7 @@ void parseStylesData(std::string_view xml, const OpenOptions& options,
                 value->empty() || *value == "1" || *value == "true" ||
                 *value == "on";
         }
-        // Outline levels are a supported part of Owl Docs' deterministic
+        // Outline levels are a supported part of OwlDocs' deterministic
         // heading definitions. The current semantic paragraph surface does
         // not expose them independently, so accept them only inside a style;
         // a direct w:pPr/w:outlineLvl remains conservatively non-basic.
@@ -3381,7 +3533,7 @@ std::optional<ImportedTableBlock> parseSimpleImportedTable(
     }
 
     if (rows.empty() || rows.size() > NewTable::maximum_rows) {
-        reason = "the table row count is outside Owl Docs' editable range";
+        reason = "the table row count is outside OwlDocs' editable range";
         return std::nullopt;
     }
 
@@ -3397,6 +3549,8 @@ std::optional<ImportedTableBlock> parseSimpleImportedTable(
         std::vector<pugi::xml_node> cells;
         bool row_is_repeat_header = false;
         bool saw_row_properties = false;
+        bool saw_row_height = false;
+        std::uint32_t row_minimum_height = 0;
         for (const auto& row_child : rows[row_index].children()) {
             if (ignorableNode(row_child)) continue;
             if (isWordElement(row_child, "trPr")) {
@@ -3406,6 +3560,19 @@ std::optional<ImportedTableBlock> parseSimpleImportedTable(
                 }
                 saw_row_properties = true;
                 for (const auto& property : row_child.children()) {
+                    if (isWordElement(property, "trHeight")) {
+                        bool recognized = true;
+                        const auto height = parseUnsignedIntegerAttribute(property, "val", recognized);
+                        const auto rule = wordAttribute(property, "hRule");
+                        if (saw_row_height || !recognized || !height || *height > 31680 ||
+                            (rule && *rule != "atLeast" && *rule != "auto")) {
+                            reason = "a row height is not one bounded automatic or at-least height";
+                            return std::nullopt;
+                        }
+                        saw_row_height = true;
+                        if (!rule || *rule == "atLeast") row_minimum_height = *height;
+                        continue;
+                    }
                     if (isWordElement(property, "gridBefore") ||
                         isWordElement(property, "gridAfter")) {
                         reason = "a row starts or ends with omitted grid cells";
@@ -3428,6 +3595,7 @@ std::optional<ImportedTableBlock> parseSimpleImportedTable(
             reason = "a row contains a direct child outside trPr/tc";
             return std::nullopt;
         }
+        result.row_minimum_heights_twips.push_back(row_minimum_height);
 
         if (row_is_repeat_header && row_index != 0) {
             reason = "more than the first row is marked as a repeating header";
@@ -3435,7 +3603,7 @@ std::optional<ImportedTableBlock> parseSimpleImportedTable(
         }
         if (row_index == 0) first_row_repeat_header = row_is_repeat_header;
         if (cells.empty() || cells.size() > NewTable::maximum_columns) {
-            reason = "the table column count is outside Owl Docs' editable range";
+            reason = "the table column count is outside OwlDocs' editable range";
             return std::nullopt;
         }
         if (row_index == 0) {
@@ -3525,20 +3693,28 @@ std::optional<ImportedTableBlock> parseSimpleImportedTable(
                         } else if (isWordElement(property, "tcBorders")) {
                             for (const auto& border : property.children()) {
                                 const auto value = wordAttribute(border, "val");
-                                if (!value || *value != "single") continue;
+                                if (!value || (*value != "single" &&
+                                               *value != "nil" && *value != "none")) {
+                                    continue;
+                                }
+                                const bool no_border = *value == "nil" || *value == "none";
                                 bool color_recognized = true;
                                 bool width_recognized = true;
                                 const auto color = parseRgbAttribute(
                                     border, "color", color_recognized);
                                 const auto width = parseUnsignedIntegerAttribute(
                                     border, "sz", width_recognized);
-                                if (!color_recognized || !width_recognized ||
+                                if (!no_border && (!color_recognized || !width_recognized ||
                                     !color || !width || *width == 0 ||
-                                    *width > std::numeric_limits<std::uint16_t>::max()) {
+                                    *width > std::numeric_limits<std::uint16_t>::max())) {
                                     continue;
                                 }
                                 ImportedTableBorder parsed_border{
-                                    *color, static_cast<std::uint16_t>(*width)};
+                                    no_border ? 0U : *color,
+                                    no_border ? std::uint16_t{0}
+                                              : static_cast<std::uint16_t>(*width),
+                                    no_border ? BasicTableBorderStyle::none
+                                              : BasicTableBorderStyle::single};
                                 if (isWordElement(border, "top")) {
                                     imported_cell.border_top = parsed_border;
                                 } else if (isWordElement(border, "bottom")) {
@@ -3582,18 +3758,17 @@ std::optional<ImportedTableBlock> parseSimpleImportedTable(
                 reason = "equations inside table cells are preserved view-only";
                 return std::nullopt;
             }
-            if (paragraphContainsFragment(
-                    paragraphs[source->second], FragmentKind::inline_image)) {
-                reason =
-                    "inline images inside table cells are preserved view-only";
-                return std::nullopt;
-            }
             imported_cell.source_paragraph_index = source->second;
             result.cells.push_back(std::move(imported_cell));
         }
     }
 
     result.header_row = first_row_repeat_header || look_first_row;
+    if (std::all_of(result.row_minimum_heights_twips.begin(),
+                    result.row_minimum_heights_twips.end(),
+                    [](std::uint32_t height) { return height == 0; })) {
+        result.row_minimum_heights_twips.clear();
+    }
     if (declared_column_widths.size() == result.columns) {
         result.column_widths_twips = std::move(declared_column_widths);
     }
@@ -3864,7 +4039,7 @@ bool parseDocumentXml(
                             IssueSeverity::warning,
                             IssueCode::unsupported_body_content,
                             std::string(kDocumentPart),
-                            "Office Math object is outside Owl Docs' safe editable subset and was preserved unchanged",
+                            "Office Math object is outside OwlDocs' safe editable subset and was preserved unchanged",
                             paragraph_index});
                 }
                 paragraph.runs.push_back(std::move(run));
@@ -4009,7 +4184,7 @@ bool parseDocumentXml(
         const auto fallback = descendantParagraphIndices(
             child, paragraph_indices);
         const std::string reason =
-            "the direct body element is outside Owl Docs' editable block subset";
+            "the direct body element is outside OwlDocs' editable block subset";
         body_blocks.emplace_back(ImportedUnsupportedBodyBlock{
             std::string(child.name()), reason, fallback});
         appendIssueOnce(
@@ -4256,11 +4431,81 @@ AuxiliaryPartTargets auxiliaryPartTargets(
     return targets;
 }
 
+std::string regionalStoryTableXml(
+    std::uint32_t content_width, const std::array<std::string, 3>& contents,
+    bool footer);
+
+bool supportedRegionalStoryRun(const pugi::xml_node& run) {
+    if (!isWordElement(run, "r") || run.first_attribute()) return false;
+    bool content = false;
+    for (const auto child : run.children()) {
+        if (isWordElement(child, "t")) {
+            if (!hasOnlyAttributes(child, {"xml:space"}) || !hasNoElementChildren(child)) return false;
+        } else if (isWordElement(child, "br") || isWordElement(child, "tab")) {
+            if (child.first_attribute() || child.first_child()) return false;
+        } else if (isWordElement(child, "drawing")) {
+            const auto drawing = child.first_child();
+            if (child.first_attribute() || !drawing || drawing.next_sibling() ||
+                !isNamespacedElement(drawing, "inline", kWordprocessingDrawingNamespace) ||
+                !parseInlineImage(child)) return false;
+        } else return false;
+        content = true;
+    }
+    return content;
+}
+
+bool supportedRegionalStoryParagraph(const pugi::xml_node& paragraph) {
+    if (!isWordElement(paragraph, "p") || paragraph.first_attribute() ||
+        !isWordElement(paragraph.first_child(), "pPr")) return false;
+    for (auto child = paragraph.first_child().next_sibling(); child; child = child.next_sibling()) {
+        if (isWordElement(child, "r")) {
+            if (!supportedRegionalStoryRun(child)) return false;
+        } else if (isWordElement(child, "fldSimple")) {
+            const auto instruction = wordAttribute(child, "instr");
+            if (!hasOnlyAttributes(child, {"w:instr"}) || !instruction ||
+                (*instruction != " PAGE " && *instruction != " NUMPAGES ") ||
+                !supportedRegionalStoryRun(child.first_child()) || child.first_child().next_sibling()) return false;
+        } else return false;
+    }
+    return true;
+}
+
+bool supportedRegionalStoryTable(const pugi::xml_node& table, bool footer) {
+    if (!isWordElement(table, "tbl")) return false;
+    const auto width = table.child("w:tblPr").child("w:tblW").attribute("w:w").as_uint();
+    if (width < 3U || width > 63'360U) return false;
+    pugi::xml_document metadata;
+    auto copy = metadata.append_copy(table);
+    std::size_t count = 0;
+    auto source_cell = table.child("w:tr").child("w:tc");
+    for (const auto cell : copy.child("w:tr").children("w:tc")) {
+        auto paragraph = cell.child("w:p");
+        if (!supportedRegionalStoryParagraph(source_cell.child("w:p"))) return false;
+        for (auto child = paragraph.first_child().next_sibling(); child;) {
+            const auto next = child.next_sibling();
+            paragraph.remove_child(child);
+            child = next;
+        }
+        ++count;
+        source_cell = source_cell.next_sibling("w:tc");
+    }
+    if (count != 3U) return false;
+    std::ostringstream serialized;
+    copy.print(serialized, "", pugi::format_raw);
+    pugi::xml_document expected;
+    const auto expected_xml = regionalStoryTableXml(width, {}, footer);
+    if (!expected.load_buffer(expected_xml.data(), expected_xml.size())) return false;
+    std::ostringstream expected_serialized;
+    expected.document_element().print(expected_serialized, "", pugi::format_raw);
+    return serialized.str() == expected_serialized.str();
+}
+
 std::optional<ParsedStory> parseSimpleStory(
     std::string_view xml, const OpenOptions& options) {
     if (xml.empty()) return std::nullopt;
     pugi::xml_document story;
-    if (!story.load_buffer(xml.data(), xml.size(), pugi::parse_default,
+    if (!story.load_buffer(xml.data(), xml.size(),
+                           pugi::parse_default | pugi::parse_ws_pcdata_single,
                            pugi::encoding_auto) ||
         !::docxstudio::xml::inspectComplexity(
              story, options.max_xml_depth, options.max_xml_nodes)
@@ -4310,6 +4555,18 @@ std::optional<ParsedStory> parseSimpleStory(
         }
         for (const auto child : node.children()) self(self, child);
     };
+    const auto table = story.document_element().child("w:tbl");
+    if (table) {
+        if (table != story.document_element().first_child() || table.next_sibling() ||
+            !supportedRegionalStoryTable(table, isWordElement(story.document_element(), "ftr"))) return std::nullopt;
+        bool firstCell = true;
+        for (const auto cell : table.child("w:tr").children("w:tc")) {
+            if (!firstCell) result.text.push_back('\t');
+            firstCell = false;
+            appendNode(appendNode, cell.child("w:p"));
+        }
+        return result;
+    }
     bool firstParagraph = true;
     for (const auto node : story.document_element().children()) {
         if (!isWordElement(node, "p")) continue;
@@ -4841,7 +5098,7 @@ bool canonicalWriterParagraph(const pugi::xml_node& paragraph) {
 }
 
 std::optional<std::uint32_t> canonicalDefaultTabStop(
-    std::string_view settings_xml) {
+    std::string_view settings_xml, bool require_canonical_shape = true) {
     pugi::xml_document document;
     if (!document.load_buffer(
             settings_xml.data(), settings_xml.size(), pugi::parse_default,
@@ -4854,6 +5111,7 @@ std::optional<std::uint32_t> canonicalDefaultTabStop(
     pugi::xml_node tab_stop;
     for (const pugi::xml_node child : root.children()) {
         if (ignorableNode(child)) continue;
+        if (!require_canonical_shape && !isWordElement(child, "defaultTabStop")) continue;
         if (!isWordElement(child, "defaultTabStop") || tab_stop) {
             return std::nullopt;
         }
@@ -5127,6 +5385,8 @@ std::optional<DocumentDefaults> canonicalSimpleRegenerationDefaults(
     defaults.font_size_half_points =
         *context.default_run_format.font_size_half_points;
     defaults.default_tab_stop_twips = *tab_stop;
+    defaults.legacy_style_defaults = parsed.document_defaults.legacy_style_defaults;
+    defaults.neutral_style_defaults = parsed.document_defaults.neutral_style_defaults;
     NewParagraphStyleCatalog paragraph_styles;
     for (const auto& paragraph : parsed.paragraphs) {
         if (!paragraph.style_id) continue;
@@ -5143,6 +5403,58 @@ std::optional<DocumentDefaults> canonicalSimpleRegenerationDefaults(
     return canonicalSimpleDocumentEnvelope(parsed.document_xml, parsed)
         ? std::optional<DocumentDefaults>{std::move(defaults)}
         : std::nullopt;
+}
+
+
+constexpr std::string_view kAcademicRegistryPart = "word/owldocs-academic.xml";
+std::string academicBase64(std::string_view bytes) {
+    constexpr std::string_view alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string result;
+    result.reserve((bytes.size() + 2U) / 3U * 4U);
+    for (std::size_t index = 0; index < bytes.size(); index += 3U) {
+        const auto a = static_cast<unsigned char>(bytes[index]);
+        const auto b = index + 1U < bytes.size() ? static_cast<unsigned char>(bytes[index + 1U]) : 0U;
+        const auto c = index + 2U < bytes.size() ? static_cast<unsigned char>(bytes[index + 2U]) : 0U;
+        result += alphabet[a >> 2U];
+        result += alphabet[((a & 3U) << 4U) | (b >> 4U)];
+        result += index + 1U < bytes.size() ? alphabet[((b & 15U) << 2U) | (c >> 6U)] : '=';
+        result += index + 2U < bytes.size() ? alphabet[c & 63U] : '=';
+    }
+    return result;
+}
+std::optional<std::string> verifiedAcademicRecovery(
+    zip_t* archive, const std::vector<EntryRecord>& entries, const OpenOptions& options) {
+    const auto registry = std::find_if(entries.begin(), entries.end(), [](const EntryRecord& entry) {
+        return entry.member.name == kAcademicRegistryPart;
+    });
+    if (registry == entries.end()) return std::nullopt;
+    std::string bytes;
+    Error error;
+    constexpr std::uint64_t maximum_registry = 192ULL * 1024ULL * 1024ULL;
+    if (!readEntry(archive, registry->index, std::min(options.max_member_uncompressed_bytes, maximum_registry), bytes, &error)) return std::nullopt;
+    pugi::xml_document xml;
+    if (!xml.load_buffer(bytes.data(), bytes.size()) ||
+        !docxstudio::xml::inspectComplexity(xml, 8U, options.max_xml_nodes).accepted()) return std::nullopt;
+    const auto root = xml.child("academics");
+    if (!root || std::string_view(root.attribute("xmlns").value()) != "urn:owldocs:academic:1" ||
+        root.attribute("version").as_int() != 1) return std::nullopt;
+    const auto recovery = root.child("recovery");
+    if (!recovery || recovery.next_sibling("recovery") || recovery.first_child().type() != pugi::node_pcdata) return std::nullopt;
+    const std::string payload = recovery.child_value();
+    if (payload.empty() || payload.size() > 64U * 1024U * 1024U) return std::nullopt;
+    std::unordered_set<std::string> seen;
+    for (const auto member : root.children()) {
+        if (std::string_view(member.name()) == "recovery") continue;
+        if (std::string_view(member.name()) != "member") return std::nullopt;
+        const std::string name = member.attribute("name").value();
+        if (name == kAcademicRegistryPart || !seen.insert(name).second) return std::nullopt;
+        const auto found = std::find_if(entries.begin(), entries.end(), [&name](const EntryRecord& entry) { return entry.member.name == name; });
+        std::string original;
+        if (found == entries.end() || !readEntry(archive, found->index, options.max_member_uncompressed_bytes, original, &error) ||
+            academicBase64(original) != member.child_value()) return std::nullopt;
+    }
+    if (seen.size() + 1U != entries.size()) return std::nullopt;
+    return payload;
 }
 
 bool inspectPackage(
@@ -5374,6 +5686,7 @@ bool inspectPackage(
         zip_discard(archive);
         return false;
     }
+    parsed.academic_recovery = verifiedAcademicRecovery(archive, parsed.entries, options);
     zip_discard(archive);
 
     if (!validateOpcMetadata(content_types_xml, relationships_xml, options, error)) {
@@ -5419,6 +5732,15 @@ bool inspectPackage(
     import_context.theme = parseThemeData(theme_xml, options);
     parseStylesData(styles_xml, options, import_context);
     parseNumberingData(numbering_xml, options, import_context);
+    if (import_context.default_run_format.font_family) {
+        parsed.document_defaults.font_family = *import_context.default_run_format.font_family;
+    }
+    if (import_context.default_run_format.font_size_half_points) {
+        parsed.document_defaults.font_size_half_points = *import_context.default_run_format.font_size_half_points;
+    }
+    if (const auto tab = canonicalDefaultTabStop(settings_xml, false)) {
+        parsed.document_defaults.default_tab_stop_twips = *tab;
+    }
 
     if (!parseDocumentXml(
             parsed.document_xml,
@@ -5430,6 +5752,31 @@ bool inspectPackage(
             options,
             error)) {
         return false;
+    }
+    NewParagraphStyleCatalog source_styles;
+    bool supported_style_ids = true;
+    for (const auto& paragraph : parsed.paragraphs) {
+        if (!paragraph.style_id) continue;
+        if (!safeParagraphStyleIdToken(*paragraph.style_id) ||
+            !supportedBuiltInParagraphStyle(*paragraph.style_id)) {
+            supported_style_ids = false;
+            break;
+        }
+        source_styles.insert(*paragraph.style_id);
+    }
+    if (supported_style_ids) {
+        auto legacy_defaults = parsed.document_defaults;
+        legacy_defaults.legacy_style_defaults = true;
+        auto neutral_defaults = parsed.document_defaults;
+        neutral_defaults.neutral_style_defaults = true;
+        // A producer label never grants a source profile. Prefer current when
+        // the used catalog is identical, then require an exact frozen catalog.
+        const bool current=styles_xml == buildNewStylesXml(parsed.document_defaults, source_styles);
+        parsed.document_defaults.legacy_style_defaults = !current &&
+            styles_xml == buildNewStylesXml(legacy_defaults, source_styles);
+        parsed.document_defaults.neutral_style_defaults = !current &&
+            !parsed.document_defaults.legacy_style_defaults &&
+            styles_xml == buildNewStylesXml(neutral_defaults, source_styles);
     }
     parsed.sections = parseBodySections(parsed.document_xml);
     parsed.page_settings = parseBodyPageSettings(parsed.document_xml);
@@ -5444,6 +5791,45 @@ bool inspectPackage(
         parsed.footer_images = std::move(footer->images);
     }
     resolveInlineImages(parsed, options);
+    // Eligibility needs resolved package bytes: shape metadata alone cannot
+    // authorize an editable cell image (external/missing/malformed payloads
+    // retain the complete original table as a view-only block).
+    for (auto& block:parsed.body_blocks) {
+        const auto* table=std::get_if<ImportedTableBlock>(&block);
+        if (!table) continue;
+        bool supported=true;
+        std::vector<std::size_t> fallback;
+        for (const auto& cell:table->cells) {
+            fallback.push_back(cell.source_paragraph_index);
+            for (const auto& run:parsed.paragraphs[cell.source_paragraph_index].runs) {
+                for (const auto& fragment:run.fragments) {
+                    if (!fragment.inline_image) continue;
+                    const auto& image=*fragment.inline_image;
+                    const bool png=image.content_type=="image/png";
+                    const bool jpeg=image.content_type=="image/jpeg";
+                    raster::ValidationLimits limits;
+                    limits.maximum_encoded_bytes=NewInlineImage::maximum_encoded_bytes;
+                    supported=supported && image.layout.placement==ImagePlacement::inline_with_text &&
+                        image.renderable() && image.width_emu<=kMaximumInlineExtentEmu &&
+                        image.height_emu<=kMaximumInlineExtentEmu && (png || jpeg) &&
+                        raster::inspect({image.bytes.data(),image.bytes.size()},
+                            png ? RasterImageFormat::png : RasterImageFormat::jpeg,limits).ok();
+                }
+            }
+        }
+        if (!supported) {
+            const std::string reason="inline images inside table cells have an unsupported raster payload or placement";
+            block=ImportedUnsupportedBodyBlock{"w:tbl",reason,fallback};
+            parsed.compatibility.issues.push_back(CompatibilityIssue{
+                IssueSeverity::warning,IssueCode::unsupported_body_content,std::string(kDocumentPart),
+                "Table is preserved as view-only fallback because "+reason,
+                fallback.empty() ? std::nullopt : std::optional<std::size_t>{fallback.front()}});
+            const bool editable=std::any_of(parsed.spans.begin(),parsed.spans.end(),
+                [](const auto& span) { return span.editable; });
+            parsed.compatibility.classification=editable ? CompatibilityClass::safe_text_patch
+                : CompatibilityClass::exact_round_trip_only;
+        }
+    }
     parsed.canonical_simple_regeneration_defaults =
         canonicalSimpleRegenerationDefaults(
             parsed, content_types_xml, relationships_xml,
@@ -5698,6 +6084,7 @@ public:
 
     [[nodiscard]] const std::filesystem::path& path() const noexcept { return path_; }
     [[nodiscard]] int descriptor() const noexcept { return descriptor_; }
+    [[nodiscard]] bool committed() const noexcept { return committed_; }
 
     bool closeDescriptor(Error* error) {
         if (descriptor_ < 0) {
@@ -6362,6 +6749,14 @@ bool collectBodyImages(
             continue;
         }
         for (const auto& paragraph : std::get<NewTable>(block).cell_paragraphs) {
+            if (std::any_of(paragraph.runs.begin(),paragraph.runs.end(),[](const auto& run) {
+                    return run.inline_image && run.inline_image->layout.placement!=ImagePlacement::inline_with_text;
+                })) {
+                const std::string message="Table cell pictures support inline placement only";
+                loss.issues.push_back(blockingIssue(IssueCode::structural_rewrite_required,message,paragraph_index));
+                setError(error,ErrorCode::unsafe_edit,message);
+                return false;
+            }
             if (!collectParagraphImages(
                     paragraph, paragraph_index++, images, loss, error)) {
                 return false;
@@ -6555,15 +6950,18 @@ std::string ommlDelimiterGlyph(std::string_view token) {
 void appendOmmlNode(
     std::ostringstream& output,
     const math::MathNodePtr& node,
-    const BasicRunFormat& format);
+    const BasicRunFormat& format,
+    std::string_view math_style = {});
 
 void appendOmmlTextRun(
     std::ostringstream& output,
     std::string_view token,
     const BasicRunFormat& format,
+    std::string_view math_style = {},
     bool plain_style = false) {
     output << "<m:r>";
-    if (plain_style) output << "<m:rPr><m:sty m:val=\"p\"/></m:rPr>";
+    if (!math_style.empty() || plain_style) output << "<m:rPr><m:sty m:val=\""
+        << (math_style.empty() ? "p" : math_style) << "\"/></m:rPr>";
     appendBasicRunProperties(output, format);
     output << "<m:t>" << escapeXmlText(ommlTextForLatexToken(token)) << "</m:t></m:r>";
 }
@@ -6573,26 +6971,35 @@ void appendOmmlNary(
     const math::LargeOperator& operation,
     const std::optional<math::MathNodePtr>& subscript,
     const std::optional<math::MathNodePtr>& superscript,
-    const BasicRunFormat& format) {
+    const BasicRunFormat& format,
+    std::string_view math_style) {
     output << "<m:nary><m:naryPr><m:chr m:val=\""
-           << (operation.kind == math::LargeOperatorKind::sum ? "∑" : "∫")
+           << (operation.kind == math::LargeOperatorKind::sum ? "∑" : operation.kind == math::LargeOperatorKind::product ? "∏" : "∫")
            << "\"/><m:limLoc m:val=\"undOvr\"/></m:naryPr><m:sub>";
-    if (subscript && *subscript) appendOmmlNode(output, *subscript, format);
+    if (subscript && *subscript) appendOmmlNode(output, *subscript, format, math_style);
     output << "</m:sub><m:sup>";
-    if (superscript && *superscript) appendOmmlNode(output, *superscript, format);
+    if (superscript && *superscript) appendOmmlNode(output, *superscript, format, math_style);
     output << "</m:sup><m:e/></m:nary>";
 }
 
 void appendOmmlMatrixBody(
     std::ostringstream& output,
     const math::Matrix& matrix,
-    const BasicRunFormat& format) {
+    const BasicRunFormat& format,
+    std::string_view math_style) {
     output << "<m:m>";
+    if (matrix.environment == math::MatrixEnvironment::aligned ||
+        matrix.environment == math::MatrixEnvironment::cases) {
+        output << "<m:mPr><m:mcs><m:mc><m:mcPr><m:count m:val=\"1\"/><m:mcJc m:val=\""
+               << (matrix.environment == math::MatrixEnvironment::aligned ? "right" : "left")
+               << "\"/></m:mcPr></m:mc>"
+                  "<m:mc><m:mcPr><m:count m:val=\"1\"/><m:mcJc m:val=\"left\"/></m:mcPr></m:mc></m:mcs></m:mPr>";
+    }
     for (const auto& row : matrix.rows) {
         output << "<m:mr>";
         for (const auto& cell : row) {
             output << "<m:e>";
-            appendOmmlNode(output, cell, format);
+            appendOmmlNode(output, cell, format, math_style);
             output << "</m:e>";
         }
         output << "</m:mr>";
@@ -6603,31 +7010,60 @@ void appendOmmlMatrixBody(
 void appendOmmlNode(
     std::ostringstream& output,
     const math::MathNodePtr& node,
-    const BasicRunFormat& format) {
+    const BasicRunFormat& format,
+    std::string_view math_style) {
     if (!node) return;
     std::visit(
         [&](const auto& value) {
             using Value = std::decay_t<decltype(value)>;
             if constexpr (std::is_same_v<Value, math::Row>) {
-                for (const auto& child : value.children) appendOmmlNode(output, child, format);
+                for (const auto& child : value.children) appendOmmlNode(output, child, format, math_style);
             } else if constexpr (std::is_same_v<Value, math::Group>) {
                 output << "<m:box><m:e>";
-                appendOmmlNode(output, value.body, format);
+                appendOmmlNode(output, value.body, format, math_style);
                 output << "</m:e></m:box>";
             } else if constexpr (std::is_same_v<Value, math::Identifier>) {
                 const bool plain = value.text == "\\sin" || value.text == "\\cos" ||
                                    value.text == "\\tan" || value.text == "\\log" ||
                                    value.text == "\\ln" || value.text == "\\exp" ||
                                    value.text == "\\lim";
-                appendOmmlTextRun(output, value.text, format, plain);
+                appendOmmlTextRun(output, value.text, format, math_style, plain);
+            } else if constexpr (std::is_same_v<Value, math::Text>) {
+                output << "<m:r><m:rPr><m:nor/></m:rPr>";
+                appendBasicRunProperties(output, format);
+                output << "<m:t xml:space=\"preserve\">" << escapeXmlText(value.text) << "</m:t></m:r>";
+            } else if constexpr (std::is_same_v<Value, math::Styled>) {
+                if (value.command == "operatorname") {
+                    output << "<m:func><m:fName>";
+                    appendOmmlNode(output, value.body, format, "p");
+                    output << "</m:fName><m:e/></m:func>";
+                } else {
+                    const bool bold = value.command == "mathbf";
+                    const bool italic = value.command == "mathit";
+                    output << "<m:box><m:boxPr><m:ctrlPr><w:rPr><w:b w:val=\"" << (bold ? 1 : 0)
+                           << "\"/><w:i w:val=\"" << (italic ? 1 : 0)
+                           << "\"/></w:rPr></m:ctrlPr></m:boxPr><m:e>";
+                    appendOmmlNode(output, value.body, format, bold ? "b" : italic ? "i" : "p");
+                    output << "</m:e></m:box>";
+                }
+            } else if constexpr (std::is_same_v<Value, math::Accent>) {
+                const bool bar = value.command == "underline" || value.command == "overline";
+                if (bar) output << "<m:bar><m:barPr><m:pos m:val=\"" << (value.command == "underline" ? "bot" : "top") << "\"/></m:barPr><m:e>";
+                else output << "<m:acc><m:accPr><m:chr m:val=\"" << (value.command == "hat" ? "\u0302" : value.command == "vec" ? "\u20d7" : "\u0304") << "\"/></m:accPr><m:e>";
+                appendOmmlNode(output, value.body, format, math_style);
+                output << (bar ? "</m:e></m:bar>" : "</m:e></m:acc>");
+            } else if constexpr (std::is_same_v<Value, math::Spacing>) {
+                const std::map<std::string, std::string> spaces{{",", "\u2009"}, {":", "\u205f"}, {";", "\u2004"},
+                    {"quad", "\u2003"}, {"qquad", "\u2003\u2003"}, {"!", "\u200b"}, {" ", "\u00a0"}};
+                appendOmmlTextRun(output, spaces.at(value.command), format, math_style);
             } else if constexpr (std::is_same_v<Value, math::Number> ||
                                  std::is_same_v<Value, math::Operator>) {
-                appendOmmlTextRun(output, value.text, format);
+                appendOmmlTextRun(output, value.text, format, math_style);
             } else if constexpr (std::is_same_v<Value, math::Fraction>) {
                 output << "<m:f><m:fPr><m:type m:val=\"bar\"/></m:fPr><m:num>";
-                appendOmmlNode(output, value.numerator, format);
+                appendOmmlNode(output, value.numerator, format, math_style);
                 output << "</m:num><m:den>";
-                appendOmmlNode(output, value.denominator, format);
+                appendOmmlNode(output, value.denominator, format, math_style);
                 output << "</m:den></m:f>";
             } else if constexpr (std::is_same_v<Value, math::Radical>) {
                 output << "<m:rad>";
@@ -6635,16 +7071,16 @@ void appendOmmlNode(
                     output << "<m:radPr><m:degHide m:val=\"1\"/></m:radPr>";
                 }
                 output << "<m:deg>";
-                if (value.index && *value.index) appendOmmlNode(output, *value.index, format);
+                if (value.index && *value.index) appendOmmlNode(output, *value.index, format, math_style);
                 output << "</m:deg><m:e>";
-                appendOmmlNode(output, value.radicand, format);
+                appendOmmlNode(output, value.radicand, format, math_style);
                 output << "</m:e></m:rad>";
             } else if constexpr (std::is_same_v<Value, math::Script>) {
                 if (value.base) {
                     if (const auto* operation =
                             std::get_if<math::LargeOperator>(&value.base->value)) {
                         appendOmmlNary(
-                            output, *operation, value.subscript, value.superscript, format);
+                            output, *operation, value.subscript, value.superscript, format, math_style);
                         return;
                     }
                 }
@@ -6652,34 +7088,36 @@ void appendOmmlNode(
                                       ? "sSubSup"
                                       : (value.subscript ? "sSub" : "sSup");
                 output << "<m:" << tag << "><m:e>";
-                appendOmmlNode(output, value.base, format);
+                appendOmmlNode(output, value.base, format, math_style);
                 output << "</m:e>";
                 if (value.subscript) {
                     output << "<m:sub>";
-                    appendOmmlNode(output, *value.subscript, format);
+                    appendOmmlNode(output, *value.subscript, format, math_style);
                     output << "</m:sub>";
                 }
                 if (value.superscript) {
                     output << "<m:sup>";
-                    appendOmmlNode(output, *value.superscript, format);
+                    appendOmmlNode(output, *value.superscript, format, math_style);
                     output << "</m:sup>";
                 }
                 output << "</m:" << tag << ">";
             } else if constexpr (std::is_same_v<Value, math::LargeOperator>) {
-                appendOmmlNary(output, value, std::nullopt, std::nullopt, format);
+                appendOmmlNary(output, value, std::nullopt, std::nullopt, format, math_style);
             } else if constexpr (std::is_same_v<Value, math::Delimited>) {
                 output << "<m:d><m:dPr><m:begChr m:val=\""
                        << escapeXmlAttribute(ommlDelimiterGlyph(value.left))
                        << "\"/><m:endChr m:val=\""
                        << escapeXmlAttribute(ommlDelimiterGlyph(value.right))
                        << "\"/></m:dPr><m:e>";
-                appendOmmlNode(output, value.body, format);
+                appendOmmlNode(output, value.body, format, math_style);
                 output << "</m:e></m:d>";
             } else if constexpr (std::is_same_v<Value, math::Matrix>) {
                 std::string left;
                 std::string right;
                 switch (value.environment) {
-                    case math::MatrixEnvironment::matrix: break;
+                    case math::MatrixEnvironment::matrix:
+                    case math::MatrixEnvironment::aligned: break;
+                    case math::MatrixEnvironment::cases: left = "{"; break;
                     case math::MatrixEnvironment::pmatrix: left = "("; right = ")"; break;
                     case math::MatrixEnvironment::bmatrix: left = "["; right = "]"; break;
                     case math::MatrixEnvironment::Bmatrix: left = "{"; right = "}"; break;
@@ -6691,7 +7129,7 @@ void appendOmmlNode(
                            << escapeXmlAttribute(left) << "\"/><m:endChr m:val=\""
                            << escapeXmlAttribute(right) << "\"/></m:dPr><m:e>";
                 }
-                appendOmmlMatrixBody(output, value, format);
+                appendOmmlMatrixBody(output, value, format, math_style);
                 if (!left.empty()) output << "</m:e></m:d>";
             }
         },
@@ -6831,6 +7269,167 @@ void appendInlineImageDrawing(
                 ? "</wp:inline>"
                 : "</wp:anchor>")
         << "</w:drawing></w:r>";
+}
+
+
+std::string academicBookmark(std::string_view id, std::string_view prefix = "od_") {
+    std::string result(prefix);
+    std::size_t digits = 0;
+    for (const auto character : id) {
+        if (character == '-') continue;
+        if (!std::isxdigit(static_cast<unsigned char>(character))) return {};
+        result += character;
+        ++digits;
+    }
+    return digits == 32U ? result : std::string{};
+}
+void academicTextRun(std::ostringstream& output, std::string_view text, const BasicRunFormat& format = {}, bool hidden = false) {
+    output << "<w:r>";
+    if (hidden) output << "<w:rPr><w:vanish/></w:rPr>";
+    else appendBasicRunProperties(output, format);
+    appendWordRunContents(output, text);
+    output << "</w:r>";
+}
+void academicSimpleField(std::ostringstream& output, std::string_view instruction,
+                         std::string_view text, const BasicRunFormat& format, bool hidden = false) {
+    output << "<w:fldSimple w:instr=\"" << escapeXmlAttribute(instruction) << "\">";
+    academicTextRun(output, text, format, hidden);
+    output << "</w:fldSimple>";
+}
+bool appendAcademicField(std::ostringstream& output, const AcademicFieldPayload& field,
+                         const BasicRunFormat& format, Error* error, bool hidden = false) {
+    IssueCode issue{};
+    std::string detail;
+    if (field.cached_text.size() > 65536U || field.locator.size() > 2048U ||
+        !isValidUtf8XmlText(field.cached_text, issue, detail) ||
+        !isValidUtf8XmlText(field.locator, issue, detail) || academicBookmark(field.id).empty() ||
+        academicBookmark(field.target_id).empty()) {
+        setError(error, ErrorCode::unsafe_edit, "Academic field contains invalid text or identity"); return false;
+    }
+    if (field.kind == AcademicFieldKind::note_reference) {
+        if (field.note_number == 0U || field.note_number > 10000U) {
+            setError(error, ErrorCode::unsafe_edit, "Academic note reference number is invalid"); return false;
+        }
+        output << "<w:r><w:rPr><w:vertAlign w:val=\"superscript\"/></w:rPr><w:"
+               << (field.endnote ? "endnoteReference" : "footnoteReference")
+               << " w:id=\"" << field.note_number << "\"/></w:r>";
+        return true;
+    }
+    if (field.kind == AcademicFieldKind::caption_number || field.kind == AcademicFieldKind::bibliography_number) {
+        const bool bibliography = field.kind == AcademicFieldKind::bibliography_number;
+        std::string label;
+        std::string number = field.cached_text;
+        if (!bibliography) {
+            const auto space = number.rfind(' ');
+            if (space == std::string::npos) { setError(error, ErrorCode::unsafe_edit, "Caption number has no label"); return false; }
+            label = number.substr(0, space);
+            number.erase(0, space + 1U);
+            if (label != "Figure" && label != "Table" && label != "Equation") {
+                setError(error, ErrorCode::unsafe_edit, "Caption label is unsupported"); return false;
+            }
+        }
+        if (number.empty() || !std::all_of(number.begin(), number.end(), [](unsigned char value) { return std::isdigit(value) != 0; })) {
+            setError(error, ErrorCode::unsafe_edit, "Sequence result is not a decimal number"); return false;
+        }
+        output << "<w:bookmarkStart w:id=\"" << field.bookmark_number << "\" w:name=\""
+               << academicBookmark(field.target_id, bibliography ? "odb_" : "odc_") << "\"/>";
+        if (!bibliography) academicTextRun(output, label + " ", format, hidden);
+        academicSimpleField(output, " SEQ " + (bibliography ? std::string("Reference") : label) + " \\* ARABIC ", number, format, hidden);
+        output << "<w:bookmarkEnd w:id=\"" << field.bookmark_number << "\"/>";
+        return true;
+    }
+    if (field.kind == AcademicFieldKind::citation) {
+        std::string number = field.cached_text;
+        if (number.size() >= 2U && number.front() == '[' && number.back() == ']') number = number.substr(1U, number.size() - 2U);
+        const auto comma = number.find(',');
+        if (comma != std::string::npos) number.resize(comma);
+        academicTextRun(output, "[", format);
+        academicSimpleField(output, " REF " + academicBookmark(field.target_id, "odb_") + " \\h ", number, format);
+        if (!field.locator.empty()) academicTextRun(output, ", " + field.locator, format);
+        academicTextRun(output, "]", format);
+        return true;
+    }
+    if (field.kind == AcademicFieldKind::cross_reference) {
+        academicSimpleField(output, " REF " + academicBookmark(field.target_id,
+            field.full_text || !field.target_is_caption ? "od_" : "odc_") + " \\h ", field.cached_text, format);
+        return true;
+    }
+    setError(error, ErrorCode::unsafe_edit, "Academic field kind is unsupported");
+    return false;
+}
+bool appendAcademicToc(std::ostringstream& output, const TocPayload& toc, Error* error) {
+    if (toc.max_level < 1U || toc.max_level > 9U || toc.entries.size() > 10000U || academicBookmark(toc.id).empty()) {
+        setError(error, ErrorCode::unsafe_edit, "Table of contents metadata is invalid"); return false;
+    }
+    output << "<w:r><w:fldChar w:fldCharType=\"begin\"/></w:r><w:r><w:instrText xml:space=\"preserve\"> TOC \\o &quot;1-"
+           << static_cast<unsigned>(toc.max_level) << "&quot; \\h \\z \\u </w:instrText></w:r><w:r><w:fldChar w:fldCharType=\"separate\"/></w:r>";
+    bool first = true;
+    for (const auto& entry : toc.entries) {
+        if (entry.level > toc.max_level) continue;
+        IssueCode issue{}; std::string detail;
+        if (entry.level < 1U || entry.level > 9U || entry.text.size() > 65536U ||
+            academicBookmark(entry.target_id).empty() || !isValidUtf8XmlText(entry.text, issue, detail)) {
+            setError(error, ErrorCode::unsafe_edit, "Table of contents entry is invalid"); return false;
+        }
+        if (!first) output << "<w:r><w:br/></w:r>";
+        first = false;
+        output << "<w:hyperlink w:anchor=\"" << academicBookmark(entry.target_id) << "\">";
+        academicTextRun(output, std::string(static_cast<std::size_t>(entry.level - 1U) * 2U, ' ') + entry.text);
+        output << "<w:r><w:tab/></w:r>";
+        academicTextRun(output, std::to_string(entry.page));
+        output << "</w:hyperlink>";
+    }
+    output << "<w:r><w:fldChar w:fldCharType=\"end\"/></w:r>";
+    return true;
+}
+std::string buildAcademicNotes(const std::vector<AcademicNotePayload>& notes, bool endnotes) {
+    std::ostringstream output;
+    const std::string element = endnotes ? "endnote" : "footnote";
+    output << "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><w:"
+           << element << "s xmlns:w=\"" << kWordNamespace << "\">";
+    output << "<w:" << element << " w:type=\"separator\" w:id=\"-1\"><w:p><w:r><w:separator/></w:r></w:p></w:" << element << ">"
+           << "<w:" << element << " w:type=\"continuationSeparator\" w:id=\"0\"><w:p><w:r><w:continuationSeparator/></w:r></w:p></w:" << element << ">";
+    for (const auto& note : notes) {
+        if (note.endnote != endnotes) continue;
+        output << "<w:" << element << " w:id=\"" << note.number << "\"><w:p><w:r><w:rPr><w:vertAlign w:val=\"superscript\"/></w:rPr><w:"
+               << element << "Ref/></w:r>";
+        academicTextRun(output, " " + note.text);
+        output << "</w:p></w:" << element << ">";
+    }
+    output << "</w:" << element << "s>";
+    return output.str();
+}
+
+bool validNewTableLayout(const NewTable& table) {
+    constexpr std::uint32_t maximum_twips = 31680;
+    if ((!table.column_widths_twips.empty() && table.column_widths_twips.size() != table.columns) ||
+        (!table.row_minimum_heights_twips.empty() && table.row_minimum_heights_twips.size() != table.rows) ||
+        (!table.cell_layouts.empty() && table.cell_layouts.size() != table.rows * table.columns)) {
+        return false;
+    }
+    std::uint64_t total = 0;
+    for (const auto width : table.column_widths_twips) {
+        if (width == 0 || width > maximum_twips) return false;
+        total += width;
+    }
+    if (total > maximum_twips) return false;
+    if (std::any_of(table.row_minimum_heights_twips.begin(), table.row_minimum_heights_twips.end(),
+                    [](std::uint32_t height) { return height > maximum_twips; })) return false;
+    const auto valid_border = [](const std::optional<ImportedTableBorder>& border) {
+        if (!border) return true;
+        if (border->rgb > 0xffffffU) return false;
+        if (border->style == BasicTableBorderStyle::none) return border->width_eighth_points == 0;
+        return border->style == BasicTableBorderStyle::single &&
+            border->width_eighth_points > 0 && border->width_eighth_points <= 96;
+    };
+    for (const auto& layout : table.cell_layouts) {
+        if (layout.vertical_alignment && *layout.vertical_alignment != BasicVerticalAlignment::top &&
+            *layout.vertical_alignment != BasicVerticalAlignment::center &&
+            *layout.vertical_alignment != BasicVerticalAlignment::bottom) return false;
+        if (!valid_border(layout.border_top) || !valid_border(layout.border_right) ||
+            !valid_border(layout.border_bottom) || !valid_border(layout.border_left)) return false;
+    }
+    return true;
 }
 
 bool buildNewDocumentXml(
@@ -7034,6 +7633,23 @@ bool buildNewDocumentXml(
             document << "</w:pPr>";
         }
 
+        if (paragraph.hidden_sequence_target) {
+            const auto& target = *paragraph.hidden_sequence_target;
+            if ((target.kind != AcademicFieldKind::caption_number && target.kind != AcademicFieldKind::bibliography_number) ||
+                target.target_id != paragraph.stable_id) {
+                setError(error, ErrorCode::unsafe_edit, "Hidden sequence target does not match its semantic paragraph");
+                return false;
+            }
+            if (!appendAcademicField(document, target, {}, error, true)) return false;
+        }
+        if (!paragraph.stable_id.empty()) {
+            const auto bookmark = academicBookmark(paragraph.stable_id);
+            if (bookmark.empty()) { setError(error, ErrorCode::unsafe_edit, "Paragraph bookmark identity is invalid"); return false; }
+            document << "<w:bookmarkStart w:id=\"" << paragraph.bookmark_number << "\" w:name=\"" << bookmark << "\"/>";
+        }
+        if (paragraph.table_of_contents) {
+            if (!paragraph.runs.empty() || !appendAcademicToc(document, *paragraph.table_of_contents, error)) return false;
+        }
         for (const NewRun& run : paragraph.runs) {
             IssueCode issue_code = IssueCode::invalid_utf8;
             std::string detail;
@@ -7047,6 +7663,11 @@ bool buildNewDocumentXml(
                 return false;
             }
 
+            if (run.field) {
+                if (!run.text.empty() || run.equation || run.inline_image ||
+                    !appendAcademicField(document, *run.field, run.format, error)) return false;
+                continue;
+            }
             if (run.equation.has_value() && run.inline_image.has_value()) {
                 const std::string message =
                     "A run cannot contain both an equation and an inline image";
@@ -7105,6 +7726,7 @@ bool buildNewDocumentXml(
             appendWordRunContents(document, run.text);
             document << "</w:r>";
         }
+        if (!paragraph.stable_id.empty()) document << "<w:bookmarkEnd w:id=\"" << paragraph.bookmark_number << "\"/>";
         document << "</w:p>";
     }
     document << "<w:sectPr><w:pgSz w:w=\"" << page.width_twips
@@ -7198,7 +7820,7 @@ bool buildNewDocumentXml(
             table.rows > NewTable::maximum_rows ||
             table.columns > NewTable::maximum_columns ||
             table.rows > std::numeric_limits<std::size_t>::max() / table.columns ||
-            !has_valid_cell_payload) {
+            !has_valid_cell_payload || !validNewTableLayout(table)) {
             const std::string message =
                 "Table must be a rectangular grid between 1x1 and " +
                 std::to_string(NewTable::maximum_rows) + "x" +
@@ -7284,19 +7906,45 @@ bool buildNewDocumentXml(
                "w:noHBand=\"0\" w:noVBand=\"1\"/>"
                "</w:tblPr><w:tblGrid>";
         for (std::size_t column = 0; column < table.columns; ++column) {
-            document << "<w:gridCol w:w=\"" << column_width << "\"/>";
+            document << "<w:gridCol w:w=\""
+                     << (table.column_widths_twips.empty() ? column_width : table.column_widths_twips[column])
+                     << "\"/>";
         }
         document << "</w:tblGrid>";
 
         for (std::size_t row = 0; row < table.rows; ++row) {
             document << "<w:tr>";
-            if (table.header_row && row == 0) {
-                document << "<w:trPr><w:tblHeader/></w:trPr>";
+            const auto minimum_height = table.row_minimum_heights_twips.empty()
+                ? 0U : table.row_minimum_heights_twips[row];
+            if ((table.header_row && row == 0) || minimum_height != 0) {
+                document << "<w:trPr>";
+                if (minimum_height != 0) {
+                    document << "<w:trHeight w:val=\"" << minimum_height << "\" w:hRule=\"atLeast\"/>";
+                }
+                if (table.header_row && row == 0) document << "<w:tblHeader/>";
+                document << "</w:trPr>";
             }
             for (std::size_t column = 0; column < table.columns; ++column) {
                 const std::size_t cell_index = row * table.columns + column;
-                document << "<w:tc><w:tcPr><w:tcW w:w=\"" << column_width
+                document << "<w:tc><w:tcPr><w:tcW w:w=\""
+                         << (table.column_widths_twips.empty() ? column_width : table.column_widths_twips[column])
                          << "\" w:type=\"dxa\"/>";
+                const auto* layout = table.cell_layouts.empty() ? nullptr : &table.cell_layouts[cell_index];
+                if (layout && (layout->border_top || layout->border_right || layout->border_bottom || layout->border_left)) {
+                    document << "<w:tcBorders>";
+                    const auto append_border = [&document](const char* side, const std::optional<ImportedTableBorder>& border) {
+                        if (!border) return;
+                        document << "<w:" << side << " w:val=\"";
+                        if (border->style == BasicTableBorderStyle::none) document << "nil\"/>";
+                        else document << "single\" w:sz=\"" << border->width_eighth_points
+                                      << "\" w:space=\"0\" w:color=\"" << rgbHex(border->rgb) << "\"/>";
+                    };
+                    append_border("top", layout->border_top);
+                    append_border("left", layout->border_left);
+                    append_border("bottom", layout->border_bottom);
+                    append_border("right", layout->border_right);
+                    document << "</w:tcBorders>";
+                }
                 if (table.header_row && row == 0) {
                     document << "<w:shd w:val=\"clear\" w:color=\"auto\" "
                                 "w:fill=\""
@@ -7309,6 +7957,11 @@ bool buildNewDocumentXml(
                                     "w:fill=\""
                                  << style.band_fill_rgb << "\"/>";
                     }
+                }
+                if (layout && layout->vertical_alignment) {
+                    const char* alignment = *layout->vertical_alignment == BasicVerticalAlignment::center ? "center"
+                        : *layout->vertical_alignment == BasicVerticalAlignment::bottom ? "bottom" : "top";
+                    document << "<w:vAlign w:val=\"" << alignment << "\"/>";
                 }
                 document << "</w:tcPr>";
                 NewParagraph cell_paragraph;
@@ -7420,11 +8073,41 @@ void appendStoryRunContents(std::ostringstream& output,
     }
 }
 
+std::string regionalStoryTableXml(
+    std::uint32_t content_width, const std::array<std::string, 3>& contents,
+    bool footer) {
+    const std::array<std::uint32_t, 3> widths{
+        content_width / 3U, content_width / 3U,
+        content_width - 2U * (content_width / 3U)};
+    std::ostringstream output;
+    output << "<w:tbl><w:tblPr><w:tblW w:w=\"" << content_width
+           << "\" w:type=\"dxa\"/><w:tblLayout w:type=\"fixed\"/><w:tblBorders>";
+    for (const auto* edge : {"top", "left", "bottom", "right", "insideH", "insideV"})
+        output << "<w:" << edge << " w:val=\"nil\"/>";
+    output << "</w:tblBorders><w:tblCellMar>";
+    for (const auto* edge : {"top", "left", "bottom", "right"})
+        output << "<w:" << edge << " w:w=\"0\" w:type=\"dxa\"/>";
+    output << "</w:tblCellMar></w:tblPr><w:tblGrid>";
+    for (const auto width : widths) output << "<w:gridCol w:w=\"" << width << "\"/>";
+    output << "</w:tblGrid><w:tr>";
+    constexpr std::array<std::string_view, 3> alignments{"left", "center", "right"};
+    for (std::size_t region = 0; region < 3U; ++region) {
+        output << "<w:tc><w:tcPr><w:tcW w:w=\"" << widths[region]
+               << "\" w:type=\"dxa\"/><w:vAlign w:val=\"" << (footer ? "bottom" : "top")
+               << "\"/></w:tcPr><w:p><w:pPr>"
+                  "<w:spacing w:before=\"0\" w:after=\"0\" w:line=\"240\" w:lineRule=\"auto\"/>"
+                  "<w:jc w:val=\"" << alignments[region] << "\"/></w:pPr>"
+               << contents[region] << "</w:p></w:tc>";
+    }
+    output << "</w:tr></w:tbl>";
+    return output.str();
+}
+
 std::string buildStoryXml(
     std::string_view text, const std::vector<NewStoryImage>& story_images,
     bool header, const PageSettings& page,
     const std::vector<AuthoredImagePart>* images,
-    std::size_t first_image_index) {
+    std::size_t first_image_index, bool regional_layout) {
     const std::uint32_t content_width = page.width_twips >
             page.margin_left_twips + page.margin_right_twips
         ? page.width_twips - page.margin_left_twips - page.margin_right_twips
@@ -7436,8 +8119,39 @@ std::string buildStoryXml(
            << " xmlns:r=\"" << kOfficeRelationshipsNamespace << "\""
            << " xmlns:wp=\"" << kWordprocessingDrawingNamespace << "\""
            << " xmlns:a=\"" << kDrawingMainNamespace << "\""
-           << " xmlns:pic=\"" << kDrawingPictureNamespace << "\"><w:p>"
-           << "<w:pPr><w:tabs><w:tab w:val=\"center\" w:pos=\""
+           << " xmlns:pic=\"" << kDrawingPictureNamespace << "\">";
+    const auto first_tab = text.find('\t');
+    const auto second_tab = first_tab == std::string_view::npos
+        ? std::string_view::npos : text.find('\t', first_tab + 1U);
+    if (second_tab != std::string_view::npos &&
+        (regional_layout || text.find('\n') != std::string_view::npos) &&
+        content_width >= 3U) {
+        const std::array<std::size_t, 3> starts{0U, first_tab + 1U, second_tab + 1U};
+        const std::array<std::size_t, 3> ends{first_tab, second_tab, text.size()};
+        std::array<std::string, 3> contents;
+        for (std::size_t region = 0; region < 3U; ++region) {
+            std::ostringstream cell;
+            std::size_t cursor = starts[region];
+            for (std::size_t index = 0; index < story_images.size(); ++index) {
+                const auto offset = story_images[index].text_offset_bytes;
+                if (offset < starts[region] || offset >= ends[region]) continue;
+                if (offset > cursor) appendStoryRunContents(cell, text.substr(cursor, offset - cursor));
+                if (images && first_image_index + index < images->size()) {
+                    NewRun run;
+                    run.inline_image = story_images[index].image;
+                    appendInlineImageDrawing(cell, run, (*images)[first_image_index + index],
+                                             first_image_index + index + 1U);
+                }
+                cursor = offset + 3U;
+            }
+            if (cursor < ends[region]) appendStoryRunContents(cell, text.substr(cursor, ends[region] - cursor));
+            contents[region] = cell.str();
+        }
+        output << regionalStoryTableXml(content_width, contents, !header)
+               << (header ? "</w:hdr>" : "</w:ftr>");
+        return output.str();
+    }
+    output << "<w:p><w:pPr><w:tabs><w:tab w:val=\"center\" w:pos=\""
            << content_width / 2U
            << "\"/><w:tab w:val=\"right\" w:pos=\""
            << content_width
@@ -7949,7 +8663,10 @@ std::string buildNewStylesXml(
         << "\"/><w:szCs w:val=\"" << defaults.font_size_half_points
         << "\"/></w:rPr></w:style>";
 
-    for (const auto& descriptor : kBuiltInParagraphStyles) {
+    const auto& catalog = defaults.legacy_style_defaults
+        ? kLegacyBuiltInParagraphStyles : defaults.neutral_style_defaults
+            ? kNeutralBuiltInParagraphStyles : kBuiltInParagraphStyles;
+    for (const auto& descriptor : catalog) {
         if (!paragraph_styles.contains(std::string(descriptor.id))) {
             continue;
         }
@@ -8141,6 +8858,35 @@ const std::filesystem::path& DocxDocument::sourcePath() const noexcept {
     return impl_->source_path;
 }
 
+std::unique_ptr<DocxDocument> DocxDocument::openBytes(
+    std::span<const std::uint8_t> bytes, Error* error,
+    const OpenOptions& options) {
+    if (error) *error = {};
+    if (bytes.empty() || bytes.size() > options.max_package_bytes) {
+        setError(error, ErrorCode::package_too_large, "Retained DOCX is empty or exceeds the package limit");
+        return nullptr;
+    }
+    ParsedPackage parsed;
+    if (!inspectPackage(std::vector<std::uint8_t>(bytes.begin(), bytes.end()),
+                        0600U, options, parsed, error)) return nullptr;
+    auto impl = std::make_unique<Impl>();
+    impl->options = options;
+    impl->package = std::move(parsed);
+    for (const auto& entry : impl->package.entries) impl->public_members.push_back(entry.member);
+    for (std::size_t index = 0; index < impl->package.spans.size(); ++index) {
+        impl->span_indices.emplace(impl->package.spans[index].id, index);
+    }
+    return std::unique_ptr<DocxDocument>(new DocxDocument(std::move(impl)));
+}
+
+std::span<const std::uint8_t> DocxDocument::sourceBytes() const noexcept {
+    return impl_->package.bytes;
+}
+
+const DocumentDefaults& DocxDocument::sourceDefaults() const noexcept {
+    return impl_->package.document_defaults;
+}
+
 const std::vector<PackageMember>& DocxDocument::packageMembers() const noexcept {
     return impl_->public_members;
 }
@@ -8167,6 +8913,10 @@ const std::optional<std::string>& DocxDocument::headerText() const noexcept {
 
 const std::optional<std::string>& DocxDocument::footerText() const noexcept {
     return impl_->package.footer_text;
+}
+
+const std::optional<std::string>& DocxDocument::academicRecovery() const noexcept {
+    return impl_->package.academic_recovery;
 }
 
 const std::vector<ImportedStoryImage>&
@@ -8319,7 +9069,8 @@ void DocxDocument::discardEdits() {
     impl_->edits.clear();
 }
 
-SaveResult DocxDocument::saveAs(const std::filesystem::path& target) {
+SaveResult DocxDocument::saveAs(const std::filesystem::path& target,
+                                const SaveCommitGuard& before_commit) {
     SaveResult result;
     const bool modified = dirty();
     if (modified) {
@@ -8368,9 +9119,19 @@ SaveResult DocxDocument::saveAs(const std::filesystem::path& target) {
         result.error = std::move(save_error);
         return result;
     }
-    if (!temporary->commit(target, &save_error)) {
+    // Keep the parsed candidate rather than reopening a pathname after rename:
+    // another writer may replace that pathname immediately after our commit.
+    auto candidate = DocxDocument::open(temporary->path(), &save_error, impl_->options);
+    if (!candidate || (before_commit && !before_commit(save_error))) {
         result.error = std::move(save_error);
         return result;
+    }
+    if (!temporary->commit(target, &save_error)) {
+        if (!temporary->committed()) {
+            result.error = std::move(save_error);
+            return result;
+        }
+        result.durability_warning = std::move(save_error);
     }
 
     result.saved = true;
@@ -8379,16 +9140,8 @@ SaveResult DocxDocument::saveAs(const std::filesystem::path& target) {
                                         ? impl_->package.entries.size() - 1
                                         : impl_->package.entries.size();
 
-    Error reopen_error;
-    std::unique_ptr<DocxDocument> reopened = DocxDocument::open(target, &reopen_error, impl_->options);
-    if (reopened != nullptr) {
-        impl_ = std::move(reopened->impl_);
-    } else {
-        // The pre-commit copy was already reopened and validated. Keep the
-        // saved result successful, but surface the unexpected post-rename
-        // state and leave this instance on its prior baseline.
-        result.error = std::move(reopen_error);
-    }
+    candidate->impl_->source_path = target;
+    impl_ = std::move(candidate->impl_);
     return result;
 }
 
@@ -8405,11 +9158,26 @@ SaveResult DocxDocument::writeNew(
     return writeNew(target, body, page, defaults);
 }
 
-SaveResult DocxDocument::writeNew(
-    const std::filesystem::path& target,
-    const NewDocumentBody& body,
+namespace {
+
+struct PreparedPackage {
+    std::map<std::string, std::string> members;
+};
+
+SaveResult prepareNewPackage(
+    const NewDocumentBody& source_body,
     const PageSettings& page,
-    const DocumentDefaults& defaults) {
+    const DocumentDefaults& defaults,
+    PreparedPackage& prepared) {
+    NewDocumentBody body = source_body;
+    std::uint32_t bookmark = 1;
+    for (auto& block : body.blocks) {
+        if (auto* paragraph = std::get_if<NewParagraph>(&block)) {
+            if (!paragraph->stable_id.empty()) paragraph->bookmark_number = bookmark++;
+            if (paragraph->hidden_sequence_target) paragraph->hidden_sequence_target->bookmark_number = bookmark++;
+            for (auto& run : paragraph->runs) if (run.field) run.field->bookmark_number = bookmark++;
+        }
+    }
     SaveResult result;
     if (!validPageSettings(page)) {
         const std::string message =
@@ -8422,6 +9190,7 @@ SaveResult DocxDocument::writeNew(
     IssueCode defaults_issue = IssueCode::invalid_utf8;
     std::string defaults_detail;
     const bool defaults_valid =
+        !(defaults.legacy_style_defaults && defaults.neutral_style_defaults) &&
         !defaults.font_family.empty() &&
         isValidUtf8XmlText(defaults.font_family, defaults_issue,
                            defaults_detail) &&
@@ -8483,6 +9252,21 @@ SaveResult DocxDocument::writeNew(
         result.error = std::move(save_error);
         return result;
     }
+    std::string section_note_properties;
+    for (const bool endnotes : {false, true}) {
+        if (std::none_of(body.notes.begin(), body.notes.end(), [endnotes](const auto& note) { return note.endnote == endnotes; })) continue;
+        const std::string name = endnotes ? "endnote" : "footnote";
+        section_note_properties += "<w:" + name + "Pr><w:pos w:val=\"" + (endnotes ? std::string("docEnd") : std::string("pageBottom")) +
+            "\"/><w:numFmt w:val=\"decimal\"/><w:numStart w:val=\"1\"/><w:numRestart w:val=\"continuous\"/></w:" + name + "Pr>";
+    }
+    if (!section_note_properties.empty()) {
+        const auto section = document_xml.rfind("<w:sectPr>");
+        const auto geometry = document_xml.find("<w:pgSz", section);
+        if (section == std::string::npos || geometry == std::string::npos) {
+            result.error = Error{ErrorCode::save_validation_failed, "The native notes section has no page properties"}; return result;
+        }
+        document_xml.insert(geometry, section_note_properties);
+    }
     std::string numbering_xml;
     if (!buildNewNumberingXml(
             body, numbering_xml, result.loss_report, &save_error)) {
@@ -8509,50 +9293,295 @@ SaveResult DocxDocument::writeNew(
     const std::string header_xml = has_header
         ? buildStoryXml(
               *body.header_text, body.header_images, true, page, &images,
-              header_image_index)
+              header_image_index, body.header_regional_layout)
         : std::string{};
     const std::string footer_xml = has_footer
         ? buildStoryXml(
               *body.footer_text, body.footer_images, false, page, &images,
-              footer_image_index)
+              footer_image_index, body.footer_regional_layout)
         : std::string{};
-    const std::string content_types = newContentTypes(
+    std::string content_types = newContentTypes(
         has_numbering, has_header, has_footer, images);
-    const std::string document_relationships =
+    std::string document_relationships =
         newDocumentRelationships(has_numbering, has_header, has_footer, images);
-
-    auto temporary = AtomicTempFile::create(target, 0600U, &save_error);
-    if (!temporary.has_value()) {
-        result.error = std::move(save_error);
-        return result;
+    std::unordered_set<std::string> note_ids;
+    std::set<std::pair<bool, std::uint32_t>> note_numbers;
+    for (const auto& note : body.notes) {
+        IssueCode issue{}; std::string detail;
+        if (body.notes.size() > 2048U || academicBookmark(note.id).empty() || !note_ids.insert(note.id).second ||
+            note.number == 0U || note.number > 10000U || !note_numbers.emplace(note.endnote, note.number).second ||
+            note.text.size() > 131072U || !isValidUtf8XmlText(note.text, issue, detail)) {
+            result.error = Error{ErrorCode::unsafe_edit, "Academic note content or identity is invalid"}; return result;
+        }
     }
-    if (!temporary->closeDescriptor(&save_error) ||
-        !writeNewArchive(
-            temporary->path(),
-            content_types,
-            kNewRootRelationships,
-            document_relationships,
-            buildNewStylesXml(defaults, paragraph_styles),
-            buildNewSettingsXml(defaults),
-            numbering_xml,
-            document_xml,
-            header_xml,
-            footer_xml,
-            images,
-            &save_error) ||
-        !temporary->syncClosedFile(&save_error) ||
-        !validateSavedPackage(
-            temporary->path(), nullptr, document_xml, nullptr, OpenOptions{}, &save_error)) {
-        result.error = std::move(save_error);
-        return result;
+    for (const auto& block : body.blocks) {
+        const auto* paragraph = std::get_if<NewParagraph>(&block);
+        if (!paragraph) continue;
+        for (const auto& run : paragraph->runs) {
+            if (!run.field || run.field->kind != AcademicFieldKind::note_reference) continue;
+            const auto& field = *run.field;
+            const auto note = std::find_if(body.notes.begin(), body.notes.end(), [&field](const auto& item) {
+                return item.id == field.target_id && item.endnote == field.endnote && item.number == field.note_number;
+            });
+            if (note == body.notes.end()) {
+                result.error = Error{ErrorCode::unsafe_edit, "A note reference has no matching native note"}; return result;
+            }
+        }
     }
-    if (!temporary->commit(target, &save_error)) {
-        result.error = std::move(save_error);
-        return result;
+    const auto add_relationship = [&](std::string_view id, std::string_view type, std::string_view target) {
+        document_relationships.insert(document_relationships.rfind("</Relationships>"),
+            "<Relationship Id=\"" + std::string(id) + "\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/" +
+            std::string(type) + "\" Target=\"" + std::string(target) + "\"/>");
+    };
+    const auto add_override = [&](std::string_view path, std::string_view type) {
+        content_types.insert(content_types.rfind("</Types>"), "<Override PartName=\"/" + std::string(path) + "\" ContentType=\"" + std::string(type) + "\"/>");
+    };
+    for (const bool endnotes : {false, true}) {
+        if (std::none_of(body.notes.begin(), body.notes.end(), [endnotes](const auto& note) { return note.endnote == endnotes; })) continue;
+        const std::string name = endnotes ? "endnotes" : "footnotes";
+        add_override("word/" + name + ".xml", "application/vnd.openxmlformats-officedocument.wordprocessingml." + name + "+xml");
+        add_relationship(endnotes ? "rIdEndnotes" : "rIdFootnotes", name, name + ".xml");
+    }
+    if (body.academic_recovery) {
+        IssueCode issue{}; std::string detail;
+        if (body.academic_recovery->empty() || body.academic_recovery->size() > 64U * 1024U * 1024U ||
+            !isValidUtf8XmlText(*body.academic_recovery, issue, detail)) {
+            result.error = Error{ErrorCode::unsafe_edit, "Academic snapshot is invalid"}; return result;
+        }
+        add_override(kAcademicRegistryPart, "application/xml");
+        add_relationship("rIdOwlDocsAcademics", "customXml", "owldocs-academic.xml");
+    }
+    std::string settings_xml = buildNewSettingsXml(defaults);
+    for (const bool endnotes : {false, true}) {
+        if (std::none_of(body.notes.begin(), body.notes.end(), [endnotes](const auto& note) { return note.endnote == endnotes; })) continue;
+        const std::string name = endnotes ? "endnote" : "footnote";
+        const std::string position = endnotes ? "docEnd" : "pageBottom";
+        settings_xml.insert(settings_xml.rfind("</w:settings>"), "<w:" + name + "Pr><w:pos w:val=\"" + position +
+            "\"/><w:numFmt w:val=\"decimal\"/><w:numStart w:val=\"1\"/><w:numRestart w:val=\"continuous\"/>" +
+            "<w:" + name + " w:id=\"-1\"/><w:" + name + " w:id=\"0\"/></w:" + name + "Pr>");
+    }
+    prepared.members = {
+        {std::string(kContentTypesPart), content_types},
+        {std::string(kRootRelationshipsPart), std::string(kNewRootRelationships)},
+        {std::string(kDocumentPart), document_xml},
+        {std::string(kDocumentRelationshipsPart), document_relationships},
+        {"word/styles.xml", buildNewStylesXml(defaults, paragraph_styles)},
+        {"word/settings.xml", settings_xml},
+    };
+    if (!numbering_xml.empty()) prepared.members.emplace("word/numbering.xml", numbering_xml);
+    if (!header_xml.empty()) prepared.members.emplace("word/header1.xml", header_xml);
+    if (!footer_xml.empty()) prepared.members.emplace("word/footer1.xml", footer_xml);
+    for (const auto owner : {ImagePartOwner::header, ImagePartOwner::footer}) {
+        if (std::any_of(images.begin(), images.end(), [owner](const auto& part) { return part.owner == owner; })) {
+            prepared.members.emplace(owner == ImagePartOwner::header
+                ? "word/_rels/header1.xml.rels" : "word/_rels/footer1.xml.rels",
+                newStoryRelationships(owner, images));
+        }
+    }
+    for (const auto& part : images) {
+        prepared.members.emplace(part.package_member, std::string(
+            reinterpret_cast<const char*>(part.image->bytes.data()), part.image->bytes.size()));
+    }
+    for (const bool endnotes : {false, true}) {
+        if (std::any_of(body.notes.begin(), body.notes.end(), [endnotes](const auto& note) { return note.endnote == endnotes; }))
+            prepared.members.emplace(endnotes ? "word/endnotes.xml" : "word/footnotes.xml", buildAcademicNotes(body.notes, endnotes));
+    }
+    if (body.academic_recovery) {
+        std::ostringstream registry;
+        registry << "<?xml version=\"1.0\" encoding=\"UTF-8\"?><academics xmlns=\"urn:owldocs:academic:1\" version=\"1\"><recovery>"
+                 << escapeXmlText(*body.academic_recovery) << "</recovery>";
+        for (const auto& [name, bytes] : prepared.members) registry << "<member name=\"" << escapeXmlAttribute(name) << "\">" << academicBase64(bytes) << "</member>";
+        registry << "</academics>";
+        auto xml = registry.str();
+        if (xml.size() > 192U * 1024U * 1024U) {
+            result.error = Error{ErrorCode::unsafe_edit, "Academic snapshot package exceeds the size limit"}; return result;
+        }
+        prepared.members.emplace(kAcademicRegistryPart, std::move(xml));
     }
     result.saved = true;
-    result.byte_identical_to_opened_file = false;
-    result.preserved_member_count = 0;
+    return result;
+}
+
+bool writePreparedPackage(const std::filesystem::path& path,
+                          const PreparedPackage& prepared, Error* error) {
+    int zip_error = 0;
+    auto* archive = zip_open(path.c_str(), ZIP_CREATE | ZIP_TRUNCATE, &zip_error);
+    if (!archive) {
+        setError(error, ErrorCode::io_error, "Cannot create DOCX: " + zipCodeError(zip_error));
+        return false;
+    }
+    for (const auto& [name, bytes] : prepared.members) {
+        if (!addBufferMember(archive, name, bytes, error)) {
+            zip_discard(archive);
+            return false;
+        }
+    }
+    if (zip_close(archive) != 0) {
+        setError(error, ErrorCode::io_error, "Cannot finalize DOCX: " + zipArchiveError(archive));
+        zip_discard(archive);
+        return false;
+    }
+    return true;
+}
+
+std::vector<std::string> differingMembers(const ParsedPackage& source,
+                                        const PreparedPackage& prepared,
+                                        const OpenOptions& options) {
+    std::vector<std::string> differences;
+    Error error;
+    auto* archive = openZipFromBytes(source.bytes, &error);
+    if (!archive) return {"Unreadable original package"};
+    for (const auto& entry : source.entries) {
+        const auto found = prepared.members.find(entry.member.name);
+        std::string original;
+        if (found == prepared.members.end() ||
+            !readEntry(archive, entry.index, options.max_member_uncompressed_bytes, original, &error) ||
+            found->second != original) {
+            differences.push_back(entry.member.name);
+        }
+    }
+    for (const auto& [name, bytes] : prepared.members) {
+        (void)bytes;
+        if (std::none_of(source.entries.begin(), source.entries.end(), [&name](const auto& entry) {
+                return entry.member.name == name;
+            })) differences.push_back(name);
+    }
+    zip_discard(archive);
+    return differences;
+}
+
+void omitRedundantImportedSpacing(PreparedPackage& prepared,
+                                  const ParsedPackage& source) {
+    // The semantic projection resolves docDefaults even for paragraphs with
+    // no explicit pStyle. Its exporter can consequently emit direct spacing
+    // equal to those inherited values. Remove only that generated redundancy
+    // for the coverage proof; never discard or normalize original XML.
+    auto& xml = prepared.members.at(std::string(kDocumentPart));
+    pugi::xml_document original, generated;
+    if (!original.load_buffer(source.document_xml.data(), source.document_xml.size()) ||
+        !generated.load_buffer(xml.data(), xml.size())) return;
+    std::vector<pugi::xml_node> source_paragraphs, candidate_paragraphs;
+    collectParagraphNodes(original.document_element(), source_paragraphs);
+    collectParagraphNodes(generated.document_element(), candidate_paragraphs);
+    if (source_paragraphs.size() != candidate_paragraphs.size() ||
+        source_paragraphs.size() != source.paragraphs.size()) return;
+    std::vector<std::pair<std::size_t, std::size_t>> removals;
+    const auto childNamed = [](pugi::xml_node node, const char* name) {
+        for (auto child : node.children()) if (isWordElement(child, name)) return child;
+        return pugi::xml_node{};
+    };
+    for (std::size_t index = 0; index < source_paragraphs.size(); ++index) {
+        const auto original_properties = childNamed(source_paragraphs[index], "pPr");
+        if (childNamed(original_properties, "spacing")) continue;
+        const auto properties = childNamed(candidate_paragraphs[index], "pPr");
+        const auto spacing = childNamed(properties, "spacing");
+        if (!spacing) continue;
+        Paragraph direct;
+        parseParagraphFormat(candidate_paragraphs[index], direct, nullptr);
+        const auto& inherited = source.paragraphs[index];
+        if (direct.space_before_twips != inherited.space_before_twips ||
+            direct.space_after_twips != inherited.space_after_twips ||
+            direct.line_spacing != inherited.line_spacing ||
+            direct.line_spacing_rule != inherited.line_spacing_rule) continue;
+        auto remove = spacing;
+        if (!original_properties && std::distance(properties.children().begin(), properties.children().end()) == 1) {
+            remove = properties;
+        }
+        const auto offset = remove.offset_debug();
+        if (offset <= 0) continue;
+        const auto begin = static_cast<std::size_t>(offset - 1);
+        const auto ending = remove == spacing ? xml.find("/>", begin)
+                                             : xml.find("</w:pPr>", begin);
+        if (ending == std::string::npos) continue;
+        removals.emplace_back(begin, ending + (remove == spacing ? 2U : 8U) - begin);
+    }
+    for (auto removal = removals.rbegin(); removal != removals.rend(); ++removal) {
+        xml.erase(removal->first, removal->second);
+    }
+}
+
+}  // namespace
+
+RegenerationAssessment DocxDocument::assessRegeneration(
+    const NewDocumentBody& body, const PageSettings& page,
+    const DocumentDefaults& defaults) const {
+    PreparedPackage prepared;
+    const auto result = prepareNewPackage(body, page, defaults, prepared);
+    RegenerationAssessment assessment;
+    assessment.loss_report = result.loss_report;
+    if (!result) {
+        if (assessment.loss_report.issues.empty()) {
+            assessment.loss_report.issues.push_back(blockingIssue(
+                IssueCode::structural_rewrite_required,
+                result.error ? result.error->message : "The editable content cannot be serialized"));
+        }
+        return assessment;
+    }
+    if (!body.academic_recovery) omitRedundantImportedSpacing(prepared, impl_->package);
+    const auto differences = differingMembers(impl_->package, prepared, impl_->options);
+    const auto describe = [](const std::string& name) -> std::string {
+        if (name.find("comments") != std::string::npos) return "Comments would not be retained in an editable copy";
+        if (name.find("footnotes") != std::string::npos || name.find("endnotes") != std::string::npos)
+            return "Original notes outside the supported note format would not be retained";
+        if (name.find("header") != std::string::npos || name.find("footer") != std::string::npos)
+            return "Original header or footer content cannot be reproduced completely";
+        if (name == kDocumentPart) return "Some original document content or formatting cannot be reproduced completely";
+        if (name == "word/styles.xml") return "Original style definitions differ from the supported editable styles";
+        if (name == "word/settings.xml") return "Additional original document settings would not be retained";
+        if (name.find("media/") != std::string::npos || name.find("drawings/") != std::string::npos)
+            return "Some embedded pictures or drawings would not be retained";
+        if (name.ends_with(".rels")) return "Some original document relationships cannot be reproduced";
+        if (name == kContentTypesPart) return "The original package contains additional document features";
+        return "Additional embedded document data would not be retained";
+    };
+    for (const auto& name : differences) {
+        assessment.loss_report.issues.push_back(CompatibilityIssue{
+            IssueSeverity::warning, IssueCode::structural_rewrite_required, name,
+            describe(name), std::nullopt});
+    }
+    for (const auto& issue : impl_->package.compatibility.issues) {
+        if (issue.severity == IssueSeverity::blocking || !differences.empty()) assessment.loss_report.issues.push_back(issue);
+    }
+    assessment.lossless = assessment.loss_report.issues.empty();
+    return assessment;
+}
+
+SaveResult DocxDocument::writeNew(
+    const std::filesystem::path& target, const NewDocumentBody& body,
+    const PageSettings& page, const DocumentDefaults& defaults,
+    const SaveCommitGuard& before_commit) {
+    PreparedPackage prepared;
+    auto result = prepareNewPackage(body, page, defaults, prepared);
+    if (!result) return result;
+    result.saved = false;
+    Error error;
+    auto temporary = AtomicTempFile::create(target, 0600U, &error);
+    if (!temporary || !temporary->closeDescriptor(&error) ||
+        !writePreparedPackage(temporary->path(), prepared, &error) ||
+        !temporary->syncClosedFile(&error)) {
+        result.error = std::move(error);
+        return result;
+    }
+    auto candidate = DocxDocument::open(temporary->path(), &error);
+    if (!candidate || !differingMembers(candidate->impl_->package, prepared, OpenOptions{}).empty()) {
+        result.error = candidate ? Error{ErrorCode::save_validation_failed,
+            "Saved package differs from the prepared document"} : std::move(error);
+        return result;
+    }
+    if (before_commit && !before_commit(error)) {
+        result.error = std::move(error);
+        return result;
+    }
+    if (!temporary->commit(target, &error)) {
+        if (!temporary->committed()) {
+            result.error = std::move(error);
+            return result;
+        }
+        result.durability_warning = std::move(error);
+    }
+    result.saved = true;
+    result.validated_package_bytes = std::make_shared<const std::vector<std::uint8_t>>(
+        std::move(candidate->impl_->package.bytes));
     return result;
 }
 
@@ -8637,8 +9666,11 @@ SaveResult DocxDocument::writeNew(
         return result;
     }
     if (!temporary->commit(target, &save_error)) {
-        result.error = std::move(save_error);
-        return result;
+        if (!temporary->committed()) {
+            result.error = std::move(save_error);
+            return result;
+        }
+        result.durability_warning = std::move(save_error);
     }
     result.saved = true;
     result.byte_identical_to_opened_file = false;

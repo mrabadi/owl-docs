@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Regenerate or verify Owl Docs' checked-in hicolor application icons."""
+"""Regenerate or verify OwlDocs' checked-in hicolor application icons."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ from PIL import Image
 SIZES = (16, 24, 32, 48, 64, 128, 256, 512)
 MASTER_SHA256 = "058f151ffce9299c30d8cc068d17f21b4b5c34f3701b6b76641a1fa2f58c6205"
 MASTER_SIZE = (1254, 1254)
-REQUIRED_PILLOW_VERSION = "12.3.0"
+SUPPORTED_PILLOW_VERSIONS = ("12.3.0", "13.0.0")
 REQUIRED_ZLIB_VERSION = "1.3.2"
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -30,9 +30,10 @@ def output_path(size: int) -> Path:
 
 
 def check_runtime() -> None:
-    if PIL.__version__ != REQUIRED_PILLOW_VERSION:
+    if PIL.__version__ not in SUPPORTED_PILLOW_VERSIONS:
         raise RuntimeError(
-            f"Pillow {REQUIRED_PILLOW_VERSION} is required; found {PIL.__version__}"
+            f"Pillow {' or '.join(SUPPORTED_PILLOW_VERSIONS)} is required; "
+            f"found {PIL.__version__}"
         )
     if zlib.ZLIB_RUNTIME_VERSION != REQUIRED_ZLIB_VERSION:
         raise RuntimeError(
@@ -112,7 +113,7 @@ def main() -> int:
         if arguments.check:
             if not verify(master):
                 return 1
-            print("all Owl Docs application icons match the canonical master")
+            print("all OwlDocs application icons match the canonical master")
         else:
             write(master)
     except (OSError, RuntimeError) as error:

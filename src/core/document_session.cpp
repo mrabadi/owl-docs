@@ -21,6 +21,27 @@ Result<void> applyOne(Document& document, const Operation& operation) {
                 return document.insertEquation(
                     typed.position, typed.canonical_latex, typed.display,
                     typed.equation_id, typed.format);
+            } else if constexpr (std::is_same_v<Type, ReplaceEquation>) {
+                return document.replaceEquation(
+                    typed.equation_id, typed.canonical_latex, typed.display);
+            } else if constexpr (std::is_same_v<Type, InsertField>) {
+                return document.insertField(typed.position, typed.field, typed.format);
+            } else if constexpr (std::is_same_v<Type, ReplaceField>) {
+                return document.replaceField(typed.field_id, typed.field);
+            } else if constexpr (std::is_same_v<Type, SetNote>) {
+                return document.setNote(typed.note);
+            } else if constexpr (std::is_same_v<Type, SetCaption>) {
+                return document.setCaption(typed.paragraph_id, typed.caption);
+            } else if constexpr (std::is_same_v<Type, SetBibliographyEntry>) {
+                return document.setBibliographyEntry(typed.paragraph_id, typed.enabled);
+            } else if constexpr (std::is_same_v<Type, InsertToc>) {
+                return document.insertToc(typed.before_block_id, typed.toc);
+            } else if constexpr (std::is_same_v<Type, ConfigureToc>) {
+                return document.configureToc(typed.toc_id, typed.max_level);
+            } else if constexpr (std::is_same_v<Type, DeleteToc>) {
+                return document.deleteToc(typed.toc_id);
+            } else if constexpr (std::is_same_v<Type, MoveBodyBlock>) {
+                return document.moveBodyBlock(typed.block_id, typed.before_block_id);
             } else if constexpr (std::is_same_v<Type, InsertImage>) {
                 return document.insertImage(
                     typed.position, typed.encoded_payload, typed.image_format,
@@ -69,6 +90,17 @@ Result<void> applyOne(Document& document, const Operation& operation) {
                 return document.mergeWithNext(typed.paragraph_id);
             } else if constexpr (std::is_same_v<Type, InsertTable>) {
                 return document.insertTable(typed.before_block_id, typed.table);
+            } else if constexpr (std::is_same_v<Type, InsertTableCellImage>) {
+                return document.insertTableCellImage(
+                    typed.table_id, typed.row, typed.column, typed.utf16_offset,
+                    typed.encoded_payload, typed.image_format, typed.accessible_name,
+                    typed.width_emu, typed.height_emu, typed.image_id, typed.character_format);
+            } else if constexpr (std::is_same_v<Type, SetTableGeometry>) {
+                return document.setTableGeometry(typed.table_id, typed.geometry);
+            } else if constexpr (std::is_same_v<Type, SetTableCellLayout>) {
+                return document.setTableCellLayout(typed.table_id, typed.row, typed.column, typed.layout);
+            } else if constexpr (std::is_same_v<Type, SetTableCellContent>) {
+                return document.setTableCellContent(typed.table_id, typed.row, typed.column, typed.content);
             } else if constexpr (std::is_same_v<Type, SetTableCellText>) {
                 return document.setTableCellText(typed.table_id, typed.row,
                                                  typed.column, typed.text,
@@ -110,9 +142,9 @@ Result<void> applyOne(Document& document, const Operation& operation) {
             } else if constexpr (std::is_same_v<Type, DeleteTable>) {
                 return document.deleteTable(typed.table_id);
             } else if constexpr (std::is_same_v<Type, SetHeaderText>) {
-                return document.setHeaderText(typed.text);
+                return document.setHeaderText(typed.text, typed.replaced_range);
             } else if constexpr (std::is_same_v<Type, SetFooterText>) {
-                return document.setFooterText(typed.text);
+                return document.setFooterText(typed.text, typed.replaced_range);
             } else if constexpr (
                 std::is_same_v<Type, InsertHeaderFooterImage>) {
                 return document.insertHeaderFooterImage(
@@ -127,27 +159,31 @@ Result<void> applyOne(Document& document, const Operation& operation) {
 
 using PayloadIdentity = const std::uint8_t*;
 
+template <typename Include>
+void forEachImage(const Document& document, const Include& include) {
+    for (const auto& paragraph : document.paragraphs())
+        for (const auto& image : paragraph.images()) include(image);
+    for (const auto& table : document.tables())
+        for (const auto& cell : table.cells())
+            for (const auto& image : cell.images) include(image);
+    for (const auto* story : {&document.headerImages(), &document.footerImages()})
+        for (const auto& image : *story) include(image);
+}
+
 void collectPayloadIdentities(
     const Document& document,
     std::unordered_set<PayloadIdentity>& identities) {
-    for (const auto& paragraph : document.paragraphs()) {
-        for (const auto& image : paragraph.images()) {
-            const auto bytes = image.encoded_payload.bytes();
-            if (!bytes.empty()) {
-                identities.insert(bytes.data());
-            }
-        }
-    }
-    for (const auto* story : {&document.headerImages(),
-                              &document.footerImages()}) {
-        for (const auto& image : *story) {
-            const auto bytes = image.encoded_payload.bytes();
-            if (!bytes.empty()) identities.insert(bytes.data());
-        }
-    }
+    forEachImage(document, [&identities](const auto& image) {
+        const auto bytes = image.encoded_payload.bytes();
+        if (!bytes.empty()) identities.insert(bytes.data());
+    });
 }
 
 }  // namespace
+
+Result<void> applyDocumentOperation(Document& document, const Operation& operation) {
+    return applyOne(document, operation);
+}
 
 DocumentSession::DocumentSession() = default;
 
@@ -177,21 +213,13 @@ void DocumentSession::trimRetainedHistoryImages() {
         std::size_t total = 0;
         const auto collect_history_document =
             [&active, &retained, &total](const Document& document) {
-                for (const auto& paragraph : document.paragraphs()) {
-                    for (const auto& image : paragraph.images()) {
-                        const auto bytes = image.encoded_payload.bytes();
-                        if (bytes.empty() || active.contains(bytes.data()) ||
-                            !retained.insert(bytes.data()).second) {
-                            continue;
-                        }
-                        if (bytes.size() >
-                            std::numeric_limits<std::size_t>::max() - total) {
-                            total = std::numeric_limits<std::size_t>::max();
-                        } else {
-                            total += bytes.size();
-                        }
-                    }
-                }
+                forEachImage(document, [&active, &retained, &total](const auto& image) {
+                    const auto bytes = image.encoded_payload.bytes();
+                    if (bytes.empty() || active.contains(bytes.data()) || !retained.insert(bytes.data()).second) return;
+                    if (bytes.size() > std::numeric_limits<std::size_t>::max() - total)
+                        total = std::numeric_limits<std::size_t>::max();
+                    else total += bytes.size();
+                });
             };
         const auto collect_stack = [&collect_history_document](
                                        const std::vector<HistoryEntry>& stack) {
@@ -215,15 +243,12 @@ void DocumentSession::trimRetainedHistoryImages() {
             for (const auto& entry : stack) {
                 for (const Document* document :
                      {&entry.before, &entry.after}) {
-                    for (const auto& paragraph : document->paragraphs()) {
-                        for (const auto& image : paragraph.images()) {
-                            const auto bytes = image.encoded_payload.bytes();
-                            if (!bytes.empty() &&
-                                !active.contains(bytes.data())) {
-                                return true;
-                            }
-                        }
-                    }
+                    bool inactive = false;
+                    forEachImage(*document, [&active, &inactive](const auto& image) {
+                        const auto bytes = image.encoded_payload.bytes();
+                        if (!bytes.empty() && !active.contains(bytes.data())) inactive = true;
+                    });
+                    if (inactive) return true;
                 }
             }
             return false;
@@ -289,7 +314,7 @@ Result<Document> DocumentSession::applyOperations(const Document& base,
                                                    std::span<const Operation> operations) {
     Document candidate = base;
     for (std::size_t index = 0; index < operations.size(); ++index) {
-        const auto result = applyOne(candidate, operations[index]);
+        const auto result = applyDocumentOperation(candidate, operations[index]);
         if (!result) {
             auto error = result.error();
             error.message = "Operation " + std::to_string(index) + ": " + error.message;

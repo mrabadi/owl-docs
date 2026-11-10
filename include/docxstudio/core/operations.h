@@ -24,6 +24,23 @@ struct InsertEquation {
     std::optional<CharacterFormat> format;
 };
 
+// Retains semantic identity, position and character formatting.
+struct ReplaceEquation {
+    NodeId equation_id;
+    std::string canonical_latex;
+    bool display{false};
+};
+
+struct InsertField { Position position; FieldAtom field; std::optional<CharacterFormat> format; };
+struct ReplaceField { NodeId field_id; FieldAtom field; };
+struct SetNote { Note note; };
+struct SetCaption { NodeId paragraph_id; std::optional<CaptionMetadata> caption; };
+struct SetBibliographyEntry { NodeId paragraph_id; bool enabled{true}; };
+struct InsertToc { std::optional<NodeId> before_block_id; TocBlock toc; };
+struct ConfigureToc { NodeId toc_id; std::uint8_t max_level{3}; };
+struct DeleteToc { NodeId toc_id; };
+struct MoveBodyBlock { NodeId block_id; std::optional<NodeId> before_block_id; };
+
 struct InsertImage {
     Position position;
     EncodedImagePayload encoded_payload;
@@ -155,6 +172,30 @@ struct InsertTable {
     Table table;
 };
 
+struct InsertTableCellImage {
+    NodeId table_id;
+    std::size_t row{0};
+    std::size_t column{0};
+    std::size_t utf16_offset{0};
+    EncodedImagePayload encoded_payload;
+    ImageFormat image_format{ImageFormat::png};
+    std::string accessible_name;
+    std::int64_t width_emu{0};
+    std::int64_t height_emu{0};
+    NodeId image_id{NodeId::generate()};
+    std::optional<CharacterFormat> character_format{};
+};
+
+struct SetTableGeometry { NodeId table_id; TableGeometry geometry; };
+struct SetTableCellLayout { NodeId table_id; std::size_t row{0}; std::size_t column{0}; TableCellLayout layout; };
+
+struct SetTableCellContent {
+    NodeId table_id;
+    std::size_t row{0};
+    std::size_t column{0};
+    TableCell content;
+};
+
 struct SetTableCellText {
     NodeId table_id;
     std::size_t row{0};
@@ -248,10 +289,12 @@ struct DeleteTable {
 
 struct SetHeaderText {
     std::u16string text;
+    std::optional<StoryTextEditRange> replaced_range{};
 };
 
 struct SetFooterText {
     std::u16string text;
+    std::optional<StoryTextEditRange> replaced_range{};
 };
 
 struct InsertHeaderFooterImage {
@@ -265,7 +308,10 @@ struct InsertHeaderFooterImage {
     NodeId image_id{NodeId::generate()};
 };
 
-using Operation = std::variant<InsertText, InsertEquation, InsertImage,
+using Operation = std::variant<InsertText, InsertEquation, ReplaceEquation, InsertImage,
+                               InsertField, ReplaceField, SetNote, SetCaption,
+                               SetBibliographyEntry, InsertToc, ConfigureToc,
+                               DeleteToc, MoveBodyBlock,
                                ResizeImage, ReplaceImagePayload, SetImageLayout,
                                SetImageAccessibleName, DeleteRange, ReplaceRange,
                                SetCharacterFormat,
@@ -273,7 +319,7 @@ using Operation = std::variant<InsertText, InsertEquation, InsertImage,
                                SetParagraphFormat, SetParagraphStyle,
                                SetParagraphStyleProvenance,
                                SplitParagraph, MergeWithNextParagraph,
-                               InsertTable, SetTableCellText,
+                               InsertTable, InsertTableCellImage, SetTableGeometry, SetTableCellLayout, SetTableCellContent, SetTableCellText,
                                ReplaceTableCellRange,
                                SetTableCellCharacterFormat,
                                SetTableCellParagraphFormat, AppendTableRow,
@@ -282,5 +328,10 @@ using Operation = std::variant<InsertText, InsertEquation, InsertImage,
                                SetTableStyle, MoveTable, DeleteTable,
                                SetHeaderText, SetFooterText,
                                InsertHeaderFooterImage>;
+
+// Shared operation semantics for session transactions and isolated authoring
+// planners. Callers requiring atomic batches apply to a private candidate.
+[[nodiscard]] Result<void> applyDocumentOperation(Document& document,
+                                                   const Operation& operation);
 
 }  // namespace docxstudio::core

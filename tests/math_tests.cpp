@@ -93,6 +93,8 @@ void testMatrices() {
 
     CHECK(canonical("\\begin{bmatrix}1&0\\\\0&1\\\\\\end{bmatrix}") ==
           "\\begin{bmatrix}1 & 0 \\\\ 0 & 1\\end{bmatrix}");
+    CHECK(canonical(R"(\begin{matrix}a\\b&c\end{matrix})") ==
+          R"(\begin{matrix}a &  \\ b & c\end{matrix})");
 }
 
 void testStrictRejection() {
@@ -155,6 +157,48 @@ void testResourceLimits() {
                 limits);
 }
 
+void testTextAndFontCommands() {
+    CHECK(canonical("\\text{when x is positive}") == "\\text{when x is positive}");
+    CHECK(canonical("\\mathrm{AB}+\\mathbf{x}+\\mathit{y}+\\operatorname{rank}") ==
+          "\\mathrm{AB} + \\mathbf{x} + \\mathit{y} + \\operatorname{rank}");
+    const auto source = canonical("\\text{if } x + \\mathbf{\\alpha_1}");
+    CHECK(canonical(source) == source);
+    expectError("\\text{unterminated", ParseErrorCode::unexpected_end);
+    expectError("\\text{\\input{secret}}", ParseErrorCode::forbidden_command);
+}
+
+void testAccentsAndSpacing() {
+    CHECK(canonical(R"(\hat{x}+\vec{v}+\bar{z}+\overline{AB}+\underline{CD})") ==
+          R"(\hat{x} + \vec{v} + \bar{z} + \overline{AB} + \underline{CD})");
+    CHECK(canonical(R"(\prod_{i=1}^{n} i\,x\quad y\!z+\dfrac{a}{b}+\tfrac{c}{d})") ==
+          R"(\prod_{i = 1}^{n} i \, x \quad y \! z + \frac{a}{b} + \frac{c}{d})");
+    expectError(R"(\hat{})", ParseErrorCode::empty_argument);
+}
+
+void testAlignedAndCases() {
+    const auto aligned = R"(\begin{aligned}a&=b\\c&=d\end{aligned})";
+    const auto cases = R"(\begin{cases}x & \text{if positive}\\0 & \text{otherwise}\end{cases})";
+    CHECK(!canonical(aligned).empty());
+    CHECK(!canonical(cases).empty());
+    CHECK(canonical(canonical(aligned)) == canonical(aligned));
+    CHECK(canonical(R"(\begin{cases}x&\text{positive}\\0\end{cases})") ==
+          R"(\begin{cases}x & \text{positive} \\ 0 & \end{cases})");
+    CHECK(canonical(R"(\begin{aligned}a&=b\\c\end{aligned})") ==
+          R"(\begin{aligned}a & = b \\ c & \end{aligned})");
+    expectError(R"(\begin{aligned}a&b&c\end{aligned})", ParseErrorCode::matrix_too_large);
+    expectError(R"(\begin{cases}a&b&c\end{cases})", ParseErrorCode::matrix_too_large);
+}
+
+void testXmlCharacterSafety() {
+    for (const char control : {char(0), char(1), char(11), char(12), char(31)}) {
+        const std::string source = std::string("\\text{A") + control + "B}";
+        expectError(source, ParseErrorCode::unexpected_token);
+    }
+    expectError("\\text{\xef\xbf\xbe}", ParseErrorCode::unexpected_token);
+    expectError("\\text{\xef\xbf\xbf}", ParseErrorCode::unexpected_token);
+    CHECK(canonical("\\text{line\nnext}") == "\\text{line\nnext}");
+}
+
 }  // namespace
 
 int main() {
@@ -163,6 +207,10 @@ int main() {
     testMatrices();
     testStrictRejection();
     testResourceLimits();
+    testTextAndFontCommands();
+    testAccentsAndSpacing();
+    testAlignedAndCases();
+    testXmlCharacterSafety();
 
     if (failures != 0) {
         std::cerr << failures << " math test(s) failed\n";

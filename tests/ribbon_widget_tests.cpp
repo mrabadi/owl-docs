@@ -3,6 +3,9 @@
 #include "docxstudio/app/FontFamilyPicker.h"
 #include "docxstudio/app/MainWindow.h"
 #include "docxstudio/app/RibbonWidget.h"
+#include "docxstudio/app/ColorPaletteWidget.h"
+#include <QAbstractButton>
+#include <QKeyEvent>
 
 #include <QAction>
 #include <QAbstractItemModel>
@@ -192,13 +195,27 @@ int main(int argc, char** argv) {
         QStringLiteral("#8f6b1c"), QStringLiteral("#b38b30"),
         QStringLiteral("#994a55"), QStringLiteral("#c06b73"),
         QStringLiteral("#a95f2b"), QStringLiteral("#c37c40")};
-    for (qsizetype index = 0; index < expectedLightPalette.size(); ++index) {
-        auto* action = ribbon.findChild<QAction*>(
-            QStringLiteral("ribbonColor.text.%1").arg(index));
-        check(action && action->data().value<QColor>().name() ==
-                            expectedLightPalette[index],
-              "font-color palette differs from the light core/figure system");
+    ribbon.rememberTextColor(QColor(QStringLiteral("#123456")));
+    ribbon.rememberHighlightColor(QColor(QStringLiteral("#abcdef")));
+    auto* textMenu=ribbon.findChild<QMenu*>(QStringLiteral("ribbonMenu.textColor"));
+    auto* grid=textMenu ? textMenu->findChild<docxstudio::app::ColorPaletteWidget*>() : nullptr;
+    check(grid,"font color is still a named menu instead of the swatch grid");
+    auto* highlightMenu=ribbon.findChild<QMenu*>(QStringLiteral("ribbonMenu.highlightColor"));
+    check(highlightMenu && highlightMenu->findChild<docxstudio::app::ColorPaletteWidget*>(),
+          "highlight is still a named menu instead of the swatch grid");
+    QSet<QString> actualColors;
+    for (auto* button:grid->findChildren<QAbstractButton*>()) {
+        const QColor color=button->property("paletteColor").value<QColor>();
+        if (color.isValid()) actualColors.insert(color.name());
     }
+    check(actualColors.contains(QStringLiteral("#123456")),"committed custom text color was not added to the grid history");
+    for (const auto& expected:expectedLightPalette)
+        check(actualColors.contains(expected),"font color grid lost an exact reference palette color");
+    auto* textButton=ribbon.findChild<QToolButton*>(QStringLiteral("ribbonButton.format.textColor"));
+    auto* highlightButton=ribbon.findChild<QToolButton*>(QStringLiteral("ribbonButton.format.highlightColor"));
+    check(textButton && highlightButton && (textButton->focusPolicy() & Qt::TabFocus) &&
+          (highlightButton->focusPolicy() & Qt::TabFocus) && textButton->size()==QSize(30,30) &&
+          highlightButton->size()==QSize(30,30),"color controls lack compact keyboard access");
 
     // Replacing Qt's noisy delegate must not filter multilingual fonts out of
     // the model: editing imported Arabic/CJK/Indic text still needs every
@@ -337,17 +354,29 @@ int main(int argc, char** argv) {
           "Table tab is visible without a selected table");
     check(!tabs->isTabVisible(pictureIndex),
           "Picture tab is visible without a selected picture");
+    for (const auto* group : {"insert", "delete"}) {
+        auto* button = ribbon.findChild<QToolButton*>(
+            QStringLiteral("ribbonButton.table.%1").arg(group));
+        check(button && button->menu() &&
+                  button->popupMode() == QToolButton::InstantPopup &&
+                  !button->icon().isNull() && !button->accessibleName().isEmpty() &&
+                  !button->toolTip().isEmpty() &&
+                  (button->focusPolicy() & Qt::TabFocus),
+              "Table row/column chooser is not an accessible keyboard menu");
+        check(!button->isEnabled(),
+              "Table row/column chooser is enabled outside a table context");
+    }
     for (const auto& id : tableCommandIds) {
         auto* action = commands.action(id);
         auto* button = ribbon.findChild<QToolButton*>(
-            QStringLiteral("ribbonButton.%1").arg(id));
-        check(action && button && button->defaultAction() == action,
-              "Table command has no matching ribbon action/button");
+            QStringLiteral("ribbonButton.table.%1")
+                .arg(id.startsWith(QStringLiteral("table.insert")) ? "insert" : "delete"));
+        check(action && button && button->menu()->actions().contains(action),
+              "Table command is missing from its row/column chooser");
         check(!action->isEnabled(),
               "Table command is enabled outside a table context");
-        check(!button->icon().isNull() && !button->accessibleName().isEmpty() &&
-                  !button->toolTip().isEmpty(),
-              "Table command is not an accessible icon action");
+        check(!action->icon().isNull() && !action->text().isEmpty(),
+              "Table row/column menu command lacks an icon or label");
     }
     for (const auto& id : pictureCommandIds) {
         check(!commands.action(id)->isEnabled(),
@@ -366,13 +395,12 @@ int main(int argc, char** argv) {
               !commands.action(QStringLiteral("picture.wrapInline"))->isChecked() &&
               !commands.action(QStringLiteral("picture.wrapTopBottom"))->isChecked(),
           "Picture ribbon did not mirror the selected wrap mode");
-    auto* pictureWrap = ribbon.findChild<QToolButton*>(
-        QStringLiteral("ribbonButton.picture.wrap"));
-    check(pictureWrap && pictureWrap->menu() &&
-              pictureWrap->menu()->actions().size() == 3 &&
-              !pictureWrap->icon().isNull() &&
-              !pictureWrap->accessibleName().isEmpty(),
-          "Picture ribbon has no accessible visual wrap menu");
+    for (const auto* id : {"picture.wrapInline", "picture.wrapSquare", "picture.wrapTopBottom"}) {
+        auto* wrapChoice = ribbon.findChild<QToolButton*>(QStringLiteral("ribbonButton.%1").arg(id));
+        check(wrapChoice && wrapChoice->defaultAction() == commands.action(id) &&
+                  !wrapChoice->icon().isNull() && !wrapChoice->accessibleName().isEmpty(),
+              "Picture ribbon has no direct accessible wrap choice");
+    }
     tabs->setCurrentIndex(pictureIndex);
     ribbon.setPictureContext(false);
     check(!tabs->isTabVisible(pictureIndex) &&
@@ -385,6 +413,12 @@ int main(int argc, char** argv) {
     for (const auto& id : tableCommandIds) {
         check(commands.action(id)->isEnabled(),
               "Table command stayed disabled inside a table context");
+    }
+    for (const auto* group : {"insert", "delete"}) {
+        auto* button = ribbon.findChild<QToolButton*>(
+            QStringLiteral("ribbonButton.table.%1").arg(group));
+        check(button && button->isEnabled(),
+              "Table row/column chooser stayed disabled inside a table context");
     }
 
     auto* styles = ribbon.findChild<QToolButton*>(
@@ -457,6 +491,17 @@ int main(int argc, char** argv) {
         check(!commands.action(id)->isEnabled(),
               "hidden Table command remained enabled");
     }
+
+    ribbon.resize(1280,180);ribbon.show();ribbon.activateWindow();
+    QApplication::processEvents();
+    textMenu->popup(textButton->mapToGlobal(QPoint(0,textButton->height())));
+    QApplication::processEvents();
+    auto* paletteFocus=QApplication::focusWidget();
+    check(paletteFocus && grid->isAncestorOf(paletteFocus),
+          "opening the swatch menu does not focus a usable palette choice");
+    QKeyEvent escape(QEvent::KeyPress,Qt::Key_Escape,Qt::NoModifier);
+    QApplication::sendEvent(paletteFocus,&escape);QApplication::processEvents();
+    check(!textMenu->isVisible(),"Escape cannot dismiss the swatch popup");
 
     docxstudio::app::MainWindow window;
     auto* windowRibbonTabs = window.findChild<QTabWidget*>(

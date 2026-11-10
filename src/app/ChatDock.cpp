@@ -1,9 +1,11 @@
 #include "docxstudio/app/ChatDock.h"
+#include "docxstudio/app/AppTheme.h"
 
 #include <QComboBox>
 #include <QColor>
 #include <QFont>
 #include <QHBoxLayout>
+#include <QGridLayout>
 #include <QKeyEvent>
 #include <QLabel>
 #include <QPlainTextEdit>
@@ -12,11 +14,27 @@
 #include <QTextCharFormat>
 #include <QTextCursor>
 #include <QVBoxLayout>
+#include <QToolButton>
+#include <QSignalBlocker>
+#include <QStyle>
+#include <QStyleOptionComboBox>
 
 #include <functional>
 
 namespace docxstudio::app {
 namespace {
+
+void fitChoiceLabels(QComboBox* choice) {
+    QStyleOptionComboBox option;
+    option.initFrom(choice);
+    option.rect = QRect(0, 0, 200, choice->sizeHint().height());
+    const int chrome = option.rect.width() - choice->style()->subControlRect(
+        QStyle::CC_ComboBox, &option, QStyle::SC_ComboBoxEditField, choice).width();
+    int textWidth = 0;
+    for (int index = 0; index < choice->count(); ++index)
+        textWidth = qMax(textWidth, choice->fontMetrics().horizontalAdvance(choice->itemText(index)));
+    choice->setMinimumWidth(textWidth + chrome);
+}
 
 class SendTextEdit final : public QPlainTextEdit {
 public:
@@ -39,7 +57,9 @@ protected:
 }  // namespace
 
 ChatDock::ChatDock(QWidget* parent) : QDockWidget(tr("Codex"), parent) {
+    applyAppTheme(this);
     setObjectName(QStringLiteral("codexDock"));
+    setAccessibleName(tr("Codex document assistant"));
     setAllowedAreas(Qt::LeftDockWidgetArea | Qt::RightDockWidgetArea);
     setMinimumWidth(320);
 
@@ -48,34 +68,61 @@ ChatDock::ChatDock(QWidget* parent) : QDockWidget(tr("Codex"), parent) {
     layout->setContentsMargins(8, 8, 8, 8);
     layout->setSpacing(7);
 
-    privacy_ = new QLabel(tr("Chat is off. The document stays local until you enable Codex."), body);
+    privacy_ = new QLabel(tr("Document context is shared when you send a message."), body);
+    privacy_->setObjectName(QStringLiteral("codex.privacy"));
+    privacy_->setProperty("tone", QStringLiteral("info"));
     privacy_->setWordWrap(true);
-    privacy_->setStyleSheet(QStringLiteral("QLabel { background: #fff4ce; padding: 8px; border-radius: 4px; }"));
     layout->addWidget(privacy_);
 
     auto* connection = new QHBoxLayout;
     status_ = new QLabel(tr("Offline"), body);
-    enable_ = new QPushButton(tr("Enable Codex…"), body);
-    connect(enable_, &QPushButton::clicked, this, &ChatDock::enableRequested);
+    enable_ = new QPushButton(tr("Reconnect"), body);
+    enable_->setObjectName(QStringLiteral("codex.connection"));
+    connect(enable_, &QPushButton::clicked, this, [this] {
+        if (connected_) emit disconnectRequested();
+        else emit enableRequested();
+    });
     connection->addWidget(status_);
     connection->addStretch(1);
     connection->addWidget(enable_);
     layout->addLayout(connection);
 
-    auto* controls = new QHBoxLayout;
-    models_ = new QComboBox(body);
+    auto* settings = new QWidget(body);
+    auto* controls = new QGridLayout(settings);
+    controls->setContentsMargins(0, 0, 0, 0);
+    controls->setHorizontalSpacing(6);
+    controls->setVerticalSpacing(3);
+    models_ = new QComboBox(settings);
+    models_->setObjectName(QStringLiteral("codex.model"));
+    models_->setAccessibleName(tr("Codex model"));
+    models_->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
+    models_->setMinimumContentsLength(8);
     models_->setToolTip(tr("Model (discovered from Codex)"));
-    efforts_ = new QComboBox(body);
+    efforts_ = new QComboBox(settings);
+    efforts_->setObjectName(QStringLiteral("codex.effort"));
+    efforts_->setAccessibleName(tr("Reasoning effort"));
     efforts_->setToolTip(tr("Reasoning effort"));
-    tiers_ = new QComboBox(body);
+    tiers_ = new QComboBox(settings);
+    tiers_->setObjectName(QStringLiteral("codex.speed"));
+    tiers_->setAccessibleName(tr("Response speed"));
     tiers_->setToolTip(tr("Speed / service tier"));
-    controls->addWidget(models_, 2);
-    controls->addWidget(efforts_, 1);
-    controls->addWidget(tiers_, 1);
-    layout->addLayout(controls);
-    connect(models_, &QComboBox::currentTextChanged, this, &ChatDock::modelChanged);
+    controls->addWidget(new QLabel(tr("Model"), settings), 0, 0);
+    controls->addWidget(new QLabel(tr("Reasoning"), settings), 0, 1);
+    controls->addWidget(new QLabel(tr("Speed"), settings), 0, 2);
+    controls->addWidget(models_, 1, 0);
+    controls->addWidget(efforts_, 1, 1);
+    controls->addWidget(tiers_, 1, 2);
+    controls->setColumnStretch(0, 2);
+    controls->setColumnStretch(1, 1);
+    controls->setColumnStretch(2, 1);
+    layout->addWidget(settings);
+    connect(models_, qOverload<int>(&QComboBox::currentIndexChanged), this, [this](int index) {
+        if (index >= 0) emit modelChanged(selectedModel());
+    });
 
     transcript_ = new QTextBrowser(body);
+    transcript_->setObjectName(QStringLiteral("codex.transcript"));
+    transcript_->setAccessibleName(tr("Codex conversation"));
     transcript_->setOpenExternalLinks(false);
     transcript_->setPlaceholderText(tr("Codex conversation"));
     layout->addWidget(transcript_, 1);
@@ -89,12 +136,13 @@ ChatDock::ChatDock(QWidget* parent) : QDockWidget(tr("Codex"), parent) {
     layout->addWidget(previewResponse_);
 
     preview_ = new QWidget(body);
-    preview_->setStyleSheet(QStringLiteral("QWidget { background: #eaf4ff; border-radius: 4px; }"));
+    preview_->setProperty("tone", QStringLiteral("info"));
     auto* previewLayout = new QVBoxLayout(preview_);
     previewSummary_ = new QLabel(preview_);
     previewSummary_->setWordWrap(true);
     auto* previewActions = new QHBoxLayout;
     auto* accept = new QPushButton(tr("Accept as one edit"), preview_);
+    accept->setProperty("role", QStringLiteral("primary"));
     auto* reject = new QPushButton(tr("Discard"), preview_);
     connect(accept, &QPushButton::clicked, this, &ChatDock::acceptPreviewRequested);
     connect(reject, &QPushButton::clicked, this, &ChatDock::rejectPreviewRequested);
@@ -112,10 +160,13 @@ ChatDock::ChatDock(QWidget* parent) : QDockWidget(tr("Codex"), parent) {
     typedInput->send = [this] { sendCurrentMessage(); };
     input_ = typedInput;
     input_->setObjectName(QStringLiteral("codex.input"));
+    input_->setAccessibleName(tr("Message to Codex"));
+    input_->setAccessibleDescription(tr("Enter sends your message; Shift+Enter starts a new line"));
     layout->addWidget(input_);
 
     send_ = new QPushButton(tr("Send"), body);
     send_->setObjectName(QStringLiteral("codex.send"));
+    send_->setProperty("role", QStringLiteral("primary"));
     send_->setDefault(true);
     connect(send_, &QPushButton::clicked, this, &ChatDock::sendCurrentMessage);
     layout->addWidget(send_);
@@ -135,11 +186,9 @@ void ChatDock::setConnected(bool connected, const QString& detail) {
     if (!detail.isEmpty()) {
         status_->setToolTip(detail);
     }
-    enable_->setVisible(!connected);
+    enable_->setText(connected ? tr("Disconnect") : tr("Reconnect"));
+    enable_->setAccessibleName(enable_->text());
     updateInteractionState();
-    privacy_->setText(connected
-                          ? tr("Codex is enabled. Requested document context may be processed by Codex/OpenAI.")
-                          : tr("Chat is off. The document stays local until you enable Codex."));
 }
 
 void ChatDock::setBusy(bool busy) {
@@ -159,19 +208,28 @@ void ChatDock::updateInteractionState() {
 }
 
 void ChatDock::setModels(const QStringList& models) {
+    const QSignalBlocker blocker(models_);
     models_->clear();
-    models_->addItems(models);
-    const int preferred = models_->findText(
-        QStringLiteral("gpt-5.6-luna"), Qt::MatchFixedString);
+    for (const auto& model : models)
+        models_->addItem(model == QStringLiteral("gpt-6.1-sol") ? tr("GPT-6.1 Sol") : model, model);
+    const int preferred = models_->findData(QStringLiteral("gpt-6.1-sol"));
     if (preferred >= 0) models_->setCurrentIndex(preferred);
 }
 
 void ChatDock::setEfforts(const QStringList& efforts) {
     efforts_->clear();
-    efforts_->addItem(tr("Default"), QString());
-    for (const auto& effort : efforts) efforts_->addItem(effort, effort);
+    if (efforts.isEmpty()) efforts_->addItem(tr("Default"), QString());
+    for (const auto& effort : efforts) {
+        const QString label = effort == QStringLiteral("low") ? tr("Light")
+            : effort == QStringLiteral("medium") ? tr("Medium")
+            : effort == QStringLiteral("high") ? tr("High")
+            : effort == QStringLiteral("xhigh") ? tr("XHigh")
+            : effort == QStringLiteral("ultra") ? tr("Ultra") : effort;
+        efforts_->addItem(label, effort);
+    }
     const int preferred = efforts_->findData(QStringLiteral("low"));
     if (preferred >= 0) efforts_->setCurrentIndex(preferred);
+    fitChoiceLabels(efforts_);
 }
 
 void ChatDock::setServiceTiers(const QStringList& tiers,
@@ -212,6 +270,7 @@ void ChatDock::setServiceTiers(const QStringList& tiers,
     if (selected >= 0) tiers_->setCurrentIndex(selected);
     tiers_->setEnabled(connected_ && tiers_->count() > 0);
     tiers_->setToolTip(warning.isEmpty() ? tr("Speed / service tier") : warning);
+    fitChoiceLabels(tiers_);
 }
 
 void ChatDock::clearConversation() {
@@ -293,7 +352,7 @@ void ChatDock::hidePreview() {
     previewResponse_->setVisible(!lastAssistant_.trimmed().isEmpty());
 }
 
-QString ChatDock::selectedModel() const { return models_->currentText(); }
+QString ChatDock::selectedModel() const { return models_->currentData().toString(); }
 QString ChatDock::selectedEffort() const {
     return efforts_->currentData().isValid() ? efforts_->currentData().toString()
                                               : efforts_->currentText();

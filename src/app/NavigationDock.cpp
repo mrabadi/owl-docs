@@ -1,4 +1,5 @@
 #include "docxstudio/app/NavigationDock.h"
+#include "docxstudio/app/AppTheme.h"
 
 #include <QCheckBox>
 #include <QFormLayout>
@@ -41,10 +42,11 @@ protected:
 
 NavigationDock::NavigationDock(QWidget* parent)
     : QDockWidget(tr("Navigation"), parent) {
+    applyAppTheme(this);
     setObjectName(QStringLiteral("navigationDock"));
     setAccessibleName(tr("Document navigation"));
     setAllowedAreas(Qt::LeftDockWidgetArea | Qt::RightDockWidgetArea);
-    setMinimumWidth(300);
+    setMinimumWidth(280);
 
     auto* body = new QWidget(this);
     body->setObjectName(QStringLiteral("navigation.body"));
@@ -59,9 +61,31 @@ NavigationDock::NavigationDock(QWidget* parent)
     modes_->setDocumentMode(true);
     modes_->addTab(tr("Find"));
     modes_->addTab(tr("Replace"));
+    modes_->addTab(tr("Outline"));
     modes_->setTabToolTip(0, tr("Find text in the document"));
     modes_->setTabToolTip(1, tr("Find and replace text in the document"));
     layout->addWidget(modes_);
+
+    auto* outerLayout = layout;
+    searchBody_ = new QWidget(body);
+    layout = new QVBoxLayout(searchBody_);
+    layout->setContentsMargins(0, 0, 0, 0);
+    layout->setSpacing(7);
+    outerLayout->addWidget(searchBody_, 1);
+    outlineHint_ = new QLabel(tr("Use Heading 1–9 to build your document outline."), body);
+    outlineHint_->setWordWrap(true);
+    outerLayout->addWidget(outlineHint_);
+    auto* headings = new NavigationResultsList(body);
+    outline_ = headings;
+    outline_->setObjectName(QStringLiteral("navigation.outline"));
+    outline_->setAccessibleName(tr("Document outline"));
+    outline_->setAccessibleDescription(tr("Headings in document order; press Enter to jump to a heading"));
+    outerLayout->addWidget(outline_, 1);
+    connect(outline_, &QListWidget::itemClicked, this, [this](QListWidgetItem* item) {
+        const int index = outline_->row(item);
+        if (index >= 0) emit headingActivated(index);
+    });
+    headings->activateCurrent = [this](int index) { emit headingActivated(index); };
 
     auto* queryRow = new QWidget(body);
     queryRow->setObjectName(QStringLiteral("navigation.queryRow"));
@@ -162,7 +186,8 @@ NavigationDock::NavigationDock(QWidget* parent)
     setWidget(body);
 
     connect(modes_, &QTabBar::currentChanged, this, [this](int index) {
-        const Mode requested = index == 1 ? Mode::replace : Mode::find;
+        const Mode requested = index == 2 ? Mode::outline
+                                         : index == 1 ? Mode::replace : Mode::find;
         if (mode_ == requested) return;
         mode_ = requested;
         updateModePresentation();
@@ -244,7 +269,7 @@ int NavigationDock::currentResultIndex() const noexcept {
 }
 
 void NavigationDock::setMode(Mode mode) {
-    const int index = mode == Mode::replace ? 1 : 0;
+    const int index = mode == Mode::outline ? 2 : mode == Mode::replace ? 1 : 0;
     if (mode_ == mode && modes_->currentIndex() == index) {
         updateModePresentation();
         return;
@@ -316,6 +341,10 @@ void NavigationDock::clearSearchResults() {
 void NavigationDock::focusQuery(bool selectAll) {
     show();
     raise();
+    if (mode_ == Mode::outline) {
+        outline_->setFocus(Qt::ShortcutFocusReason);
+        return;
+    }
     query_->setFocus(Qt::ShortcutFocusReason);
     if (selectAll) query_->selectAll();
 }
@@ -328,10 +357,27 @@ void NavigationDock::emitQueryChanged() {
 }
 
 void NavigationDock::updateModePresentation() {
+    const bool outlining = mode_ == Mode::outline;
+    searchBody_->setVisible(!outlining);
+    outline_->setVisible(outlining);
+    outlineHint_->setVisible(outlining && outline_->count() == 0);
     const bool replacing = mode_ == Mode::replace;
     replacementRow_->setVisible(replacing);
     replaceActions_->setVisible(replacing);
     updateActionAvailability();
+}
+
+void NavigationDock::setHeadings(const QList<NavigationHeading>& headings) {
+    outline_->clear();
+    for (const auto& heading : headings) {
+        const int level = std::clamp(heading.level, 1, 9);
+        auto* row = new QListWidgetItem(
+            QString((level - 1) * 2, QLatin1Char(' ')) + heading.title, outline_);
+        row->setData(Qt::AccessibleTextRole,
+            tr("Heading level %1: %2").arg(level).arg(heading.title));
+        row->setToolTip(heading.title);
+    }
+    updateModePresentation();
 }
 
 void NavigationDock::updateResultPresentation() {

@@ -209,7 +209,7 @@ int main(int argc, char** argv) {
 
     QCommandLineParser parser;
     parser.setApplicationDescription(QStringLiteral(
-        "Open a DOCX through Owl Docs and export its editor pagination to PDF."));
+        "Open a DOCX through OwlDocs and export its editor pagination to PDF."));
     parser.addHelpOption();
     parser.addVersionOption();
     const QCommandLineOption textOutputOption(
@@ -258,7 +258,7 @@ int main(int argc, char** argv) {
     docxstudio::app::MainWindow window;
     if (!window.openPath(inputPath)) {
         const QString detail = dialogs.summary().isEmpty()
-            ? QStringLiteral("Owl Docs rejected the document without a diagnostic.")
+            ? QStringLiteral("OwlDocs rejected the document without a diagnostic.")
             : dialogs.summary();
         return fail(QStringLiteral("import"), detail, 65);
     }

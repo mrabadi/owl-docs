@@ -1,6 +1,6 @@
 # Third-party notices
 
-The Owl Docs figure editor is derived from the local Excalidraw fork at commit
+The OwlDocs figure editor is derived from the local Excalidraw fork at commit
 `6609200dd9a756410a4199fe6c06ab3ce9fbcab0`.
 
 The fork's reviewed Excalidraw 0.18 source snapshot is vendored under

@@ -7,6 +7,7 @@
 #include <QAction>
 #include <QApplication>
 #include <QCheckBox>
+#include <QContextMenuEvent>
 #include <QDialog>
 #include <QDialogButtonBox>
 #include <QFile>
@@ -14,7 +15,9 @@
 #include <QFileInfo>
 #include <QImage>
 #include <QKeyEvent>
-#include <QLineEdit>
+#include <QMouseEvent>
+#include <QMenu>
+#include <QPlainTextEdit>
 #include <QProcess>
 #include <QPushButton>
 #include <QStandardPaths>
@@ -236,6 +239,63 @@ void testScreenAndPdfRendering(docxstudio::app::SpellChecker& spelling) {
     }
 }
 
+void testEquationReplacement(docxstudio::app::SpellChecker& spelling) {
+    DocumentCanvas canvas(spelling);
+    canvas.resize(900, 700);
+    canvas.show();
+    canvas.insertText(QStringLiteral("Before After"));
+    sendKey(canvas, Qt::Key_Home);
+    for (int i = 0; i < 7; ++i) sendKey(canvas, Qt::Key_Right);
+    check(canvas.insertEquation(QStringLiteral("x^2")), "replacement fixture insert failed");
+    const auto before = canvas.snapshot();
+    const auto id = before.document.paragraphs()[0].equations()[0].id;
+    check(canvas.selectEquation(id), "could not select an equation for editing");
+    check(canvas.replaceSelectedEquation(QStringLiteral("\\frac{x}{y}"), true), "could not edit selected equation");
+    const auto after = canvas.snapshot();
+    const auto& equation = after.document.paragraphs()[0].equations()[0];
+    check(equation.id == id && equation.utf16_offset == 7 && equation.display &&
+              equation.canonical_latex == "\\frac{x}{y}" &&
+              after.document.paragraphs()[0].text() == before.document.paragraphs()[0].text(),
+          "equation editing changed identity, text or location");
+    const auto bounds = canvas.equationBounds(id);
+    check(!bounds.isEmpty() && std::abs(bounds.center().x() - canvas.pageWidthPoints() / 2.0) < 2.0,
+          "display equation was not centered on its own line");
+    canvas.undo();
+    check(canvas.snapshot().document == before.document, "equation edit was not one undoable transaction");
+    canvas.redo();
+    check(canvas.snapshot().document == after.document, "equation edit redo changed its result");
+    QApplication::processEvents();
+    bool reopened = false;
+    QTimer::singleShot(0, &canvas, [&] {
+        auto* dialog = canvas.findChild<QDialog*>(QStringLiteral("insertEquationDialog"));
+        check(dialog != nullptr, "double-clicking the visible equation did not reopen its editor");
+        auto* source = dialog->findChild<QPlainTextEdit*>(QStringLiteral("insertEquation.latex"));
+        check(source && source->toPlainText() == QStringLiteral("\\frac{x}{y}"), "equation editor did not reopen the stored source");
+        reopened = true;
+        dialog->reject();
+    });
+    const double scale = 96.0 / 72.0;
+    const double pageWidth = canvas.pageWidthPoints() * scale;
+    const double pageLeft = (std::max(pageWidth + 56.0, static_cast<double>(canvas.viewport()->width())) - pageWidth) / 2.0;
+    const QPointF point(pageLeft + bounds.center().x() * scale, 28.0 + bounds.center().y() * scale);
+    QMouseEvent event(QEvent::MouseButtonDblClick, point, Qt::LeftButton, Qt::LeftButton, Qt::NoModifier);
+    QApplication::sendEvent(canvas.viewport(), &event);
+    QApplication::processEvents();
+    check(reopened && canvas.snapshot().document == after.document, "canceling equation edit mutated the document");
+    bool contextAvailable = false;
+    QTimer::singleShot(0, &canvas, [&] {
+        auto* menu = qobject_cast<QMenu*>(QApplication::activePopupWidget());
+        check(menu != nullptr, "equation context menu did not open");
+        auto* action = menu->findChild<QAction*>(QStringLiteral("context.editEquation"));
+        contextAvailable = action && action->isEnabled();
+        menu->close();
+    });
+    QContextMenuEvent context(QContextMenuEvent::Mouse, point.toPoint(), canvas.viewport()->mapToGlobal(point.toPoint()));
+    QApplication::sendEvent(canvas.viewport(), &context);
+    check(contextAvailable && canvas.selectedEquationId() == id,
+          "right-clicking an equation does not offer its contextual editor");
+}
+
 DocumentCanvas* equationCanvasIn(docxstudio::app::MainWindow& window) {
     for (auto* canvas : window.findChildren<DocumentCanvas*>()) {
         const auto snapshot = canvas->snapshot();
@@ -266,7 +326,7 @@ void testDialogNativeSaveAndReopen() {
             QStringLiteral("insertEquationDialog"));
         check(dialog && dialog->isModal(),
               "Insert Equation did not open one modal dialog");
-        auto* latex = dialog->findChild<QLineEdit*>(
+        auto* latex = dialog->findChild<QPlainTextEdit*>(
             QStringLiteral("insertEquation.latex"));
         auto* display = dialog->findChild<QCheckBox*>(
             QStringLiteral("insertEquation.display"));
@@ -278,7 +338,7 @@ void testDialogNativeSaveAndReopen() {
         check(latex->window() == dialog && display->window() == dialog &&
                   buttons->window() == dialog,
               "LaTeX and display controls were split across dialogs");
-        latex->setText(QStringLiteral("\\frac{a}{b}"));
+        latex->setPlainText(QStringLiteral("\\frac{a}{b}"));
         display->setChecked(true);
         inspectedDialog = true;
         buttons->button(QDialogButtonBox::Ok)->click();
@@ -354,6 +414,7 @@ int main(int argc, char** argv) {
     docxstudio::app::SpellChecker spelling;
     testSemanticEquationEditing(spelling);
     testScreenAndPdfRendering(spelling);
+    testEquationReplacement(spelling);
     testDialogNativeSaveAndReopen();
     std::cout << "equation UI tests passed\n";
     return 0;

@@ -302,17 +302,46 @@ void testBuiltInParagraphStyleCatalog() {
     CHECK(heading_two != nullptr);
     if (title != nullptr) {
         CHECK(title->character_format.font_size_half_points == 56);
-        CHECK(title->character_format.foreground_argb == 0xff77216fU);
+        CHECK(title->character_format.foreground_argb == 0xff173b32U);
     }
     if (heading_one != nullptr) {
-        CHECK(heading_one->character_format.font_size_half_points == 32);
-        CHECK(heading_one->character_format.foreground_argb == 0xffe95420U);
+        CHECK(heading_one->character_format.font_size_half_points == 40);
+        CHECK(heading_one->character_format.foreground_argb == 0xff173b32U);
         CHECK(heading_one->paragraph_format.keep_with_next == true);
         CHECK(heading_one->paragraph_format.keep_lines == true);
     }
     if (heading_two != nullptr) {
-        CHECK(heading_two->character_format.foreground_argb == 0xff77216fU);
+        CHECK(heading_two->character_format.font_size_half_points == 32);
+        CHECK(heading_two->character_format.foreground_argb == 0xff2f6b57U);
     }
+    const auto* subtitle = findBuiltInParagraphStyle("Subtitle");
+    CHECK(subtitle && subtitle->character_format.font_size_half_points == 28 &&
+          subtitle->character_format.italic == false &&
+          subtitle->character_format.foreground_argb == 0xff626a66U);
+    const std::array<std::int32_t, 9> headingSizes{40, 32, 28, 24, 22, 22, 22, 22, 22};
+    const std::array<std::uint32_t,9> headingColors{0xff173b32U,0xff2f6b57U,0xff356078U,0xff66507aU,0xff6f5747U,0xff2f6b57U,0xff626a66U,0xff626a66U,0xff626a66U};
+    for (std::size_t level = 0; level < headingSizes.size(); ++level) {
+        const auto* heading = findBuiltInParagraphStyle("Heading" + std::to_string(level + 1));
+        CHECK(heading != nullptr);
+        if (!heading) continue;
+        CHECK(heading->character_format.font_size_half_points == headingSizes[level]);
+        CHECK(heading->character_format.foreground_argb ==
+              headingColors[level]);
+        CHECK(heading->paragraph_format.keep_with_next == true);
+        CHECK(heading->next_style_id == "Normal");
+    }
+    const auto* legacyHeading = findLegacyBuiltInParagraphStyle("Heading1");
+    CHECK(legacyHeading && legacyHeading->character_format.font_size_half_points == 32 &&
+          legacyHeading->character_format.foreground_argb == 0xffe95420U);
+    const auto* legacyTitle = findLegacyBuiltInParagraphStyle("Title");
+    CHECK(legacyTitle && legacyTitle->character_format.foreground_argb == 0xff77216fU);
+    CHECK(findLegacyBuiltInParagraphStyle("Unknown") == nullptr);
+    const auto* neutralTitle=findNeutralBuiltInParagraphStyle("Title");
+    const auto* neutralHeading=findNeutralBuiltInParagraphStyle("Heading2");
+    CHECK(neutralTitle && neutralTitle->character_format.foreground_argb==0xff000000U);
+    CHECK(neutralHeading && neutralHeading->character_format.foreground_argb==0xff000000U &&
+          neutralHeading->character_format.font_size_half_points==32);
+    CHECK(findNeutralBuiltInParagraphStyle("Unknown")==nullptr);
 }
 
 void testParagraphStyleIdentityAndValidation() {
@@ -533,10 +562,15 @@ void testParagraphStyleSplitMergeAndPreview() {
 
 void testParagraphStyleProvenanceEditingLifecycle() {
     const auto* headingOne = findBuiltInParagraphStyle("Heading1");
-    const auto* headingTwo = findBuiltInParagraphStyle("Heading2");
+    const auto* headingTwoDefault = findBuiltInParagraphStyle("Heading2");
     CHECK(headingOne != nullptr);
-    CHECK(headingTwo != nullptr);
-    if (!headingOne || !headingTwo) return;
+    CHECK(headingTwoDefault != nullptr);
+    if (!headingOne || !headingTwoDefault) return;
+    // An imported Heading 2 can inherit a different color even though the
+    // new neutral built-ins share black. Keep exercising that provenance.
+    auto sourceHeadingTwo = *headingTwoDefault;
+    sourceHeadingTwo.character_format.foreground_argb = 0xff223344U;
+    const auto* headingTwo = &sourceHeadingTwo;
 
     const auto firstId = NodeId::generate();
     const auto secondId = NodeId::generate();
@@ -588,7 +622,7 @@ void testParagraphStyleProvenanceEditingLifecycle() {
         {{secondId, 1}, {secondId, 2}}, explicitBold));
     CharacterFormatDelta explicitFirstStyleColor;
     explicitFirstStyleColor.foreground_argb =
-        PropertyDelta<std::uint32_t>::set(0xffe95420U);
+        PropertyDelta<std::uint32_t>::set(*headingOne->character_format.foreground_argb);
     CHECK(mergedStyles.applyCharacterFormat(
         {{secondId, 2}, {secondId, 3}}, explicitFirstStyleColor));
 
@@ -2441,6 +2475,108 @@ void testHeaderFooterOperationsAndHistory() {
     CHECK(session.snapshot().revision == snapshot.revision);
 }
 
+void testHeaderFooterImageBudgetIncludesTableImages() {
+    Document document;
+    auto table = Table::create(1, 1, false);
+    CHECK(table);
+    if (!table) return;
+    const auto tableId = table.value().id();
+    CHECK(document.insertTable(std::nullopt, table.value()));
+    const EncodedImagePayload payload(tinyPngBytes());
+    for (std::size_t index = 0; index < kMaximumInlineImagesPerDocument; ++index)
+        CHECK(document.insertTableCellImage(tableId, 0, 0, index, payload,
+            ImageFormat::png, "Cell picture", 914400, 914400));
+    const auto before = document;
+    for (const bool footer : {false, true}) {
+        CHECK(!document.insertHeaderFooterImage(footer, 0, payload,
+            ImageFormat::png, "Over budget", 914400, 914400));
+        CHECK(document == before);
+    }
+}
+
+void testHeaderFooterImageIdentityAfterTextDeletion() {
+    for (const bool footer : {false,true}) {
+        auto document=documentWithText(u"Body");
+        CHECK(footer ? document.setFooterText(u"A") : document.setHeaderText(u"A"));
+        const auto first=NodeId::generate();
+        const auto second=NodeId::generate();
+        CHECK(document.insertHeaderFooterImage(footer,0,EncodedImagePayload(tinyPngBytes()),
+              ImageFormat::png,"First picture",914400,914400,first));
+        CHECK(document.insertHeaderFooterImage(footer,2,EncodedImagePayload(tinyJpegBytes()),
+              ImageFormat::jpeg,"Second picture",457200,457200,second));
+        DocumentSession session(document);
+        const auto before=session.snapshot();
+        const std::vector<Operation> deletion{footer ? Operation{SetFooterText{u"A\ufffc"}}
+                                                    : Operation{SetHeaderText{u"A\ufffc"}}};
+        CHECK(session.applyBatch(before.revision,deletion));
+        const auto after=session.snapshot();
+        const auto& images=footer ? after.document.footerImages() : after.document.headerImages();
+        CHECK(images.size()==1);
+        if (images.size()==1) {
+            CHECK(images.front().id==second);
+            CHECK(images.front().utf16_offset==1);
+            CHECK(images.front().format==ImageFormat::jpeg);
+            CHECK(images.front().encoded_payload==EncodedImagePayload(tinyJpegBytes()));
+            CHECK(images.front().accessible_name=="Second picture");
+            CHECK(images.front().width_emu==457200);
+        }
+        CHECK(session.undo(after.revision));
+        CHECK(session.snapshot().document==before.document);
+        CHECK(session.redo(session.snapshot().revision));
+        CHECK(session.snapshot().document==after.document);
+        auto changed=document;
+        CHECK(footer ? changed.setFooterText(u"\ufffcBC\ufffc") : changed.setHeaderText(u"\ufffcBC\ufffc"));
+        const auto& shifted=footer ? changed.footerImages() : changed.headerImages();
+        CHECK(shifted.size()==2 && shifted.front().id==first && shifted.back().id==second && shifted.back().utf16_offset==3);
+    }
+    auto adjacent=documentWithText(u"Body");
+    CHECK(adjacent.insertHeaderFooterImage(false,0,EncodedImagePayload(tinyPngBytes()),ImageFormat::png,"First",914400,914400));
+    CHECK(adjacent.insertHeaderFooterImage(false,1,EncodedImagePayload(tinyJpegBytes()),ImageFormat::jpeg,"Second",914400,914400));
+    const auto before=adjacent;
+    CHECK(!adjacent.setHeaderText(u"\ufffc"));
+    CHECK(adjacent==before);
+    auto orphan=documentWithText(u"Body");
+    CHECK(!orphan.setHeaderText(u"\ufffc"));
+    CHECK(orphan.headerText().empty() && orphan.headerImages().empty());
+}
+
+void testHeaderFooterImageIdentityWithExplicitRange() {
+    for (const bool footer : {false,true}) {
+        for (const bool deleteFirst : {false,true}) {
+            auto document=documentWithText(u"Body");
+            const auto first=NodeId::generate();
+            const auto second=NodeId::generate();
+            CHECK(document.insertHeaderFooterImage(footer,0,EncodedImagePayload(tinyPngBytes()),ImageFormat::png,"First",914400,914400,first));
+            CHECK(document.insertHeaderFooterImage(footer,1,EncodedImagePayload(tinyJpegBytes()),ImageFormat::jpeg,"Second",457200,457200,second));
+            DocumentSession session(document);
+            const auto before=session.snapshot();
+            const StoryTextEditRange range{deleteFirst ? 0U : 1U,1};
+            const std::vector<Operation> operations{footer ? Operation{SetFooterText{u"\ufffc",range}}
+                                                          : Operation{SetHeaderText{u"\ufffc",range}}};
+            CHECK(session.applyBatch(before.revision,operations));
+            const auto after=session.snapshot();
+            const auto& images=footer ? after.document.footerImages() : after.document.headerImages();
+            CHECK(images.size()==1);
+            if (images.size()==1) {
+                CHECK(images.front().id==(deleteFirst ? second : first));
+                CHECK(images.front().encoded_payload==EncodedImagePayload(deleteFirst ? tinyJpegBytes() : tinyPngBytes()));
+                CHECK(images.front().utf16_offset==0);
+            }
+            CHECK(session.undo(after.revision));
+            CHECK(session.snapshot().document==before.document);
+            CHECK(session.redo(session.snapshot().revision));
+            CHECK(session.snapshot().document==after.document);
+            auto invalid=document;
+            CHECK(!(footer ? invalid.setFooterText(u"\ufffc",StoryTextEditRange{10,0})
+                           : invalid.setHeaderText(u"\ufffc",StoryTextEditRange{10,0})));
+            CHECK(invalid==document);
+            CHECK(!(footer ? invalid.setFooterText(u"\ufffc\ufffc",StoryTextEditRange{0,1})
+                           : invalid.setHeaderText(u"\ufffc\ufffc",StoryTextEditRange{0,1})));
+            CHECK(invalid==document);
+        }
+    }
+}
+
 void testSemanticTableOperationsAndHistory() {
     CHECK(!Table::create(0, 2, false));
     CHECK(!Table::create(Table::maximum_rows + 1, 1, false));
@@ -2969,6 +3105,9 @@ int main() {
     testSemanticEquationAtomEditing();
     testEquationStructureAndSessionHistory();
     testHeaderFooterOperationsAndHistory();
+    testHeaderFooterImageBudgetIncludesTableImages();
+    testHeaderFooterImageIdentityAfterTextDeletion();
+    testHeaderFooterImageIdentityWithExplicitRange();
     testSemanticTableOperationsAndHistory();
     testTableFormattingStructureAndStyles();
     testInsertedTableCellsInheritFormatting();

@@ -1,4 +1,5 @@
 #include "docxstudio/app/DocumentCanvas.h"
+#include "docxstudio/app/AppTheme.h"
 #include "docxstudio/app/MainWindow.h"
 #include "docxstudio/app/SpellChecker.h"
 
@@ -20,6 +21,7 @@
 #include <QMenu>
 #include <QMouseEvent>
 #include <QProcess>
+#include <QScrollBar>
 #include <QPlainTextEdit>
 #include <QPushButton>
 #include <QRawFont>
@@ -127,14 +129,22 @@ QImage renderedViewport(DocumentCanvas& canvas) {
         QImage::Format_ARGB32);
 }
 
-int blueSelectionPixels(const QImage& image) {
+int selectionTintPixels(const QImage& image) {
+    const QColor accent = docxstudio::app::accentColor();
+    const auto blendOverPaper = [](int channel) {
+        return (channel * 28 + 255 * (255 - 28) + 127) / 255;
+    };
+    const QColor selectedPaper(blendOverPaper(accent.red()),
+                               blendOverPaper(accent.green()),
+                               blendOverPaper(accent.blue()));
     int result = 0;
     for (int y = 0; y < image.height(); ++y) {
         for (int x = 0; x < image.width(); ++x) {
             const QColor pixel = image.pixelColor(x, y);
             if (pixel.alpha() >= 220 &&
-                pixel.blue() >= pixel.red() + 8 &&
-                pixel.blue() >= pixel.green() + 5) {
+                std::abs(pixel.red() - selectedPaper.red()) <= 2 &&
+                std::abs(pixel.green() - selectedPaper.green()) <= 2 &&
+                std::abs(pixel.blue() - selectedPaper.blue()) <= 2) {
                 ++result;
             }
         }
@@ -284,19 +294,21 @@ void testCanvasTableEditing(docxstudio::app::SpellChecker& spelling) {
         check(rendered.save(renderPath),
               "could not save the rendered table QA image");
     }
-    bool foundLongBlueTableRule = false;
-    for (int y = 80; y < rendered.height() - 40 && !foundLongBlueTableRule; ++y) {
-        int bluePixels = 0;
+    const QColor accent = docxstudio::app::accentColor();
+    bool foundLongAccentTableRule = false;
+    for (int y = 80; y < rendered.height() - 40 && !foundLongAccentTableRule; ++y) {
+        int accentPixels = 0;
         for (int x = 40; x < rendered.width() - 40; ++x) {
             const QColor pixel = rendered.pixelColor(x, y);
-            if (pixel.blue() > pixel.red() + 35 &&
-                pixel.blue() > pixel.green() + 20) {
-                ++bluePixels;
+            if (std::abs(pixel.red() - accent.red()) <= 2 &&
+                std::abs(pixel.green() - accent.green()) <= 2 &&
+                std::abs(pixel.blue() - accent.blue()) <= 2) {
+                ++accentPixels;
             }
         }
-        foundLongBlueTableRule = bluePixels > 180;
+        foundLongAccentTableRule = accentPixels > 180;
     }
-    check(foundLongBlueTableRule,
+    check(foundLongAccentTableRule,
           "screen rendering did not show a bordered selected table");
 
     QTemporaryDir output;
@@ -331,22 +343,22 @@ void testActiveCellAndRectangularSelectionPainting(
     canvas.selectAll();
     canvas.selectAll();
     const QImage neutralTable = renderedViewport(canvas);
-    const int neutralBluePixels = blueSelectionPixels(neutralTable);
+    const int neutralTintPixels = selectionTintPixels(neutralTable);
 
     check(canvas.activateTableCell(tableId, 0, 0, 2),
           "could not activate the table-cell painting fixture");
     const QImage activeCell = renderedViewport(canvas);
-    const int activeBluePixels = blueSelectionPixels(activeCell);
-    check(activeBluePixels <= neutralBluePixels + 100 &&
+    const int activeTintPixels = selectionTintPixels(activeCell);
+    check(activeTintPixels <= neutralTintPixels + 100 &&
               materiallyDifferentPixels(neutralTable, activeCell, 20) < 500,
-          "editing one table cell tinted the cell or table blue");
+          "editing one table cell tinted the cell or table as selected");
 
     check(canvas.selectTableCells(tableId, 0, 0, 1, 0),
           "could not select a rectangular table-cell range");
     const QImage selectedCells = renderedViewport(canvas);
-    const int selectedBluePixels = blueSelectionPixels(selectedCells);
-    check(selectedBluePixels > activeBluePixels + 1000,
-          "an explicit rectangular cell selection had no visible blue tint");
+    const int selectedTintPixels = selectionTintPixels(selectedCells);
+    check(selectedTintPixels > activeTintPixels + 1000,
+          "an explicit rectangular cell selection had no visible accent tint");
     canvas.hide();
 }
 
@@ -1171,7 +1183,8 @@ void testMouseHandleMovesTable(docxstudio::app::SpellChecker& spelling) {
     for (int y = 0; y < image.height() && handle.x() < 0; ++y) {
         for (int x = 0; x < image.width(); ++x) {
             if (image.pixelColor(x, y) == handleColor) {
-                handle = QPoint(x, y);
+                handle = QPointF(x / image.devicePixelRatio(),
+                                 y / image.devicePixelRatio()).toPoint();
                 break;
             }
         }
@@ -1778,13 +1791,17 @@ void testSingleDialogAndNativeSave() {
               canvas->footerText() ==
                   QStringLiteral("\t\tPage {PAGE} of {PAGES}"),
           "on-page header/footer regions did not apply to the document");
-    const QPoint headerCenterPoint(canvas->viewport()->width() / 2, 58);
+    canvas->verticalScrollBar()->setValue(0);
+    const QPoint headerCenterPoint(canvas->viewport()->width() / 2, 90);
     sendMouseEvent(*canvas, QEvent::MouseButtonPress, headerCenterPoint,
                    Qt::LeftButton, Qt::LeftButton);
     sendMouseEvent(*canvas, QEvent::MouseButtonRelease, headerCenterPoint,
                    Qt::LeftButton, Qt::NoButton);
+    check(!canvas->isHeaderFooterEditing(), "one margin click should not enter header editing");
+    sendMouseEvent(*canvas, QEvent::MouseButtonDblClick, headerCenterPoint,
+                   Qt::LeftButton, Qt::LeftButton);
     check(canvas->isHeaderFooterEditing() && headerCenter->hasFocus(),
-          "clicking the center header region did not activate it in place");
+          "double-clicking the center header region did not activate it in place");
     canvas->endHeaderFooterEditing();
 
     bool inspectedDialog = false;

@@ -19,6 +19,9 @@ QAction* CommandRegistry::add(const QString& id,
 
     auto* created = new QAction(text, this);
     created->setObjectName(id);
+    QString category = id.section(QLatin1Char('.'), 0, 0);
+    if (!category.isEmpty()) category[0] = category[0].toUpper();
+    created->setProperty("command.category", category);
     created->setCheckable(checkable);
     if (!shortcut.isEmpty()) {
         created->setShortcut(shortcut);
@@ -60,7 +63,11 @@ QStringList CommandRegistry::search(const QString& query) const {
     QList<Match> matches;
     const auto needle = query.trimmed().toCaseFolded();
     for (auto it = actions_.cbegin(); it != actions_.cend(); ++it) {
-        const auto haystack = (it.key() + QLatin1Char(' ') + it.value()->text()).toCaseFolded();
+        if (!it.value()->isVisible() || !it.value()->isEnabled()) continue;
+        const auto haystack = (it.key() + QLatin1Char(' ') + it.value()->text() +
+            QLatin1Char(' ') + it.value()->property("command.category").toString() +
+            QLatin1Char(' ') + it.value()->property("command.keywords")
+                .toStringList().join(QLatin1Char(' '))).toCaseFolded();
         const auto position = haystack.indexOf(needle);
         if (needle.isEmpty() || position >= 0) {
             matches.push_back({position < 0 ? 0 : static_cast<int>(position), it.key()});
@@ -74,6 +81,19 @@ QStringList CommandRegistry::search(const QString& query) const {
         result.push_back(match.id);
     }
     return result;
+}
+
+void CommandRegistry::describe(const QString& id, const QString& category,
+                                const QStringList& keywords) {
+    if (auto* command = action(id)) {
+        command->setProperty("command.category", category);
+        command->setProperty("command.keywords", keywords);
+    }
+}
+
+QString CommandRegistry::category(const QString& id) const {
+    const auto* command = action(id);
+    return command ? command->property("command.category").toString() : QString{};
 }
 
 }  // namespace docxstudio::app

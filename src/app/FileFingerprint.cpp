@@ -76,8 +76,11 @@ FileFingerprintComparison compareFileFingerprint(
     const QString& path, const FileFingerprint& expected, QString& error) {
     const auto current = fingerprintFile(path, error);
     if (!current) return FileFingerprintComparison::unavailable;
-    return *current == expected ? FileFingerprintComparison::matches
-                                : FileFingerprintComparison::differs;
+    // Metadata can change when a file is touched, copied or synchronized.
+    // Content determines whether another writer's work would be overwritten.
+    return current->size == expected.size && current->sha256 == expected.sha256
+               ? FileFingerprintComparison::matches
+               : FileFingerprintComparison::differs;
 }
 
 }  // namespace docxstudio::app

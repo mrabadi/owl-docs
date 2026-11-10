@@ -1450,12 +1450,12 @@ void testNativeParagraphStyleWriting(const TemporaryDirectory& temporary) {
               "<w:next w:val=\"Normal\"/>"
               "<w:uiPriority w:val=\"9\"/><w:qFormat/><w:pPr>"
               "<w:keepNext/><w:keepLines/>"
-              "<w:spacing w:before=\"200\" w:after=\"80\" "
+              "<w:spacing w:before=\"280\" w:after=\"120\" "
               "w:line=\"240\" w:lineRule=\"auto\"/>"
               "<w:jc w:val=\"left\"/>"
               "<w:outlineLvl w:val=\"1\"/></w:pPr><w:rPr>"
-              "<w:b/><w:color w:val=\"77216F\"/>"
-              "<w:sz w:val=\"26\"/><w:szCs w:val=\"26\"/>"
+              "<w:b/><w:color w:val=\"2F6B57\"/>"
+              "<w:sz w:val=\"32\"/><w:szCs w:val=\"32\"/>"
               "</w:rPr></w:style>") != std::string::npos,
           "Heading2 definition lost metadata, outline, or formatting");
     check(styles_xml.find("<w:outlineLvl w:val=\"8\"/>") !=
@@ -1492,7 +1492,7 @@ void testNativeParagraphStyleWriting(const TemporaryDirectory& temporary) {
                   56 &&
               reopened->paragraphs()[1].space_after_twips == 77 &&
               reopened->paragraphs()[1].runs[0].format.foreground_rgb ==
-                  0x0077216fU,
+                  0x002f6b57U,
           "built-in style formatting or direct-format precedence changed on reopen");
     check(reopened->compatibility().classification ==
                   CompatibilityClass::basic_body_text_patch &&
@@ -2829,6 +2829,47 @@ void testCanonicalSimplePackageRegenerationEligibility(
           "an unsupported final-section column setting was incorrectly declared regeneratable");
 }
 
+void testRichRegenerationAssessment(const TemporaryDirectory& temporary) {
+    NewParagraph paragraph;
+    paragraph.runs.emplace_back("Rich text", BasicRunFormat{});
+    paragraph.runs.emplace_back("", BasicRunFormat{}, EquationPayload{"x^{2}", false});
+    NewDocumentBody body{{paragraph}};
+    const auto path = temporary.file("rich-regeneration.docx");
+    check(DocxDocument::writeNew(path, body).saved, "could not write rich assessment fixture");
+    Error error;
+    auto document = DocxDocument::open(path, &error);
+    check(document != nullptr, error.message);
+    check(document->assessRegeneration(body, {}, {}).lossless,
+          "authored rich package was not recognized as fully reproducible");
+    appendMembers(path, {{"customXml/opaque.bin", std::string("opaque\0content", 14)}});
+    document = DocxDocument::open(path, &error);
+    check(document != nullptr, error.message);
+    const auto assessment = document->assessRegeneration(body, {}, {});
+    check(!assessment.lossless && !assessment.loss_report.issues.empty(),
+          "opaque original data was silently considered regeneratable");
+}
+
+void testSaveCommitGuard(const TemporaryDirectory& temporary) {
+    const auto source = temporary.file("guard-source.docx");
+    const auto output = temporary.file("guard-output.docx");
+    check(DocxDocument::writeNew(source, {NewParagraph{{NewRun{"Original", {}}}}}).saved,
+          "could not create guarded save fixture");
+    check(std::filesystem::copy_file(source, output), "could not create guarded target");
+    const auto original = readBytes(output);
+    Error error;
+    auto document = DocxDocument::open(source, &error);
+    check(document && document->replaceParagraphText(0, "Edited").accepted,
+          "could not prepare guarded text edit");
+    bool called = false;
+    const auto saved = document->saveAs(output, [&](Error& refusal) {
+        called = true;
+        refusal = {docxstudio::ooxml::ErrorCode::unsafe_edit, "Destination changed"};
+        return false;
+    });
+    check(called && !saved.saved && saved.error && readBytes(output) == original && document->dirty(),
+          "save ignored a final destination conflict or changed its clean baseline");
+}
+
 void testTextPatchPreservesOpaqueMembers(const TemporaryDirectory& temporary) {
     const auto source = temporary.file("complex.docx");
     const auto output = temporary.file("complex-edited.docx");
@@ -2965,6 +3006,8 @@ int main() {
         testUnsupportedFormattingIsReported(temporary);
         testXmlComplexityLimits(temporary);
         testCanonicalSimplePackageRegenerationEligibility(temporary);
+        testRichRegenerationAssessment(temporary);
+        testSaveCommitGuard(temporary);
         testUnsafeEditsAreRefused(temporary);
         testExcludedWordMainTypesAreRejected(temporary);
         std::cout << "OOXML tests passed\n";

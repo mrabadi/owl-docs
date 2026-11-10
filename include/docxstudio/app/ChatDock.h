@@ -45,6 +45,7 @@ signals:
     void rejectPreviewRequested();
     void modelChanged(const QString& model);
     void previewLastResponseRequested(const QString& response);
+    void disconnectRequested();
 
 private:
     void sendCurrentMessage();

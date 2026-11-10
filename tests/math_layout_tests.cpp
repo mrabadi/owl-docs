@@ -56,6 +56,12 @@ void renderAndCheck(std::string_view latex) {
 int main(int argc, char** argv) {
     QApplication application(argc, argv);
     const std::vector<std::string_view> expressions{
+        R"(\text{when x is positive})",
+        R"(\mathrm{AB}+\mathbf{x}+\mathit{y}+\operatorname{rank})",
+        R"(\hat{x}+\vec{v}+\bar{z}+\overline{AB}+\underline{CD})",
+        R"(\prod_{i=1}^{n} i\,x\quad y\!z)",
+        R"(\begin{aligned}a&=b\\c&=d\end{aligned})",
+        R"(\begin{cases}x & \text{if positive}\\0 & \text{otherwise}\end{cases})",
         R"(x+\frac{a}{b})",
         R"(\sqrt[3]{x^2+y_1})",
         R"(\sum_{i=1}^{n} i \times \int_0^1 x)",
@@ -68,6 +74,15 @@ int main(int argc, char** argv) {
         R"(\begin{Vmatrix}1&2\\3&4\end{Vmatrix})",
     };
     for (const auto expression : expressions) renderAndCheck(expression);
+    QFont font(QStringLiteral("Carlito"));
+    font.setPixelSize(32);
+    const auto regular = docxstudio::math::parseLatex(R"(\mathrm{WWW})");
+    const auto nested = docxstudio::math::parseLatex(R"(\mathbf{\mathrm{WWW}})");
+    check(regular && nested, "nested math font fixture did not parse");
+    const docxstudio::app::MathLayout regularLayout(regular.value(), font);
+    const docxstudio::app::MathLayout nestedLayout(nested.value(), font);
+    check(std::abs(regularLayout.metrics().width - nestedLayout.metrics().width) < 0.01,
+          "an inner mathrm command retained the outer bold font");
     std::cout << "math layout tests passed\n";
     return 0;
 }

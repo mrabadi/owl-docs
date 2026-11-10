@@ -23,6 +23,8 @@ using Json = nlohmann::json;
 constexpr std::size_t kMaximumPayloadBytes = 64U * 1024U * 1024U;
 constexpr std::size_t kMaximumParagraphs = 1'000'000U;
 constexpr std::size_t kMaximumTables = 100'000U;
+constexpr int kTableImageRecoveryVersion = 15;
+constexpr int kTableLayoutRecoveryVersion = 16;
 constexpr std::size_t kMaximumTableCells = 1'000'000U;
 constexpr std::size_t kMaximumEquations = 1'000'000U;
 // UTF-16 units are JSON encoded as bounded integers; eight million units can
@@ -394,6 +396,72 @@ bool decodeImageLayout(const Json& input, core::ImageLayout& layout,
         error = validation.error().message;
         return false;
     }
+    return true;
+}
+
+Json encodeTableCellLayout(const core::TableCellLayout& layout) {
+    Json output = Json::object();
+    if (layout.vertical_alignment) output["vertical_alignment"] =
+        *layout.vertical_alignment == core::TableCellVerticalAlignment::top ? "top" :
+        *layout.vertical_alignment == core::TableCellVerticalAlignment::center ? "center" : "bottom";
+    const auto edge = [&output](const char* key, const std::optional<core::TableBorder>& border) {
+        if (border) output[key] = {{"style", border->style == core::TableBorderStyle::none ? "none" : "single"},
+            {"width_eighth_points", border->width_eighth_points}, {"argb", border->argb}};
+    };
+    edge("top", layout.border_top); edge("right", layout.border_right);
+    edge("bottom", layout.border_bottom); edge("left", layout.border_left);
+    return output;
+}
+bool tableUnsigned(const Json& input, std::uint64_t maximum, std::uint32_t& output) {
+    std::uint64_t value = 0;
+    if (input.is_number_unsigned()) value = input.get<std::uint64_t>();
+    else if (input.is_number_integer()) { const auto signed_value = input.get<std::int64_t>(); if (signed_value < 0) return false; value = static_cast<std::uint64_t>(signed_value); }
+    else return false;
+    if (value > maximum) return false;
+    output = static_cast<std::uint32_t>(value); return true;
+}
+bool decodeTableCellLayout(const Json& input, core::TableCellLayout& layout, std::string& error) {
+    if (!input.is_object()) { error = "Recovery cell layout must be an object"; return false; }
+    for (const auto& [key, value] : input.items()) {
+        if (key == "vertical_alignment") {
+            if (!value.is_string()) { error = "Recovery cell alignment must be a string"; return false; }
+            const auto encoded = value.get<std::string>();
+            if (encoded == "top") layout.vertical_alignment = core::TableCellVerticalAlignment::top;
+            else if (encoded == "center") layout.vertical_alignment = core::TableCellVerticalAlignment::center;
+            else if (encoded == "bottom") layout.vertical_alignment = core::TableCellVerticalAlignment::bottom;
+            else { error = "Recovery cell alignment is unknown"; return false; }
+            continue;
+        }
+        std::optional<core::TableBorder>* destination = key == "top" ? &layout.border_top : key == "right" ? &layout.border_right :
+            key == "bottom" ? &layout.border_bottom : key == "left" ? &layout.border_left : nullptr;
+        if (!destination || !value.is_object() || value.size() != 3 || !value.contains("style") || !value.at("style").is_string() ||
+            !value.contains("width_eighth_points") || !value.contains("argb")) { error = "Recovery cell border is invalid"; return false; }
+        const auto style = value.at("style").get<std::string>();
+        std::uint32_t width = 0, argb = 0;
+        if ((style != "none" && style != "single") || !tableUnsigned(value.at("width_eighth_points"), 96, width) ||
+            !tableUnsigned(value.at("argb"), 0xffffffffULL, argb)) { error = "Recovery cell border is out of range"; return false; }
+        *destination = core::TableBorder{style == "none" ? core::TableBorderStyle::none : core::TableBorderStyle::single,
+            static_cast<std::uint16_t>(width), argb};
+    }
+    const auto valid = layout.validate(); if (!valid) { error = valid.error().message; return false; }
+    return true;
+}
+Json encodeTableGeometry(const core::TableGeometry& geometry) {
+    Json output = Json::object();
+    if (!geometry.column_widths_twips.empty()) output["column_widths_twips"] = geometry.column_widths_twips;
+    if (!geometry.row_minimum_heights_twips.empty()) output["row_minimum_heights_twips"] = geometry.row_minimum_heights_twips;
+    return output;
+}
+bool decodeTableGeometry(const Json& input, core::TableGeometry& geometry, std::size_t rows, std::size_t columns, std::string& error) {
+    if (!input.is_object()) { error = "Recovery table geometry must be an object"; return false; }
+    for (const auto& [key, value] : input.items()) {
+        auto* destination = key == "column_widths_twips" ? &geometry.column_widths_twips :
+            key == "row_minimum_heights_twips" ? &geometry.row_minimum_heights_twips : nullptr;
+        const auto count = key == "column_widths_twips" ? columns : rows;
+        if (!destination || !value.is_array() || (!value.empty() && value.size() != count)) { error = "Recovery table geometry count is invalid"; return false; }
+        for (const auto& entry : value) { std::uint32_t number = 0; if (!tableUnsigned(entry, 31680, number)) { error = "Recovery table geometry value is out of range"; return false; } destination->push_back(number); }
+    }
+    const auto valid = geometry.validate(rows, columns); if (!valid) { error = valid.error().message; return false; }
     return true;
 }
 
@@ -1050,14 +1118,20 @@ std::optional<std::string> RecoveryCodec::encode(const RecoveryDocument& recover
             totalImageBytes += image.encoded_payload.size();
         }
     }
+    bool hasCellImages = false;
+    bool hasTableLayout = false;
     std::size_t totalCells = 0;
     for (const auto& table : recovery.document.tables()) {
+        if (!table.geometry().validate(table.rowCount(), table.columnCount())) { error = "Recovery table geometry is invalid"; return std::nullopt; }
+        hasTableLayout = hasTableLayout || !table.geometry().empty();
         if (table.cells().size() > kMaximumTableCells - totalCells) {
             error = "Recovery document has too many table cells";
             return std::nullopt;
         }
         totalCells += table.cells().size();
         for (const auto& cell : table.cells()) {
+            if (!cell.layout.validate()) { error = "Recovery cell layout is invalid"; return std::nullopt; }
+            hasTableLayout = hasTableLayout || !cell.layout.empty();
             if (cell.text.size() > kMaximumCodeUnits - totalCodeUnits) {
                 error = "Recovery document text exceeds the size limit";
                 return std::nullopt;
@@ -1069,9 +1143,24 @@ std::optional<std::string> RecoveryCodec::encode(const RecoveryDocument& recover
                 return std::nullopt;
             }
             totalFormatRuns += cell.character_formats.size();
+            if (cell.images.size() > core::kMaximumInlineImagesPerDocument - totalImages) {
+                error = "Recovery table pictures exceed the document image count limit";
+                return std::nullopt;
+            }
+            totalImages += cell.images.size();
+            hasCellImages = hasCellImages || !cell.images.empty();
+            for (const auto& image : cell.images) {
+                if (!imageIds.insert(image.id).second ||
+                    image.encoded_payload.size() > core::kMaximumDocumentEncodedImageBytes - totalImageBytes ||
+                    !validEncodedImage(image.encoded_payload, image.format)) {
+                    error = "Recovery table-picture metadata or payload is invalid";
+                    return std::nullopt;
+                }
+                totalImageBytes += image.encoded_payload.size();
+            }
         }
     }
-    Json root{{"schema", "docxstudio.recovery"}, {"version", currentVersion}};
+    Json root{{"schema", "docxstudio.recovery"}, {"version", hasTableLayout ? kTableLayoutRecoveryVersion : hasCellImages ? kTableImageRecoveryVersion : currentVersion}};
     root["page"] = {{"width_points", recovery.page.width_points},
                     {"height_points", recovery.page.height_points},
                     {"margin_top_points", recovery.page.margin_top_points},
@@ -1104,6 +1193,13 @@ std::optional<std::string> RecoveryCodec::encode(const RecoveryDocument& recover
                  {"format", imageFormatName(image.format)},
                  {"encoded_base64", base64Encode(image.encoded_payload.bytes())}});
         }
+        Json fields = Json::array();
+        for (const auto& field : paragraph.fields()) {
+            fields.push_back({{"id", field.id.toString()}, {"offset", field.utf16_offset},
+                {"kind", static_cast<int>(field.kind)}, {"target_id", field.target_id.toString()},
+                {"locator_utf16", encodeUtf16(field.locator)},
+                {"reference_format", static_cast<int>(field.reference_format)}});
+        }
         Json encodedParagraph{
             {"id", paragraph.id().toString()},
             {"text_utf16", encodeUtf16(paragraph.text())},
@@ -1113,7 +1209,11 @@ std::optional<std::string> RecoveryCodec::encode(const RecoveryDocument& recover
                  paragraph.paragraphMarkCharacterFormat())},
             {"runs", std::move(runs)},
             {"equations", std::move(equations)},
-            {"images", std::move(images)}};
+            {"images", std::move(images)}, {"fields", std::move(fields)},
+            {"bibliography_entry", paragraph.isBibliographyEntry()}};
+        if (paragraph.caption()) encodedParagraph["caption"] = {
+            {"label", static_cast<int>(paragraph.caption()->label)},
+            {"target_id", paragraph.caption()->target_id.toString()}};
         if (paragraph.styleId()) {
             encodedParagraph["style_id"] = *paragraph.styleId();
         }
@@ -1158,19 +1258,32 @@ std::optional<std::string> RecoveryCodec::encode(const RecoveryDocument& recover
                                 {"end", run.end},
                                 {"format", encodeCharacterFormat(run.format)}});
             }
-            cells.push_back({{"id", cell.id.toString()},
+            Json encodedCell{{"id", cell.id.toString()},
                              {"text_utf16", encodeUtf16(cell.text)},
                              {"format", encodeParagraphFormat(cell.paragraph_format)},
                              {"default_character_format",
                               encodeCharacterFormat(
                                   cell.default_character_format)},
-                             {"runs", std::move(runs)}});
+                             {"runs", std::move(runs)}};
+            if (!cell.layout.empty()) encodedCell["layout"] = encodeTableCellLayout(cell.layout);
+            if (!cell.images.empty()) {
+                Json images = Json::array();
+                for (const auto& image : cell.images)
+                    images.push_back({{"id", image.id.toString()}, {"offset", image.utf16_offset},
+                        {"width_emu", image.width_emu}, {"height_emu", image.height_emu},
+                        {"accessible_name", image.accessible_name}, {"layout", encodeImageLayout(image.layout)},
+                        {"format", imageFormatName(image.format)},
+                        {"encoded_base64", base64Encode(image.encoded_payload.bytes())}});
+                encodedCell["images"] = std::move(images);
+            }
+            cells.push_back(std::move(encodedCell));
         }
         Json encodedTable{{"id", table.id().toString()},
                           {"rows", table.rowCount()},
                           {"columns", table.columnCount()},
                           {"header_row", table.hasHeaderRow()},
                           {"cells", std::move(cells)}};
+        if (!table.geometry().empty()) encodedTable["geometry"] = encodeTableGeometry(table.geometry());
         encodedTable["style"] = table.style()
             ? Json(tableStyleName(*table.style()))
             : Json(nullptr);
@@ -1180,9 +1293,15 @@ std::optional<std::string> RecoveryCodec::encode(const RecoveryDocument& recover
     for (const auto& block : recovery.document.bodyBlocks()) {
         root["body_blocks"].push_back(
             {{"kind", block.kind == core::BodyBlockKind::paragraph
-                           ? "paragraph" : "table"},
+                           ? "paragraph" : (block.kind == core::BodyBlockKind::table ? "table" : "table_of_contents")},
              {"id", block.id.toString()}});
     }
+    root["notes"] = Json::array();
+    for (const auto& note : recovery.document.notes()) root["notes"].push_back({
+        {"id", note.id.toString()}, {"kind", static_cast<int>(note.kind)}, {"text_utf16", encodeUtf16(note.text)}});
+    root["tables_of_contents"] = Json::array();
+    for (const auto& toc : recovery.document.tablesOfContents()) root["tables_of_contents"].push_back({
+        {"id", toc.id.toString()}, {"max_level", toc.max_level}});
     root["header_text_utf16"] = encodeUtf16(recovery.document.headerText());
     root["footer_text_utf16"] = encodeUtf16(recovery.document.footerText());
     const auto encodeStoryImages = [](const std::vector<core::ImageAtom>& images) {
@@ -1234,7 +1353,7 @@ std::optional<RecoveryDocument> RecoveryCodec::decode(std::string_view payload,
         }
         const int version = root.value("version", 0);
         if (root.value("schema", std::string{}) != "docxstudio.recovery" ||
-            version < 1 || version > currentVersion) {
+            version < 1 || version > kTableLayoutRecoveryVersion) {
             error = "Recovery snapshot uses an unsupported format version";
             return std::nullopt;
         }
@@ -1289,6 +1408,8 @@ std::optional<RecoveryDocument> RecoveryCodec::decode(std::string_view payload,
             core::ImageLayout layout;
             std::size_t source_order{};
         };
+        struct PendingField { core::NodeId paragraph_id; core::FieldAtom field; };
+        std::vector<PendingField> fields;
         std::vector<core::Paragraph> paragraphs;
         std::vector<PendingRun> runs;
         std::vector<PendingParagraphFormat> paragraphFormats;
@@ -1394,6 +1515,7 @@ std::optional<RecoveryDocument> RecoveryCodec::decode(std::string_view payload,
                 return std::nullopt;
             }
 
+            std::vector<PendingField> paragraphFields;
             std::vector<PendingEquation> paragraphEquations;
             std::vector<PendingImage> paragraphImages;
             if (version >= 2) {
@@ -1530,6 +1652,29 @@ std::optional<RecoveryDocument> RecoveryCodec::decode(std::string_view payload,
                     });
             }
 
+            if (version >= 14) {
+                const auto& encodedFields = encodedParagraph.at("fields");
+                if (!encodedFields.is_array() || encodedFields.size() > core::kMaximumAcademicFields - fields.size()) {
+                    error = "Recovery academic field list is invalid"; return std::nullopt;
+                }
+                for (const auto& encoded : encodedFields) {
+                    const auto fieldId = core::NodeId::parse(encoded.at("id").get<std::string>());
+                    const auto target = core::NodeId::parse(encoded.at("target_id").get<std::string>());
+                    const auto offset = encoded.at("offset").get<std::uint64_t>();
+                    const auto kind = encoded.at("kind").get<int>();
+                    const auto format = encoded.value("reference_format", 0);
+                    std::u16string locator;
+                    if (!fieldId || !target || offset >= text.size() ||
+                        text[static_cast<std::size_t>(offset)] != core::kInlineObjectReplacementCharacter ||
+                        kind < 0 || kind > static_cast<int>(core::FieldKind::citation) || format < 0 || format > 1 ||
+                        !decodeUtf16(encoded.at("locator_utf16"), locator, totalCodeUnits, error)) {
+                        error = "Recovery academic field metadata is invalid"; return std::nullopt;
+                    }
+                    paragraphFields.push_back({*id, {*fieldId, static_cast<std::size_t>(offset),
+                        static_cast<core::FieldKind>(kind), *target, std::move(locator),
+                        static_cast<core::CrossReferenceFormat>(format)}});
+                }
+            }
             std::set<std::size_t> typedObjectOffsets;
             for (const auto& equation : paragraphEquations) {
                 if (!typedObjectOffsets.insert(equation.offset).second) {
@@ -1544,6 +1689,12 @@ std::optional<RecoveryDocument> RecoveryCodec::decode(std::string_view payload,
                 }
             }
 
+            for (const auto& field : paragraphFields) {
+                if (!typedObjectOffsets.insert(field.field.utf16_offset).second) {
+                    error = "Recovery inline objects share a placeholder"; return std::nullopt;
+                }
+            }
+            fields.insert(fields.end(), paragraphFields.begin(), paragraphFields.end());
             if (version == 5) {
                 const auto legacy = legacyImagesByParagraph.find(*id);
                 if (legacy != legacyImagesByParagraph.end()) {
@@ -1562,7 +1713,7 @@ std::optional<RecoveryDocument> RecoveryCodec::decode(std::string_view payload,
             const auto placeholderCount = static_cast<std::size_t>(std::count(
                 text.begin(), text.end(), core::kInlineObjectReplacementCharacter));
             const std::size_t expectedPlaceholders =
-                paragraphEquations.size() + paragraphImages.size();
+                paragraphEquations.size() + paragraphImages.size() + paragraphFields.size();
             if (placeholderCount != expectedPlaceholders) {
                 error = "Recovery paragraph has orphan inline-object placeholders";
                 return std::nullopt;
@@ -1784,22 +1935,54 @@ std::optional<RecoveryDocument> RecoveryCodec::decode(std::string_view payload,
             error = document.error().message;
             return std::nullopt;
         }
+        if (version >= 14) {
+            const auto& encodedNotes = root.at("notes");
+            if (!encodedNotes.is_array() || encodedNotes.size() > core::kMaximumNotes) {
+                error = "Recovery note list is invalid"; return std::nullopt;
+            }
+            std::unordered_set<core::NodeId, core::NodeIdHash> noteIds;
+            for (const auto& encoded : encodedNotes) {
+                const auto id = core::NodeId::parse(encoded.at("id").get<std::string>());
+                const auto kind = encoded.at("kind").get<int>();
+                std::u16string text;
+                if (!id || !noteIds.insert(*id).second || kind < 0 || kind > 1 ||
+                    !decodeUtf16(encoded.at("text_utf16"), text, totalCodeUnits, error)) {
+                    error = "Recovery note is invalid"; return std::nullopt;
+                }
+                const auto restored = document.value().setNote({*id, static_cast<core::NoteKind>(kind), std::move(text)});
+                if (!restored) { error = restored.error().message; return std::nullopt; }
+            }
+            const auto& encodedTocs = root.at("tables_of_contents");
+            if (!encodedTocs.is_array() || encodedTocs.size() > 16) {
+                error = "Recovery TOC list is invalid"; return std::nullopt;
+            }
+            for (const auto& encoded : encodedTocs) {
+                const auto id = core::NodeId::parse(encoded.at("id").get<std::string>());
+                const int level = encoded.at("max_level").get<int>();
+                if (!id || level < 1 || level > 9) { error = "Recovery TOC is invalid"; return std::nullopt; }
+                const auto restored = document.value().insertToc(std::nullopt, {*id, static_cast<std::uint8_t>(level)});
+                if (!restored) { error = restored.error().message; return std::nullopt; }
+            }
+        }
         if (version >= 6) {
             struct PendingObjectRef {
                 core::NodeId paragraph_id;
                 std::size_t offset{};
-                bool image{false};
+                int kind{0};
                 std::size_t index{};
             };
             std::vector<PendingObjectRef> objects;
-            objects.reserve(equations.size() + images.size());
+            objects.reserve(equations.size() + images.size() + fields.size());
             for (std::size_t index = 0; index < equations.size(); ++index) {
                 objects.push_back({equations[index].paragraph_id,
-                                   equations[index].offset, false, index});
+                                   equations[index].offset, 0, index});
             }
             for (std::size_t index = 0; index < images.size(); ++index) {
                 objects.push_back({images[index].paragraph_id,
-                                   images[index].offset, true, index});
+                                   images[index].offset, 1, index});
+            }
+            for (std::size_t index = 0; index < fields.size(); ++index) {
+                objects.push_back({fields[index].paragraph_id, fields[index].field.utf16_offset, 2, index});
             }
             std::sort(
                 objects.begin(), objects.end(),
@@ -1812,7 +1995,11 @@ std::optional<RecoveryDocument> RecoveryCodec::decode(std::string_view payload,
                 });
             for (const auto& object : objects) {
                 core::Result<void> inserted = [&]() {
-                    if (!object.image) {
+                    if (object.kind == 2) {
+                        auto& field = fields[object.index];
+                        return document.value().insertField({field.paragraph_id, field.field.utf16_offset}, std::move(field.field));
+                    }
+                    if (object.kind == 0) {
                         auto& equation = equations[object.index];
                         return document.value().insertEquation(
                             {equation.paragraph_id, equation.offset},
@@ -1868,6 +2055,22 @@ std::optional<RecoveryDocument> RecoveryCodec::decode(std::string_view payload,
             if (!attached) {
                 error = attached.error().message;
                 return std::nullopt;
+            }
+        }
+        if (version >= 14) {
+            for (const auto& encoded : paragraphJson) {
+                const auto id = *core::NodeId::parse(encoded.at("id").get<std::string>());
+                if (encoded.value("bibliography_entry", false)) {
+                    const auto applied = document.value().setBibliographyEntry(id, true);
+                    if (!applied) { error = applied.error().message; return std::nullopt; }
+                }
+                if (const auto caption = encoded.find("caption"); caption != encoded.end()) {
+                    const auto target = core::NodeId::parse(caption->at("target_id").get<std::string>());
+                    const auto label = caption->at("label").get<int>();
+                    if (!target || label < 0 || label > 2) { error = "Recovery caption is invalid"; return std::nullopt; }
+                    const auto applied = document.value().setCaption(id, core::CaptionMetadata{static_cast<core::CaptionLabel>(label), *target});
+                    if (!applied) { error = applied.error().message; return std::nullopt; }
+                }
             }
         }
         if (version == 5) {
@@ -2027,10 +2230,45 @@ std::optional<RecoveryDocument> RecoveryCodec::decode(std::string_view payload,
                                  std::move(cellFormat)});
                         }
                     }
+                    core::TableCellLayout cellLayout;
+                    if (const auto encodedLayout = encodedCell.find("layout"); encodedLayout != encodedCell.end()) {
+                        if (version < kTableLayoutRecoveryVersion || !decodeTableCellLayout(*encodedLayout, cellLayout, error)) {
+                            if (error.empty()) error = "Recovery cell layout is invalid for its schema";
+                            return std::nullopt;
+                        }
+                    }
+                    std::vector<core::ImageAtom> cellImages;
+                    if (const auto encodedImages = encodedCell.find("images"); encodedImages != encodedCell.end()) {
+                        if (version < kTableImageRecoveryVersion || !encodedImages->is_array() ||
+                            encodedImages->size() > core::kMaximumInlineImagesPerDocument - totalImages) {
+                            error = "Recovery table-picture list is invalid for its schema";
+                            return std::nullopt;
+                        }
+                        totalImages += encodedImages->size();
+                        for (const auto& encodedImage : *encodedImages) {
+                            const auto imageId = core::NodeId::parse(encodedImage.at("id").get<std::string>());
+                            const auto offset = encodedImage.at("offset").get<std::uint64_t>();
+                            const auto format = parseImageFormat(encodedImage.at("format").get<std::string>());
+                            auto bytes = base64Decode(encodedImage.at("encoded_base64").get<std::string>(),
+                                std::min(core::kMaximumEncodedImageBytes, core::kMaximumDocumentEncodedImageBytes - totalImageBytes));
+                            core::ImageLayout layout;
+                            if (!imageId || !format || !bytes || !imageIds.insert(*imageId).second ||
+                                offset > std::numeric_limits<std::size_t>::max() ||
+                                !decodeImageLayout(encodedImage.at("layout"), layout, error)) {
+                                error = "Recovery table-picture metadata or payload is invalid";
+                                return std::nullopt;
+                            }
+                            core::EncodedImagePayload imagePayload(std::move(*bytes));
+                            totalImageBytes += imagePayload.size();
+                            cellImages.push_back({*imageId, static_cast<std::size_t>(offset), std::move(imagePayload), *format,
+                                encodedImage.at("accessible_name").get<std::string>(), encodedImage.at("width_emu").get<std::int64_t>(),
+                                encodedImage.at("height_emu").get<std::int64_t>(), layout});
+                        }
+                    }
                     cells.push_back({*cellId, std::move(cellText),
                                      std::move(cellRuns),
                                      std::move(cellParagraphFormat),
-                                     std::move(cellDefaultCharacterFormat)});
+                                     std::move(cellDefaultCharacterFormat), std::move(cellImages), std::move(cellLayout)});
                 }
                 std::optional<core::TableStyle> tableStyle =
                     core::TableStyle::grid;
@@ -2053,9 +2291,16 @@ std::optional<RecoveryDocument> RecoveryCodec::decode(std::string_view payload,
                         return std::nullopt;
                     }
                 }
+                core::TableGeometry geometry;
+                if (const auto encodedGeometry = encodedTable.find("geometry"); encodedGeometry != encodedTable.end()) {
+                    if (version < kTableLayoutRecoveryVersion || !decodeTableGeometry(*encodedGeometry, geometry, rows, columns, error)) {
+                        if (error.empty()) error = "Recovery table geometry is invalid for its schema";
+                        return std::nullopt;
+                    }
+                }
                 auto restored = core::Table::restore(
                     rows, columns, encodedTable.value("header_row", false),
-                    *id, std::move(cells), tableStyle);
+                    *id, std::move(cells), tableStyle, std::move(geometry));
                 if (!restored || !tableIds.insert(*id).second) {
                     error = restored ? "Recovery table IDs are not unique"
                                      : restored.error().message;
@@ -2067,7 +2312,7 @@ std::optional<RecoveryDocument> RecoveryCodec::decode(std::string_view payload,
             const auto& encodedBlocks = root.at("body_blocks");
             if (!encodedBlocks.is_array() ||
                 encodedBlocks.size() !=
-                    document.value().paragraphs().size() + tables.size()) {
+                    document.value().paragraphs().size() + tables.size() + document.value().tablesOfContents().size()) {
                 error = "Recovery body-block order is invalid";
                 return std::nullopt;
             }
@@ -2097,6 +2342,8 @@ std::optional<RecoveryDocument> RecoveryCodec::decode(std::string_view payload,
                     blocks.push_back({core::BodyBlockKind::paragraph, *id});
                 } else if (kind == "table" && tableIds.contains(*id)) {
                     blocks.push_back({core::BodyBlockKind::table, *id});
+                } else if (kind == "table_of_contents" && document.value().findToc(*id)) {
+                    blocks.push_back({core::BodyBlockKind::table_of_contents, *id});
                 } else {
                     error = "Recovery body block kind or ID is invalid";
                     return std::nullopt;
@@ -2115,12 +2362,12 @@ std::optional<RecoveryDocument> RecoveryCodec::decode(std::string_view payload,
                 }
             }
             for (std::size_t index = blocks.size(); index-- > 0;) {
-                if (blocks[index].kind != core::BodyBlockKind::table) continue;
+                if (blocks[index].kind == core::BodyBlockKind::paragraph) continue;
                 const std::optional<core::NodeId> before =
                     index + 1 < blocks.size()
                         ? std::optional<core::NodeId>(blocks[index + 1].id)
                         : std::nullopt;
-                const auto moved = document.value().moveTable(
+                const auto moved = document.value().moveBodyBlock(
                     blocks[index].id, before);
                 if (!moved) {
                     error = moved.error().message;

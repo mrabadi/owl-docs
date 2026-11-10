@@ -363,16 +363,48 @@ void setCellContent(TableCell& cell, std::u16string text,
     }
 }
 
+std::pair<std::size_t, std::size_t> imageResources(const Document& document) {
+    std::size_t count = 0, bytes = 0;
+    const auto include = [&](const auto& images) {
+        count += images.size();
+        for (const auto& image : images) bytes += image.encoded_payload.size();
+    };
+    for (const auto& paragraph : document.paragraphs()) include(paragraph.images());
+    for (const auto& table : document.tables())
+        for (const auto& cell : table.cells()) include(cell.images);
+    include(document.headerImages()); include(document.footerImages());
+    return {count, bytes};
+}
+
 Result<void> validateTableCell(const TableCell& cell) {
+    const auto layout_validation = cell.layout.validate();
+    if (!layout_validation) return layout_validation.error();
     if (!cell.id.isValid()) {
         return Error{ErrorCode::invalid_node_id,
                      "Table cell NodeId cannot be zero"};
     }
-    if (!isValidUtf16(cell.text) || containsParagraphBreak(cell.text) ||
-        containsInlineObjectPlaceholder(cell.text)) {
+    if (!isValidUtf16(cell.text) || containsParagraphBreak(cell.text)) {
         return Error{ErrorCode::invalid_operation,
                      "Table cell text is invalid"};
     }
+    if (cell.images.size() > kMaximumInlineImagesPerDocument)
+        return Error{ErrorCode::invalid_operation, "Table cell contains too many pictures"};
+    std::size_t previous_offset = 0;
+    std::unordered_set<NodeId, NodeIdHash> image_ids;
+    for (std::size_t index = 0; index < cell.images.size(); ++index) {
+        const auto& image = cell.images[index];
+        if (image.utf16_offset >= cell.text.size() || cell.text[image.utf16_offset] != kInlineObjectReplacementCharacter ||
+            (index && image.utf16_offset <= previous_offset) || !image_ids.insert(image.id).second ||
+            image.layout != ImageLayout{})
+            return Error{ErrorCode::invalid_operation, "Table picture has no unique inline placeholder"};
+        previous_offset = image.utf16_offset;
+        const auto metadata = validateImageMetadata(image);
+        if (!metadata) return metadata.error();
+        const auto payload = validateImagePayload(image);
+        if (!payload) return payload.error();
+    }
+    if (static_cast<std::size_t>(std::count(cell.text.begin(), cell.text.end(), kInlineObjectReplacementCharacter)) != cell.images.size())
+        return Error{ErrorCode::invalid_operation, "Table cell contains an orphan picture placeholder"};
     const auto paragraph_validation = cell.paragraph_format.validate();
     if (!paragraph_validation) return paragraph_validation.error();
     const auto default_format_validation =
@@ -402,10 +434,15 @@ CharacterFormat inheritedCellInsertionFormat(const TableCell& source) {
 
 TableCell inheritedEmptyCell(NodeId id, const TableCell& source) {
     return TableCell{id, {}, {}, source.paragraph_format,
-                     inheritedCellInsertionFormat(source)};
+                     inheritedCellInsertionFormat(source), {}, source.layout};
 }
 
 }  // namespace
+
+const ImageAtom* TableCell::imageAt(std::size_t offset) const noexcept {
+    const auto found = std::find_if(images.begin(), images.end(), [offset](const auto& image) { return image.utf16_offset == offset; });
+    return found == images.end() ? nullptr : &*found;
+}
 
 CharacterFormat TableCell::characterFormatAt(
     std::size_t utf16_offset) const {
@@ -419,11 +456,41 @@ CharacterFormat TableCell::characterFormatAt(
     return default_character_format;
 }
 
+Result<void> TableGeometry::validate(std::size_t rows, std::size_t columns) const {
+    if ((!column_widths_twips.empty() && column_widths_twips.size() != columns) ||
+        (!row_minimum_heights_twips.empty() && row_minimum_heights_twips.size() != rows))
+        return Error{ErrorCode::invalid_operation, "Table geometry must match its row and column counts"};
+    std::uint64_t sum = 0;
+    for (const auto width : column_widths_twips) {
+        if (width == 0 || width > 31680) return Error{ErrorCode::invalid_operation, "Table column width is outside 1..31680 twips"};
+        sum += width;
+    }
+    if (sum > 31680) return Error{ErrorCode::invalid_operation, "Table total width exceeds 31680 twips"};
+    for (const auto height : row_minimum_heights_twips)
+        if (height > 31680) return Error{ErrorCode::invalid_operation, "Table row minimum exceeds 31680 twips"};
+    return {};
+}
+Result<void> TableCellLayout::validate() const {
+    if (vertical_alignment && *vertical_alignment != TableCellVerticalAlignment::top &&
+        *vertical_alignment != TableCellVerticalAlignment::center && *vertical_alignment != TableCellVerticalAlignment::bottom)
+        return Error{ErrorCode::invalid_operation, "Table cell vertical alignment is unsupported"};
+    for (const auto* edge : {&border_top, &border_right, &border_bottom, &border_left}) {
+        if (!*edge) continue;
+        const auto& border = **edge;
+        if ((border.argb & 0xff000000U) != 0xff000000U ||
+            (border.style != TableBorderStyle::none && border.style != TableBorderStyle::single) ||
+            (border.style == TableBorderStyle::none ? border.width_eighth_points != 0 :
+                border.width_eighth_points == 0 || border.width_eighth_points > 96))
+            return Error{ErrorCode::invalid_operation, "Table border requires opaque color and none/0 or single/1..96 width"};
+    }
+    return {};
+}
+
 Table::Table(NodeId id, std::size_t rows, std::size_t columns, bool header_row,
              std::vector<TableCell> cells,
-             std::optional<TableStyle> style)
+             std::optional<TableStyle> style, TableGeometry geometry)
     : id_(id), rows_(rows), columns_(columns), header_row_(header_row),
-      style_(style), cells_(std::move(cells)) {}
+      style_(style), cells_(std::move(cells)), geometry_(std::move(geometry)) {}
 
 Result<Table> Table::create(std::size_t rows, std::size_t columns,
                             bool header_row, NodeId id,
@@ -457,7 +524,7 @@ Result<Table> Table::create(std::size_t rows, std::size_t columns,
 Result<Table> Table::restore(std::size_t rows, std::size_t columns,
                              bool header_row, NodeId id,
                              std::vector<TableCell> cells,
-                             std::optional<TableStyle> style) {
+                             std::optional<TableStyle> style, TableGeometry geometry) {
     if (!id.isValid()) {
         return Error{ErrorCode::invalid_node_id, "Table NodeId cannot be zero"};
     }
@@ -471,17 +538,22 @@ Result<Table> Table::restore(std::size_t rows, std::size_t columns,
                 std::to_string(maximum_rows) + "x" +
                 std::to_string(maximum_columns)};
     }
+    const auto geometry_validation = geometry.validate(rows, columns);
+    if (!geometry_validation) return geometry_validation.error();
     std::unordered_set<NodeId, NodeIdHash> identifiers;
     identifiers.insert(id);
     for (const auto& cell : cells) {
         const auto validation = validateTableCell(cell);
         if (!validation) return validation.error();
+        for (const auto& image : cell.images)
+            if (!identifiers.insert(image.id).second)
+                return Error{ErrorCode::duplicate_node_id, "Table picture NodeIds must be unique"};
         if (!identifiers.insert(cell.id).second) {
             return Error{ErrorCode::duplicate_node_id,
                          "Table and cell NodeIds must be unique"};
         }
     }
-    return Table(id, rows, columns, header_row, std::move(cells), style);
+    return Table(id, rows, columns, header_row, std::move(cells), style, std::move(geometry));
 }
 
 const TableCell* Table::cell(std::size_t row, std::size_t column) const noexcept {
@@ -560,6 +632,9 @@ Result<void> Table::setCellText(
     if (text.empty() && !cell.text.empty()) {
         cell.default_character_format = replacement_format;
     }
+    std::erase_if(cell.images, [prefix, old_suffix_start](const auto& image) { return image.utf16_offset >= prefix && image.utf16_offset < old_suffix_start; });
+    for (auto& image : cell.images) if (image.utf16_offset >= old_suffix_start)
+        image.utf16_offset = new_suffix_start + image.utf16_offset - old_suffix_start;
     setCellContent(cell, std::move(text), std::move(updated_formats));
     return {};
 }
@@ -627,6 +702,9 @@ Result<void> Table::replaceCellRange(
     if (updated.empty() && !cell.text.empty()) {
         cell.default_character_format = replacement_format;
     }
+    std::erase_if(cell.images, [start, end](const auto& image) { return image.utf16_offset >= start && image.utf16_offset < end; });
+    for (auto& image : cell.images) if (image.utf16_offset >= end)
+        image.utf16_offset = image.utf16_offset - (end - start) + text.size();
     setCellContent(cell, std::move(updated), std::move(updated_formats));
     return {};
 }
@@ -727,6 +805,8 @@ Result<void> Table::insertRow(std::size_t index,
         inserted.push_back(inheritedEmptyCell(
             id, cells_[source_row * columns_ + column]));
     }
+    if (!geometry_.row_minimum_heights_twips.empty())
+        geometry_.row_minimum_heights_twips.insert(geometry_.row_minimum_heights_twips.begin() + static_cast<std::ptrdiff_t>(index), geometry_.row_minimum_heights_twips[source_row]);
     cells_.insert(
         cells_.begin() + static_cast<std::ptrdiff_t>(index * columns_),
         std::make_move_iterator(inserted.begin()),
@@ -749,6 +829,7 @@ Result<void> Table::deleteRows(std::size_t index, std::size_t count) {
         static_cast<std::ptrdiff_t>(index * columns_);
     const auto last = first + static_cast<std::ptrdiff_t>(count * columns_);
     cells_.erase(first, last);
+    if (!geometry_.row_minimum_heights_twips.empty()) geometry_.row_minimum_heights_twips.erase(geometry_.row_minimum_heights_twips.begin() + static_cast<std::ptrdiff_t>(index), geometry_.row_minimum_heights_twips.begin() + static_cast<std::ptrdiff_t>(index + count));
     rows_ -= count;
     return {};
 }
@@ -772,6 +853,10 @@ Result<void> Table::insertColumn(std::size_t index,
         source == TableInsertionSource::following && index < columns_
             ? index
             : (index == 0 ? 0 : index - 1);
+    auto geometry = geometry_;
+    if (!geometry.column_widths_twips.empty()) geometry.column_widths_twips.insert(geometry.column_widths_twips.begin() + static_cast<std::ptrdiff_t>(index), geometry.column_widths_twips[source_column]);
+    const auto valid_geometry = geometry.validate(rows_, columns_ + 1);
+    if (!valid_geometry) return valid_geometry.error();
     std::vector<TableCell> updated;
     updated.reserve(rows_ * (columns_ + 1));
     for (std::size_t row = 0; row < rows_; ++row) {
@@ -789,6 +874,7 @@ Result<void> Table::insertColumn(std::size_t index,
                        old_start + static_cast<std::ptrdiff_t>(index),
                        old_start + static_cast<std::ptrdiff_t>(columns_));
     }
+    geometry_ = std::move(geometry);
     cells_ = std::move(updated);
     ++columns_;
     return {};
@@ -816,6 +902,7 @@ Result<void> Table::deleteColumns(std::size_t index, std::size_t count) {
             old_start + static_cast<std::ptrdiff_t>(index + count),
             old_start + static_cast<std::ptrdiff_t>(columns_));
     }
+    if (!geometry_.column_widths_twips.empty()) geometry_.column_widths_twips.erase(geometry_.column_widths_twips.begin() + static_cast<std::ptrdiff_t>(index), geometry_.column_widths_twips.begin() + static_cast<std::ptrdiff_t>(index + count));
     cells_ = std::move(updated);
     columns_ -= count;
     return {};
@@ -1051,6 +1138,7 @@ Result<void> Paragraph::insertText(std::size_t offset, const std::u16string& tex
             image.utf16_offset += text.size();
         }
     }
+    for (auto& field : fields_) if (field.utf16_offset >= offset) field.utf16_offset += text.size();
     setContent(std::move(updated_text), std::move(formats));
     setStyleOverrideMasks(std::move(override_masks));
     equations_ = std::move(updated_equations);
@@ -1124,6 +1212,7 @@ Result<void> Paragraph::insertEquation(
         }
     }
 
+    for (auto& field : fields_) if (field.utf16_offset >= offset) field.utf16_offset += 1;
     setContent(std::move(updated_text), std::move(formats));
     setStyleOverrideMasks(std::move(override_masks));
     equations_ = std::move(updated_equations);
@@ -1180,6 +1269,7 @@ Result<void> Paragraph::insertImage(
         });
     updated_images.insert(insertion, std::move(image));
 
+    for (auto& field : fields_) if (field.utf16_offset >= offset) field.utf16_offset += 1;
     setContent(std::move(updated_text), std::move(formats));
     setStyleOverrideMasks(std::move(override_masks));
     equations_ = std::move(updated_equations);
@@ -1230,6 +1320,8 @@ Result<void> Paragraph::erase(std::size_t start, std::size_t end) {
             image.utf16_offset -= end - start;
         }
     }
+    std::erase_if(fields_, [start, end](const FieldAtom& field) { return field.utf16_offset >= start && field.utf16_offset < end; });
+    for (auto& field : fields_) if (field.utf16_offset >= end) field.utf16_offset -= end - start;
     setContent(std::move(updated_text), std::move(formats));
     setStyleOverrideMasks(std::move(override_masks));
     if (text_.empty() && emptied_format) {
@@ -1393,6 +1485,15 @@ Result<Document> Document::create(std::vector<Paragraph> paragraphs) {
             encoded_image_bytes += image.encoded_payload.size();
             image_payloads_to_inspect.push_back(&image);
         }
+        for (const auto& field : paragraph.fields_) {
+            if (!field.id.isValid() || !field.target_id.isValid() ||
+                field.utf16_offset >= paragraph.text().size() ||
+                paragraph.text()[field.utf16_offset] != kInlineObjectReplacementCharacter ||
+                !typed_object_offsets.insert(field.utf16_offset).second)
+                return Error{ErrorCode::invalid_operation, "Field metadata has no unique placeholder"};
+            if (!identifiers.insert(field.id).second)
+                return Error{ErrorCode::duplicate_node_id, "Document NodeIds must be unique"};
+        }
         const auto placeholder_count = static_cast<std::size_t>(std::count(
             paragraph.text().begin(), paragraph.text().end(),
             kInlineObjectReplacementCharacter));
@@ -1477,6 +1578,8 @@ const ImageAtom* Document::findImage(NodeId id) const noexcept {
             return &*found;
         }
     }
+    for (const auto& table : tables_) for (const auto& cell : table.cells())
+        for (const auto& image : cell.images) if (image.id == id) return &image;
     for (const auto* story : {&header_images_, &footer_images_}) {
         const auto found = std::find_if(
             story->begin(), story->end(),
@@ -1515,7 +1618,7 @@ std::optional<std::size_t> Document::bodyBlockIndex(NodeId id) const noexcept {
 
 bool Document::nodeIdInUse(NodeId id) const noexcept {
     if (findParagraph(id) || findTable(id) || findEquation(id) ||
-        findImage(id)) {
+        findImage(id) || findField(id) || findNote(id) || findToc(id)) {
         return true;
     }
     for (const auto& table : tables_) {
@@ -1594,6 +1697,22 @@ Result<void> Document::insertEquation(
         format);
 }
 
+Result<void> Document::replaceEquation(
+    NodeId equation_id, std::string canonical_latex, bool display) {
+    const auto validation = validateEquationSource(canonical_latex);
+    if (!validation) return validation.error();
+    for (auto& paragraph : paragraphs_) {
+        for (auto& equation : paragraph.equations_) {
+            if (equation.id == equation_id) {
+                equation.canonical_latex = std::move(canonical_latex);
+                equation.display = display;
+                return {};
+            }
+        }
+    }
+    return Error{ErrorCode::invalid_node_id, "Equation does not exist"};
+}
+
 Result<void> Document::insertImage(
     const Position& position, EncodedImagePayload encoded_payload,
     ImageFormat image_format, std::string accessible_name,
@@ -1634,6 +1753,10 @@ Result<void> Document::insertImage(
         for (const auto& existing : paragraph.images()) {
             encoded_image_bytes += existing.encoded_payload.size();
         }
+    }
+    for (const auto& table : tables_) for (const auto& cell : table.cells()) {
+        image_count += cell.images.size();
+        for (const auto& existing : cell.images) encoded_image_bytes += existing.encoded_payload.size();
     }
     for (const auto* story : {&header_images_, &footer_images_}) {
         image_count += story->size();
@@ -1683,6 +1806,8 @@ Result<void> Document::resizeImage(NodeId image_id, std::int64_t width_emu,
             return {};
         }
     }
+    for (auto& table : tables_) for (auto& cell : table.cells_)
+        for (auto& image : cell.images) if (image.id == image_id) { image.width_emu = width_emu; image.height_emu = height_emu; return {}; }
     for (auto* story : {&header_images_, &footer_images_}) {
         const auto found = std::find_if(
             story->begin(), story->end(),
@@ -1718,6 +1843,11 @@ Result<void> Document::replaceImagePayload(
             }
         }
     }
+    for (auto& table : tables_) for (auto& cell : table.cells_)
+        for (auto& image : cell.images) {
+            if (image.id == image_id) target = &image;
+            else encoded_image_bytes += image.encoded_payload.size();
+        }
     for (auto* story : {&header_images_, &footer_images_}) {
         for (auto& image : *story) {
             if (image.id == image_id) target = &image;
@@ -1767,6 +1897,8 @@ Result<void> Document::setImageLayout(NodeId image_id, ImageLayout layout) {
             return {};
         }
     }
+    for (auto& table : tables_) for (auto& cell : table.cells_)
+        for (auto& image : cell.images) if (image.id == image_id) { if (layout != ImageLayout{}) return Error{ErrorCode::invalid_operation, "Table pictures support inline layout only"}; image.layout = layout; return {}; }
     for (auto* story : {&header_images_, &footer_images_}) {
         const auto found = std::find_if(
             story->begin(), story->end(),
@@ -1807,6 +1939,8 @@ Result<void> Document::setImageAccessibleName(
             return {};
         }
     }
+    for (auto& table : tables_) for (auto& cell : table.cells_)
+        for (auto& image : cell.images) if (image.id == image_id) { image.accessible_name = std::move(accessible_name); return {}; }
     for (auto* story : {&header_images_, &footer_images_}) {
         const auto found = std::find_if(
             story->begin(), story->end(),
@@ -1855,6 +1989,7 @@ Result<void> Document::deleteRange(
                             ->inherited_paragraph_mark_character_format));
             }
         }
+        removeUnreferencedNotes();
         return {};
     }
 
@@ -1869,10 +2004,10 @@ Result<void> Document::deleteRange(
             body_blocks_.begin() + static_cast<std::ptrdiff_t>(*start_block + 1),
             body_blocks_.begin() + static_cast<std::ptrdiff_t>(*end_block),
             [](const BodyBlockRef& block) {
-                return block.kind == BodyBlockKind::table;
+                return block.kind != BodyBlockKind::paragraph;
             })) {
         return Error{ErrorCode::invalid_operation,
-                     "A text range cannot implicitly delete across a table"};
+                     "A text range cannot implicitly delete across a table or generated body block"};
     }
 
     auto& first = paragraphs_[normalized.start_paragraph_index];
@@ -1987,6 +2122,13 @@ Result<void> Document::deleteRange(
             joined_images.push_back(std::move(moved));
         }
     }
+    std::vector<FieldAtom> joined_fields;
+    for (const auto& field : first.fields_) if (field.utf16_offset < normalized.start.utf16_offset) joined_fields.push_back(field);
+    for (auto field : last.fields_) if (field.utf16_offset >= normalized.end.utf16_offset) {
+        field.utf16_offset = normalized.start.utf16_offset + field.utf16_offset - normalized.end.utf16_offset;
+        joined_fields.push_back(std::move(field));
+    }
+    first.fields_ = std::move(joined_fields);
     first.setContent(std::move(joined), std::move(joined_formats));
     first.setStyleOverrideMasks(std::move(joined_override_masks));
     if (first.text_.empty()) {
@@ -2029,6 +2171,7 @@ Result<void> Document::deleteRange(
                std::find(removed_ids.begin(), removed_ids.end(), block.id) !=
                    removed_ids.end();
     });
+    removeUnreferencedNotes();
     return {};
 }
 
@@ -2378,8 +2521,14 @@ Result<void> Document::splitParagraph(
         }
     }
 
+    std::vector<FieldAtom> left_fields, right_fields;
+    for (auto field : original.fields_) {
+        if (field.utf16_offset < position.utf16_offset) left_fields.push_back(field);
+        else { field.utf16_offset -= position.utf16_offset; right_fields.push_back(field); }
+    }
     original.setContent(std::move(left_text), std::move(left_formats));
     original.setStyleOverrideMasks(std::move(left_override_masks));
+    original.fields_ = std::move(left_fields);
     original.equations_ = std::move(left_equations);
     original.images_ = std::move(left_images);
     Paragraph right(new_paragraph_id, {}, inherited_mark_format,
@@ -2391,8 +2540,17 @@ Result<void> Document::splitParagraph(
     right.format_ = original_format;
     right.setContent(std::move(right_text), std::move(right_formats));
     right.setStyleOverrideMasks(std::move(right_override_masks));
+    right.fields_ = std::move(right_fields);
     right.equations_ = std::move(right_equations);
     right.images_ = std::move(right_images);
+    const bool moved_semantic_role = position.utf16_offset == 0 &&
+        (original.caption_.has_value() || original.bibliography_entry_);
+    if (moved_semantic_role) {
+        right.caption_ = std::move(original.caption_);
+        right.bibliography_entry_ = original.bibliography_entry_;
+        original.caption_.reset();
+        original.bibliography_entry_ = false;
+    }
     paragraphs_.insert(paragraphs_.begin() + static_cast<std::ptrdiff_t>(index + 1),
                        std::move(right));
     const auto body_index = bodyBlockIndex(position.paragraph_id);
@@ -2403,6 +2561,12 @@ Result<void> Document::splitParagraph(
     body_blocks_.insert(
         body_blocks_.begin() + static_cast<std::ptrdiff_t>(*body_index + 1),
         {BodyBlockKind::paragraph, new_paragraph_id});
+    if (moved_semantic_role) {
+        for (auto& paragraph : paragraphs_) {
+            for (auto& field : paragraph.fields_) if (field.kind != FieldKind::note_reference &&
+                field.target_id == position.paragraph_id) field.target_id = new_paragraph_id;
+        }
+    }
     return {};
 }
 
@@ -2427,6 +2591,13 @@ Result<void> Document::mergeWithNext(NodeId paragraph_id) {
     auto& first = paragraphs_[index];
     const auto& second = paragraphs_[index + 1];
     const auto second_id = second.id();
+    const bool retained_semantic_role = !first.caption_ && !first.bibliography_entry_ &&
+        (second.caption_.has_value() || second.bibliography_entry_);
+    if (retained_semantic_role) {
+        first.caption_ = second.caption_;
+        first.bibliography_entry_ = second.bibliography_entry_;
+    }
+    const auto second_fields = second.fields_;
     const auto second_equations = second.equations_;
     const auto second_images = second.images_;
     const auto first_text_size = first.text_.size();
@@ -2451,6 +2622,7 @@ Result<void> Document::mergeWithNext(NodeId paragraph_id) {
     }
     first.setContent(std::move(text), std::move(formats));
     first.setStyleOverrideMasks(std::move(override_masks));
+    for (auto field : second_fields) { field.utf16_offset += first_text_size; first.fields_.push_back(std::move(field)); }
     first.equations_.reserve(first.equations_.size() + second_equations.size());
     for (auto equation : second_equations) {
         equation.utf16_offset += first_text_size;
@@ -2462,6 +2634,12 @@ Result<void> Document::mergeWithNext(NodeId paragraph_id) {
         first.images_.push_back(std::move(image));
     }
     paragraphs_.erase(paragraphs_.begin() + static_cast<std::ptrdiff_t>(index + 1));
+    if (retained_semantic_role) {
+        for (auto& paragraph : paragraphs_) {
+            for (auto& field : paragraph.fields_) if (field.kind != FieldKind::note_reference &&
+                field.target_id == second_id) field.target_id = paragraph_id;
+        }
+    }
     const auto second_block = bodyBlockIndex(second_id);
     if (second_block) {
         body_blocks_.erase(
@@ -2486,6 +2664,16 @@ Result<void> Document::insertTable(std::optional<NodeId> before_block_id,
         }
     }
 
+    auto [image_count, image_bytes] = imageResources(*this);
+    for (const auto& cell : table.cells()) for (const auto& image : cell.images) {
+        if (!incoming_ids.insert(image.id).second || nodeIdInUse(image.id))
+            return Error{ErrorCode::duplicate_node_id, "Table picture NodeId already exists"};
+        if (++image_count > kMaximumInlineImagesPerDocument ||
+            image.encoded_payload.size() > kMaximumDocumentEncodedImageBytes - std::min(image_bytes, kMaximumDocumentEncodedImageBytes))
+            return Error{ErrorCode::invalid_operation, "Table pictures exceed document media limits"};
+        image_bytes += image.encoded_payload.size();
+    }
+
     std::size_t block_index = body_blocks_.size();
     if (before_block_id) {
         const auto found = bodyBlockIndex(*before_block_id);
@@ -2498,6 +2686,86 @@ Result<void> Document::insertTable(std::optional<NodeId> before_block_id,
         body_blocks_.begin() + static_cast<std::ptrdiff_t>(block_index),
         {BodyBlockKind::table, table.id()});
     tables_.push_back(std::move(table));
+    return {};
+}
+
+Result<void> Document::insertTableCellImage(
+    NodeId table_id, std::size_t row, std::size_t column, std::size_t offset,
+    EncodedImagePayload payload, ImageFormat image_format, std::string name,
+    std::int64_t width_emu, std::int64_t height_emu, NodeId image_id,
+    const std::optional<CharacterFormat>& character_format) {
+    const auto index = tableIndex(table_id);
+    if (!index) return tableMissing(table_id);
+    auto& table = tables_[*index];
+    if (row >= table.rowCount() || column >= table.columnCount())
+        return Error{ErrorCode::invalid_range, "Table picture cell coordinates are invalid"};
+    auto& cell = table.cells_[row * table.columnCount() + column];
+    if (!isUtf16Boundary(cell.text, offset))
+        return Error{ErrorCode::invalid_position, "Table picture offset is not a UTF-16 boundary"};
+    if (!image_id.isValid()) return Error{ErrorCode::invalid_node_id, "Image NodeId cannot be zero"};
+    if (nodeIdInUse(image_id)) return Error{ErrorCode::duplicate_node_id, "Image NodeId already exists"};
+    ImageAtom image{image_id, offset, std::move(payload), image_format, std::move(name), width_emu, height_emu, {}};
+    const auto metadata = validateImageMetadata(image);
+    if (!metadata) return metadata.error();
+    if (character_format) { const auto valid = character_format->validate(); if (!valid) return valid.error(); }
+    const auto [count, bytes] = imageResources(*this);
+    if (count >= kMaximumInlineImagesPerDocument || image.encoded_payload.size() > kMaximumDocumentEncodedImageBytes - std::min(bytes, kMaximumDocumentEncodedImageBytes))
+        return Error{ErrorCode::invalid_operation, "Document exceeds table picture media limits"};
+    const auto valid_payload = validateImagePayload(image);
+    if (!valid_payload) return valid_payload.error();
+    auto formats = denseCellFormats(cell);
+    formats.insert(formats.begin() + static_cast<std::ptrdiff_t>(offset), character_format.value_or(cell.characterFormatAt(offset)));
+    auto text = cell.text; text.insert(offset, 1, kInlineObjectReplacementCharacter);
+    for (auto& existing : cell.images) if (existing.utf16_offset >= offset) ++existing.utf16_offset;
+    cell.images.insert(std::lower_bound(cell.images.begin(), cell.images.end(), offset,
+        [](const auto& existing, std::size_t position) { return existing.utf16_offset < position; }), std::move(image));
+    setCellContent(cell, std::move(text), std::move(formats));
+    return {};
+}
+
+Result<void> Document::setTableGeometry(NodeId table_id, TableGeometry geometry) {
+    const auto index = tableIndex(table_id); if (!index) return tableMissing(table_id);
+    auto& table = tables_[*index];
+    const auto valid = geometry.validate(table.rowCount(), table.columnCount()); if (!valid) return valid.error();
+    table.geometry_ = std::move(geometry); return {};
+}
+Result<void> Document::setTableCellLayout(NodeId table_id, std::size_t row, std::size_t column, TableCellLayout layout) {
+    const auto index = tableIndex(table_id); if (!index) return tableMissing(table_id);
+    auto& table = tables_[*index];
+    if (row >= table.rowCount() || column >= table.columnCount()) return Error{ErrorCode::invalid_range, "Table cell layout coordinates are invalid"};
+    const auto valid = layout.validate(); if (!valid) return valid.error();
+    table.cells_[row * table.columnCount() + column].layout = std::move(layout); return {};
+}
+
+Result<void> Document::setTableCellContent(
+    NodeId table_id, std::size_t row, std::size_t column, TableCell content) {
+    const auto index = tableIndex(table_id);
+    if (!index) return tableMissing(table_id);
+    auto& table = tables_[*index];
+    if (row >= table.rowCount() || column >= table.columnCount())
+        return Error{ErrorCode::invalid_range, "Cell content destination is outside its table"};
+    const auto& existingCell = table.cells_[row * table.columnCount() + column];
+    if (content.id != existingCell.id)
+        return Error{ErrorCode::invalid_node_id, "Cell content replacement must retain its destination identity"};
+    const auto valid = validateTableCell(content);
+    if (!valid) return valid.error();
+    for (const auto& incoming : content.images) {
+        const bool retained = std::any_of(existingCell.images.begin(), existingCell.images.end(),
+            [&incoming](const auto& previous) { return previous.id == incoming.id; });
+        if (nodeIdInUse(incoming.id) && !retained)
+            return Error{ErrorCode::duplicate_node_id, "Cell picture identity already belongs to another node"};
+    }
+    auto [count, bytes] = imageResources(*this);
+    count -= existingCell.images.size();
+    for (const auto& previous : existingCell.images) bytes -= previous.encoded_payload.size();
+    if (content.images.size() > kMaximumInlineImagesPerDocument - count)
+        return Error{ErrorCode::invalid_operation, "Cell content exceeds the document image count limit"};
+    for (const auto& incoming : content.images) {
+        if (incoming.encoded_payload.size() > kMaximumDocumentEncodedImageBytes - std::min(bytes, kMaximumDocumentEncodedImageBytes))
+            return Error{ErrorCode::invalid_operation, "Cell content exceeds the document encoded image limit"};
+        bytes += incoming.encoded_payload.size();
+    }
+    table.cells_[row * table.columnCount() + column] = std::move(content);
     return {};
 }
 
@@ -2687,7 +2955,8 @@ Result<void> validateHeaderFooterText(const std::u16string& text) {
 
 Result<void> setStoryText(std::u16string text,
                           std::u16string& destination,
-                          std::vector<ImageAtom>& images) {
+                          std::vector<ImageAtom>& images,
+                          std::optional<StoryTextEditRange> replaced_range) {
     const auto validation = validateHeaderFooterText(text);
     if (!validation) return validation.error();
     std::vector<std::size_t> offsets;
@@ -2700,22 +2969,77 @@ Result<void> setStoryText(std::u16string text,
         return Error{ErrorCode::invalid_operation,
                      "Header or footer contains an orphan image placeholder"};
     }
-    images.resize(offsets.size());
-    for (std::size_t index = 0; index < offsets.size(); ++index) {
-        images[index].utf16_offset = offsets[index];
+    std::size_t prefix = 0;
+    std::size_t suffix = 0;
+    if (replaced_range) {
+        prefix = replaced_range->start;
+        if (prefix > destination.size() ||
+            replaced_range->length > destination.size() - prefix ||
+            !isUtf16Boundary(destination, prefix) ||
+            !isUtf16Boundary(destination, prefix + replaced_range->length)) {
+            return Error{ErrorCode::invalid_position,
+                         "Header or footer replacement range is invalid"};
+        }
+        suffix = destination.size() - prefix - replaced_range->length;
+        if (text.size() < prefix + suffix ||
+            text.compare(0, prefix, destination, 0, prefix) != 0 ||
+            text.compare(text.size() - suffix, suffix, destination,
+                         destination.size() - suffix, suffix) != 0) {
+            return Error{ErrorCode::invalid_operation,
+                         "Header or footer text does not match its replacement range"};
+        }
+        const auto inserted_object = text.find(kInlineObjectReplacementCharacter, prefix);
+        if (inserted_object != std::u16string::npos && inserted_object < text.size() - suffix) {
+            return Error{ErrorCode::invalid_operation,
+                         "Header or footer contains an orphan image placeholder"};
+        }
+    } else {
+        if (destination == text) return {};
+        const auto shared = std::min(destination.size(), text.size());
+        while (prefix < shared && destination[prefix] == text[prefix]) ++prefix;
+        while (suffix < shared && destination[destination.size() - suffix - 1] ==
+                                      text[text.size() - suffix - 1]) ++suffix;
+        // Retain only positions common to every equally short interpretation.
+        if (prefix + suffix > shared) {
+            const auto overlap = prefix + suffix - shared;
+            prefix -= overlap;
+            suffix -= overlap;
+        }
     }
+    std::vector<ImageAtom> retained;
+    for (const auto& image : images) {
+        if (image.utf16_offset < prefix) {
+            retained.push_back(image);
+        } else if (image.utf16_offset >= destination.size() - suffix) {
+            auto shifted = image;
+            shifted.utf16_offset = text.size() - suffix +
+                (image.utf16_offset - (destination.size() - suffix));
+            retained.push_back(std::move(shifted));
+        }
+    }
+    if (retained.size() != offsets.size() ||
+        !std::equal(retained.begin(), retained.end(), offsets.begin(),
+                    [](const ImageAtom& image, std::size_t offset) {
+                        return image.utf16_offset == offset;
+                    })) {
+        return Error{ErrorCode::invalid_operation,
+                     "Header or footer image edit is ambiguous; use an explicit image selection"};
+    }
+    images = std::move(retained);
     destination = std::move(text);
     return {};
 }
 
 }  // namespace
 
-Result<void> Document::setHeaderText(std::u16string text) {
-    return setStoryText(std::move(text), header_text_, header_images_);
+Result<void> Document::setHeaderText(
+    std::u16string text, std::optional<StoryTextEditRange> replaced_range) {
+    return setStoryText(std::move(text), header_text_, header_images_, replaced_range);
 }
 
-Result<void> Document::setFooterText(std::u16string text) {
-    return setStoryText(std::move(text), footer_text_, footer_images_);
+Result<void> Document::setFooterText(
+    std::u16string text, std::optional<StoryTextEditRange> replaced_range) {
+    return setStoryText(std::move(text), footer_text_, footer_images_, replaced_range);
 }
 
 Result<void> Document::insertHeaderFooterImage(
@@ -2750,19 +3074,7 @@ Result<void> Document::insertHeaderFooterImage(
     const auto payload_validation = validateImagePayload(image);
     if (!payload_validation) return payload_validation.error();
 
-    std::size_t image_count = header_images_.size() + footer_images_.size();
-    std::size_t encoded_image_bytes = 0;
-    for (const auto& paragraph : paragraphs_) {
-        image_count += paragraph.images().size();
-        for (const auto& existing : paragraph.images()) {
-            encoded_image_bytes += existing.encoded_payload.size();
-        }
-    }
-    for (const auto* story : {&header_images_, &footer_images_}) {
-        for (const auto& existing : *story) {
-            encoded_image_bytes += existing.encoded_payload.size();
-        }
-    }
+    const auto [image_count, encoded_image_bytes] = imageResources(*this);
     if (image_count >= kMaximumInlineImagesPerDocument) {
         return Error{ErrorCode::invalid_operation,
                      "Document exceeds the inline-image count limit"};

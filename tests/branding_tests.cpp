@@ -1,3 +1,5 @@
+#include <QMenu>
+#include <QAbstractButton>
 #include "docxstudio/app/MainWindow.h"
 #include "docxstudio/app/DocumentCanvas.h"
 #include "docxstudio/app/OwlDocsIcon.h"
@@ -35,6 +37,12 @@
 #include <set>
 
 namespace {
+QAbstractButton* paletteChoice(QMenu* menu,const QColor& color) {
+    if (!menu) return nullptr;
+    for (auto* button:menu->findChildren<QAbstractButton*>())
+        if (button->property("paletteColor").value<QColor>()==color) return button;
+    return nullptr;
+}
 
 void check(bool condition, const char* message) {
     if (!condition) {
@@ -114,7 +122,7 @@ int main(int argc, char** argv) {
     const QString root = QStringLiteral(OWL_DOCS_SOURCE_DIR);
     const QString desktop = readFile(
         root + QStringLiteral("/packaging/debian/owl-docs.desktop"));
-    check(desktop.contains(QStringLiteral("Name=Owl Docs\n")),
+    check(desktop.contains(QStringLiteral("Name=OwlDocs\n")),
           "desktop file has the wrong product name");
     check(desktop.contains(QStringLiteral("TryExec=owl-docs\n")) &&
               desktop.contains(QStringLiteral("Exec=owl-docs %F\n")) &&
@@ -127,7 +135,7 @@ int main(int argc, char** argv) {
     const QString mime = readFile(
         root + QStringLiteral("/packaging/debian/owl-docs.xml"));
     checkXml(mime, "Owl Docs MIME metadata is not valid XML");
-    check(mime.contains(QStringLiteral("Owl Docs")) &&
+    check(mime.contains(QStringLiteral("OwlDocs")) &&
               mime.contains(QStringLiteral("*.docx")),
           "MIME metadata is missing branding or the DOCX glob");
 
@@ -277,14 +285,14 @@ int main(int argc, char** argv) {
               "packaged icon lost the transparent owl silhouette");
         check(applicationIcon.availableSizes().contains(QSize(size, size)),
               "application icon does not advertise a packaged launcher size");
-        const QPixmap pixmap = applicationIcon.pixmap(size, size);
+        const QPixmap pixmap = applicationIcon.pixmap(QSize(size, size), 1.0);
         check(!pixmap.isNull() && pixmap.size() == QSize(size, size),
               "application icon is missing an exact launcher size");
     }
 
     for (const int smallSize : {16, 24, 32}) {
         const QImage smallIcon =
-            applicationIcon.pixmap(smallSize, smallSize).toImage()
+            applicationIcon.pixmap(QSize(smallSize, smallSize), 1.0).toImage()
                 .convertToFormat(QImage::Format_ARGB32);
         int transparentPixels = 0;
         int visiblePixels = 0;
@@ -332,7 +340,7 @@ int main(int argc, char** argv) {
               "small icon lost transparency, composition, detail, or contrast");
     }
     const QPixmap renderedIcon =
-        applicationIcon.pixmap(512, 512);
+        applicationIcon.pixmap(QSize(512, 512), 1.0);
     check(!renderedIcon.isNull() && renderedIcon.size() == QSize(512, 512),
           "Owl Docs application icon cannot be rendered at 512 px");
     const QString renderPath = qEnvironmentVariable("OWL_DOCS_ICON_RENDER_PATH");
@@ -341,7 +349,7 @@ int main(int argc, char** argv) {
     }
 
     docxstudio::app::MainWindow window;
-    check(window.windowTitle().endsWith(QStringLiteral("Owl Docs")),
+    check(window.windowTitle().endsWith(QStringLiteral("OwlDocs")),
           "main window retains the old product title");
     check(!window.windowIcon().isNull(),
           "main window does not expose the geometric Owl Docs icon");
@@ -519,8 +527,9 @@ int main(int argc, char** argv) {
 
     auto* bulletButton = window.findChild<QToolButton*>(
         QStringLiteral("ribbonButton.paragraph.bullets"));
-    check(bulletButton && bulletButton->focusPolicy() == Qt::NoFocus,
-          "Bullets is missing or can steal document focus");
+    check(bulletButton && (bulletButton->focusPolicy() & Qt::ClickFocus) == 0 &&
+              (bulletButton->focusPolicy() & Qt::TabFocus) != 0,
+          "Bullets must retain mouse typing focus and remain reachable with Tab");
     canvas->selectAll();
     canvas->insertText({});
     sizeEditor->setFocus();
@@ -575,17 +584,16 @@ int main(int argc, char** argv) {
           "committing a font size did not apply it and return focus to the page");
 
     canvas->selectAll();
-    auto* yellowHighlight = window.findChild<QAction*>(
-        QStringLiteral("ribbonColor.highlight.0"));
-    auto* redText = window.findChild<QAction*>(
-        QStringLiteral("ribbonColor.text.16"));
-    auto* noHighlight = window.findChild<QAction*>(
-        QStringLiteral("ribbonColor.highlight.none"));
+    auto* textMenu=window.findChild<QMenu*>(QStringLiteral("ribbonMenu.textColor"));
+    auto* highlightMenu=window.findChild<QMenu*>(QStringLiteral("ribbonMenu.highlightColor"));
+    auto* yellowHighlight=paletteChoice(highlightMenu,QColor(QStringLiteral("#fff200")));
+    auto* redText=paletteChoice(textMenu,QColor(QStringLiteral("#994a55")));
+    auto* noHighlight=highlightMenu ? highlightMenu->findChild<QAbstractButton*>(QStringLiteral("palette.default")) : nullptr;
     check(yellowHighlight && redText && noHighlight,
           "window color palettes are missing expected immediate actions");
-    yellowHighlight->trigger();
-    redText->trigger();
-    noHighlight->trigger();
+    yellowHighlight->click();
+    redText->click();
+    noHighlight->click();
     QApplication::processEvents();
     const auto recolored = canvas->snapshot().document.paragraphs().front()
                                .characterFormatAt(1);
@@ -593,10 +601,9 @@ int main(int argc, char** argv) {
               recolored.foreground_argb == 0xff994a55U,
           "No Highlight failed or also removed the selected font color");
 
-    auto* moreTextColors = window.findChild<QAction*>(
-        QStringLiteral("ribbonColor.text.more"));
+    auto* moreTextColors = textMenu->findChild<QAbstractButton*>(QStringLiteral("palette.custom"));
     check(moreTextColors, "text palette has no More Colors action");
-    moreTextColors->trigger();
+    moreTextColors->click();
     QApplication::processEvents();
     auto* livePicker = window.findChild<QColorDialog*>(
         QStringLiteral("textColorPicker"));
@@ -613,7 +620,7 @@ int main(int argc, char** argv) {
     livePicker->close();
     QApplication::processEvents();
 
-    moreTextColors->trigger();
+    moreTextColors->click();
     QApplication::processEvents();
     check(window.findChild<QColorDialog*>(QStringLiteral("textColorPicker")),
           "could not reopen the modeless color picker");
@@ -633,8 +640,9 @@ int main(int argc, char** argv) {
           "a new tab inherited color state from another document's picker");
 
     const QPixmap renderedWindow = window.grab();
-    check(!renderedWindow.isNull() && renderedWindow.width() == 1280 &&
-              renderedWindow.height() == 860,
+    check(!renderedWindow.isNull() &&
+              renderedWindow.width() == qRound(1280 * renderedWindow.devicePixelRatio()) &&
+              renderedWindow.height() == qRound(860 * renderedWindow.devicePixelRatio()),
           "Owl Docs main window could not be rendered offscreen");
     const QString windowRenderPath =
         qEnvironmentVariable("OWL_DOCS_UI_RENDER_PATH");
@@ -647,10 +655,10 @@ int main(int argc, char** argv) {
     auto* closingWindow = new docxstudio::app::MainWindow;
     closingWindow->show();
     QApplication::processEvents();
-    auto* closingPickerAction = closingWindow->findChild<QAction*>(
-        QStringLiteral("ribbonColor.text.more"));
+    auto* closingMenu=closingWindow->findChild<QMenu*>(QStringLiteral("ribbonMenu.textColor"));
+    auto* closingPickerAction=closingMenu ? closingMenu->findChild<QAbstractButton*>(QStringLiteral("palette.custom")) : nullptr;
     check(closingPickerAction, "closing-window color action is missing");
-    closingPickerAction->trigger();
+    closingPickerAction->click();
     QApplication::processEvents();
     auto* closingPicker = closingWindow->findChild<QColorDialog*>(
         QStringLiteral("textColorPicker"));

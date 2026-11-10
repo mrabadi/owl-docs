@@ -47,3 +47,11 @@ and verifies identical uncompressed bytes for every other package member.
 This closes the initial 100-document preservation gate. It does not claim
 layout fidelity, editable support for every feature in those files, coverage
 of every document producer, or Microsoft Word parity.
+
+The 0.6.0 clean strict Release validation on 2026-11-09 repeated this gate:
+100 fixtures opened, 100 byte-identical untouched copies, zero failures. The
+registered `public_docx_corpus` test passed in the complete 49-test release run.
+
+The final 0.6.1 clean strict Release on 2026-11-09 repeated the same pinned
+preservation gate: 100 opened, 100 byte-identical unchanged copies, zero
+failures. It passed within the final complete 59-test run.

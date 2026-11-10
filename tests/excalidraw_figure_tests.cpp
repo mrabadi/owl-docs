@@ -16,6 +16,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QKeyEvent>
+#include <QPointer>
 #include <QTemporaryDir>
 
 #include <cstdlib>
@@ -56,6 +57,26 @@ QByteArray atomBytes(const docxstudio::core::ImageAtom& image) {
         static_cast<qsizetype>(payload.size()));
 }
 
+QByteArray supportedScene(int count = 1, int labelLength = 12) {
+    QJsonArray elements;
+    for (int index = 0; index < count; ++index) {
+        const QString id = QStringLiteral("shape-%1").arg(index);
+        const QString labelId = QStringLiteral("label-%1").arg(index);
+        elements.append(QJsonObject{{"id", id}, {"type", "rectangle"}, {"x", index * 120}, {"y", 20},
+            {"width", 100}, {"height", 60}, {"roughness", 0}, {"fillStyle", "solid"},
+            {"strokeColor", "#222624"}, {"backgroundColor", "#ffffff"}, {"strokeWidth", 2},
+            {"opacity", 100}, {"angle", 0}, {"groupIds", QJsonArray{}},
+            {"boundElements", QJsonArray{QJsonObject{{"id", labelId}, {"type", "text"}}}}});
+        elements.append(QJsonObject{{"id", labelId}, {"type", "text"}, {"containerId", id}, {"x", index * 120 + 10},
+            {"y", 30}, {"width", 80}, {"height", 20}, {"text", "Visible wrap"},
+            {"originalText", QString(labelLength, QLatin1Char('x'))}, {"fontFamily", 2}, {"fontSize", 20},
+            {"textAlign", "center"}, {"verticalAlign", "middle"}, {"autoResize", true}, {"lineHeight", 1.15},
+            {"roughness", 1}, {"fillStyle", "hachure"}, {"strokeWidth", 1}, {"strokeColor", "#222624"}, {"opacity", 100}});
+    }
+    return QJsonDocument(QJsonObject{{"type", "excalidraw"}, {"version", 2}, {"elements", elements},
+        {"appState", QJsonObject{}}, {"files", QJsonObject{}}}).toJson(QJsonDocument::Compact);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -91,6 +112,270 @@ int main(int argc, char** argv) {
     check(docxstudio::app::pngWithExcalidrawScene(
               png(Qt::black, 4, 4), QByteArrayLiteral("{}"), error).isEmpty(),
           "invalid figure scene was accepted");
+
+    // The renderer is a process boundary. Exercise the actual tool dispatcher
+    // with an inert result so normalization and transaction tests stay local.
+    {
+        docxstudio::app::SpellChecker toolSpelling;
+        docxstudio::app::DocumentCanvas toolCanvas(toolSpelling);
+        const auto before = toolCanvas.snapshot();
+        docxstudio::codex::Json normalized;
+        int renderCalls = 0;
+        const docxstudio::app::ExcalidrawRenderer renderer =
+            [&](const QJsonArray& skeleton, QString& renderError)
+                -> std::optional<docxstudio::app::ExcalidrawFigureEditor::Result> {
+                ++renderCalls;
+                normalized = docxstudio::codex::Json::parse(
+                    QJsonDocument(skeleton).toJson(QJsonDocument::Compact).toStdString());
+                renderError.clear();
+                return docxstudio::app::ExcalidrawFigureEditor::Result{first, sceneOne};
+            };
+        const docxstudio::codex::Json arrow{
+            {"id", "process-arrow"}, {"type", "arrow"}, {"x", 0}, {"y", 0},
+            {"points", {{0, 0}, {120, 0}}},
+            {"label", {{"text", "Continue"}, {"fontSize", 18}}}};
+        const docxstudio::codex::Json operation{
+            {"kind", "insert_excalidraw_figure"},
+            {"target", {{"blockId", before.document.paragraphs().front().id().toString()}, {"start", 0}}},
+            {"figure", {{"accessibleName", "Process arrow"},
+                {"elements", docxstudio::codex::Json::array({arrow})}}}};
+        const docxstudio::codex::Json request{
+            {"documentId", "document:figure-normalization"},
+            {"baseRevision", before.revision.value()},
+            {"summary", "A labeled process arrow"},
+            {"operations", docxstudio::codex::Json::array({operation})}};
+        QString summary;
+        error.clear();
+        const auto result = docxstudio::app::invokeEditorTool(
+            toolCanvas, QStringLiteral("document:figure-normalization"),
+            QString::fromLatin1(docxstudio::codex::kEditorPreviewTool.data()),
+            request, summary, error, renderer);
+        check(error.isEmpty() && !result.empty() && renderCalls == 1 &&
+                  normalized.at(0).contains("label") &&
+                  normalized.at(0).at("label").at("text") == "Continue" &&
+                  normalized.at(0).at("label").at("fontSize") == 18,
+              "Codex discarded the advertised arrow label before rendering");
+        check(toolCanvas.snapshot().revision == before.revision && toolCanvas.hasPreview(),
+              "figure generation mutated the document before acceptance");
+        toolCanvas.discardPreview();
+        auto invalidLine = request;
+        invalidLine["operations"][0]["figure"]["elements"][0]["type"] = "line";
+        const auto rejectedLine = docxstudio::app::invokeEditorTool(
+            toolCanvas, QStringLiteral("document:figure-normalization"),
+            QString::fromLatin1(docxstudio::codex::kEditorPreviewTool.data()),
+            invalidLine, summary, error, renderer);
+        check(rejectedLine.empty() && error.contains(QStringLiteral("line")) &&
+                  renderCalls == 1 && !toolCanvas.hasPreview(),
+              "unsupported line label was silently discarded instead of rejected before rendering");
+        auto missingFigure = request;
+        missingFigure["operations"][0]["kind"] = "replace_excalidraw_figure";
+        missingFigure["operations"][0].erase("target");
+        missingFigure["operations"][0]["imageId"] = docxstudio::core::NodeId::generate().toString();
+        const auto rejectedFigure = docxstudio::app::invokeEditorTool(
+            toolCanvas, QStringLiteral("document:figure-normalization"),
+            QString::fromLatin1(docxstudio::codex::kEditorPreviewTool.data()),
+            missingFigure, summary, error, renderer);
+        check(rejectedFigure.empty() && error.contains(QStringLiteral("no longer exists")) &&
+                  renderCalls == 1 && !toolCanvas.hasPreview() &&
+                  toolCanvas.snapshot().document == before.document,
+              "missing figure target was rendered before its identity was validated");
+        QPointer<docxstudio::app::DocumentCanvas> closingCanvas =
+            new docxstudio::app::DocumentCanvas(toolSpelling);
+        auto closingRequest = request;
+        closingRequest["operations"][0]["target"]["blockId"] =
+            closingCanvas->snapshot().document.paragraphs().front().id().toString();
+        const auto closedResult = docxstudio::app::invokeEditorTool(
+            *closingCanvas, QStringLiteral("document:figure-normalization"),
+            QString::fromLatin1(docxstudio::codex::kEditorPreviewTool.data()),
+            closingRequest, summary, error,
+            [&](const QJsonArray&, QString& renderError)
+                -> std::optional<docxstudio::app::ExcalidrawFigureEditor::Result> {
+                delete closingCanvas.data();
+                renderError.clear();
+                return docxstudio::app::ExcalidrawFigureEditor::Result{first, sceneOne};
+            });
+        check(!closingCanvas && closedResult.empty() &&
+                  error.contains(QStringLiteral("closed")),
+              "closing the document during figure rendering did not cancel its preview safely");
+        bool sessionCurrent = true;
+        const auto canceledResult = docxstudio::app::invokeEditorTool(
+            toolCanvas, QStringLiteral("document:figure-normalization"),
+            QString::fromLatin1(docxstudio::codex::kEditorPreviewTool.data()),
+            request, summary, error,
+            [&](const QJsonArray&, QString& renderError)
+                -> std::optional<docxstudio::app::ExcalidrawFigureEditor::Result> {
+                sessionCurrent = false;
+                renderError.clear();
+                return docxstudio::app::ExcalidrawFigureEditor::Result{first, sceneOne};
+            }, [&] { return sessionCurrent; });
+        check(canceledResult.empty() && error.contains(QStringLiteral("cancel"), Qt::CaseInsensitive) &&
+                  !toolCanvas.hasPreview() && toolCanvas.snapshot().document == before.document,
+              "a disconnected Codex session created a late figure preview");
+    }
+
+    {
+        docxstudio::app::SpellChecker placementSpelling;
+        docxstudio::app::DocumentCanvas placement(placementSpelling);
+        check(placement.insertTable(1, 1, false), "could not create figure-placement table");
+        const auto before = placement.snapshot();
+        const auto tableId = before.document.tables().front().id();
+        const auto cellId = before.document.findTable(tableId)->cell(0, 0)->id;
+        const auto imageId = docxstudio::core::NodeId::generate();
+        const docxstudio::codex::Json figure{
+            {"accessibleName", "A native table figure"}, {"widthPoints", 72}, {"heightPoints", 36},
+            {"elements", {{{"id", "box"}, {"type", "rectangle"}, {"x", 0}, {"y", 0}, {"width", 80}, {"height", 40}}}}};
+        docxstudio::codex::Json request{
+            {"documentId", "document:figure-placement"}, {"baseRevision", before.revision.value()},
+            {"summary", "Create a figure in the cell"},
+            {"operations", {{{"kind", "insert_excalidraw_figure"}, {"imageId", imageId.toString()},
+                {"target", {{"blockId", cellId.toString()}, {"start", 0}}}, {"figure", figure}}}}};
+        int renders = 0;
+        const docxstudio::app::ExcalidrawRenderer renderer =
+            [&](const QJsonArray&, QString& renderError)
+                -> std::optional<docxstudio::app::ExcalidrawFigureEditor::Result> {
+                ++renders;
+                renderError.clear();
+                return docxstudio::app::ExcalidrawFigureEditor::Result{first, sceneOne};
+            };
+        QString summary;
+        auto result = docxstudio::app::invokeEditorTool(placement,
+            QStringLiteral("document:figure-placement"),
+            QString::fromLatin1(docxstudio::codex::kEditorPreviewTool.data()), request, summary, error, renderer);
+        check(error.isEmpty() && !result.empty() && placement.hasPreview() &&
+                  placement.snapshot().document == before.document,
+              "Codex cannot create an editable figure inside a table cell");
+        placement.discardPreview();
+        check(placement.snapshot().document == before.document, "discard changed the figure's table cell");
+        result = docxstudio::app::invokeEditorTool(placement,
+            QStringLiteral("document:figure-placement"),
+            QString::fromLatin1(docxstudio::codex::kEditorPreviewTool.data()), request, summary, error, renderer);
+        check(!result.empty() && placement.acceptPreview(error), "could not accept a table figure");
+        check(placement.snapshot().document.findTable(tableId)->cell(0, 0)->images.front().id == imageId,
+              "figure insertion ignored its declared stable image identity");
+        placement.undo();
+        check(placement.snapshot().document == before.document, "table figure insertion was not one Undo");
+
+        for (const bool footer : {false, true}) {
+            docxstudio::app::DocumentCanvas story(placementSpelling);
+            auto source = story.snapshot().document;
+            check(bool(footer ? source.setFooterText(u"A\tB\tC") : source.setHeaderText(u"A\tB\tC")),
+                  "could not create story figure fixture");
+            story.setDocument(source);
+            const auto storyBefore = story.snapshot();
+            const auto storyImageId = docxstudio::core::NodeId::generate();
+            request["baseRevision"] = storyBefore.revision.value();
+            request["operations"][0]["imageId"] = storyImageId.toString();
+            request["operations"][0]["target"] = {{"story", footer ? "footer" : "header"}, {"start", 2}};
+            result = docxstudio::app::invokeEditorTool(story,
+                QStringLiteral("document:figure-placement"),
+                QString::fromLatin1(docxstudio::codex::kEditorPreviewTool.data()), request, summary, error, renderer);
+            check(error.isEmpty() && !result.empty() && story.snapshot().document == source && story.acceptPreview(error),
+                  "Codex cannot create a native figure in the header/footer story");
+            check(story.snapshot().document.findImage(storyImageId) &&
+                      (footer ? story.snapshot().document.footerImages() : story.snapshot().document.headerImages()).front().utf16_offset == 2,
+                  "story figure lost its identity or chosen UTF-16 position");
+            story.undo();
+            check(story.snapshot().document == source, "story figure insertion was not one Undo");
+            request["baseRevision"] = story.snapshot().revision.value();
+            request["operations"][0]["target"]["start"] = 200;
+            const int previousRenders = renders;
+            result = docxstudio::app::invokeEditorTool(story,
+                QStringLiteral("document:figure-placement"),
+                QString::fromLatin1(docxstudio::codex::kEditorPreviewTool.data()), request, summary, error, renderer);
+            check(result.empty() && !error.isEmpty() && renders == previousRenders && story.snapshot().document == source,
+                  "invalid story figure anchor reached the renderer or changed its story");
+        }
+    }
+
+    {
+        docxstudio::app::SpellChecker readSpelling;
+        docxstudio::app::DocumentCanvas readable(readSpelling);
+        const auto scene = supportedScene();
+        const auto embedded = docxstudio::app::pngWithExcalidrawScene(png(Qt::white, 100, 60), scene, error);
+        check(readable.insertInlineImage(bytes(embedded), QStringLiteral("Readable figure")), "could not insert readable scene");
+        const auto imageId = readable.snapshot().document.paragraphs().front().images().front().id;
+        QString summary;
+        auto read = docxstudio::app::invokeEditorTool(readable, QStringLiteral("document:figure-read"),
+            QString::fromLatin1(docxstudio::codex::kEditorReadTool.data()),
+            {{"documentId", "document:figure-read"}, {"scope", "images"}, {"imageIds", {imageId.toString()}}}, summary, error);
+        check(error.isEmpty() && !read.empty() && read.at("blocks").size() == 1, "targeted figure read failed");
+        const auto attributes = read.at("blocks").front().at("attributes");
+        check(attributes.value("editableElementsComplete", false) && attributes.at("editableElements").size() == 1 &&
+                  attributes.at("editableElements").front().at("label").at("id") == "label-0" &&
+                  attributes.at("editableElements").front().at("label").at("text") == std::string(12, 'x'),
+              "figure read loses bound-label identity/source text or hides skeleton completeness");
+        check(attributes.contains("nativeScene") && !attributes.value("nativeSceneTruncated", true) &&
+                  attributes.at("nativeScene").at("elements").size() == 2,
+              "targeted figure read does not expose bounded native source for safe edits");
+        bool retainedLabelId = false;
+        bool retainedBinding = false;
+        auto editable = attributes.at("editableElements");
+        editable.push_back({{"id", "connected-arrow"}, {"type", "arrow"}, {"x", 100}, {"y", 50},
+            {"points", {{0, 0}, {80, 0}}}, {"start", {{"id", "shape-0"}}}});
+        const auto normalizedRead = docxstudio::app::invokeEditorTool(readable, QStringLiteral("document:figure-read"),
+            QString::fromLatin1(docxstudio::codex::kEditorPreviewTool.data()),
+            {{"documentId", "document:figure-read"}, {"baseRevision", readable.snapshot().revision.value()},
+             {"summary", "Copy the supported editable skeleton"},
+             {"operations", {{{"kind", "insert_excalidraw_figure"},
+                 {"target", {{"blockId", readable.snapshot().document.paragraphs().front().id().toString()}, {"start", 1}}},
+                 {"figure", {{"elements", editable}}}}}}}, summary, error,
+            [&](const QJsonArray& skeleton, QString& renderError)
+                -> std::optional<docxstudio::app::ExcalidrawFigureEditor::Result> {
+                retainedLabelId = skeleton.at(0).toObject().value("label").toObject().value("id") == "label-0";
+                retainedBinding = skeleton.at(1).toObject().value("start").toObject().value("id") == "shape-0";
+                renderError.clear(); return docxstudio::app::ExcalidrawFigureEditor::Result{embedded, scene};
+            });
+        check(!normalizedRead.empty() && retainedLabelId && retainedBinding,
+              "read-to-edit normalization discarded bound-label or connector identity");
+        readable.discardPreview();
+
+        // Multiple moderately sized sources share a single context budget.
+        auto largeDocument = readable.snapshot().document;
+        const auto paragraphId = largeDocument.paragraphs().front().id();
+        const auto largeScene = supportedScene(50, 2000);
+        const auto largePng = docxstudio::app::pngWithExcalidrawScene(png(Qt::white, 100, 60), largeScene, error);
+        for (std::size_t index = 1; index < 5; ++index)
+            check(bool(largeDocument.insertImage({paragraphId, index}, docxstudio::core::EncodedImagePayload(bytes(largePng)),
+                docxstudio::core::ImageFormat::png, "Large figure", 914400, 548640)), "could not insert context-budget scene");
+        readable.setDocument(largeDocument);
+        read = docxstudio::app::invokeEditorTool(readable, QStringLiteral("document:figure-read"),
+            QString::fromLatin1(docxstudio::codex::kEditorReadTool.data()),
+            {{"documentId", "document:figure-read"}, {"scope", "images"}}, summary, error);
+        std::size_t contextBytes = 0;
+        bool explicitlyTruncated = false;
+        for (const auto& block : read.at("blocks")) {
+            const auto& image = block.at("attributes");
+            contextBytes += image.at("editableElements").dump().size();
+            explicitlyTruncated = explicitlyTruncated || image.value("editableElementsTruncated", false);
+            check(!image.contains("nativeScene"), "untargeted figure read duplicates whole native scenes");
+        }
+        check(error.isEmpty() && contextBytes <= 256U * 1024U && explicitlyTruncated,
+              "figure context is unbounded across multiple pictures or truncation is hidden");
+
+        QJsonArray unknownElements;
+        for (int index = 0; index < 128; ++index) unknownElements.append(QJsonObject{
+            {"id", QStringLiteral("unknown-%1-").arg(index) + QString(230, QLatin1Char('q'))}, {"type", "freedraw"}});
+        const auto unknownScene = QJsonDocument(QJsonObject{{"elements", unknownElements}}).toJson(QJsonDocument::Compact);
+        const auto unknownPng = docxstudio::app::pngWithExcalidrawScene(png(Qt::white, 2, 2), unknownScene, error);
+        docxstudio::core::Document unknownDocument;
+        const auto unknownParagraph = unknownDocument.paragraphs().front().id();
+        for (std::size_t index = 0; index < 8; ++index)
+            check(bool(unknownDocument.insertImage({unknownParagraph, index}, docxstudio::core::EncodedImagePayload(bytes(unknownPng)),
+                docxstudio::core::ImageFormat::png, "Unsupported scene", 914400, 914400)), "could not insert unsupported context fixture");
+        readable.setDocument(unknownDocument);
+        read = docxstudio::app::invokeEditorTool(readable, QStringLiteral("document:figure-read"),
+            QString::fromLatin1(docxstudio::codex::kEditorReadTool.data()),
+            {{"documentId", "document:figure-read"}, {"scope", "images"}}, summary, error);
+        contextBytes = 0;
+        bool reasonsTruncated = false;
+        for (const auto& block : read.at("blocks")) {
+            const auto& image = block.at("attributes");
+            contextBytes += image.at("editableElements").dump().size() + image.at("editableElementsUnsupported").dump().size();
+            reasonsTruncated = reasonsTruncated || image.value("editableElementsUnsupportedTruncated", false);
+        }
+        check(error.isEmpty() && contextBytes <= 256U * 1024U && reasonsTruncated,
+              "unsupported figure reasons bypass the shared read context budget");
+    }
 
     const auto boundedDisplay =
         docxstudio::app::fitExcalidrawFigureDisplaySize(
@@ -205,8 +490,9 @@ int main(int argc, char** argv) {
               "Codex Excalidraw operation did not create a review preview");
         check(bridgeCanvas.acceptPreview(error),
               "Codex Excalidraw preview could not be accepted");
+        const auto bridgeSnapshot = bridgeCanvas.snapshot();
         const auto& bridgeImages =
-            bridgeCanvas.snapshot().document.paragraphs().front().images();
+            bridgeSnapshot.document.paragraphs().front().images();
         check(bridgeImages.size() == 1 &&
                   docxstudio::app::excalidrawSceneFromPng(
                       atomBytes(bridgeImages.front()))

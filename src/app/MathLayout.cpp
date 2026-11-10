@@ -37,7 +37,7 @@ qreal basePixelSize(const QFont& font) {
 QFont mathFont(const QFont& base, qreal pixels, bool italic = false) {
     QFont font(base);
     font.setPixelSize(std::max(1, static_cast<int>(std::lround(pixels))));
-    font.setItalic(italic);
+    font.setItalic(italic || base.italic());
     return font;
 }
 
@@ -108,6 +108,47 @@ Box textBox(const QFont& base, qreal size, const QString& text,
 
 Box measureNode(const math::MathNodePtr& node, const QFont& base, qreal size);
 
+// Font commands apply to the complete expression, including nested scripts.
+// Converting identifiers to literal text keeps upright math independent of
+// the default italic identifier treatment without modifying the stored AST.
+math::MathNodePtr uprightNode(const math::MathNodePtr& node) {
+    if (!node) return node;
+    return std::visit([&](const auto& original) -> math::MathNodePtr {
+        using T = std::decay_t<decltype(original)>;
+        auto value = original;
+        if constexpr (std::is_same_v<T, math::Identifier>) {
+            return std::make_shared<const math::MathNode>(math::Text{mappedToken(value.text).toStdString()});
+        } else if constexpr (std::is_same_v<T, math::Row>) {
+            for (auto& child : value.children) child = uprightNode(child);
+        } else if constexpr (std::is_same_v<T, math::Group> || std::is_same_v<T, math::Accent>) {
+            value.body = uprightNode(value.body);
+        } else if constexpr (std::is_same_v<T, math::Fraction>) {
+            value.numerator = uprightNode(value.numerator);
+            value.denominator = uprightNode(value.denominator);
+        } else if constexpr (std::is_same_v<T, math::Radical>) {
+            value.radicand = uprightNode(value.radicand);
+            if (value.index) value.index = uprightNode(*value.index);
+        } else if constexpr (std::is_same_v<T, math::Script>) {
+            value.base = uprightNode(value.base);
+            if (value.subscript) value.subscript = uprightNode(*value.subscript);
+            if (value.superscript) value.superscript = uprightNode(*value.superscript);
+        } else if constexpr (std::is_same_v<T, math::Delimited>) {
+            value.body = uprightNode(value.body);
+        } else if constexpr (std::is_same_v<T, math::Matrix>) {
+            for (auto& row : value.rows) for (auto& cell : row) cell = uprightNode(cell);
+        }
+        return std::make_shared<const math::MathNode>(std::move(value));
+    }, node->value);
+}
+
+std::pair<math::MathNodePtr, QFont> styledBody(const math::Styled& value, const QFont& base) {
+    QFont font(base);
+    font.setBold(value.command == "mathbf");
+    const bool italic = value.command == "mathit";
+    font.setItalic(italic);
+    return {italic ? value.body : uprightNode(value.body), font};
+}
+
 Box measureRow(const math::Row& row, const QFont& base, qreal size) {
     Box result;
     const qreal gap = size * 0.07;
@@ -135,6 +176,8 @@ std::pair<QString, QString> matrixDelimiters(
     using Environment = math::MatrixEnvironment;
     switch (environment) {
         case Environment::matrix: return {};
+        case Environment::aligned: return {};
+        case Environment::cases: return {QStringLiteral("{"), QString()};
         case Environment::pmatrix:
             return {QStringLiteral("("), QStringLiteral(")")};
         case Environment::bmatrix:
@@ -199,6 +242,25 @@ Box measureNode(const math::MathNodePtr& node, const QFont& base, qreal size) {
             [&](const math::Operator& value) {
                 return textBox(base, size, mappedToken(value.text));
             },
+            [&](const math::Text& value) {
+                return textBox(base, size, utf8(value.text));
+            },
+            [&](const math::Styled& value) {
+                const auto [body, font] = styledBody(value, base);
+                return measureNode(body, font, size);
+            },
+            [&](const math::Accent& value) {
+                auto body = measureNode(value.body, base, size);
+                if (value.command == "underline") body.descent += size * 0.18;
+                else body.ascent += size * 0.25;
+                return body;
+            },
+            [&](const math::Spacing& value) {
+                const qreal em = value.command == "qquad" ? 2.0 : value.command == "quad" ? 1.0 :
+                    value.command == "!" ? -0.1667 : value.command == "," ? 0.1667 :
+                    value.command == ":" ? 0.2222 : value.command == ";" ? 0.2778 : 0.3333;
+                return Box{size * em, 0, 0};
+            },
             [&](const math::Fraction& value) {
                 const qreal childSize = size * 0.76;
                 const Box numerator =
@@ -253,7 +315,7 @@ Box measureNode(const math::MathNodePtr& node, const QFont& base, qreal size) {
                     base, size * 1.38,
                     value.kind == math::LargeOperatorKind::sum
                         ? QStringLiteral("∑")
-                        : QStringLiteral("∫"));
+                        : value.kind == math::LargeOperatorKind::product ? QStringLiteral("∏") : QStringLiteral("∫"));
             },
             [&](const math::Delimited& value) {
                 const Box body = measureNode(value.body, base, size);
@@ -338,7 +400,9 @@ void drawMatrix(QPainter& painter, const math::Matrix& matrix,
                     measureNode(matrix.rows[row][column], base, cellSize);
                 drawNode(
                     painter, matrix.rows[row][column], base, cellSize,
-                    QPointF(cellX + (widths[column] - box.width) / 2,
+                    QPointF(cellX + (matrix.environment == math::MatrixEnvironment::cases ? 0.0 :
+                        matrix.environment == math::MatrixEnvironment::aligned ? (column == 0 ? widths[column] - box.width : 0.0) :
+                        (widths[column] - box.width) / 2),
                             rowBaseline),
                     color);
             }
@@ -390,6 +454,31 @@ void drawNode(QPainter& painter, const math::MathNodePtr& node,
                 drawText(painter, base, size, baseline,
                          mappedToken(value.text), color);
             },
+            [&](const math::Text& value) {
+                drawText(painter, base, size, baseline, utf8(value.text), color);
+            },
+            [&](const math::Styled& value) {
+                const auto [body, font] = styledBody(value, base);
+                drawNode(painter, body, font, size, baseline, color);
+            },
+            [&](const math::Accent& value) {
+                const auto body = measureNode(value.body, base, size);
+                drawNode(painter, value.body, base, size, baseline, color);
+                const qreal y = value.command == "underline" ? baseline.y() + body.descent + size * 0.10
+                    : baseline.y() - body.ascent - size * 0.10;
+                painter.setPen(QPen(color, std::max<qreal>(0.8, size * 0.05)));
+                if (value.command == "hat") {
+                    painter.drawLine(QPointF(baseline.x(), y), QPointF(baseline.x() + body.width / 2, y - size * 0.15));
+                    painter.drawLine(QPointF(baseline.x() + body.width / 2, y - size * 0.15), QPointF(baseline.x() + body.width, y));
+                } else {
+                    painter.drawLine(QPointF(baseline.x(), y), QPointF(baseline.x() + body.width, y));
+                    if (value.command == "vec") {
+                        painter.drawLine(QPointF(baseline.x() + body.width - size * 0.15, y - size * 0.10), QPointF(baseline.x() + body.width, y));
+                        painter.drawLine(QPointF(baseline.x() + body.width - size * 0.15, y + size * 0.10), QPointF(baseline.x() + body.width, y));
+                    }
+                }
+            },
+            [&](const math::Spacing&) {},
             [&](const math::Fraction& value) {
                 const qreal childSize = size * 0.76;
                 const Box numerator =
@@ -474,7 +563,7 @@ void drawNode(QPainter& painter, const math::MathNodePtr& node,
                 drawText(painter, base, size * 1.38, baseline,
                          value.kind == math::LargeOperatorKind::sum
                              ? QStringLiteral("∑")
-                             : QStringLiteral("∫"),
+                             : value.kind == math::LargeOperatorKind::product ? QStringLiteral("∏") : QStringLiteral("∫"),
                          color);
             },
             [&](const math::Delimited& value) {

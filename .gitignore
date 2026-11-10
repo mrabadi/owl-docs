@@ -26,6 +26,13 @@ node_modules/
 *.autosave
 *.user
 *.docx
+!/tests/fixtures/owldocs-0.6.0-styles.docx
+!/tests/fixtures/owldocs-0.6.0-desktop-styles.docx
+!/tests/fixtures/owldocs-0.6.0-academic.docx
+!/tests/fixtures/owldocs-0.6.1-styles.docx
+!/tests/fixtures/owldocs-0.6.1-desktop-styles.docx
+!/tests/fixtures/owldocs-0.6.1-academic.docx
+!/tests/fixtures/owldocs-0.6.2-desktop-table.docx
 *.docm
 *.dotx
 *.dotm

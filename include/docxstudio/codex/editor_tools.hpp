@@ -14,12 +14,13 @@ inline constexpr std::string_view kEditorSchemaVersion = "editor.v1";
 // Bump this whenever a persisted app-server thread must be recreated to pick
 // up a changed dynamic-tool catalog. thread/resume does not accept dynamicTools.
 inline constexpr std::string_view kEditorToolCatalogVersion =
-    "editor.v1.catalog.8";
+    "editor.v1.catalog.10";
 inline constexpr std::string_view kEditorReadTool = "editor_v1_read";
 inline constexpr std::string_view kEditorSearchTool = "editor_v1_search";
 inline constexpr std::string_view kEditorPreviewTool = "editor_v1_preview";
 inline constexpr std::string_view kEditorFileCapabilityTool =
     "editor_v1_file_capability_read";
+inline constexpr std::string_view kEditorCapabilitiesTool = "editor_v1_capabilities";
 
 struct EditorToolDefinition {
     std::string name;
@@ -35,6 +36,7 @@ struct EditorToolDefinition {
 
 [[nodiscard]] std::vector<EditorToolDefinition> editorV1ToolDefinitions();
 [[nodiscard]] Json editorV1ToolManifest();
+[[nodiscard]] Json editorV1Capabilities();
 [[nodiscard]] bool isEditorV1Tool(std::string_view name) noexcept;
 
 }  // namespace docxstudio::codex
